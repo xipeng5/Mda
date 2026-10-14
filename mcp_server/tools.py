@@ -18,6 +18,8 @@ import time
 
 from mcp.server.mcpserver import MCPServer
 
+from version import __version__
+
 from core.session import Session
 
 server = MCPServer(
@@ -27,7 +29,7 @@ server = MCPServer(
         "多 so 静态+动态分析工具。支持跨 so 调用链、字符串引用还原、"
         "adb/frida 动态断点与内存读取。"
     ),
-    version="0.1.0",
+    version=__version__,   # 版本号唯一来源见 version.py
 )
 
 # 单例会话：MCP 与 GUI 共享

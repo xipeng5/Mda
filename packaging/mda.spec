@@ -15,6 +15,12 @@ from PyInstaller.utils.hooks import collect_submodules
 
 ROOT = os.path.dirname(SPECPATH)          # 仓库根目录（spec 在 packaging/ 下）
 
+# 版本号唯一来源（version.py），避免 spec 与代码各写一份
+_ver_ns = {}
+with open(os.path.join(ROOT, "version.py"), encoding="utf-8") as _f:
+    exec(_f.read(), _ver_ns)
+VERSION = _ver_ns["__version__"]
+
 datas = [
     (os.path.join(ROOT, "assets"), "assets"),
     (os.path.join(ROOT, "plugins"), "plugins"),
@@ -99,8 +105,8 @@ app = BUNDLE(
     info_plist={
         "CFBundleName": "MDA",
         "CFBundleDisplayName": "MDA",
-        "CFBundleShortVersionString": "0.1.0",
-        "CFBundleVersion": "0.1.0",
+        "CFBundleShortVersionString": VERSION,
+        "CFBundleVersion": VERSION,
         "NSHighResolutionCapable": True,
         "LSMinimumSystemVersion": "11.0",
         # 需要访问本地网络（GUI 内置 MCP 服务监听 127.0.0.1）

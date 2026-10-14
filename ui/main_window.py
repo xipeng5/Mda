@@ -47,7 +47,9 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("MDA — Multi-so DisAssembly Analyzer")
+        from version import __version__
+
+        self.setWindowTitle(f"MDA {__version__} — Multi-so DisAssembly Analyzer")
         self.resize(1680, 980)
         from mcp_server.tools import get_session
 
@@ -302,6 +304,12 @@ class MainWindow(QMainWindow):
         act_chain = QAction("⛓ 跨 so 调用链", self)
         act_chain.triggered.connect(self._show_call_chain)
         tb.addAction(act_chain)
+
+        # MCP 配置一键复制：省去手写「python 绝对路径 + mda.py 绝对路径」
+        act_mcp_cfg = QAction("📋 MCP 配置", self)
+        act_mcp_cfg.setToolTip("复制 MCP 配置到剪贴板，粘到 AI 客户端即可接入")
+        act_mcp_cfg.triggered.connect(self._show_mcp_config)
+        tb.addAction(act_mcp_cfg)
 
         tb.addSeparator()
         self.dev_label = QLabel(" 设备: 未连接 ")
@@ -959,6 +967,13 @@ class MainWindow(QMainWindow):
             self.show_function(self.current_so, fn.addr)
 
     # ---------- 跨 so 调用链 ----------
+
+    def _show_mcp_config(self) -> None:
+        """弹出 MCP 配置对话框，一键复制给 AI 客户端。"""
+        from ui.mcp_config_dialog import McpConfigDialog
+
+        dlg = McpConfigDialog(port=getattr(self.mcp, "port", 8765), parent=self)
+        dlg.exec()
 
     def _show_call_chain(self) -> None:
         if not (self.current_so and self.current_func):
