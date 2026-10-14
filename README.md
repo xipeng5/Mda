@@ -40,11 +40,28 @@ IDA 无法直接分析**多个 so 之间的调用链路**。MDA 为此而生：
 
 ## 安装
 
+### 方式一：下载 macOS 客户端（推荐）
+
+到 [Releases](https://github.com/xipeng5/Mda/releases) 下载最新的
+`MDA-<版本>-macos-arm64.dmg`：
+
+1. 双击打开 `.dmg`
+2. 把 **MDA** 拖进 **Applications**（窗口里已经放好快捷方式）
+3. 从启动台打开
+
+> 首次打开若提示「无法验证开发者」（未签名应用的正常提示）：
+> **右键 → 打开**，或执行 `xattr -dr com.apple.quarantine /Applications/MDA.app`
+>
+> 当前安装包是 **Apple Silicon (arm64)** 版本；Intel 机器请用下面的源码方式运行。
+
+### 方式二：从源码运行
+
 ```bash
 git clone https://github.com/xipeng5/Mda.git
 cd Mda
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
+.venv/bin/python app.py
 ```
 
 > 需要 Python 3.11+（开发环境 3.11.15 / macOS arm64）。
@@ -165,7 +182,28 @@ adb shell "chmod 755 /data/local/tmp/frida-server"
 open dist/MDA.app
 ```
 
-产物在 `dist/MDA.app`（macOS）。图标取自 `assets/icon.icns`（由 `assets/logo.png` 生成）。
+产物在 `dist/MDA.app`。图标取自 `assets/icon.icns`（由 `assets/logo.png` 生成），
+版本号取自根目录 `version.py`（唯一来源，窗口标题 / MCP serverInfo / Info.plist 都用它）。
+
+### 做成 dmg 安装包
+
+```bash
+# 1) 暂存目录：放 app + 指向 /Applications 的快捷方式（拖拽安装用）
+rm -rf dist/dmg_root && mkdir -p dist/dmg_root
+cp -R dist/MDA.app dist/dmg_root/
+ln -s /Applications dist/dmg_root/Applications
+
+# 2) 生成压缩镜像
+hdiutil create -volname "MDA <版本>" \
+  -srcfolder dist/dmg_root -ov -format UDZO \
+  dist/MDA-<版本>-macos-arm64.dmg
+```
+
+> 打包用的两个坑（已在 spec 里处理）：
+> ① `collect_submodules("mcp")` 会 import `mcp.cli`（依赖 typer 且 import 期
+> `sys.exit(1)`），必须用 `filter=` 排除；
+> ② PyInstaller 缓存目录默认在 `~/Library/...`，受限环境下用
+> `PYINSTALLER_CONFIG_DIR=<项目>/.pyinstaller` 重定向。
 
 ## 项目结构
 
