@@ -1,0 +1,17 @@
+# MDA 运行期依赖（Python 3.11+）
+# 安装： python -m venv .venv && .venv/bin/pip install -r requirements.txt
+
+# --- 反汇编与 ELF 解析 ---
+capstone==5.0.9
+pyelftools==0.33
+
+# --- GUI ---
+PySide6==6.12.0
+
+# --- MCP（给 AI 客户端接入）---
+mcp==2.3.0
+uvicorn>=0.30
+httpx2==2.13.1
+
+# --- 动态分析（adb/frida 断点与内存读取，可选）---
+frida==17.23.3

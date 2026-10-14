@@ -1,0 +1,27 @@
+# 虚拟环境与缓存
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 打包产物
+build/
+dist/
+*.spec
+!packaging/*.spec
+
+# macOS
+.DS_Store
+
+# ===== 样本与第三方二进制（刻意不入库）=====
+# 逆向目标 App 的 so 属他人二进制，公开仓库不收录；
+# 需要跑测试请自备 AOSP 的 liblog/libbase/libcutils 放入 samples/。
+samples/
+so_test/
+tools/frida-server-*
+
+# 运行期产物
+*.log
+
+# PyInstaller 缓存（沙箱内构建用）
+.pyinstaller/
