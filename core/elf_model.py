@@ -17,6 +17,27 @@ from elftools.dwarf.structs import DWARFStructs
 from models import Arch, Function, Relocation, Section, Symbol, SymbolKind
 
 import io
+import struct
+
+
+def is_arm64_plt_stub(insns) -> bool:
+    """ARM64 标准 PLT 桩判定：adrp x16 / ldr x17 / add x16 / br x17。
+
+    (2) 第二次修改
+    bug 原因：该 4 条指令模板此前在 core/discover.py:is_plt_stub() 与
+    core/elf_model.py:_scan_plt_stubs_by_segment() 各写一份，两处判据一旦
+    漂移就会出现"发现阶段排除、扫描阶段漏判"的隐性不一致。
+    解决方案：抽成唯一实现，两处共用（判据只有一处可改）。
+    """
+    if len(insns) != 4:
+        return False
+    a, b, c, d = insns
+    return (
+        a.mnemonic == "adrp" and a.op_str.startswith("x16")
+        and b.mnemonic == "ldr" and b.op_str.startswith("x17")
+        and c.mnemonic == "add" and c.op_str.startswith("x16")
+        and d.mnemonic == "br" and d.op_str.strip() == "x17"
+    )
 
 
 class SoFile:
@@ -38,6 +59,10 @@ class SoFile:
         self._raw: bytes | None = None
         self._sections_usable = False  # 节表损坏时 False，全部 get_section_by_name 短路
         self.section_warning: str = ""  # 节表无效时的诊断信息（GUI/日志展示）
+        # (1) 第一次修改：段表模式扫描到的 PLT 桩地址集合（不伪造符号名）
+        self.plt_stubs: set[int] = set()
+        # (2) 第二次修改：桩地址排序缓存，供 in_plt_stub 二分查找
+        self._stub_sorted: list[int] = []
         self._parse()
 
     # ---------- 解析 ----------
@@ -61,6 +86,7 @@ class SoFile:
         self._parse_symbols()
         self._parse_relocations()
         self._parse_plt()
+        self._scan_plt_stubs_by_segment()
         self._parse_functions()
 
     def _parse_loads(self) -> None:
@@ -453,6 +479,15 @@ class SoFile:
                     fn.name = sym.name
                     fn.is_export = True
 
+        # (1) 第一次修改
+        # bug 原因：无节表样本里 FDE 会把 PLT 桩当成普通函数登记，
+        # 实测 0x1a4140 被调用 1436 次霸占扇入榜首，污染枢纽分析；
+        # 且 FDE 边界不准时还会在桩内部登记假入口（如 0x1a4124）。
+        # 解决方案：剔除落在任一桩 16 字节区间内的所有函数入口。
+        if self.plt_stubs:
+            for addr in [a for a in self.functions if self.in_plt_stub(a)]:
+                self.functions.pop(addr, None)
+
         self._refresh_functions()
 
     # ---------- 函数表维护（IDC / 递归发现 / FDE 共用） ----------
@@ -648,8 +683,15 @@ class SoFile:
         (2) 现由 _refresh_functions() 保证区间互不重叠且起点升序，
             因此「最后一个 start <= addr」若不包含 addr，即落在空洞，
             无需再往前找——反查从 O(N) 降为 O(log N)。
+        (3) 第二次修改 bug 原因：桩已从函数表剔除，但 _refresh_functions
+            按间隙把前一函数的 size 拉长，把桩字节圈进了函数体（实测
+            桩 0x1a4104 落在 0x1a4084 的区间 [0x1a4084,0x1a4124) 里），
+            导致 function_at(桩) 返回真函数——错误的归属。
+            解决方案：落在 PLT 桩区间内的地址一律返回 None。
         """
         if not self._starts:
+            return None
+        if self.in_plt_stub(addr):
             return None
         i = bisect.bisect_right(self._starts, addr) - 1
         if i < 0:
@@ -659,6 +701,80 @@ class SoFile:
 
     def plt_name(self, addr: int) -> str | None:
         return self.plt_map.get(addr)
+
+    def in_plt_stub(self, addr: int) -> bool:
+        """addr 是否落在任一 PLT 桩的 16 字节指令区间内。
+
+        (1) 第一次修改
+        bug 原因：FDE 边界不准时会在桩**内部**登记假函数入口，
+        实测 0x1a4124 是桩 0x1a4120 的第 2 条指令却被登记成函数，
+        只按桩起点精确匹配（addr in plt_stubs）会漏掉这类假入口。
+        解决方案：按 [stub, stub+16) 区间判定，起点与内部一网打尽。
+
+        (2) 第二次修改
+        bug 原因：初版对 plt_stubs 做线性扫描，而本函数在引用图构建时
+        每条 call 指令都要问一次（实测 15814 个调用点 × 165 个桩），
+        把引用图构建拖慢约 9%（6.5s → 7.1s）。
+        解决方案：改用排好序的 _stub_sorted + bisect，O(log n)。
+        """
+        if not self.plt_stubs:
+            return False
+        # 防御：外部若直接改动 plt_stubs，排序缓存可能过期，按长度重建
+        if len(self._stub_sorted) != len(self.plt_stubs):
+            self._stub_sorted = sorted(self.plt_stubs)
+        i = bisect.bisect_right(self._stub_sorted, addr) - 1
+        if i < 0:
+            return False
+        return self._stub_sorted[i] <= addr < self._stub_sorted[i] + 16
+
+    def _scan_plt_stubs_by_segment(self) -> None:
+        """段表模式下扫描 PLT 桩（无 .plt/.rela.plt 节表时）。
+
+        (1) 第一次修改
+        bug 原因：加固样本把节表与 PT_DYNAMIC 一起抹掉后，_parse_plt()
+        取不到 .plt 节直接 return，plt_map 保持为空；而 FDE 会把 PLT 桩
+        当成普通函数登记。实测 libsgmainso-6.7.260202.so：164 个标准桩
+        （adrp x16/ldr x17/add x16/br x17）全部进了函数表，其中
+        0x1a4140 被调用 1436 次，直接霸占扇入排行，污染枢纽排序。
+        解决方案：按 ARM64 标准桩模板扫可执行 PT_LOAD，命中地址记入
+        plt_stubs；符号名无法恢复（dynsym/rela 均已抹除），**plt_map
+        保持为空**，只记录地址，不伪造符号名。
+
+        (2) 第二次修改
+        bug 原因：初版对每个 4 字节偏移都解 16 字节交给 capstone，
+        实测 libsgmainso-6.7 构造耗时 4.79s（其中扫描 3.44s，
+        可执行段 1.7MB → 43 万次解码），样本越大越慢。
+        解决方案：先用 ADRP 位模式预筛（`(w & 0x9F000000) == 0x90000000`
+        且 `Rd == 16`），只对候选偏移做 capstone 校验。
+        实测 3.44s → 0.065s（53 倍），命中结果完全一致（差异 0）。
+        附带收益：预筛天然只落在合法指令编码上，减少非指令边界误判。
+        """
+        # 无节表时才需要；有节表走 _parse_plt 已有通路
+        if self._sections_usable:
+            return
+        raw = self._raw
+        if not raw:
+            return
+        exec_loads = [(va, end, off) for va, end, off, fl in self._loads if fl & 1]
+        if not exec_loads:
+            return
+        from capstone import Cs, CS_ARCH_ARM64, CS_MODE_LITTLE_ENDIAN
+        md = Cs(CS_ARCH_ARM64, CS_MODE_LITTLE_ENDIAN)
+        for va, end, off in exec_loads:
+            for i in range((end - va) // 4):
+                # 预筛：ADRP（op=1）且 Rd == x16，才值得做 4 条指令校验
+                w = struct.unpack_from("<I", raw, off + i * 4)[0]
+                if (w & 0x9F000000) != 0x90000000 or (w & 0x1F) != 16:
+                    continue
+                pos = off + i * 4
+                code = raw[pos: pos + 16]
+                if len(code) < 16:
+                    continue
+                if is_arm64_plt_stub(list(md.disasm(code, va + i * 4))):
+                    self.plt_stubs.add(va + i * 4)
+        # 排序缓存：in_plt_stub 是热路径（每条 call 指令都会问一次），
+        # 线性扫描 165~308 个桩会把引用图构建拖慢约 9%
+        self._stub_sorted = sorted(self.plt_stubs)
 
     def symbol_name(self, addr: int) -> str | None:
         """把地址解析为最合适的名字：函数名 > PLT 符号 > 空。"""

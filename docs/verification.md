@@ -488,3 +488,146 @@ e2e 14/14 ✓
 
 ### 回归
 e2e 14/14 ✓；liblog 111 / libbase 386 / libcutils 168 均 +0 ✓
+
+---
+
+## PLT 桩剔除：无节表加固样本的扇入污染修复（2026-10-27 第八轮）
+
+样本：`libsgmainso-6.7.260202.so`（2985052 字节，ARM64，用户提供）
+文件特征比前几轮的 dump 更刁钻：
+
+```
+$ file libsgmainso-6.7.260202.so
+ELF 64-bit LSB shared object, ARM aarch64, dynamically linked,
+can't read elf note at -1
+```
+
+- **节表头完好但内容被写坏**：pyelftools 迭代 section 直接抛
+  `Expected section size to be a multiple of entry size in section ''`
+- **PT_DYNAMIC 也被抹**：`relocations=0`、`symbols=0`
+  → 导入/导出符号名在文件里已无任何残留，**不可能恢复**（非代码缺陷）
+- MDA 表现：`sections=0 exports=0 imports=0`，靠 PT_LOAD 兜底 +
+  PT_GNU_EH_FRAME 二分表恢复函数，FDE 初扫 **3016** 个函数
+
+### 缺陷 1：PLT 桩被当成普通函数，霸占扇入榜首
+
+- 现象：扇入 TOP5 全是 `size=0`、零出边的函数，
+  其中 `0x1a4140` 被调用 **1436 次**排第一
+- 反汇编一看全是标准桩：
+  `adrp x16,#0x1aa000 | ldr x17,[x16,#0xee8] | add x16,x16,#0xee8 | br x17`
+- 根因：`_parse_plt()` 开头 `plt = self._sec_by_name(".plt")`，
+  无节表时返回 None 直接 return → `plt_map` 恒空；
+  而 FDE 会把这些桩原样登记进函数表（`discovered_by="fde"`）
+- 修复：新增 `_scan_plt_stubs_by_segment()`——无节表时按 ARM64
+  标准 4 条桩指令模板扫可执行 PT_LOAD，命中地址进 `plt_stubs`；
+  `_parse_functions()` 末尾按 `[stub, stub+16)` **区间**剔除函数入口
+- 为什么必须按区间而非精确匹配：FDE 边界不准时会在桩**内部**登记假入口，
+  实测 `0x1a4124` 是桩 `0x1a4120` 的第 2 条指令却被登记成函数
+- 效果：3016 → **3007**（剔掉 9 个假入口）；扫出 **165** 个桩
+
+### 缺陷 2：桩剔除后仍污染扇入统计
+
+- 现象：桩已从函数表删除，`calls_to` 里 `0x1a4140` 仍以 1436 次排第一
+- 根因：`xref._collect_function()` 把所有 bl 目标无差别写入 `_calls_to`
+- 修复：落到桩的调用改记 `_plt_calls`（外部导入调用），不进 `_calls_to`；
+  新增 `Xref.plt_calls` 只读属性暴露该表
+- 效果（同一份样本，修复前后对比）：
+
+| | 扇入榜首 | 值 |
+|---|---|---|
+| 修复前 | `0x1a4140`（PLT 桩） | 1436 |
+| 修复后 | `0x14054c`（真函数，带完整序言） | 1064 |
+
+外部调用 TOP5 正确归入 `plt_calls`：`0x1a4140`(1436) `0x1a41a0`(759)
+`0x1a4160`(376) `0x1a4170`(206) `0x1a42f0`(205)
+
+### 缺陷 3：`list_functions` 返回值误导
+
+- 现象：无节表样本只显示 FDE 初扫数（3016），用户会误判"函数就这么多"
+- 实际：建引用图时递归补 bl 目标，3016 → **4363**（+1356，+45%）
+- 修复：初扫状态下返回 `hint` 字段明确提示；补全后不再出现
+
+### 缺陷 4：`metadata` 三项全 0 掩盖真实外部依赖
+
+- 修复：`plt_stubs` 数量 + 说明文案（符号名无法恢复，但外部调用确实存在）
+
+### 同轮样本对比（5.5.110 dump）
+
+`libsgmainso-5.5.110.so.758a6e6000.bin`（节表偏移非法，`too large
+section header offset`）：扫出 **308** 个桩，但该样本 FDE 本就没把桩
+登记成函数（桩附近 0 个函数入口），故剔除数 = 0 —— 属正确行为，非漏修。
+其扇入榜首修复前后由 `0x27c00`(1656) 变为 `0x113548`(638)。
+
+### 回归
+
+- e2e **14/14 通过**
+- 健康样本零误伤：liblog 111/plt_map 105、libbase 386/235、
+  libcutils 168/174、libanti_complete_patched 1984/367
+  （`plt_stubs` 均为 0，走原 `.plt` 节解析通路，行为不变）
+- 桩复活检查：补全后函数表中落在桩区间内的入口 = **0**
+
+### 第九轮：代码评审后的 5 项修正（2026-10-27）
+
+第八轮改动经 code-review 审出 2 个阻断 + 3 个重要问题，逐条修复：
+
+**① 桩扫描性能：构造耗时 4.79s → 0.35s**
+
+初版对可执行段**每个 4 字节偏移**都解 16 字节交给 capstone
+（1.7MB 段 → 43 万次解码，占 3.44s）。改为 ADRP 位模式预筛：
+
+```python
+w = struct.unpack_from("<I", raw, off + i * 4)[0]
+if (w & 0x9F000000) != 0x90000000 or (w & 0x1F) != 16:   # ADRP 且 Rd==x16
+    continue
+```
+
+实测 3.44s → 0.065s（53 倍），命中 165 个桩，与旧实现差异 **0**。
+附带收益：预筛只落在合法 ADRP 编码上，减少非指令边界误判。
+
+> 曾尝试"线性扫全段"（capstone 顺序解码），命中 0 —— 数据区会让
+> 解码脱同步，此路不通，勿再尝试。
+
+**② `list_functions` hint 在健康样本误报**
+
+初版判据 `len(functions) == by_fde`（全来自 FDE），而这是健康样本常态：
+liblog 111 个全 fde、libbase 386 个全 fde，补全增量实际为 **+0**，
+却收到"函数数通常明显增加"的提示。改为 `by_fde and not so.sections`
+（段表模式才提示）。实测：liblog/libbase 不再出现 hint，6.7 样本仍提示。
+
+**③ `in_plt_stub` 线性扫描 → 二分**
+
+该函数在引用图构建时每条 call 指令都要问一次（15814 调用点 × 165 桩），
+把构建拖慢约 9%。改为 `_stub_sorted` + `bisect`，O(log n)。
+保留长度不一致时自动重建的防御（外部若直接改 `plt_stubs`）。
+
+**④ 桩地址被邻近函数"吞掉"，`function_at` 归属错误**
+
+实测桩 `0x1a4104` 落在函数 `0x1a4084` 的区间 `[0x1a4084,0x1a4124)` 内
+（`_refresh_functions` 按间隙拉长 size 所致）→ `function_at(桩)` 返回真函数。
+修复：`function_at` 遇桩区间一律返回 `None`。
+
+**⑤ `call_chain` 静默丢弃外部调用边**
+
+段表模式桩无名字（`plt_map` 空），`resolve_call` 返回 None，
+`call_chain` 遇 None 直接 `continue` → 实测 `children=[]`，边凭空消失。
+修复：`resolve_call` 识别桩并返回 `callee=f"plt_{addr:x}", callee_addr=0,
+via_plt=True`（地址派生名，不臆造真实符号名）。
+
+**⑥ 模板判据去重**
+
+`discover.is_plt_stub()` 与段表扫描各写一份 4 条指令模板，有判据漂移风险。
+抽出 `elf_model.is_arm64_plt_stub(insns)` 作为唯一实现，两处共用。
+
+### 修正后完整验证
+
+| 项目 | 结果 |
+|---|---|
+| SoFile 构造（6.7 样本） | 0.350s（原 4.79s） |
+| SoFile 构造（5.5 dump） | 0.367s |
+| 引用图构建 | 8.04s / 8.42s（与基线 7.1~8.2s 同级） |
+| 调用边完整性 | `calls_to` 8323 + `plt_calls` 5168 = **13491**（与修复前完全一致，无丢边） |
+| 扇入 TOP3 | `0x14054c`(1064) `0x14f598`(709) `0x152598`(456)，无桩 |
+| `function_at(桩)` | None ✓ |
+| `call_chain` 外部边 | 可见 `plt_1a4140` / `plt_1a41b0` ✓ |
+| 健康样本零误伤 | liblog 111/桩0、libbase 386/桩0、libcutils 168/桩0、libanti 1984/桩0 |
+| e2e | **14/14 通过** |

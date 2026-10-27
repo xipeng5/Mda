@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import struct
 
+from core.elf_model import is_arm64_plt_stub
+
 # 标准序言首指令（精确匹配）
 _PROLOGUE_EXACT = {
     0xD503233F,  # paciasp
@@ -89,16 +91,12 @@ class FunctionDiscoverer:
         但 PLT 桩仍留在代码里，会被当成普通 bl 目标。实测形态为
         `adrp x16,pg; ldr x17,[x16,#imm]; add x16,x16,#imm; br x17`
         （我最初按 3 条判定而全部漏掉，因为中间还有一条 add）。
+
+        (2) 第二次修改：判据改由 elf_model.is_arm64_plt_stub() 统一提供，
+        避免与段表扫描各写一份导致判据漂移。
         """
         ins = list(self._md().disasm(self.so.read(addr, 16), addr))[:4]
-        if len(ins) != 4:
-            return False
-        return (
-            ins[0].mnemonic == "adrp" and ins[0].op_str.startswith("x16")
-            and ins[1].mnemonic == "ldr" and ins[1].op_str.startswith("x17")
-            and ins[2].mnemonic == "add" and ins[2].op_str.startswith("x16")
-            and ins[3].mnemonic == "br" and ins[3].op_str.strip() == "x17"
-        )
+        return is_arm64_plt_stub(ins)
 
     def _bl_entry_ok(self, addr: int) -> bool:
         """bl 目标能否建为函数（**不要求标准序言**）。
@@ -112,6 +110,11 @@ class FunctionDiscoverer:
         if addr in self.so.functions:
             return False
         if not self.so.in_load(addr) or addr % 4:
+            return False
+        # (1) 第一次修改：段表模式已扫出的 PLT 桩直接排除，
+        # 按 16 字节区间判定（桩内部地址同样要排除），
+        # 省下对每个 bl 目标重复解码 4 条指令模板的开销
+        if self.so.in_plt_stub(addr):
             return False
         first = next(self._md().disasm(self.so.read(addr, 4), addr), None)
         if first is None or first.mnemonic in ("udf", ".byte"):

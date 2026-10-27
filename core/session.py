@@ -211,6 +211,22 @@ class Session:
             if resolved:
                 link.callee_so, link.callee_addr = resolved
             return link
+        # (2) 第二次修改
+        # bug 原因：段表模式下桩没有名字（plt_map 为空），旧代码走到这里
+        # 直接 return None，call_chain 遇到 None 就 continue，
+        # 导致"调用了外部函数"这条边被**静默丢弃**（实测 children=[]）。
+        # 解决方案：识别为未解析的外部导入，名字用地址派生（plt_xxxx），
+        # 不臆造真实符号名；callee_addr=0 表示外部，调用方据此可提示未解析。
+        if so.in_plt_stub(target):
+            return CallLink(
+                caller_so=so_name,
+                caller="",
+                caller_addr=target,
+                callee_so="",
+                callee=f"plt_{target:x}",
+                callee_addr=0,
+                via_plt=True,
+            )
         return None
 
     # ---------- 跨 so 调用链 ----------

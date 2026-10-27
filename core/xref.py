@@ -37,6 +37,9 @@ class Xref:
         self._calls_to: dict[int, list[int]] = defaultdict(list)
         self._called_by: dict[int, list[int]] = defaultdict(list)
         self._data_refs: dict[int, list[int]] = defaultdict(list)
+        # (1) 第一次修改：落到 PLT 桩的调用（外部导入调用），与 _calls_to 分表，
+        # 避免导入跳板污染本 so 的扇入统计
+        self._plt_calls: dict[int, list[int]] = defaultdict(list)
         # 每函数发出的数据引用：fn_addr -> [被引用的数据地址]（BUG-3 修复的关键）
         self._fn_data_refs: dict[int, list[int]] = defaultdict(list)
         # 指令缓存：fn_addr -> [Instruction]（BUG-2 修复：不再依赖 fn.instructions 回写）
@@ -63,6 +66,16 @@ class Xref:
         """某函数调用了谁 → 目标列表（首次访问自动全量构建）。"""
         self.build()
         return self._called_by
+
+    @property
+    def plt_calls(self) -> dict[int, list[int]]:
+        """PLT 桩地址 → 调用点列表（外部导入调用，不计入本 so 扇入）。
+
+        (1) 第一次修改：段表模式下桩已从函数表剔除，
+        其调用记录单独存放于此，供"哪些外部函数被大量调用"分析。
+        """
+        self.build()
+        return self._plt_calls
 
     @property
     def data_refs(self) -> dict[int, list[int]]:
@@ -151,6 +164,16 @@ class Xref:
             # 目标）。落不到 PT_LOAD 的引用一律丢弃，避免野边污染引用图。
             if ins.is_call and ins.call_target is not None:
                 if not self.so.in_load(ins.call_target):
+                    continue
+                # (1) 第一次修改
+                # bug 原因：段表模式下 PLT 桩已从函数表剔除，但调用目标仍被
+                # 无差别记进 _calls_to，实测桩 0x1a4140 以 1436 次调用霸占
+                # 扇入榜首，用户按扇入找枢纽时会被导入跳板误导。
+                # 解决方案：落到 PLT 桩的调用记为外部导入调用（_plt_calls），
+                # 不进 _calls_to，使其不参与本 so 的扇入统计。
+                if self.so.in_plt_stub(ins.call_target):
+                    self._plt_calls[ins.call_target].append(ins.addr)
+                    calls.append(ins.call_target)
                     continue
                 self._calls_to[ins.call_target].append(ins.addr)
                 calls.append(ins.call_target)

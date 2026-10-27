@@ -265,14 +265,32 @@ def list_modules() -> str:
 @logged()
 def list_functions(so_name: str, keyword: str = "", limit: int = 200) -> str:
     """列出某 so 的函数。keyword 过滤函数名（大小写不敏感）。"""
-    fns = _session.get(so_name).functions.values()
+    so = _session.get(so_name)
+    fns = so.functions.values()
     kw = keyword.lower()
     items = [
         {"addr": f.addr, "name": f.name or f"sub_{f.addr:x}", "size": f.size, "by": f.discovered_by}
         for f in fns
         if not kw or kw in (f.name or "").lower()
     ]
-    return _j({"count": len(items), "functions": items[:limit]})
+    # (1) 第一次修改 bug 原因：无节表样本 FDE 只给初扫数（实测 3016），
+    # 建引用图时还会补出 bl 目标（实测 +1356 → 4363），旧返回值看不出这个差距，
+    # 容易误判"函数就这么多"。
+    # 解决方案：附带提示字段，明确当前是否为未补全的初扫结果。
+    #
+    # (2) 第二次修改 bug 原因：初版判据是「所有函数都来自 FDE」，而这是
+    # 健康样本的常态（liblog 111 个全是 fde、libbase 386 个全是 fde），
+    # 导致健康样本也收到"函数数通常明显增加"的承诺，实际补全增量为 0，
+    # 属于误导。解决方案：只有**段表模式**（无节表，sections 为空）
+    # 才提示，该类样本的 FDE 才普遍不全。
+    hint = ""
+    by_fde = all(f.discovered_by == "fde" for f in so.functions.values())
+    if by_fde and not so.sections:
+        hint = "节表不可用，当前仅为 FDE 初扫结果；调用 build_xrefs 后会递归补全 bl 目标，函数数通常明显增加"
+    out = {"count": len(items), "functions": items[:limit]}
+    if hint:
+        out["hint"] = hint
+    return _j(out)
 
 
 @server.tool()
@@ -442,13 +460,20 @@ def segments(so_name: str) -> str:
 def metadata(so_name: str) -> str:
     """文件元信息：架构/格式/入口/模块统计。"""
     so = _session.get(so_name)
-    return _j({
+    out = {
         "name": so.name, "path": so.path, "arch": so.arch.name,
         "pie": so.is_pie, "entry": hex(so.entry),
         "functions": len(so.functions),
         "exports": len(so.exports), "imports": len(so.imports),
         "sections": len(so.sections),
-    })
+    }
+    # (1) 第一次修改 bug 原因：无节表样本的 PLT 桩既不在 exports 也不在
+    # imports 里，用户看三项全 0 会误以为"没有任何外部依赖"。
+    # 解决方案：显式报告扫出的桩数量，说明外部调用确实存在、只是符号名已抹。
+    if so.plt_stubs:
+        out["plt_stubs"] = len(so.plt_stubs)
+        out["plt_stubs_note"] = "节表/动态节被抹，桩按指令模板扫描得出；导入符号名无法恢复"
+    return _j(out)
 
 
 @server.tool()
