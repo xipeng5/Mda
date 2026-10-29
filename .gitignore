@@ -25,3 +25,16 @@ tools/frida-server-*
 
 # PyInstaller 缓存（沙箱内构建用）
 .pyinstaller/
+
+# ===== Web 前端（源码入库，依赖与构建产物不入库）=====
+web/node_modules/
+web/.npm-cache/
+
+# 拖入文件的落盘目录
+.cache/
+
+# UI 评审截图/临时产物（体积大，不入库）
+docs/ui-review/
+
+# 前端导出的示例数据（由 tests/ui_review/dump_sphere_data.py 生成，不入库）
+web/public/data.js

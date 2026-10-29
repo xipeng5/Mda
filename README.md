@@ -27,6 +27,29 @@ IDA 无法直接分析**多个 so 之间的调用链路**。MDA 为此而生：
 左上工具栏是 logo；中间是 IDA View-A 风格的反汇编（带 XREF 注释与分支连线导航条），
 底部 Output 面板实时滚动 AI 的工具调用日志。
 
+## 界面
+
+界面用 React + TypeScript 写，跑在本机 WKWebView 里：多 so 函数球（每点=一个函数）、
+调用关系线、断点标记、引用图构建进度环、透明操作卡、代码浮出层，深浅双主题。
+
+```bash
+# 1. 构建前端（只需一次，改前端代码后重跑）
+cd web && npm install && npm run build && cd ..
+
+# 2. 启动（服务 + 原生窗口；未装 pywebview 时自动开浏览器）
+.venv/bin/python app.py
+```
+
+Web 版复用同一套分析内核（`core.Session`），不经过 MCP 协议层：
+`server/api.py` 提供 `/api/modules`、`/api/functions`、`/api/disasm`、
+`/api/xrefs`、`/api/strings`、`/api/xrefs/build` 与 `/api/events`（WebSocket）。
+
+冒烟测试：
+
+```bash
+.venv/bin/python tests/ui_review/smoke_web_api.py
+```
+
 ## 核心能力
 
 | 能力 | 说明 |
@@ -69,12 +92,14 @@ python3 -m venv .venv
 
 ## 使用
 
-### 图形界面
+### 启动界面
 
 ```bash
-.venv/bin/python app.py                     # 空启动
-.venv/bin/python app.py a.so b.so c.so      # 启动即加载多个 so
+.venv/bin/python app.py
 ```
+
+界面会启动本地分析服务（`127.0.0.1:8766`）并打开窗口；
+内置 MCP 仍监听 `127.0.0.1:8765`，AI 与界面共享同一会话。
 
 启动后 MCP 服务**自动监听** `http://127.0.0.1:8765/mcp`，状态显示在工具栏。
 

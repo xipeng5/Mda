@@ -1,13 +1,15 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""MDA 打包配置（macOS .app / Windows .exe 通用）。
+"""MDA 打包配置（macOS .app）。
 
-要点：
-  1. assets/ 与 plugins/ 是**运行期按路径读取**的资源（不是 import 进来的），
-     必须作为 data 打进包，否则装完没有 logo、插件也扫不到。
-     - assets/  由 ui/main_window.py:asset_path() 定位（打包后取 sys._MEIPASS）
-     - plugins/ 由 core/plugins.py 按 __file__ 相对定位
-  2. uvicorn / mcp 的部分实现是动态导入，显式声明 hiddenimports 才不会漏。
-  3. 排除体积巨大且用不到的 Qt 模块（WebEngine 一个就上百 MB）。
+当前形态：Web UI（React + TS）+ Python 内核 + 内置 MCP，窗口用 pywebview（系统 WKWebView）。
+所以打包只需要三样东西：
+  1. Python 代码：app.py / core / mcp_server / server / dyn / scripting / plugins
+  2. 运行期按路径读取的资源：assets/（图标）、plugins/（插件）
+  3. 前端构建产物：web/dist（由 server/api.py 静态托管）
+
+注意：
+  - 不再依赖 PySide6；若环境里装着也会被 excludes 排掉，体积少一大截。
+  - uvicorn / mcp / webview / dyn 有动态导入，必须显式声明 hiddenimports。
 """
 import os
 
@@ -24,35 +26,23 @@ VERSION = _ver_ns["__version__"]
 datas = [
     (os.path.join(ROOT, "assets"), "assets"),
     (os.path.join(ROOT, "plugins"), "plugins"),
+    (os.path.join(ROOT, "web", "dist"), os.path.join("web", "dist")),   # 前端产物
 ]
 
 hiddenimports = (
     collect_submodules("uvicorn")
-    # 排除 mcp.cli：那是官方命令行入口，依赖 typer（本项目不用），
-    # 且它在 import 期会 sys.exit(1)，会让 collect_submodules 直接失败。
+    # mcp.cli 是官方命令行入口，依赖 typer 且 import 期会 sys.exit
     + collect_submodules("mcp", filter=lambda n: not n.startswith("mcp.cli"))
+    + collect_submodules("webview")      # pywebview 按平台动态选后端
+    + collect_submodules("dyn")          # 动态分析按需 import，静态扫不到
     + ["anyio._backends._asyncio"]
 )
 
-# 未使用的重型 Qt 模块，排除以控制体积
+# 用不到的重型依赖，排除以控制体积
 excludes = [
-    "PySide6.QtWebEngineCore",
-    "PySide6.QtWebEngineWidgets",
-    "PySide6.QtWebEngineQuick",
-    "PySide6.QtQuick",
-    "PySide6.QtQml",
-    "PySide6.Qt3DCore",
-    "PySide6.QtCharts",
-    "PySide6.QtDataVisualization",
-    "PySide6.QtMultimedia",
-    "PySide6.QtNetworkAuth",
-    "PySide6.QtPdf",
-    "mcp.cli",
-    "typer",
-    "tkinter",
-    "matplotlib",
-    "pandas",
-    "numpy",
+    "PySide6", "PyQt5", "PyQt6", "shiboken6",
+    "mcp.cli", "typer", "tkinter", "matplotlib", "pandas", "numpy",
+    "scipy", "IPython", "pytest",
 ]
 
 a = Analysis(

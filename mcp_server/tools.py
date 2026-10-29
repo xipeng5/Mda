@@ -686,27 +686,22 @@ def start_frida(serial: str) -> str:
     """以 root 启动设备端 frida-server（须已 push 对应版本）。"""
     from dyn.adb import Adb
 
-    ok = Adb(serial).start_frida()
-    return _j({"running": ok})
+    # (1) 第一次修改：原来只返回 {"running": bool}，失败无原因。
+    #     现在透传 dyn.adb 的结构化结果（running/code/message/path），
+    #     running 键保持不变，老调用方不受影响。
+    return _j(Adb(serial).start_frida())
 
 
 @server.tool()
 @logged()
 def runtime_modules(serial: str, pid: int, keyword: str = "") -> str:
     """列出目标进程加载的模块及运行时基址。keyword 过滤模块名。"""
-    from dyn.rebase import Rebase
+    # (2) 第二次修改：改走 DynSession 注册表。
+    #     原因：每次调用都 attach/detach，既抖动又让断点无法复用同一会话。
+    #     契约：返回字段与顺序不变。
+    from dyn.service import get_dyn
 
-    rb = Rebase.attach(serial, pid)
-    try:
-        mods = rb.refresh_modules()
-        kw = keyword.lower()
-        return _j([
-            {"name": m.name, "base": hex(m.base), "size": hex(m.size), "path": m.path}
-            for m in mods
-            if not kw or kw in m.name.lower()
-        ][:200])
-    finally:
-        rb.detach()
+    return _j(get_dyn().modules(serial, pid, keyword))
 
 
 @server.tool()
@@ -717,30 +712,66 @@ def set_breakpoint(serial: str, pid: int, so_name: str, static_addr: int, hold: 
     hold=False 命中即继续（只记录）；hold=True 挂起等待，
     调用 wait_hits 拿到命中后分析，再调 resume 放行。
     """
-    from dyn.debugger import Debugger
-    from dyn.rebase import Rebase
+    # (1) 第一次修改
+    # bug 原因：原实现既不保存 dbg 也不 detach，函数一返回脚本就被回收，
+    #           实测连续调用 attach=3 / detach=0，既泄漏又查不到断点。
+    # (2) 第二次修改：改走 DynSession 注册表，断点由单例持有 → 真正持久。
+    #     契约：保留 set 字段，新增 id/runtime_addr/persistent 等。
+    from dyn.service import get_dyn
 
-    rb = Rebase.attach(serial, pid)
-    dbg = Debugger(rb)
-    ok = dbg.set_breakpoint(so_name, static_addr, policy="hold" if hold else "resume")
-    return _j({"set": ok})
+    bp = get_dyn().set_breakpoint(serial, pid, so_name, static_addr, hold=hold)
+    return _j({"set": True, "persistent": True, **bp})
 
 
 @server.tool()
 @logged()
 def read_process_memory(serial: str, pid: int, so_name: str, static_addr: int, size: int = 32) -> str:
     """按 so 静态地址读取目标进程内存（自动完成 ASLR 换算）。"""
-    from dyn.rebase import Rebase
+    # (1) 第一次修改：size 越界与空结果都显式报错，不伪装成功（细节见 dyn/service.py）。
+    # (2) 第二次修改：改走 DynSession 注册表，复用已附加的会话。
+    from dyn.service import get_dyn
 
-    rb = Rebase.attach(serial, pid)
     try:
-        mod = rb.find_module(so_name)
-        if mod is None:
-            return _j({"error": f"{so_name} not loaded in process {pid}"})
-        data = rb.read_memory(rb.to_runtime(static_addr, mod), size)
-        return _j({"static_addr": hex(static_addr), "runtime_addr": hex(rb.to_runtime(static_addr, mod)), "hex": data.hex()})
-    finally:
-        rb.detach()
+        data = get_dyn().read_memory(serial, pid, so_name, static_addr, size)
+    except Exception as exc:                      # noqa: BLE001 - DynError 带 code
+        return _j({"error": f"{type(exc).__name__}: {exc}"})
+    return _j({
+        "static_addr": hex(data["static_addr"]),
+        "runtime_addr": hex(data["runtime_addr"]),
+        "hex": data["hex"],
+        "size": data["size"],
+    })
+
+
+@server.tool()
+@logged()
+def wait_hits(serial: str, pid: int, timeout: float = 10.0) -> str:
+    """等待断点命中（阻塞到超时或出现新命中）。
+
+    必须先用 set_breakpoint 下断；hold=True 的断点会挂住目标线程，
+    拿到命中后用 resume 放行。
+    """
+    from dyn.service import get_dyn
+
+    return _j({"hits": get_dyn().wait_hits(serial, pid, timeout=timeout)})
+
+
+@server.tool()
+@logged()
+def resume(serial: str, pid: int) -> str:
+    """放行 hold 策略下挂起的线程（重复调用无副作用）。"""
+    from dyn.service import get_dyn
+
+    return _j({"resumed": get_dyn().resume(serial, pid)})
+
+
+@server.tool()
+@logged()
+def list_breakpoints() -> str:
+    """列出当前所有断点（AI 与界面共用同一份）。"""
+    from dyn.service import get_dyn
+
+    return _j({"breakpoints": get_dyn().list_breakpoints()})
 
 
 # ---------------- 脚本通道 ----------------
