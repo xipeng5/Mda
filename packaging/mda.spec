@@ -35,6 +35,12 @@ hiddenimports = (
     + collect_submodules("mcp", filter=lambda n: not n.startswith("mcp.cli"))
     + collect_submodules("webview")      # pywebview 按平台动态选后端
     + collect_submodules("dyn")          # 动态分析按需 import，静态扫不到
+    # (1) 第一次修改（2026-10-30）：显式声明 mcp_server 子模块。
+    #     bug 原因：mcp_server.link 是在工具包装器里用 `from mcp_server import link`
+    #               运行期动态导入的，PyInstaller 静态分析扫不到，打包后
+    #               该导入失败 →「AI 调用转发到 GUI」的修复在发布版里失效。
+    #     解决方案：collect_submodules("mcp_server") 把所有子模块都打进去。
+    + collect_submodules("mcp_server")
     + ["anyio._backends._asyncio"]
 )
 

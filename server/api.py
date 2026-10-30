@@ -322,6 +322,15 @@ async def lifespan(_app):
     global _loop
     _loop = asyncio.get_running_loop()
 
+    # (3) 第三次修改（2026-10-30）：标记本进程是 GUI。
+    #     bug 原因：新增「工具调用转发到 GUI」机制后（mcp_server/link.py），
+    #               GUI 进程自己也注册了同一批工具；若它不声明身份，
+    #               link.gui_online() 会判定「GUI 在线」并转发给自己 → 自环。
+    #     解决方案：GUI 进程在启动内置 MCP 前显式置 MDA_IS_GUI=1，
+    #               mcp_server.link 据此拒绝转发。
+    #     时机：必须在 mcp.start_http() 之前设置，避免启动瞬间就被转发命中。
+    os.environ["MDA_IS_GUI"] = "1"
+
     # AI 每调用一次工具 → 推给前端：日志、观察列表、球体脉冲
     def _on_ai(entry: dict) -> None:
         _broadcast_sync({

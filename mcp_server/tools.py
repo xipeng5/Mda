@@ -174,6 +174,32 @@ def logged(tool_name: str | None = None):
             sig_keys = fn.__code__.co_varnames[:fn.__code__.co_argcount]
             call_args: dict = dict(zip(sig_keys, args)) if args else {}
             call_args.update({k: v for k, v in kwargs.items() if k in sig_keys})
+
+            # (3) 第三次修改（2026-10-30）：GUI 在线时把调用转发到 GUI 进程执行，
+            #     从根源消除「AI 在一个进程分析、界面另一个进程空着」的双会话。
+            #     bug 原因：_session 是**每进程一个**模块级单例，stdio 进程与
+            #               GUI 进程天然各持一份；旧 proxy 只在启动时探测一次，
+            #               GUI 后启动即永久不同步（实测 MCP 侧 list_modules 得
+            #               2 个 so，而 GUI /api/modules 为 []、lsof 也证实 GUI
+            #               进程从未打开那两个 so 文件）。
+            #     解决方案：调用前经 mcp_server.link 判定 GUI 是否在线；在线则
+            #               转发执行并原样返回其文本结果，离线才本地执行。
+            #               判定在**每次调用**前进行，故降级状态可自愈。
+            #     注意：GUI 进程自身设 MDA_IS_GUI=1，link 会拒绝转发，避免自环。
+            from mcp_server import link
+
+            if link.should_forward():
+                fw = link.forward(name, call_args)
+                if fw is not None:
+                    ms = (time.time() - t0) * 1000
+                    parts = [
+                        f"{k}={str(v)[:60]}"
+                        for k, v in call_args.items()
+                        if v not in (None, "")
+                    ]
+                    _activity(name, call_args, ", ".join(parts) or "-", ms)
+                    return fw
+
             try:
                 result = fn(*args, **kwargs)
                 ms = (time.time() - t0) * 1000
@@ -563,20 +589,41 @@ def search_bytes(so_name: str, hex_pattern: str, limit: int = 50) -> str:
         else:
             rx += re.escape(bytes.fromhex(p))
     pattern = re.compile(rx, re.DOTALL)
-    hits = []
+
+    # (4) 第四次修改（2026-10-30）：节表为空时用 PT_LOAD 可执行段兜底。
+    #     bug 原因：旧实现只遍历 so.sections。壳处理过的 dump so 节表被抹，
+    #               elf_model 会置 _sections=[]，循环体一次都不执行 →
+    #               在任何壳样本上都恒返回 count:0。实测在 sgm 样本上
+    #               搜单字节 "d2" 也是 0，而按 PT_LOAD 扫同一模式可命中
+    #               110 处 br x16 / 297 处 br x17，属于会误导用户的静默错误。
+    #     解决方案：优先用节表；无节表时改用 exec_regions()（PT_LOAD 中
+    #               的可执行段）扫描，保证壳样本上搜索依然有效。
+    regions: list[tuple[int, int, str]] = []
     for sec in so.sections:
+        # 保留原有过滤：非可执行且 addr==0 的节跳过（如 NULL 头）
         if not sec.is_exec and sec.addr == 0:
             continue
-        data = so.read(sec.addr, sec.size)
+        regions.append((sec.addr, sec.size, sec.name))
+    if not regions:
+        for va, end, _off, _fl in so.exec_regions():
+            regions.append((va, end - va, "(segment)"))
+
+    hits = []
+    for base, size, label in regions:
+        data = so.read(base, size)
         if not data:
             continue
         for m in pattern.finditer(data):
-            hits.append({"addr": hex(sec.addr + m.start()), "section": sec.name})
+            hits.append({"addr": hex(base + m.start()), "section": label})
             if len(hits) >= limit:
                 break
         if len(hits) >= limit:
             break
-    return _j({"count": len(hits), "matches": hits})
+    out = {"count": len(hits), "matches": hits}
+    if not so.sections:
+        # 显式告知走的是段表兜底，避免用户误判「样本里没有该字节」
+        out["scan_mode"] = "PT_LOAD（节表不可用，按可执行段扫描）"
+    return _j(out)
 
 
 @server.tool()

@@ -655,6 +655,18 @@ class SoFile:
         self._read_miss = addr  # 诊断标记：最近一次完全 miss 的地址
         return b""
 
+    def exec_regions(self) -> list[tuple[int, int, int, int]]:
+        """可执行区域列表 [(vaddr, end, file_off, flags)]。
+
+        (4) 第四次修改（2026-10-30）：新增公开访问器。
+        bug 原因：search_bytes 等上层功能只遍历 so.sections，而壳处理过的
+                  dump so 节表被抹（_sections=[]），导致「按字节搜索」在
+                  最需要它的样本上恒返回 0（实测搜单字节 d2 也为 0，
+                  而同一模式按 PT_LOAD 扫可命中 110 处 br x16）。
+        解决方案：暴露 PT_LOAD 中的可执行段，供上层在无节表时兜底扫描。
+        """
+        return [(va, end, off, fl) for va, end, off, fl in self._loads if fl & 1]
+
     def maps(self) -> list[dict]:
         """已注册的虚拟地址区域（sections + PT_LOAD），诊断 read miss 用。"""
         out = [
