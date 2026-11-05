@@ -167,6 +167,111 @@ class Adb:
             "设备上没有 frida-server，已探测：" + "、".join(candidates),
         )
 
+    def server_version(self, path: str = "") -> str:
+        """读设备上 frida-server 二进制的版本号（如 "17.23.3"）。
+
+        (2) 第二次修改（2026-11-05）：新增。
+        bug 原因：start_frida 原先不做版本校验，设备上无论放的是哪个版本都照起。
+                  而 frida 客户端与 server 版本必须一致，minor 不同也会报
+                  "ProtocolError: unable to communicate with remote frida-server"，
+                  于是表现为"起来了但连不上"，且错误信息看不出是版本问题。
+        解决方案：启动前读一次 `--version`，与调用方期望的版本比对，
+                  不一致就明确拒绝并把两个版本号都报出来。
+        返回空串表示读不到（无执行权限/非 ELF/不存在）。
+        """
+        target = path
+        if not target:
+            try:
+                target = self.resolve_server_path()
+            except DynError:
+                return ""
+        out = self._cmd("shell", "su", "-c", f"{target} --version 2>&1",
+                        check=False, timeout=25)
+        text = (out or "").strip().splitlines()[0].strip() if (out or "").strip() else ""
+        # 只认形如 17.23.3 / 16.0.19 的版本串，避免把报错信息当版本
+        import re as _re
+
+        m = _re.match(r"^(\d+\.\d+\.\d+)", text)
+        return m.group(1) if m else ""
+
+    @staticmethod
+    def _port_hex(port: int) -> str:
+        return f"{port:04X}"
+
+    def listening_port(self, port: int = 27042) -> bool:
+        """端口是否处于 LISTEN。
+
+        (3) 第三次修改（2026-11-05）：新增。
+        bug 原因：判断"frida 是否在跑"原来只看进程名，而设备上可能同时有多个
+                  frida 进程（不同版本、不同端口），按名判断会把"别人的"当成"我们的"。
+                  端口才是可靠判据——谁绑了 27042 才是真正对外的那个。
+        实现：grep 原始行回本地解析，避免设备端 awk 的 $ 被多层 shell 提前展开
+              （实测 awk 版本恒返回空）。
+        """
+        raw = self._cmd("shell", "su", "-c",
+                        f"grep -h -i :{self._port_hex(port)} /proc/net/tcp "
+                        f"/proc/net/tcp6 2>/dev/null || true", check=False)
+        for line in (raw or "").splitlines():
+            parts = line.split()
+            # 字段：sl local_address rem_address st ... （st=0A 表示 LISTEN）
+            if len(parts) > 9 and parts[3] == "0A":
+                return True
+        return False
+
+    def listening_pids(self, port: int = 27042) -> list[tuple[int, str]]:
+        """返回正在监听指定端口的进程 [(pid, name)]。
+
+        (3) 第三次修改（2026-11-05）：新增。
+        用途：启动前先看 27042 被谁占着——如果是别的版本的 frida，
+        应当明确报错让用户决定，**不能直接杀掉**（那可能是别人的项目在用的）。
+
+        (4) 第四次修改（2026-11-05）：反查方式改为逐个候选进程精确检查。
+            bug 原因：初版用 `ls -l /proc/*/fd | grep inode`，但设备上的 ls
+                      对多个目录会输出分组标题（`/proc/123/fd:`），
+                      PID 不在内容行里，正则一条都匹配不到（实测恒返回 []）。
+            解决方案：先取 LISTEN 的 socket inode，再用 ps 列出所有 frida 进程，
+                      对每个候选执行 `ls -l /proc/<pid>/fd | grep -c`，
+                      命中数 > 0 即判定为该端口的持有者。候选通常只有 1-3 个，
+                      成本可接受且不依赖 ls 的跨目录输出格式。
+        """
+        raw = self._cmd("shell", "su", "-c",
+                        f"grep -h -i :{self._port_hex(port)} /proc/net/tcp "
+                        f"/proc/net/tcp6 2>/dev/null || true", check=False)
+        inode = ""
+        for line in (raw or "").splitlines():
+            parts = line.split()
+            if len(parts) > 9 and parts[3] == "0A":
+                inode = parts[9]
+                break
+        if not inode:
+            return []
+
+        table = self._cmd("shell", "ps", "-A", "-o", "PID,NAME", check=False)
+        candidates: list[tuple[int, str]] = []
+        for line in (table or "").splitlines():
+            parts = line.split()
+            if len(parts) < 2 or not parts[0].isdigit():
+                continue
+            name = parts[-1]
+            low = name.lower()
+            # 只查名字里带 frida 的（别的进程不可能监听 frida 的端口）
+            if "frida" not in low or "gadget" in low:
+                continue
+            candidates.append((int(parts[0]), name))
+
+        holders: list[tuple[int, str]] = []
+        for pid, name in candidates:
+            out = self._cmd(
+                "shell", "su", "-c",
+                # 必须用 -F：socket:[123] 里的方括号是**字面量**，不用 -F 时
+                # grep 会把它当字符类（匹配 "socket:" 后跟一个数字），而实际文本
+                # 里方括号是真实字符，导致恒匹配不到（实测全返回 0）。
+                f"ls -l /proc/{pid}/fd 2>/dev/null | grep -cF 'socket:[{inode}]'",
+                check=False, timeout=30)
+            if (out or "").strip() not in ("", "0"):
+                holders.append((pid, name))
+        return holders
+
     def _running_name(self) -> str:
         """返回正在运行的 frida-server 进程名，没有则空串。"""
         for name in FRIDA_PROCESS_NAMES:
@@ -184,7 +289,7 @@ class Adb:
         """
         return bool(self._running_name())
 
-    def start_frida(self, wait: float = 2.5) -> dict:
+    def start_frida(self, wait: float = 2.5, expect_version: str = "") -> dict:
         """以 root 启动 frida-server，返回结构化结果。
 
         (1) 第一次修改
@@ -192,14 +297,88 @@ class Adb:
                   调用方只能拿到 {"running": false}，无法判断是缺二进制、
                   没 root 还是启动失败。
         解决方案：返回 {running, code, message, path}；code 为空表示成功。
-        """
-        if self.frida_running():
-            return {"running": True, "code": "", "message": "已在运行", "path": ""}
 
+        (5) 第五次修改（2026-11-05）：加**版本校验**与**端口占用者保护**。
+            bug 原因：① 原先不看版本，设备上放的是旧版照样起，起来后连不上，
+                        报的是 "ProtocolError"，看不出根因是版本不匹配；
+                      ② 原先只看进程名就认为"已在运行"，而设备上可能同时有多个
+                        frida 进程（别人的项目在用的、监听别的端口的），
+                        会把"别人的"当成"我们的"。
+            解决方案：① 传 expect_version 时先读设备二进制的 --version 比对，
+                         不一致立即返回 FRIDA_VERSION_MISMATCH 并给出两个版本；
+                      ② 先用端口判断 27042 有没有被占；被占时查清楚**是谁**占的，
+                         如果是别的程序就返回 FRIDA_PORT_TAKEN 并列出占用者，
+                         **绝不擅自杀掉**（那可能是用户别的项目在跑）。
+        """
+        port = 27042
+
+        # ① 端口已被占：先查清是谁
+        if self.listening_port(port):
+            holders = self.listening_pids(port)
+            try:
+                path = self.resolve_server_path()
+            except DynError:
+                path = ""
+            running_ver = self.server_version(path) if path else ""
+            # 占用者里包含我们路径对应的进程名 → 认为就是我们的在跑
+            names = {n for _, n in holders}
+            if path and names and any(n in path or path.endswith("/" + n) for n in names):
+                ok_ver = (not expect_version) or (running_ver == expect_version)
+                return {
+                    "running": True,
+                    "code": "" if ok_ver else "FRIDA_VERSION_MISMATCH",
+                    "message": (f"已在运行（{running_ver or '版本未知'}）" if ok_ver else
+                                f"已在运行但版本不匹配：设备 {running_ver}，"
+                                f"客户端 {expect_version}；用 frida_server_align 对齐"),
+                    "path": path,
+                    "version": running_ver,
+                    "holders": [{"pid": p, "name": n} for p, n in holders],
+                }
+            return {
+                "running": True,
+                "code": "FRIDA_PORT_TAKEN",
+                "message": (f"端口 {port} 已被别的进程占用："
+                            + "、".join(f"{n}(pid {p})" for p, n in holders)
+                            + "；**未做任何操作**，请确认那是谁再决定"),
+                "path": path,
+                "holders": [{"pid": p, "name": n} for p, n in holders],
+            }
+
+        # ② 没占：找二进制并校验版本
         try:
             path = self.resolve_server_path()
         except DynError as exc:
             return {"running": False, "code": exc.code, "message": exc.message, "path": ""}
+
+        ver = self.server_version(path)
+        if expect_version and ver and ver != expect_version:
+            return {
+                "running": False,
+                "code": "FRIDA_VERSION_MISMATCH",
+                "message": (f"设备上的 frida-server 是 {ver}，本机客户端是 {expect_version}；"
+                            "版本不一致会连不上（ProtocolError）。"
+                            "先用 frida_server_align 覆盖成同版本再启动"),
+                "path": path,
+                "version": ver,
+                "expected": expect_version,
+            }
+        if expect_version and not ver:
+            # (8) 第八次修改（2026-11-05）：读不到版本时**不再盲启动**。
+            #     bug 原因：原实现 `if expect_version and ver and ...`，当 ver 为空
+            #               （二进制无执行权限 / 非 ELF / 已被截断）时整个校验被跳过，
+            #               照常启动，又回到"起来了但连不上、报 ProtocolError"的老问题。
+            #     解决方案：给了期望版本却读不到设备版本，直接拒绝并说明可能原因。
+            return {
+                "running": False,
+                "code": "FRIDA_VERSION_UNKNOWN",
+                "message": (f"读不到设备上 {path} 的版本（--version 无输出或非可执行）；"
+                            "无法确认与本机客户端 "
+                            f"{expect_version} 是否匹配，故不启动。"
+                            "可先 chmod 755，或用 frida_server_align 重新部署"),
+                "path": path,
+                "version": "",
+                "expected": expect_version,
+            }
 
         if not self.is_root():
             return {
@@ -211,21 +390,44 @@ class Adb:
 
         self._cmd("shell", "su", "-c", f"nohup {path} >/dev/null 2>&1 &", timeout=15)
         time.sleep(wait)
-        ok = self.frida_running()
+        ok = self.listening_port(port) or self.frida_running()
         return {
             "running": ok,
             "code": "" if ok else "FRIDA_START_FAILED",
-            "message": "已启动" if ok else "启动命令已执行但进程未存活（可能是版本或 SELinux 限制）",
+            "message": ("已启动" if ok else
+                        "启动命令已执行但端口未监听、进程也未存活"
+                        "（可能是版本不符、SELinux 限制，或端口被临时占用）"),
             "path": path,
+            "version": ver,
         }
 
-    def stop_frida(self) -> bool:
-        name = self._running_name()
-        if not name:
-            return True
-        self._cmd("shell", "su", "-c", f"kill $(pidof {name})", check=False)
+    def stop_frida(self) -> dict:
+        """停掉占用 27042 的 frida-server。
+
+        (6) 第六次修改（2026-11-05）：改为**只按端口**停止，并回报停掉了什么。
+            bug 原因：原实现用 `pidof <名字>` 按进程名杀，而设备上可能存在多个
+                      frida 进程（别人的项目占用别的端口，如 frida_16019 监听 27100）。
+                      按名杀会**误杀别人的进程**——这是很严重的副作用。
+            解决方案：只处理监听 27042 的进程（端口是唯一可靠判据），
+                      并在返回里逐条列出 pid/名字，让用户清楚我停了什么。
+                      没有占用者时直接返回成功，不做多余动作。
+        """
+        holders = self.listening_pids(27042)
+        if not holders:
+            return {"stopped": [], "ok": True, "message": "端口 27042 没有监听者"}
+        stopped: list[dict] = []
+        for pid, name in holders:
+            self._cmd("shell", "su", "-c",
+                      f"kill {pid} 2>/dev/null; sleep 0.3; kill -9 {pid} 2>/dev/null",
+                      check=False)
+            stopped.append({"pid": pid, "name": name})
         time.sleep(0.5)
-        return not self.frida_running()
+        return {
+            "stopped": stopped,
+            "ok": not self.listening_port(27042),
+            "message": ("已停止：" + "、".join(f"{d['name']}(pid {d['pid']})" for d in stopped)
+                        if stopped else "没有需要停止的进程"),
+        }
 
     # ---------- 汇总探测 ----------
 
@@ -260,15 +462,126 @@ class Adb:
 
         if self.serial:
             info["active"] = {"serial": self.serial, "root": self.is_root()}
-            info["frida"]["running"] = self.frida_running()
+            # (7) 第七次修改（2026-11-05）：running 改由**端口**判定，并补版本信息。
+            #     bug 原因：原先 running 只看进程名，设备上同时存在别人的 frida
+            #               （监听别的端口）时会误报"在运行"；而且没有版本字段，
+            #               用户无法从这里看出"起来了但版本不匹配连不上"。
+            #     解决方案：running 用 27042 是否有 LISTEN 判定；补 device_version
+            #               与 client_version，并给出 version_match 布尔值，
+            #               让 preflight 一次把"能不能用"讲清楚。
+            info["frida"]["running"] = self.listening_port(27042)
             try:
                 info["frida"]["path"] = self.resolve_server_path()
             except DynError as exc:
                 info["frida"]["code"] = exc.code
                 info["frida"]["message"] = exc.message
+            try:
+                dev_ver = self.server_version() if info["frida"]["path"] else ""
+            except Exception:                             # noqa: BLE001
+                dev_ver = ""
+            try:
+                import frida as _frida
+
+                cli_ver = str(_frida.__version__)
+            except Exception:                             # noqa: BLE001
+                cli_ver = ""
+            info["frida"]["device_version"] = dev_ver
+            info["frida"]["client_version"] = cli_ver
+            info["frida"]["version_match"] = bool(
+                dev_ver and cli_ver and dev_ver == cli_ver)
+            if dev_ver and cli_ver and dev_ver != cli_ver:
+                info["frida"]["code"] = info["frida"]["code"] or "FRIDA_VERSION_MISMATCH"
+                info["frida"]["message"] = (
+                    f"版本不匹配：设备 {dev_ver} / 客户端 {cli_ver}；"
+                    "用 frida_server_align 对齐后才能通信")
+            # 端口被别人占着时也要说清楚
+            if info["frida"]["running"]:
+                holders = self.listening_pids(27042)
+                info["frida"]["holders"] = [
+                    {"pid": p, "name": n} for p, n in holders]
         return info
 
     # ---------- 应用 ----------
+
+    # ---------- 进程冻结 ----------
+
+    def process_status(self, pid: int) -> str:
+        """读 /proc/<pid>/stat 的状态字符。
+
+        取值含义（Linux proc(5)）：
+            R 运行中   S 可中断睡眠   D 不可中断睡眠   T 已被 SIGSTOP 冻结
+            t 被调试器冻结          Z 僵尸           X 已退出
+
+        (9) 第九次修改（2026-11-05）：新增。
+            冻结/解冻不能只看"命令执行成功"，必须能读到真实状态，
+            否则会出现"以为冻住了其实没有"的假成功。
+        """
+        out = self._cmd("shell", "su", "-c",
+                        f"cat /proc/{pid}/stat 2>/dev/null || echo MISSING",
+                        check=False)
+        text = (out or "").strip()
+        if not text or "MISSING" in text:
+            return ""
+        # 格式：pid (comm) state ...
+        # comm 可能含空格和括号，所以从**最后一个 ')'** 之后取第一个字段
+        idx = text.rfind(")")
+        if idx < 0:
+            return ""
+        rest = text[idx + 1:].strip()
+        return rest.split()[0] if rest else ""
+
+    def freeze_process(self, pid: int, wait: float = 0.4) -> dict:
+        """用 SIGSTOP **冻结整个进程**（所有线程一起停）。
+
+        (9) 第九次修改（2026-11-05）：新增。
+            与"断点 hold 住单条线程"是两回事：这里的进程会整体停在原地，
+            用来做"某一瞬间的完整快照"——所有线程的栈、所有内存都是同一时刻的，
+            不会一边读一边被别的线程改掉。
+
+        注意：冻结期间该进程**不能响应任何 frida RPC**（agent 线程也停了），
+        所以取信息要走 adb 侧（/proc），不要发起 frida 调用。
+        """
+        before = self.process_status(pid)
+        if not before:
+            return {"ok": False, "code": "NO_SUCH_PROCESS",
+                    "message": f"读不到 pid {pid} 的 /proc 状态，可能已退出",
+                    "status_before": "", "status_after": ""}
+
+        self._cmd("shell", "su", "-c", f"kill -STOP {pid} 2>/dev/null", check=False)
+        time.sleep(wait)
+        after = self.process_status(pid)
+        ok = after in ("T", "t")
+        return {
+            "ok": ok,
+            "code": "" if ok else "FREEZE_FAILED",
+            "message": (f"已冻结（状态 {before} → {after}）" if ok else
+                        f"冻结后状态为 {after!r}，未进入 T（可能权限不足或进程已退出）"),
+            "status_before": before,
+            "status_after": after,
+            "hint": ("冻结期间进程整体停止：frida RPC 会阻塞，"
+                     "读内存/栈请走 adb 侧（/proc）；分析完务必 unfreeze"),
+        }
+
+    def unfreeze_process(self, pid: int, wait: float = 0.4) -> dict:
+        """用 SIGCONT 恢复被 SIGSTOP 冻结的进程。"""
+        before = self.process_status(pid)
+        if not before:
+            return {"ok": False, "code": "NO_SUCH_PROCESS",
+                    "message": f"读不到 pid {pid} 的 /proc 状态",
+                    "status_before": "", "status_after": ""}
+
+        self._cmd("shell", "su", "-c", f"kill -CONT {pid} 2>/dev/null", check=False)
+        time.sleep(wait)
+        after = self.process_status(pid)
+        ok = after not in ("T", "t", "")
+        return {
+            "ok": ok,
+            "code": "" if ok else "UNFREEZE_FAILED",
+            "message": (f"已恢复（状态 {before} → {after}）" if ok else
+                        f"恢复后状态仍为 {after!r}"),
+            "status_before": before,
+            "status_after": after,
+        }
 
     def launch_app(self, package: str, activity: str = "") -> bool:
         """启动应用（monkey 方式无需知道 activity 名）。"""

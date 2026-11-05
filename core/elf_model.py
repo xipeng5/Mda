@@ -643,15 +643,37 @@ class SoFile:
             if sec.contains(addr):
                 data = self._cache.get(sec.addr, b"")
                 start = addr - sec.addr
-                return data[start : start + size]
+                # (5) 第五次修改（2026-11-02）：节内读取也要卡住节边界。
+                #     bug 原因：data[start:start+size] 越过节末尾时 Python 切片
+                #               不会报错，只是变短——看似"安全"，但上层若按
+                #               size 解析（如 read_typed 取 uint32）就会把不足
+                #               长度的数据当成完整值，或与后续字节拼成错值。
+                #               实测 0x227796 请求 4 字节只返回 2 字节，
+                #               read_typed 仍报 ok:true。
+                #     解决方案：截断到节边界返回，由上层按 len() 判断完整性。
+                avail = max(0, sec.size - start)
+                return data[start : start + min(size, avail)]
         # 段表兜底：dump so 的唯一读取路径
         for va, end, off, _fl in self._loads:
             if va <= addr < end:
                 raw = self._raw or b""
                 fo = off + (addr - va)
-                if fo + size <= len(raw):
-                    return raw[fo : fo + size]
-                return raw[fo:]
+                # (5) 第五次修改（2026-11-02）：段表读取必须卡住段尾，不能续读。
+                #     bug 原因：旧实现在 fo+size 超出文件时直接 raw[fo:]（截断），
+                #               但「段尾」和「文件尾」是两回事——当请求跨越段末尾，
+                #               而文件在该偏移之后仍有其他段的数据时，
+                #               raw[fo:fo+size] 会**越过段边界继续读文件**，
+                #               把不属于该地址的字节当成该地址的内存返回。
+                #               实测：dump 样本 0x227796 请求 4 字节，返回
+                #               0000bf15，其中后 2 字节已越过段尾 0x227798，
+                #               是文件中紧随其后的别段内容——这是凭空造数据。
+                #     解决方案：先按段尾算可用长度，取 min(size, 段内剩余)，
+                #               再与文件长度取 min，绝不跨段续读。
+                seg_avail = end - addr
+                take = min(size, seg_avail)
+                if fo + take > len(raw):
+                    take = max(0, len(raw) - fo)
+                return raw[fo : fo + take]
         self._read_miss = addr  # 诊断标记：最近一次完全 miss 的地址
         return b""
 

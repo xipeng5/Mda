@@ -730,13 +730,278 @@ def list_processes(serial: str, keyword: str = "") -> str:
 @server.tool()
 @logged()
 def start_frida(serial: str) -> str:
-    """以 root 启动设备端 frida-server（须已 push 对应版本）。"""
+    """以 root 启动设备端 frida-server，并校验版本与本机客户端一致。
+
+    **会自动做两件事，避免"启动了却连不上"的困惑**：
+        1. 版本校验：读设备二进制的 `--version` 与本机 frida 客户端比对，
+           不一致直接返回 FRIDA_VERSION_MISMATCH（并给出两个版本号），
+           不启动——因为版本不符时起来了也连不上，只会报 ProtocolError。
+        2. 端口占用者识别：若 27042 已被别的进程占着，先查清是**谁**占的。
+           如果占用者是别的程序（例如别人项目在用的另一个 frida 实例），
+           返回 FRIDA_PORT_TAKEN 并列出 pid/名字，**不做任何操作**；
+           只有在确认是我们自己的 server 已运行时才返回"已在运行"。
+
+    这正是本轮处理的场景：设备上曾同时存在 16.0.19（别人的项目，监听 27100）
+    与 17.23.3（mda 用，监听 27042），按进程名判断会把两者搞混。
+
+    版本不匹配时正确做法：先调 frida_server_align（dry_run 看计划，
+    再去掉 dry_run 执行），它会把设备端覆盖成本机版本。
+    """
     from dyn.adb import Adb
 
     # (1) 第一次修改：原来只返回 {"running": bool}，失败无原因。
     #     现在透传 dyn.adb 的结构化结果（running/code/message/path），
     #     running 键保持不变，老调用方不受影响。
-    return _j(Adb(serial).start_frida())
+    # (2) 第二次修改（2026-11-05）：传 expect_version 让 adb 层做版本校验，
+    #     避免"启动了旧版 → 连不上 → 报 ProtocolError"这种看不出根因的失败。
+    try:
+        import frida
+
+        expect = str(frida.__version__)
+    except Exception:                                     # noqa: BLE001
+        expect = ""
+    return _j(Adb(serial).start_frida(expect_version=expect))
+
+
+@server.tool()
+@logged()
+def frida_server_align(serial: str, version: str = "", dry_run: bool = True,
+                       device_path: str = "") -> str:
+    """把设备端 frida-server 覆盖成**与本机客户端完全一致**的版本并启动。
+
+    为什么需要：frida 客户端与设备端 server 版本必须一致才能通信，minor 不同也会报
+    `ProtocolError: unable to communicate with remote frida-server`。
+    设备上常有多份历史二进制（frida_16019 / frida-server / .fs）互相干扰，
+    手工排查很费时间。本工具把「下载→校验→备份→覆盖→启动→验证」收敛成一次操作。
+
+    **安全设计（务必先读）**：
+        dry_run=True（默认）—— 只返回计划，**不改动任何设备文件**。
+        确认无误后传 dry_run=False 才真正执行。
+        执行时：覆盖前强制备份原文件（<路径>.bak-<时间戳>），
+        任一步失败自动还原备份并把回滚结果写进返回，不留半坏状态。
+        下载后按 GitHub 官方公布的 sha256 校验，不匹配立即删除并中止。
+
+    version 留空表示用本机 `frida.__version__`，这是保证匹配的正常用法。
+    device_path 留空表示 /data/local/tmp/frida-server。
+
+    返回（dry_run）：plan 里含版本、ABI、资产名、sha256、将执行的 7 个步骤、风险警告。
+    返回（执行）：download / install（含 backup_path）/ stopped_processes /
+                started_process / verify（真实连一次设备）/ done；失败时含 error 与
+                rolled_back。
+    """
+    from dyn.frida_server import ensure_server
+
+    try:
+        result = ensure_server(
+            serial,
+            version=(version or None),
+            dry_run=bool(dry_run),
+            device_path=(device_path or "/data/local/tmp/frida-server"),
+        )
+    except Exception as exc:              # noqa: BLE001 - DynError 带 code
+        code = getattr(exc, "code", type(exc).__name__)
+        return _j({"error": str(exc), "code": code})
+    return _j(result)
+
+
+@server.tool()
+@logged()
+def freeze_process(serial: str, pid: int) -> str:
+    """**冻结整个进程**（SIGSTOP），得到"某一瞬间"的完整快照。
+
+    与 hold 断点的区别（别混用）：
+        hold 断点   只挂住**命中的那一条线程**，别的线程还在跑
+        freeze      整个进程**所有线程**一起停，所有内存/栈都是同一时刻的
+
+    什么时候该用冻结：
+        · 想看"这个时刻进程到底在干什么"——读内存不会一边读一边被改
+        · 反调试/风控在定期校验，需要完全静止才读得到干净的数据
+        · 想对比两个时刻的完整状态
+
+    **冻结期间的重要限制**：
+        · 该进程**不能响应任何 frida RPC**（agent 线程也停了），
+          所以 `read_typed(source="runtime")`、`poll_events`、`resume`
+          等所有依赖 frida 的调用都会**阻塞或超时**；
+        · 要读冻结后的内存/栈，走 adb 侧（/proc/<pid>/mem、/proc/<pid>/task）；
+        · **分析完必须调 unfreeze_process**，否则这个进程会一直卡死
+          （用户的 app 会"未响应"）。
+
+    返回：{ok, code, message, status_before, status_after, hint}
+    status 是 /proc/<pid>/stat 的状态字符：T 表示冻结成功，S/R 表示没冻住。
+    """
+    from dyn.adb import Adb
+
+    try:
+        return _j(Adb(serial).freeze_process(int(pid)))
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}",
+                   "code": getattr(exc, "code", "FREEZE_FAILED")})
+
+
+@server.tool()
+@logged()
+def unfreeze_process(serial: str, pid: int) -> str:
+    """**恢复**被 freeze_process 冻结的进程（SIGCONT）。
+
+    调用时机：frozen 的那一刻分析完就立刻解冻。**忘了解冻的后果是用户的 app
+    一直卡着**（界面无响应、ANR），所以用完务必调一次。
+
+    返回：{ok, code, message, status_before, status_after}
+    status_after 不再是 T/t 才算恢复成功。
+    """
+    from dyn.adb import Adb
+
+    try:
+        return _j(Adb(serial).unfreeze_process(int(pid)))
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}",
+                   "code": getattr(exc, "code", "UNFREEZE_FAILED")})
+
+
+@server.tool()
+@logged()
+def remove_breakpoint(bp_id: str) -> str:
+    """**删除一个断点**（与 set_breakpoint 配套）。
+
+    bp_id 从 set_breakpoint 的返回或 list_breakpoints 里取，
+    形如 "3e2ff172:22747:libc.so:48d3c"（serial:pid:so:静态地址hex）。
+
+    删除是**真的摘钩**（调 InvocationListener.detach），不是只删记录：
+    实测摘钩前命中 486 次，摘钩后 800ms 内 0 次新命中。
+
+    返回：{removed, bp_id, message}；removed=false 时说明原因
+    （断点不存在 / 摘钩失败——后者要当心，钩子可能还在命中）。
+    """
+    from dyn.service import get_dyn
+
+    try:
+        return _j(get_dyn().remove_breakpoint(str(bp_id)))
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}",
+                   "code": getattr(exc, "code", "REMOVE_FAILED")})
+
+
+@server.tool()
+@logged()
+def hits(serial: str, pid: int) -> str:
+    """取**断点命中历史**（完整现场），与 poll_events 是两份不同的数据。
+
+    区别（很容易混）：
+        poll_events   事件流（attached/detached/breakpoint_set/hit/...），
+                      有游标、可增量拉取，适合"边跑边看"
+        hits          命中现场列表（含 36 个寄存器 + 调用栈），
+                      适合"停下来逐条复盘"
+
+    返回：{count, hits[], hits_discarded}
+        hits_discarded 是**因超出保留上限被丢掉的旧命中数**。保留上限 2000 条
+        （每条约 12KB），出现非零值说明你看到的不是全部历史。
+    """
+    from dyn.service import get_dyn
+
+    svc = get_dyn()
+    try:
+        items = svc.hits(serial, int(pid))
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}",
+                   "code": getattr(exc, "code", "NOT_ATTACHED")})
+    # 顺带把丢弃计数带出去：快照不一定反映"历史全貌"
+    discarded = None
+    try:
+        tgt = svc._targets.get(f"{serial}:{pid}")          # noqa: SLF001 - 只读
+        dbg = getattr(tgt, "dbg", None) if tgt is not None else None
+        discarded = getattr(dbg, "_hits_discarded", None)
+    except Exception:                                     # noqa: BLE001
+        discarded = None
+    # 汇总所有命中的调用栈，找出没符号化的模块
+    all_frames: list = []
+    for h in items:
+        all_frames.extend(h.get("backtrace") or [])
+    hints = _backtrace_hints(all_frames)
+    out = {
+        "count": len(items),
+        "hits": items,
+        "hits_discarded": discarded,
+        "note": ("hits_discarded 非 0 表示更早的命中已因保留上限被丢弃；"
+                 "需要完整执行序列请用 poll_events 增量拉取"),
+    }
+    if hints:
+        out["hints"] = hints
+    return _j(out)
+
+
+@server.tool()
+@logged()
+def detach_target(serial: str, pid: int) -> str:
+    """**断开目标进程**，移除所有断点并释放 frida 会话。
+
+    什么时候用：
+        · 分析结束，不想在目标里留任何 hook
+        · 需要重新 attach 拿干净状态
+        · 目标要重启了，先断开避免残留
+
+    返回：{detached, message}。detached=false 表示本来就没附着。
+
+    注意：断开**不会**解冻进程。如果之前 freeze 过，先 unfreeze_process。
+    """
+    from dyn.service import get_dyn
+
+    try:
+        ok = get_dyn().detach(serial, int(pid))
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}",
+                   "code": getattr(exc, "code", "DETACH_FAILED")})
+    return _j({"detached": bool(ok),
+               "message": "已断开" if ok else "本来就没有附着"})
+
+
+@server.tool()
+@logged()
+def stop_frida(serial: str) -> str:
+    """停止设备上**占用 27042** 的 frida-server（只停这一个）。
+
+    只会停监听 27042 的进程；设备上其他 frida 实例（例如别的项目用的、
+    监听别的端口的）**不会被触碰**，结果里会说明停了什么。
+
+    返回：{stopped[], ok, message}
+    """
+    from dyn.adb import Adb
+
+    try:
+        return _j(Adb(serial).stop_frida())
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}",
+                   "code": getattr(exc, "code", "STOP_FAILED")})
+
+
+@server.tool()
+@logged()
+def preflight(serial: str = "") -> str:
+    """**一次性体检**：现在的环境到底能不能做动态分析，缺什么。
+
+    建议**每个新会话先调一次**（或遇到"连不上/起不来"时调），
+    它会把问题一次性讲清楚，省掉一轮轮试错。
+
+    返回结构：
+        adb      {ok, path, message}            adb 是否可用
+        devices  [...]                          在线设备列表
+        active   {serial, root}                 当前设备是否 root
+        frida    {running, path, code, message,
+                  device_version, client_version,
+                  version_match, holders[]}
+                 running 以 **27042 端口**是否有监听为准（不是看进程名），
+                 holders 是端口占用者 pid/名字；
+                 version_match=false 时会说明"设备 17.x / 客户端 17.y"，
+                 这时任何 attach 都会报 ProtocolError，先用 frida_server_align
+
+    传 serial 则做该设备的完整体检；不传只看 adb 与设备列表。
+    """
+    from dyn.adb import Adb
+
+    try:
+        return _j(Adb(serial or None).preflight())
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}",
+                   "code": getattr(exc, "code", "PREFLIGHT_FAILED")})
 
 
 @server.tool()
@@ -812,6 +1077,556 @@ def resume(serial: str, pid: int) -> str:
     return _j({"resumed": get_dyn().resume(serial, pid)})
 
 
+# ---- 动态观测工具：事件流 / 线程列表 / 调用栈符号化 ----
+
+# 一次性 frida 探针：跑完立刻 unload，不持有脚本、不留 hook。
+# 取数方式与 dyn/rebase.py 既有做法一致（JS send → Python 侧轮询等消息）。
+_JS_LIST_THREADS = """
+(function () {
+    var out = Process.enumerateThreads().map(function (t) {
+        // frida 16 的线程对象只有 id/state/context，name 是 17 才有的字段：
+        // 只有真拿到 name 才发这个键，缺失交给 Python 侧补 None。
+        var item = {id: t.id, state: t.state || null};
+        if (typeof t.name === "string") { item.name = t.name; }
+        if (t.context) {
+            try { item.pc = t.context.pc.toString(); } catch (e) { item.pc = null; }
+        }
+        return item;
+    });
+    send({threads: out});
+})();
+"""
+
+# 取调用栈：Thread.backtrace(context, ACCURATE) 给的是**运行时**地址裸值，
+# 不做 frida 的 DebugSymbol 解析——符号化统一在 Python 侧用 mda 静态模型做。
+_JS_CALLSTACK = """
+(function () {
+    var tid = __TID__;
+    var limit = __LIMIT__;
+    var threads = Process.enumerateThreads();
+    if (threads.length === 0) {
+        send({err: "THREADS_UNAVAILABLE: frida 对该进程枚举不到线程" +
+                   "（实测多数 app 如此，system_server 才行）；" +
+                   "替代方案：下断点命中后用 hits[].backtrace 取命中时刻的调用栈，那条路不依赖线程枚举"});
+        return;
+    }
+    var t = threads[0];
+    for (var i = 0; i < threads.length; i++) {
+        if (threads[i].id === tid) { t = threads[i]; break; }
+    }
+    if (!t.context) {
+        send({err: "线程 " + t.id + " 没有可用 context，无法取栈"});
+        return;
+    }
+    var addrs = [];
+    try {
+        addrs = Thread.backtrace(t.context, Backtracer.ACCURATE)
+            .map(function (a) { return a.toString(); });
+    } catch (e) {
+        send({err: "取调用栈失败: " + String(e)});
+        return;
+    }
+    send({tid: t.id, frames: addrs.slice(0, limit)});
+})();
+"""
+
+
+def _run_frida_script(session, js: str, wait_s: float = 5.0) -> dict:
+    """跑一段一次性 frida 脚本，取它 send() 出的第一个 dict 载荷。
+
+    消息回调是异步的，所以按 dyn/rebase.py 的既有做法轮询等待；
+    脚本用完立刻 unload——探针不能持有会话，也不能留下 hook。
+    返回空 dict 表示超时或无 dict 载荷（调用方据此给 error）。
+    """
+    got: list[dict] = []
+
+    def _on_message(msg, data=None):
+        if isinstance(msg, dict) and msg.get("type") == "send":
+            payload = msg.get("payload")
+            if isinstance(payload, dict):
+                got.append(payload)
+
+    script = session.create_script(js)
+    script.on("message", _on_message)
+    script.load()
+    try:
+        step = 0.05
+        for _ in range(max(int(wait_s / step), 1)):
+            if got:
+                break
+            time.sleep(step)
+    finally:
+        try:
+            script.unload()
+        except Exception:                # noqa: BLE001 - 卸载失败不该盖住真实结果
+            pass
+    return got[0] if got else {}
+
+
+def _as_int_addr(value) -> int | None:
+    """把 int / "0x..." / frida NativePointer 统一成 int，转不了给 None。
+
+    地址字段缺失是常态（frida 16 没线程 name、context 可能为 null），
+    这里一律不抛异常，交给调用方决定怎么展示。
+
+    (5) 第五次修改（2026-11-02）：纯数字字符串按十进制解析，不再一律当十六进制。
+        bug 原因：旧实现无条件 int(str(value), 16)，于是 "12" 被解析成 18
+                 （0x12），而不是 12。这个值被当作线程 id / 地址使用时，
+                 会**静默指向完全错误的对象**——实测 get_callstack 传入
+                 "12" 会取到线程 18 的栈，且失败后还自动退回 threads[0]，
+                 使用者根本察觉不到取错了。
+        解决方案：
+                  · 带 0x/0X 前缀        → 十六进制
+                  · 纯十进制数字串        → 十进制（人类和 JSON 的默认语义）
+                  · 含 a-f 且无前缀       → 十六进制（地址常见写法 "7fff1234"）
+                  · 其他（如 "<ptr>" 之类）→ None
+                这样 "12" 是 12、"0x12" 是 18、"7f0000" 是地址，语义都符合直觉。
+    """
+    # (15) 第十五次修改（2026-11-05）：解析逻辑收口到 core.addr，本函数只做转调。
+    #      bug 原因：项目里四份地址解析实现规则不一致（典型分歧见 core/addr.py 顶注），
+    #                "含 a-f 但无 0x 前缀"的地址在本处能解析、在另外三处解析不出来。
+    #      解决方案：统一走 core.addr.parse_addr，本处保留原签名与返回约定（失败 None）。
+    from core.addr import parse_addr
+
+    return parse_addr(value)
+
+def _thread_dict(t) -> dict:
+    """把线程对象或线程 dict 统一成 {id, name, state, pc}。
+
+    关键兼容点：**frida 16 的线程对象没有 name 字段**（17 才有），
+    所以一律走 getattr / dict.get 兜底，缺失返回 None 而不是抛 AttributeError。
+    pc 优先取扁平字段（探针脚本已拍平），退化到 context.pc
+    （dyn 层直接回传 frida 原生线程对象时只有 context 这一个嵌套来源）。
+    """
+    if isinstance(t, dict):
+        def get(key, default=None):
+            return t.get(key, default)
+    else:
+        def get(key, default=None):
+            return getattr(t, key, default)
+
+    pc = _as_int_addr(get("pc"))
+    if pc is None:
+        ctx = get("context")
+        if isinstance(ctx, dict):
+            pc = _as_int_addr(ctx.get("pc"))
+        elif ctx is not None:
+            pc = _as_int_addr(getattr(ctx, "pc", None))
+    return {
+        "id": _as_int_addr(get("id")),
+        "name": get("name"),                       # frida 16 → None
+        "state": get("state"),
+        "pc": hex(pc) if pc is not None else None,
+    }
+
+
+def _call_threads(fn, serial, pid):
+    """调线程枚举函数，自动适配它要几个参数。
+
+    svc.threads(serial, pid) 需要两个参数，dbg.threads()/rb.threads() 不需要。
+    这里按签名判定，而不是 try/except TypeError 重试——后者会把函数**内部**
+    抛出的 TypeError 误当成「参数不对」，导致重复调用并掩盖真实错误。
+    """
+    import inspect
+
+    try:
+        need = len(inspect.signature(fn).parameters)
+    except (TypeError, ValueError):      # 内建函数等取不到签名：按无参处理
+        need = 0
+    return fn(serial, pid) if need >= 2 else fn()
+
+
+def _threads_from_layers(svc, tgt):
+    """按已有实现层级依次尝试枚举线程，**都拿不到有效结果**时返回 None。
+
+    优先级：service（跨层聚合）→ debugger（frida 层）→ rebase（地址桥）。
+    这三层由 dyn/ 的同事并行实现、可能尚无该方法，故全部 getattr 判空。
+
+    (6) 第六次修改（2026-11-02）：空列表一律视为"这一层没给出结果"，继续往下试。
+        bug 原因：旧实现 `if raw is not None: return raw`，把 `[]`（空列表）也
+                 当成有效结果直接返回。于是某一层 RPC 失败返回 `[]` 时，上层
+                 会输出「该进程 0 个线程」——一个**没有任何 error 字段的成功响应**，
+                 使用者会以为进程真的没有线程，而不是查询失败。
+        解决方案：只有非空列表才算这一层成功；空列表记录后继续降级，
+                 最终全空则由调用方回明确的 error。
+    """
+    serial = getattr(tgt, "serial", None)
+    pid = getattr(tgt, "pid", None)
+    for fn in (
+        getattr(svc, "threads", None),
+        getattr(getattr(tgt, "dbg", None), "threads", None),
+        getattr(getattr(tgt, "rb", None), "threads", None),
+    ):
+        if not callable(fn):
+            continue
+        raw = _call_threads(fn, serial, pid)
+        if raw:
+            return raw
+    return None
+
+
+def _recent_thread_id(tgt) -> int:
+    """最近一次断点命中的线程 id；无命中返回 0（交给 frida 侧取第一个线程）。"""
+    hits = list(getattr(getattr(tgt, "dbg", None), "hits", None) or [])
+    if not hits:
+        return 0
+    return int(getattr(hits[-1], "thread_id", 0) or 0)
+
+
+def _pick_so_by_name(session, raw_name: str):
+    """按多级候选在会话里找 SoFile，找不到返回 None。
+
+    (11) 第十一次修改（2026-11-02）：新增本函数。
+        bug 原因：真机 frida 的模块名可能是完整路径或带壳前缀，而 mda 的键
+                  是 load_so 时的短名。只用精确全名匹配会让整条调用栈符号化失败，
+                  还会误报"该 so 未加载"。
+        解决方案：按 全名 → basename → 去壳前缀 → 后缀 四级别名依次尝试。
+                  只做**去前缀/取 basename**这类无损规范化，不做模糊猜测，
+                  避免把 A.so 错配成 B.so。
+    """
+    mods = getattr(session, "modules", {}) or {}
+    if not mods or not raw_name:
+        return None
+    name = str(raw_name)
+    # 1) 全名精确
+    so = mods.get(name)
+    if so is not None:
+        return so
+    # 2) basename（真机常带路径）
+    base = name.rsplit("/", 1)[-1]
+    if base and base != name:
+        so = mods.get(base)
+        if so is not None:
+            return so
+    # 3) 去常见壳前缀（_t1_ / lib 前缀差异）后比对
+    def _norm(t: str) -> str:
+        t = t.rsplit("/", 1)[-1].lower()
+        for pfx in ("_t1_", "_t2_", "_t0_"):
+            if t.startswith(pfx):
+                t = t[len(pfx):]
+        return t
+
+    target = _norm(name)
+    for key, cand in mods.items():
+        if _norm(key) == target:
+            return cand
+    # 4) 尾部后缀匹配：仅当唯一命中时才采用，多于一个视为不确定
+    hits = [cand for key, cand in mods.items()
+            if _norm(key).endswith(target) or target.endswith(_norm(key))]
+    if len(hits) == 1:
+        return hits[0]
+    return None
+
+
+def _symbolize_frame(runtime_addr: int, mods: list, session) -> dict:
+    """把一帧运行时地址符号化到 mda 自己的静态模型。
+
+    不用 frida 的 DebugSymbol.fromAddress：stripped 的壳样本上它没有符号表
+    可用，基本只能给裸地址。mda 的函数表来自 FDE + bl 目标 + 序言补全，才有名字。
+
+    换算：mods 就是 rb.refresh_modules() 的返回，与 rb.find_module(name) 查的是
+    同一批 RuntimeModule；这里按**地址范围**匹配所属模块（比逐帧按名 find_module
+    更准也更快），base 即 mod.base.
+    """
+    frame = {
+        "runtime_addr": hex(runtime_addr),
+        "static_addr": None,
+        "so": None,
+        "function": None,
+        "offset": None,
+        "via_plt": False,
+        "in_gap": True,
+    }
+    mod = None
+    for m in mods:
+        if m.base <= runtime_addr < m.base + m.size:
+            mod = m
+            break
+    if mod is None:
+        # 不在任何已加载模块的映射范围：frida trampoline / JIT / 匿名段
+        return frame
+
+    static = runtime_addr - mod.base
+    frame["so"] = mod.name
+    frame["static_addr"] = hex(static)
+    frame["in_gap"] = False
+
+    # (11) 第十一次修改（2026-11-02）：按多级候选匹配模块名，不再只认全名。
+    #     bug 原因：旧实现 session.modules.get(mod.name) 是**精确全名**匹配。
+    #               真机上 frida 报的 mod.name 常是完整路径（如
+    #               "/data/app/.../liblog.so"）或带壳前缀（"_t1_xxx.so"），
+    #               而 mda 里的键是 load_so 时的短名，两者对不上 → 整帧判
+    #               in_gap 并谎称"该 so 未在 mda 中加载"，实际早就加载了。
+    #               实测：传 basename 能符号化出 android_log_write_int64，
+    #               传全路径则返回 in_gap=True 且给出误导性提示。
+    #     解决方案：依次尝试 全名 → basename → 去壳前缀规范化 → 模糊后缀匹配，
+    #               命中即用；全部失败才判未加载，且提示里给出实际可用的键名，
+    #               便于人工核对。
+    so = _pick_so_by_name(session, mod.name)
+    if so is None:
+        # 设备上有、mda 里确实没有：能给出 so + 偏移，但给不出函数名
+        frame["in_gap"] = True
+        loaded = list(getattr(session, "modules", {}) or {})
+        frame["note"] = ("该 so 未在 mda 中加载，先调 load_so；"
+                         f"当前已加载：{loaded[:6]}")
+        return frame
+
+    fn = so.function_at(static)
+    if fn is not None:
+        frame["function"] = fn.name or f"sub_{fn.addr:x}"
+        frame["offset"] = static - fn.addr
+        return frame
+
+    # function_at 返回 None = 落在函数空洞或 PLT 桩区间里，不是错误
+    plt = so.plt_name(static)
+    if plt:
+        frame["function"] = plt
+        frame["offset"] = 0
+        frame["via_plt"] = True
+    else:
+        frame["in_gap"] = True
+    return frame
+
+
+def _target_state(svc, serial: str, pid: int) -> dict:
+    """从 service.state() 里筛出单个目标的状态（state() 无参、返回全部目标）。
+
+    state() 会只读同步 dbg.hits 到事件队列，但不推进 poll 游标，
+    所以 pending_events 可以放心当成「还有多少没取」的信号。
+    """
+    try:
+        st = svc.state()
+    except Exception:                    # noqa: BLE001 - 状态查询失败不该盖住事件
+        return {}
+    key = f"{serial}:{pid}"
+    for t in (st.get("targets") or []):
+        if t.get("key") == key:
+            return {
+                "target_state": t.get("state"),        # attached / paused / detached
+                "dbg_state": t.get("dbg_state"),
+                "pending_events": t.get("pending_events", 0),
+                "last_seq": t.get("last_seq", 0),
+                "global_seq": st.get("seq", 0),
+            }
+    return {"global_seq": st.get("seq", 0)}
+
+
+@server.tool()
+@logged()
+def poll_events(serial: str, pid: int, timeout: float = 0.0, limit: int = 200,
+                after_seq: int = 0) -> str:
+    """非阻塞地取动态事件，并附上目标当前状态。
+
+    **推荐工作流**：
+        1) set_breakpoint(hold=True) 下断；
+        2) resume 放行，让目标跑起来；
+        3) poll_events(timeout=0) 收事件——有就立刻返回，没有给空列表，不卡住；
+        4) 看到 type=breakpoint_hit 且 hold=true 时，目标已 paused，
+           分析完必须再调 resume 放行，否则线程一直停在那里。
+
+    每条事件都带 seq / type / ts / key / serial / pid，其余字段随 type 而定：
+        attached / detached / breakpoint_set / breakpoint_hit /
+        breakpoint_removed / breakpoint_remove_failed / resumed
+    seq 单调自增，所以「有没有新事件」看 last_seq 与 global_seq 的差即可。
+
+    timeout=0（默认）立即返回；timeout>0 最多等这么久，等到就立刻回。
+    返回里的 target_state 为 paused 表示线程正被 hold 断点挂住、等 resume。
+    """
+    from dyn.service import get_dyn
+
+    svc = get_dyn()
+    # (14) 第十四次修改（2026-11-05）：把 after_seq 真正透传给 service。
+    #      bug 原因：service.poll_events 已实现三档游标语义（None=推进游标取新增、
+    #                0=从头/显式指定、N=取 seq>N），但 MCP 工具签名里没有该参数，
+    #                于是"增量拉取 / 显式重放"在 AI 侧根本不可达。
+    #      解决方案：加 after_seq 参数；<=0 视为"不指定"（保持原来的推进语义），
+    #                >0 时按"只取 seq 大于它的事件"且**不推进**共享游标。
+    seq = int(after_seq or 0)
+    kwargs = {"timeout": timeout, "limit": limit}
+    if seq > 0:
+        kwargs["after_seq"] = seq
+    try:
+        events = svc.poll_events(serial, pid, **kwargs)
+    except Exception as exc:             # noqa: BLE001 - DynError 带 code
+        return _j({"error": f"{type(exc).__name__}: {exc}"})
+    return _j({
+        "has_new": bool(events),
+        "count": len(events),
+        "events": events,
+        "after_seq": seq if seq > 0 else None,
+        **_target_state(svc, serial, pid),
+    })
+
+
+@server.tool()
+@logged()
+def list_threads(serial: str, pid: int) -> str:
+    """列出目标进程的线程（id / name / state / pc）。
+
+    兼容 frida 16 与 17：16 的线程对象**没有 name 字段**，此时 name 返回 null
+    （不是报错），可用 name_supported 判断当前设备端是否支持线程名。
+    pc 是该线程当前的程序计数器，可直接喂给 get_callstack 对照。
+    """
+    from dyn.service import get_dyn
+
+    svc = get_dyn()
+    try:
+        tgt = svc.attach(serial, pid)    # 幂等：已附加则复用同一会话
+    except Exception as exc:             # noqa: BLE001 - DynError 带 code
+        return _j({"error": f"{type(exc).__name__}: {exc}"})
+
+    try:
+        raw = _threads_from_layers(svc, tgt)
+        if raw is None:
+            # 三层都还没有线程枚举能力：用一次性探针自己取，工具先能上线
+            payload = _run_frida_script(tgt.rb.session, _JS_LIST_THREADS)
+            if "err" in payload:
+                return _j({"error": payload["err"]})
+            raw = payload.get("threads")
+        if raw is None:
+            return _j({"error": "线程枚举无响应（探针脚本超时），目标可能已退出"})
+        threads = [_thread_dict(t) for t in raw]
+    except Exception as exc:             # noqa: BLE001 - frida 异常类型不稳定
+        return _j({"error": f"{type(exc).__name__}: {exc}"})
+
+    # (13) 第十三次修改（2026-11-05）：frida 枚举为空时**不能当成功**，改用 /proc 兜底。
+    #      bug 原因：实测 frida 17.23.3 对多数进程 Process.enumerateThreads() 恒返回
+    #               空（systemui/logd/zygote 都是 0，只有 system_server 能给 233 个）。
+    #               而本工具此前会返回 {"count": 0, "error": null} —— 一个**看起来
+    #               成功的响应**，等于告诉调用方"这个进程没有线程"。进程明明有
+    #               几十个线程，这是彻头彻尾的假信息，比报错更危险。
+    #     解决方案：① 空结果不再直接返回，先用 root 读 /proc/<pid>/task 拿真实 TID；
+    #               ② 拿到的 tid 列表如实标注 source="proc"、name_supported=false，
+    #                  并给出 unavailable_reason 说明为什么没有 name/state/pc；
+    #               ③ 两条路都拿不到才报 THREADS_UNAVAILABLE 错误。
+    #               这样"能用"和"不能用"都有明确交代，不存在假 0。
+    def _threads_from_proc() -> list[int]:
+        """从 /proc/<pid>/task 取线程号（root 权限可用，实测稳定）。"""
+        try:
+            from dyn.adb import Adb
+
+            out = Adb(serial)._cmd(
+                "shell", "su", "-c", f"ls /proc/{pid}/task 2>/dev/null", check=False)
+        except Exception:                                 # noqa: BLE001
+            return []
+        return [int(x) for x in (out or "").split() if x.isdigit()]
+
+    if not threads:
+        tids = _threads_from_proc()
+        if tids:
+            return _j({
+                "count": len(tids),
+                "name_supported": False,
+                "source": "proc",
+                "threads": [{"id": t, "name": None, "state": "unknown", "pc": None}
+                            for t in sorted(tids)],
+                "unavailable_reason": (
+                    "frida 的 Process.enumerateThreads() 对该进程返回空"
+                    "（实测 systemui/logd/zygote 均如此，只有 system_server 可用）。"
+                    "已改用 /proc/<pid>/task 兜底：线程号是真实的，"
+                    "但拿不到 name/state/pc（这些只有 frida 的线程对象才有）。"
+                    "需要 pc/调用栈时请换一个 frida 能枚举线程的目标进程。"),
+            })
+        return _j({
+            "error": f"无法枚举 pid {pid} 的线程：frida 返回空，/proc/{pid}/task 也读不到",
+            "code": "THREADS_UNAVAILABLE",
+            "count": 0,
+        })
+
+    return _j({
+        "count": len(threads),
+        "name_supported": any(t["name"] is not None for t in threads),
+        "source": "frida",
+        "threads": threads,
+    })
+
+
+@server.tool()
+@logged()
+def get_callstack(serial: str, pid: int, thread_id: int = 0, limit: int = 32) -> str:
+    """取指定线程的调用栈，并用 **mda 自己的静态模型**把每一帧符号化。
+
+    为什么不用 frida 的 DebugSymbol：stripped 的壳样本上它没有符号表可用，
+    基本只能给出裸地址；mda 的函数表来自 FDE + bl 目标 + 序言补全，才有名字。
+
+    符号化流程（每帧）：
+        运行时地址 → 按模块范围找到所属 so 与 base → 静态地址 = 运行时 - base
+        → so.function_at(静态地址) 取函数 → 输出 so / function / offset
+    其中 function 为 fn.name，无名为 sub_<addr>；offset 为该帧相对函数入口的偏移。
+
+    thread_id=0 表示自动：优先用最近一次断点命中的线程，否则用枚举里的第一个。
+    落在模块外（frida trampoline / JIT）或函数空洞里的帧标 in_gap=true、
+    function 给 null——这是正常结果，不是错误。via_plt=true 表示该帧是 PLT 桩。
+    """
+    from dyn.service import get_dyn
+
+    svc = get_dyn()
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        return _j({"error": "limit 必须是整数"})
+    if not (1 <= limit <= 512):
+        return _j({"error": "limit 必须在 1..512"})
+
+    try:
+        tgt = svc.attach(serial, pid)    # 幂等：已附加则复用同一会话
+    except Exception as exc:             # noqa: BLE001 - DynError 带 code
+        return _j({"error": f"{type(exc).__name__}: {exc}"})
+
+    # thread_id=0：优先最近命中的线程，实在没有就由 frida 端取第一个线程
+    tid = int(thread_id or 0) or _recent_thread_id(tgt)
+    js = (_JS_CALLSTACK
+          .replace("__TID__", str(tid))
+          .replace("__LIMIT__", str(limit)))
+    try:
+        payload = _run_frida_script(tgt.rb.session, js)
+    except Exception as exc:             # noqa: BLE001 - frida 异常类型不稳定
+        return _j({"error": f"{type(exc).__name__}: {exc}"})
+    if "err" in payload:
+        return _j({"error": payload["err"]})
+    raw_frames = payload.get("frames")
+    if raw_frames is None:
+        return _j({"error": "取调用栈无响应（探针脚本超时），目标可能已退出"})
+
+    try:
+        mods = tgt.rb.refresh_modules()  # 一次刷新，供所有帧按范围匹配
+    except Exception as exc:             # noqa: BLE001 - frida 异常类型不稳定
+        return _j({"error": f"刷新运行时模块失败：{exc}"})
+
+    frames = []
+    for item in list(raw_frames)[:limit]:
+        addr = _as_int_addr(item)
+        if addr is None:
+            continue
+        frames.append(_symbolize_frame(addr, mods, _session))
+
+    symbolized = sum(1 for f in frames if f["function"])
+    # (18) 第十八次修改（2026-11-05）：把"哪个 so 没载入导致符号化失败"直接说出来。
+    #     bug 原因：原来只给 unresolved 计数，AI 不知道该去 load_so 哪一个，
+    #               容易把 "libc++.so+0x4ce58" 当成已经分析到位的结论。
+    #     解决方案：把"有 so 名但没有函数名"的模块列进 hints，并给出可执行的下一步。
+    unresolved_so = sorted({
+        str(f.get("so")) for f in frames
+        if f.get("so") and not f.get("function")
+    })
+    out = {
+        "thread_id": payload.get("tid", tid),
+        "frame_count": len(frames),
+        "symbolized": symbolized,
+        "unresolved": len(frames) - symbolized,
+        "frames": frames,
+        "note": ("符号化基于 mda 静态模型（不是 frida DebugSymbol）；"
+                 "in_gap=true 表示落在函数空洞或未加载模块"),
+    }
+    if unresolved_so:
+        out["hints"] = [
+            f"有 {len(unresolved_so)} 个模块没解析出函数名：{unresolved_so}。"
+            "多半是这些 so 还没载入 mda（或载入时文件名与设备上的不一致）。"
+            "用 load_so 载入对应 so 后重新取栈即可看到函数名。"
+        ]
+    return _j(out)
+
+
 @server.tool()
 @logged()
 def list_breakpoints() -> str:
@@ -819,6 +1634,1300 @@ def list_breakpoints() -> str:
     from dyn.service import get_dyn
 
     return _j({"breakpoints": get_dyn().list_breakpoints()})
+
+
+# ---------------- 新能力：内存解释 / 单步规划 / trace 聚合 / 静动打通 ----------------
+#
+# 本区块对应 dyn/memread.py、dyn/stepper.py、dyn/tracer.py、dyn/bridge.py，
+# 这四个模块由并行开发提供，可能比本文件晚落地，因此一律**调用期惰性导入**：
+# 模块缺失只让对应工具报不可用，不会拖垮整个 MCP 服务。
+#
+# 统一约定（四条，AI 依赖它判断结果含义）：
+#   1. 占位能力（需真机 frida 但本轮留空）返回 implemented=false 的结构，
+#      **原样透传**，不包装成看起来成功的结果、也不当异常 catch 掉。
+#   2. 静态能力（读 so 文件、规划落点、按函数聚合）完全离线，不连设备。
+#   3. 任何降级都在 notes / diagnostics 里说明，不静默丢信息。
+#   4. 失败统一 {"error": ..., "code": ...}，code 机器可判定。
+
+
+def _load_dyn_module(module_path: str, *names: str):
+    """按需导入动态能力模块，并检查要用的函数是否都在。
+
+    (1) 第一次修改
+    bug 原因：memread / stepper / tracer / bridge 由其他代理并行新建，
+              本文件落地时它们可能还不存在。若写在模块顶层 import，
+              任何一个缺失都会让 mcp_server 整体起不来，既有几十个工具一起失效。
+    解决方案：改为调用期惰性导入 + 缺函数检查；缺失时返回带 code 的结构化错误，
+              模块补齐后无需改动本文件即自动生效。
+
+    返回 (module, None) 或 (None, 错误 dict)。
+    """
+    import importlib
+
+    try:
+        mod = importlib.import_module(module_path)
+    except Exception as exc:            # noqa: BLE001 - 模块内任何错误都算"不可用"
+        return None, {
+            "error": f"{module_path} 尚不可用：{type(exc).__name__}: {exc}",
+            "code": "MODULE_UNAVAILABLE",
+            "available": False,
+            "module": module_path,
+            "hint": "该模块由并行开发提供，落地后本工具自动生效，无需改动 tools.py",
+        }
+    missing = [n for n in names if not hasattr(mod, n)]
+    if missing:
+        return None, {
+            "error": f"{module_path} 缺少函数：{', '.join(missing)}（接口可能已变更）",
+            "code": "MODULE_INCOMPLETE",
+            "available": False,
+            "module": module_path,
+            "missing": missing,
+        }
+    return mod, None
+
+
+def _so_for_static_read(so_name: str):
+    """取静态 so 对象；未加载时给明确错误（不静默返回空）。"""
+    try:
+        return _session.get(so_name), None
+    except KeyError as exc:
+        return None, {
+            "error": str(exc),
+            "code": "SO_NOT_LOADED",
+            "loaded": list(_session.modules),
+        }
+
+
+def _backtrace_hints(frames, tool_hint: str = "") -> list[str]:
+    """从符号化后的栈帧里找出"只有模块+偏移、没有函数名"的模块，给 AI 提示。
+
+    (18) 第十八次修改（2026-11-05）：新增。
+        bug 原因：符号化失败时栈帧会退化成 `libc++.so+0x4ce58` 这种形式，
+                  不报错、也不提示，AI 很容易以为"分析到这一步了"，
+                  而实际上函数名一个都没解析出来。实测把 libc++.so 存成
+                  libcxx_lib64.so 时就是这样，改成原名后立刻变成
+                  `libc++.so!_Znwm+0x20`。
+        解决方案：扫描栈帧，把"有 +0x 但没有 !"的模块名收集起来，
+                  由调用方拼一条可执行的提示（去 load_so 载入这些 so）。
+    """
+    missing: list[str] = []
+    seen: set[str] = set()
+    for f in frames or []:
+        text = str(f)
+        if "!" in text:
+            continue                      # 已经有函数名，符号化成功
+        marker = "+0x" if "+0x" in text else ("+0X" if "+0X" in text else "")
+        if not marker:
+            continue                      # 裸地址：不属于任何模块，另说
+        mod = text.split(marker)[0].strip()
+        if mod and mod not in seen:
+            seen.add(mod)
+            missing.append(mod)
+    if not missing:
+        return []
+    hint = (f"调用栈里有 {len(missing)} 个模块只解析出偏移、没有函数名：{missing}。"
+            "原因是这些 so 还没载入 mda（或载入时文件名与设备上的不一致）。"
+            "用 load_so 载入后重新取栈即可拿到函数名，例如 "
+            f"load_so(path=\"<本地路径>/{missing[0]}\")")
+    if tool_hint:
+        hint += "；" + tool_hint
+    return [hint]
+
+
+def _rb_for_runtime(serial: str, pid: int):
+    """取用于换算运行时地址的 Rebase；未 attach 时给明确错误。
+
+    (12) 第十二次修改（2026-11-03）：新增本函数。
+        背景：frida-server 已对齐 17.23.3，memread 的 source="runtime" 已实现，
+        但 MCP 层此前没把 Rebase 传下去，导致工具仍在走留空分支。
+        这里复用 dyn.service 的单例会话语义（已 attach 则复用，避免重复 attach
+        造成的抖动与句柄泄漏）。
+    """
+    if not serial or not pid:
+        return None, {
+            "error": "source='runtime' 需要 serial 与 pid（指向已 attach 的目标进程）",
+            "code": "NEED_TARGET",
+        }
+    try:
+        from dyn.service import get_dyn
+
+        tgt = get_dyn().attach(serial, pid)
+    except Exception as exc:                              # noqa: BLE001 - DynError 带 code
+        return None, {"error": str(exc), "code": getattr(exc, "code", "ATTACH_FAILED")}
+    rb = getattr(tgt, "rb", None)
+    if rb is None:
+        return None, {"error": "该目标没有 Rebase（rb 为空）", "code": "NO_RB"}
+    return rb, None
+
+
+def _bases_from_hit_events(events: list) -> tuple[dict, str]:
+    """从断点命中事件反推运行时基址：base = runtime_addr - static_addr。
+
+    为什么能这么算：同一次进程运行内，某个 so 的 ASLR 基址是常量，
+    而命中事件同时带 runtime_addr 与 static_addr，相减即基址。
+    这不是猜测——它来自真实观测到的**成对地址**；同一 so 出现多个不同差值时
+    说明数据自相矛盾，此时整个 so 都不参与推导，宁可退回静态模式也不猜。
+
+    只在**同一目标**（同 serial:pid）内推导：跨进程基址不同，混用必然算错。
+    返回 ({so 名: base}, 说明文字)；推不出来时返回 ({}, 原因)。
+
+    (7) 第七次修改（2026-11-02）：容忍列表里混入非字典元素。
+        bug 原因：旧实现直接 ev.get(...)，当 events 里出现整数/字符串
+                 （如 walk 传 [1,2]）时抛 AttributeError。该异常发生在
+                 trace_aggregate 的 try 块**之外**，导致已经写好的
+                 BAD_EVENTS 结构化错误码根本走不到——调用方拿到的是一个
+                 未捕获异常，而不是可判定的错误。
+        解决方案：先过滤出 dict 元素并计数；非字典元素跳过而不是崩，
+                 若过滤后一条都不剩则明确返回失败原因，让上层报 BAD_EVENTS。
+    """
+    if not isinstance(events, list):
+        return {}, f"events 必须是列表，实际 {type(events).__name__}"
+
+    items = [ev for ev in events if isinstance(ev, dict)]
+    skipped = len(events) - len(items)
+    if not items:
+        return {}, (f"events 里没有可用的命中事件（{skipped} 个元素不是对象），"
+                    "无法推导运行时基址")
+
+    keys = {ev.get("key") or f"{ev.get('serial')}:{ev.get('pid')}"
+            for ev in items}
+    if len(keys) > 1:
+        return {}, f"事件来自 {len(keys)} 个不同目标，基址不可通用，未推导运行时基址"
+
+    seen: dict[str, set] = {}
+    for ev in items:
+        so_name = ev.get("so_name")
+        runtime = _as_int_addr(ev.get("runtime_addr"))
+        static = _as_int_addr(ev.get("static_addr"))
+        if not so_name or runtime is None or static is None:
+            continue
+        seen.setdefault(so_name, set()).add(runtime - static)
+
+    bases: dict[str, int] = {}
+    conflicts: list[str] = []
+    for so_name, diffs in seen.items():
+        if len(diffs) == 1:
+            bases[so_name] = next(iter(diffs))
+        else:
+            conflicts.append(so_name)
+    note = (f"已从 {len(bases)} 个 so 的命中事件反推运行时基址"
+            f"（base = runtime_addr - static_addr）")
+    if conflicts:
+        note += f"；{len(conflicts)} 个 so 的基址自相矛盾已跳过：{conflicts}"
+    return bases, note
+
+
+def _snapshot_service_events() -> tuple[list, str]:
+    """取动态服务里已有的断点命中事件快照，供 trace_aggregate(events=None) 使用。
+
+    为什么读私有队列：service 没有"列出全部历史事件"的公开接口
+    （poll_events 需要 serial+pid 且会推进游标）。这里**只读拷贝**，
+    不改游标、不发任何 frida 请求，与 state() 一样属于旁观。
+
+    只保留带地址的事件：attached / breakpoint_set 一类没有地址，聚合不了。
+    """
+    try:
+        from dyn.service import get_dyn
+
+        svc = get_dyn()
+    except Exception as exc:            # noqa: BLE001 - 服务不可用不该让聚合崩
+        return [], f"动态服务不可用：{type(exc).__name__}: {exc}"
+    queue = getattr(svc, "_events", None)
+    if queue is None:
+        return [], "动态服务没有可读的事件队列，请改用 events 参数显式传入事件"
+    snap = []
+    for ev in list(queue):
+        if not isinstance(ev, dict):
+            continue
+        if ev.get("runtime_addr") is None and ev.get("addr") is None:
+            continue
+        snap.append(dict(ev))
+    return snap, ""
+
+
+@server.tool()
+@logged()
+def read_typed(so_name: str, addr: int, type_name: str,
+               count: int = 1, source: str = "static",
+               serial: str = "", pid: int = 0) -> str:
+    """按类型解释**静态 so 文件**里的值（不是读运行中进程的内存）。
+
+    与 read_process_memory 的区别（别混用）：
+        read_typed          读本地 so 文件字节，等价 IDA 里看 .rodata/.data，离线可用
+        read_process_memory 读目标进程内存，需要 attach，看的是运行时真实值
+
+    典型用途：解出 so 里的表项 / 常量 / 初始化后的结构体字面量，
+    例如 "这张跳转表第 3 项是多少"、"这个 char* 字节串指向什么"。
+
+    **工作流**：
+        1) 先 load_so 把 so 加进会话（本工具只认已加载的 so）；
+        2) 用 list_strings / search_bytes / disassemble 拿到目标地址；
+        3) read_typed 取标量或数组；指针结果可再喂 read_pointer，
+           字符串可再喂 read_string。
+
+    type_name 支持：int8/int16/int32/int64、uint8/uint16/uint32/uint64、
+    float/double/pointer，以及别名 i32/u64/f32/f64/ptr/void* 等。
+    count>1 时读数组：返回的 value 是列表，values 恒为列表。
+
+    source="runtime"（读真实进程内存）：需要同时传 serial 与 pid（目标必须已
+    attach），本工具会自动把静态地址换算成运行时地址再读。能读到 .bss / 堆 /
+    栈这些**文件里不存在**的内容。地址超出模块范围会报 ADDR_UNMAPPED，
+    **绝不返回零填充或"格式正确的假值"**。
+
+    失败给 {"error", "code"}：BAD_TYPE 类型名不支持、ADDR_UNMAPPED 地址不在
+    文件任何区域、READ_FAILED 在区域内但无文件数据（如 .bss 运行时才存在）。
+    """
+    mod, err = _load_dyn_module("dyn.memread", "read_typed", "MemReadError")
+    if err:
+        return _j(err)
+    so, err = _so_for_static_read(so_name)
+    if err:
+        return _j(err)
+    rb = None
+    if source == "runtime":
+        rb, err = _rb_for_runtime(serial, pid)
+        if err:
+            return _j(err)
+    try:
+        result = mod.read_typed(so, addr, type_name, count=count,
+                                source=source, rb=rb)
+    except mod.MemReadError as exc:
+        return _j({"error": f"{exc.code}: {exc.message}", "code": exc.code})
+    return _j(result)
+
+
+@server.tool()
+@logged()
+def read_string(so_name: str, addr: int, max_length: int = 256,
+                source: str = "static", serial: str = "", pid: int = 0) -> str:
+    """从**静态 so 文件**读一个 C 字符串（遇 \\0 截止，按 UTF-8 解码）。
+
+    用途：确认某个地址上的文案/路径/URL 是什么——壳样本里定位到可疑字符串
+    引用时，用它把原始字节还原成可读文本。
+
+    **工作流**：list_strings（或 disassemble 里看到 adr/adrp 指向的地址）
+        → read_string 取原文 → 需要知道谁引用它时用 string_refs。
+
+    返回里几个标志要看清（都是如实标注，不是报错）：
+        terminated  false 表示读满 max_length 仍没遇到 \\0
+        truncated   读到了上限被截断，后面可能还有内容
+        lossy       非 UTF-8 字节，已用替换符解码，原文看 raw_hex
+
+    source="runtime"（读真实进程内存）：需同时给 serial 与 pid；addr 为静态地址，
+    内部会换算。运行时字符串常跨越页边界，允许短读（读不满不报错）。
+
+    失败给 {"error", "code"}，含义同 read_typed。
+    """
+    mod, err = _load_dyn_module("dyn.memread", "read_string", "MemReadError")
+    if err:
+        return _j(err)
+    so, err = _so_for_static_read(so_name)
+    if err:
+        return _j(err)
+    rb = None
+    if source == "runtime":
+        rb, err = _rb_for_runtime(serial, pid)
+        if err:
+            return _j(err)
+    try:
+        result = mod.read_string(so, addr, max_length=max_length,
+                                 source=source, rb=rb)
+    except mod.MemReadError as exc:
+        return _j({"error": f"{exc.code}: {exc.message}", "code": exc.code})
+    return _j(result)
+
+
+@server.tool()
+@logged()
+def read_pointer(so_name: str, addr: int, depth: int = 1, offset: int = 0,
+                 source: str = "static", serial: str = "", pid: int = 0) -> str:
+    """从**静态 so 文件**读指针，可按 depth 逐层跟链。
+
+    规则：每层读一个指针宽度（arm64 为 8 字节）的值作为下一层地址，
+    下一层读取位置 = 该值 + offset。
+
+    **典型用途**：so 里的静态结构体常有 "指向表的指针"，先 read_pointer 拿到
+    表地址，再用 read_typed 按类型把表项解出来。
+
+    返回 chain 形如 [{"level":0,"addr":"0x..","value":"0x.."}, ...]。
+    三种提前停止都会如实标注（不会假装走满 depth）：
+        reason="null"        指针值为 0（链到此为止）
+        reason="cycle"       下一层地址已访问过（防死循环）
+        reason="unmapped"    下一层地址不在文件任何区域
+    注意 source="static" 时读到的是**文件里的初值**，不是运行中被改写后的值；
+    加了 ASLR 的运行时指针在静态文件里通常是重定位占位值，这属正常。
+
+    source="runtime"（读真实进程内存）：需同时给 serial 与 pid；addr 为静态地址。
+
+    失败给 {"error", "code"}，含义同 read_typed。
+    """
+    mod, err = _load_dyn_module("dyn.memread", "read_pointer", "MemReadError")
+    if err:
+        return _j(err)
+    so, err = _so_for_static_read(so_name)
+    if err:
+        return _j(err)
+    rb = None
+    if source == "runtime":
+        rb, err = _rb_for_runtime(serial, pid)
+        if err:
+            return _j(err)
+    try:
+        result = mod.read_pointer(so, addr, depth=depth, offset=offset,
+                                  source=source, rb=rb)
+    except mod.MemReadError as exc:
+        return _j({"error": f"{exc.code}: {exc.message}", "code": exc.code})
+    return _j(result)
+
+
+@server.tool()
+@logged()
+def plan_step(so_name: str, static_addr: int | str, mode: str = "over", count: int = 1,
+              so_context: str | None = None, lr: int | str | None = None,
+              mnemonic: str = "", max_insns: int = 500) -> str:
+    """规划一次单步：**只算临时断点该下在哪，不执行**。
+
+    ⚠ 执行本身当前**未实现**（execute_step 需真机 frida 临时断点模拟）。
+    本工具是纯静态规划：告诉你"下一个该停的地址"，你可以自己在设备可用时
+    用 set_breakpoint 把 plan 的 temp_breakpoint_addr 下成断点。
+    本工具只规划、**不动目标**。要真正单步请调 execute_step（它会下临时断点、
+    放行、停在落点）。返回里 execute_available=true 表示落点可解析、可以交给
+    execute_step；resolvable=false 时 execute_step 会拒绝执行。
+
+    mode 四选一：
+        over            跨过当前指令（遇到 bl 不进入，断点放下一条）
+        out             返回上一层（必须给 lr——返回地址在 LR 里，静态算不出来）
+        into            进入被调函数，逐条推演 count 条后的落点
+        until_mnemonic  从当前地址线性扫到第一条指定助记符（要给 mnemonic）
+
+    **工作流**：
+        1) 从断点命中里拿到当前 pc：hit_analysis 或 poll_events 的 context.pc；
+        2) 静态地址 = 运行时 pc - 模块 base（或直接用 hit 的 static_addr）；
+        3) plan_step 拿 temp_breakpoint_addr；
+        4) 设备可用时 set_breakpoint 下这个地址（int 直接用，别用 hex 串）。
+
+    参数补充说明（原设计里没有、但不给就必然算不出来的两个）：
+        lr         运行时 LR 值，mode="out" 必填；mode="over" 遇到 ret 也要它
+        mnemonic   mode="until_mnemonic" 必填，如 "bl" / "ret" / "br"
+        so_context 若 so_name 为空，可作为 so 名回退（stepper 本身不消费该参数）
+
+    怎么读结果：
+        ok=true 且 resolvable=true  → 地址确定，可以下断点
+        ok=true 但 resolvable=false → 结论是"确定算不出来"（如间接跳转、扫完没找到），
+                                      不是执行失败；看 reason / stopped_by
+        temp_breakpoint_addr=null   → 绝不拿假地址凑数
+
+    已知的诚实边界（属设计而非 bug）：
+        br/lr 间接跳转的目标在寄存器里，静态一律拒绝给地址；
+        条件跳转在 into 下给两个候选；这些在 reason 里都有中文说明。
+    """
+    mod, err = _load_dyn_module(
+        "dyn.stepper", "plan_step_over", "plan_step_out",
+        "plan_step_into", "plan_step_until_mnemonic",
+    )
+    if err:
+        return _j(err)
+
+    name = (so_name or so_context or "").strip()
+    if not name:
+        return _j({"error": "so_name 不能为空（so_context 可作为回退）",
+                   "code": "BAD_SO_NAME"})
+    mode_n = (mode or "over").strip().lower()
+    # (10) 第十次修改（2026-11-02）：地址参数同时接受 int 与 "0x..." 字符串。
+    #     bug 原因：schema 声明 static_addr/lr 为 int，而文档让调用方从
+    #               hit.context['lr'] 取值——那里是**十六进制字符串**。
+    #               结果是文档给的三步工作流 100% 走不通：MCP 层在参数校验阶段
+    #               就拒绝，调用方永远拿不到规划结果。
+    #     解决方案：类型放宽为 int | str，内部用 _as_int_addr 统一解析
+    #               （它已修正为"纯数字按十进制、带 0x 按十六进制"）；
+    #               count 也做一次转换，避免字符串传进来时 planner 内部炸。
+    addr = _as_int_addr(static_addr)
+    if addr is None:
+        return _j({"error": f"static_addr 无法解析为地址，实际 {static_addr!r}；"
+                            "支持 int、'0x1234'、'1234'",
+                   "code": "BAD_ADDR"})
+    lr_val = None
+    if lr is not None:
+        lr_val = _as_int_addr(lr)
+        if lr_val is None:
+            return _j({"error": f"lr 无法解析为地址，实际 {lr!r}；"
+                                "支持 int、'0x1234'、hit.context['lr'] 的字符串",
+                       "code": "BAD_LR"})
+    try:
+        count = int(count)
+        max_insns = int(max_insns)
+    except (TypeError, ValueError):
+        return _j({"error": "count / max_insns 必须是整数", "code": "BAD_REQUEST"})
+
+    try:
+        if mode_n == "over":
+            plan = mod.plan_step_over(None, name, addr, lr=lr_val)
+        elif mode_n == "out":
+            if lr is None:
+                return _j({
+                    "error": "mode='out' 必须给 lr：返回地址来自运行时 LR，静态无法推算。"
+                             "取法：hit.context['lr']",
+                    "code": "RET_NEEDS_LR",
+                })
+            plan = mod.plan_step_out(None, lr=lr_val, so_name=name,
+                                     static_addr=addr)
+        elif mode_n == "into":
+            try:
+                n = int(count)
+            except (TypeError, ValueError):
+                return _j({"error": f"count 必须是整数，实际 {count!r}",
+                           "code": "BAD_COUNT"})
+            plan = mod.plan_step_into(None, name, addr, count=n)
+        elif mode_n in ("until_mnemonic", "until", "mnemonic"):
+            plan = mod.plan_step_until_mnemonic(None, name, addr, mnemonic,
+                                                max_insns=max_insns)
+        else:
+            return _j({
+                "error": f"未知 mode: {mode!r}，可选 over / out / into / until_mnemonic",
+                "code": "BAD_MODE",
+            })
+    except Exception as exc:            # noqa: BLE001 - 规划内部异常也要可读
+        return _j({"error": f"{type(exc).__name__}: {exc}", "code": "PLAN_FAILED"})
+
+    out = dict(plan)
+    out["mode"] = mode_n
+    out["so_name"] = name
+    out["execute_available"] = True
+    out["execute_note"] = "落点已算出；要真正单步请调 execute_step（会放行并停在落点）"
+    return _j(out)
+
+
+@server.tool()
+@logged()
+def execute_step(serial: str, pid: int, so_name: str, static_addr: int | str,
+                 mode: str = "over", count: int = 1, lr: int | str | None = None,
+                 mnemonic: str = "", timeout: float = 5.0) -> str:
+    """**真正执行一次单步**：放行目标、停在临时断点处、返回停下时的现场。
+
+    与 plan_step 的分工（别混）：
+        plan_step     只算"该停在哪"，不动目标，纯静态
+        execute_step  下临时断点 → 放行 → 等命中 → **停在落点** → 摘钩
+
+    frida 没有 CPU 单步指令，单步是用「临时断点 + 放行」模拟出来的，所以：
+        · 落点确定时（普通指令 / bl 之后 / 无条件跳转目标）可靠；
+        · 条件跳转的实际走向由运行时决定，若没走预期分支，会返回
+          matched=false 并给出实际命中地址——**这种情况不能当作单步到位**；
+        · 间接跳转（br x16 这类，AVMP 分发器正是此形态）静态无法确定落点，
+          plan 阶段就会 resolvable=false，直接拒绝执行。
+
+    执行完目标处于 paused（线程停住），由你决定下一步：检查寄存器/内存、
+    继续单步、或 resume 放行。
+
+    mode 取值同 plan_step：over / into / out / until_mnemonic。
+    lr 仅 mode='out' 需要（从 hit.context['lr'] 取，字符串也行）。
+    mnemonic 仅 until_mnemonic 需要。
+
+    返回：executed / matched / target_addr / hit_static_addr / thread_id /
+    held / context（完整寄存器）/ backtrace / dbg_state；失败含 error 与 code。
+    """
+    from dyn.stepper import (
+        execute_step as _exec,
+        plan_step_into, plan_step_out, plan_step_over,
+        plan_step_until_mnemonic,
+    )
+
+    name = (so_name or "").strip()
+    if not name:
+        return _j({"error": "so_name 不能为空", "code": "BAD_SO_NAME"})
+
+    # 先规划（复用同一套判定，避免这里和 plan_step 给出不同结论）
+    addr = _as_int_addr(static_addr)
+    if addr is None:
+        return _j({"error": f"static_addr 无法解析：{static_addr!r}", "code": "BAD_ADDR"})
+    lr_val = _as_int_addr(lr) if lr not in (None, "") else None
+    mode_n = (mode or "over").strip().lower()
+
+    # 取已连接的 debugger（复用 service 的单例，保证与断点/事件同会话）
+    try:
+        from dyn.service import get_dyn
+
+        tgt = get_dyn().attach(serial, pid)
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": str(exc), "code": getattr(exc, "code", "ATTACH_FAILED")})
+    dbg = getattr(tgt, "dbg", None)
+    if dbg is None:
+        return _j({"error": "该目标没有 debugger", "code": "NO_DEBUGGER"})
+
+    try:
+        if mode_n == "out":
+            if lr_val is None:
+                return _j({"error": "mode='out' 必须给 lr（取 hit.context['lr']）",
+                           "code": "RET_NEEDS_LR"})
+            plan = plan_step_out(dbg, lr=lr_val, so_name=name, static_addr=addr)
+        elif mode_n == "into":
+            plan = plan_step_into(dbg, name, addr, count=int(count))
+        elif mode_n == "until_mnemonic":
+            if not (mnemonic or "").strip():
+                return _j({"error": "mode='until_mnemonic' 必须给 mnemonic",
+                           "code": "BAD_MNEMONIC"})
+            plan = plan_step_until_mnemonic(dbg, name, addr, mnemonic.strip())
+        elif mode_n == "over":
+            plan = plan_step_over(dbg, name, addr, lr=lr_val)
+        else:
+            return _j({"error": f"未知 mode：{mode_n}",
+                       "code": "BAD_MODE",
+                       "supported": ["over", "into", "out", "until_mnemonic"]})
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"规划失败：{type(exc).__name__}: {exc}",
+                   "code": "PLAN_FAILED"})
+
+    # 真执行（execute_step 内部保证摘钩，异常也摘）
+    result = _exec(dbg, plan, so_name=name, timeout=float(timeout))
+    result["mode"] = mode_n
+    result["plan"] = {k: plan.get(k) for k in
+                      ("ok", "resolvable", "strategy", "temp_breakpoint_addr", "reason")}
+    return _j(result)
+
+
+@server.tool()
+@logged()
+def trace_aggregate(events: list | None = None,
+                    runtime_bases: list | dict | None = None) -> str:
+    """把 trace / 断点命中事件按**静态函数**聚合——先看"谁被执行了上万次"。
+
+    为什么需要：指令级 trace 动辄千万行，直接读会迷失；按函数折叠后变成一张
+    排序表，再决定深入看哪一段。这是 mda 的差异化能力：运行时地址要折回
+    静态函数，靠的是 mda 自己的 SoFile.function_at（unidbg 那类模拟器没有静态层）。
+
+    **两种事件来源**：
+        1) 不传 events：自动取当前动态服务里**已有**的断点命中事件快照
+           （只读拷贝，不推进 poll 游标、不发 frida 请求）；
+        2) 传 events：显式给事件列表，元素形如
+           {"runtime_addr"|"addr": ..., "static_addr": ..., "so_name": ...,
+            "thread_id": ..., "ts": ...}；poll_events 的返回可直接传。
+
+    **地址解析两种模式**（结果里 resolution_mode 会写明，务必看）：
+        runtime  有运行时基址表，能无歧义换算（正常真机场景）；
+        static   没有基址表，直接把事件地址当静态地址。**多个 so 的静态区间
+                 重叠，这时只能判为 unresolved，不会瞎猜**。
+    拿不到基址时它会**自动从命中事件反推**（base = runtime_addr - static_addr，
+    同一 so 出现矛盾差值则整个 so 跳过）；也可以显式传 runtime_bases：
+        支持 [{"name","base","size"}]、{名: base}、{名: {base,size}}，
+        runtime_modules 的返回可以直接传。
+
+    聚合口径：默认只聚 code 类（指令执行）。read/write 事件的 addr 是**数据地址**，
+    按函数归属会把"谁读了这块内存"错当成"谁执行了这段代码"，故不混入。
+
+    返回：function_count / functions（按命中数降序）/ events_used /
+    resolution_mode / bases_derived / notes。
+    落在函数空洞或模块外的事件**不丢弃**，单独成桶并标 in_gap=true、reason 说明。
+    """
+    mod, err = _load_dyn_module("dyn.tracer", "aggregate_by_function")
+    if err:
+        return _j(err)
+
+    notes: list[str] = []
+    raw = events
+    if raw is None:
+        raw, why = _snapshot_service_events()
+        if why:
+            return _j({"error": why, "code": "NO_EVENTS",
+                       "hint": "改用 events 参数显式传入事件列表"})
+        notes.append("事件取自动态服务已有记录的只读快照（未推进 poll 游标）")
+    if not isinstance(raw, list):
+        return _j({"error": f"events 必须是列表，实际 {type(raw).__name__}",
+                   "code": "BAD_EVENTS"})
+
+    bases = runtime_bases
+    if bases is None:
+        bases, base_note = _bases_from_hit_events(raw)
+        if base_note:
+            notes.append(base_note)
+    else:
+        notes.append("运行时基址表由调用方显式提供")
+
+    # (8) 第八次修改（2026-11-02）：聚合前剔除"没有地址"的控制事件。
+    #     bug 原因：poll_events 会返回 attached/resumed/breakpoint_set 这类
+    #               没有地址的控制事件。它们被原样喂给 aggregate_by_function 后，
+    #               被当成 addr=0 的"代码执行"计入统计——实测三条控制事件聚合出
+    #               一个 hit_count=3 的函数桶，等于**凭空造出执行记录**。
+    #               这类假统计比缺数据更危险：使用者会以为某段代码跑了三次。
+    #     解决方案：只保留真正带地址的事件（addr 或 runtime_addr 可解析），
+    #               控制事件单独计数并在 notes 里如实说明剔除了多少条，
+    #               既不静默丢弃、也不混入统计。
+    with_addr: list = []
+    control_events = 0
+    for ev in raw:
+        if not isinstance(ev, dict):
+            with_addr.append(ev)        # 非字典交给 tracer 报 BAD_EVENTS
+            continue
+        has_addr = (_as_int_addr(ev.get("addr")) is not None
+                    or _as_int_addr(ev.get("runtime_addr")) is not None)
+        if has_addr:
+            with_addr.append(ev)
+        else:
+            control_events += 1
+    if control_events:
+        notes.append(
+            f"已剔除 {control_events} 条无地址的控制事件"
+            "（attached/resumed/breakpoint_set 等），它们不构成代码执行记录"
+        )
+    if not with_addr:
+        return _j({
+            "events_used": 0,
+            "function_count": 0,
+            "resolution_mode": "runtime" if bases else "static",
+            "functions": [],
+            "notes": notes,
+            "note": (f"共 {len(raw)} 条事件里没有带地址的执行事件"
+                     f"（其中 {control_events} 条是无地址的控制事件），"
+                     "无可聚合内容——这不等于'没有执行'"),
+        })
+    agg_input = with_addr
+
+    try:
+        rows = mod.aggregate_by_function(agg_input, _session, runtime_bases=bases)
+    except TypeError as exc:
+        # tracer 对不认识的事件元素**直接抛错**（静默丢事件是 trace 最危险的 bug），
+        # 这里转成可读错误，不吞掉
+        return _j({"error": f"事件元素类型不受支持：{exc}", "code": "BAD_EVENTS"})
+    except Exception as exc:            # noqa: BLE001 - 坏样本不该让工具崩
+        return _j({"error": f"{type(exc).__name__}: {exc}", "code": "AGGREGATE_FAILED"})
+
+    unresolved = sum(1 for r in rows if r.get("reason") == "module_unresolved")
+    gaps = sum(1 for r in rows if r.get("in_gap"))
+    out = {
+        "events_used": len(agg_input),
+        "function_count": len(rows),
+        "resolution_mode": "runtime" if bases else "static",
+        "bases_derived": len(bases or {}),
+        "functions": rows,
+        "notes": notes,
+    }
+    if not rows:
+        out["note"] = ("没有任何可聚合的事件：采集未启动，或事件里没有可解析的地址。"
+                       "这不等于'没有执行'，见 note 与来源说明")
+    elif unresolved:
+        out["unresolved_buckets"] = unresolved
+        out["gap_buckets"] = gaps
+        out["warning"] = ("有地址判为未解析（module_unresolved）："
+                          "通常是缺运行时基址表或多 so 静态区间重叠。"
+                          "真机场景请把 runtime_modules 的返回作为 runtime_bases 传入")
+    return _j(out)
+
+
+@server.tool()
+@logged()
+def locate_runtime_addr(serial: str, pid: int, runtime_addr: int | str) -> str:
+    """运行时地址 → 完整静态定位（把"设备上那个地址"折回 mda 的静态模型）。
+
+    这是静态+动态打通的入口：frida 给的地址带 ASLR，离开模块基址没有意义；
+    本工具换算成 so / 静态地址 / 所属函数 / 函数内偏移，之后就能直接用
+    disassemble / decompile / xrefs_to 这些静态工具。
+
+    **工作流**：get_callstack 的某一帧（"runtime_addr": "0x7a0005201c"）
+        → locate_runtime_addr 拿 static_addr_int 与 function
+        → 用 static_addr_int 调 disassemble / xrefs_to（这两个接口要 int）。
+
+    runtime_addr 支持十进制整数或 "0x..." 字符串（调用栈输出就是 hex 串）。
+
+    会 attach 目标（幂等，已附加则复用同一会话），本工具**需要设备**。
+
+    怎么读结果（都是如实标注，不是错误）：
+        in_gap=true           模块内但没有函数覆盖（FDE 空洞 / PLT 桩 / 未发现区域），
+                              function=null，不编造函数名
+        in_plt_stub=true      落在 PLT 跳板（外部导入），plt_name 给出符号
+        loaded_in_mda=false   mda 没加载该 so：so/static_addr 仍有效，但没有函数名，
+                              先 load_so 再查一次才有符号
+        module_match          名字怎么对上的（exact/renamed/normalized/stem/suffix）
+    hex 字段都配了同名 *_int 字段，喂接 int 的接口请用 *_int 版。
+    """
+    mod, err = _load_dyn_module("dyn.bridge", "locate_static")
+    if err:
+        return _j(err)
+    from dyn.service import get_dyn
+
+    svc = get_dyn()
+    try:
+        tgt = svc.attach(serial, pid)      # 幂等：已附加则复用同一会话
+        mods = tgt.rb.refresh_modules()     # locate_static 自己不会取模块表，必须给
+    except Exception as exc:            # noqa: BLE001 - DynError 带 code
+        return _j({"error": f"{type(exc).__name__}: {exc}", "code": "ATTACH_FAILED"})
+
+    try:
+        result = mod.locate_static(_session, runtime_addr, mods)
+    except Exception as exc:            # noqa: BLE001 - 换算失败要给可读原因
+        return _j({"error": f"{type(exc).__name__}: {exc}",
+                   "code": "LOCATE_FAILED"})
+    return _j(result)
+
+
+@server.tool()
+@logged()
+def hit_analysis(serial: str, pid: int, build_xrefs: bool = False) -> str:
+    """最近一次断点命中 → 完整静态上下文（命中点前后指令 / 伪代码 / 调用者）。
+
+    这是"停下来之后该看什么"的一站式答案：把命中的运行时现场直接摊成静态视图，
+    省掉 命中→取 pc→减基址→查函数→反汇编→查引用 的一长串手工步骤。
+
+    **工作流**：
+        1) set_breakpoint(hold=True) 下断；
+        2) poll_events 看到 type=breakpoint_hit 且 hold=true（目标已 paused）；
+        3) hit_analysis 看命中的函数、前后指令、谁调用了它；
+        4) 分析完必须 resume 放行，否则线程一直停着。
+
+    取的是**该目标最近一次命中**（内部取命中列表最后一条）。没有命中时
+    明确报 NO_HITS，不会拿空结果冒充分析成功。
+
+    build_xrefs=True 会强制构建引用图以保证 callers 完整，**大样本很慢**
+    （6000+ 函数的样本可能二三十秒）。默认 false 时 callers_complete=false
+    ——表示调用者只是部分结果，别当全量。
+
+    **会 attach 目标**（幂等），需要设备。
+
+    返回要点：symbol（so!func+0xNN）、function{name,addr,size}、insn_index、
+    disasm（命中点前后各若干条，is_hit 标出命中那条）、pseudocode、callers、
+    context（寄存器快照）、backtrace。
+    落不到静态模型时 in_gap=true / loaded_in_mda=false，notes 里写明原因。
+    """
+    mod, err = _load_dyn_module("dyn.bridge", "hit_context")
+    if err:
+        return _j(err)
+    from dyn.service import get_dyn
+
+    svc = get_dyn()
+    try:
+        hits = svc.hits(serial, pid)
+    except Exception as exc:            # noqa: BLE001 - DynError 带 code
+        return _j({"error": f"{type(exc).__name__}: {exc}", "code": "NOT_ATTACHED"})
+    if not hits:
+        return _j({
+            "error": f"{serial}:{pid} 还没有任何断点命中，无法做命中分析",
+            "code": "NO_HITS",
+            "hint": "先 set_breakpoint(hold=True) 下断，再 resume 让目标跑起来制造命中",
+        })
+
+    # (1) 第一次修改
+    # bug 原因：初版用 "fallback_note" in dir() 判断异常分支是否走过。
+    #          dir() 无参时给的是**当前局部作用域**的名字，写法能跑但极脆弱——
+    #          一旦后续有人在函数里加个同名变量或把赋值移走，判断就静默失效，
+    #          降级说明会丢，也正是「不静默丢信息」这条约定最怕的失效方式。
+    # 解决方案：预先置空字符串，用真值判断；降级说明只在实际取不到模块表时填。
+    mods = None
+    fallback_note = ""
+    try:
+        tgt = svc.attach(serial, pid)
+        mods = tgt.rb.refresh_modules()
+    except Exception as exc:            # noqa: BLE001 - 命中缺 static_addr 时才需要它
+        # 命中对象通常自带 static_addr，模块表只作反算兜底；取不到不阻断分析
+        fallback_note = (f"取运行时模块表失败（{type(exc).__name__}），"
+                         "仅用命中自带的静态地址")
+
+    try:
+        # 直接传整个命中列表：bridge 会取最后一条（最近一次命中）并标注条数
+        result = mod.hit_context(_session, hits, mods, build_xrefs=build_xrefs)
+    except Exception as exc:            # noqa: BLE001 - 分析失败要给可读原因
+        return _j({"error": f"{type(exc).__name__}: {exc}",
+                   "code": "HIT_CONTEXT_FAILED"})
+
+    if fallback_note:
+        result.setdefault("notes", []).append(fallback_note)
+    result["hits_total"] = len(hits)
+    return _j(result)
+
+
+@server.tool()
+@logged()
+def suggest_breakpoints(so_name: str, function: str | None = None,
+                        addr: int | None = None) -> str:
+    """静态选一个函数 → 建议在哪几个位置下断点（省掉满函数乱找）。
+
+    用途：动态调试时"我到底该断在哪"是最耗神的一步。本工具从静态层给出四类候选：
+        entry        函数入口——命中时 x0-x7 就是调用方传入的实参
+        after_call   每个 bl 之后的返回点——调用已完成，可看返回值 x0 与副作用
+        before_ret   ret 之前——可看最终返回值与将要恢复的 lr
+        data_ref     引用字符串的指令——可确认走的是哪个分支/哪个文案
+
+    **工作流**：
+        1) 先用 function_by_name 找到函数（重名时必须带 so_name）；
+        2) suggest_breakpoints(so_name, function="foo") 拿候选；
+        3) 每条建议的 **addr_int** 传给 set_breakpoint（那个接口要 int，
+           返回里的 addr 是 hex 字符串，别直接喂）；
+        4) poll_events 收命中。
+
+    function 与 addr 至少给一个：
+        function 还接受 "so!foo" / "sub_5020" / "0x5020" 这几种写法；
+        addr 是**静态**地址（不是运行时地址，运行时换算用 locate_runtime_addr）。
+    重名函数会返回 candidates 列表让你指定，**不会替你猜一个**。
+
+    纯静态，不连设备。找不到函数时返回 {"error", "candidates"}。
+    """
+    mod, err = _load_dyn_module("dyn.bridge", "suggest_breakpoints")
+    if err:
+        return _j(err)
+    if function not in (None, "") and str(function).strip():
+        target = function
+    elif addr is not None:
+        target = addr
+    else:
+        return _j({"error": "function 与 addr 至少给一个",
+                   "code": "BAD_REQUEST",
+                   "hint": "先用 function_by_name 查函数地址，再传进来"})
+
+    try:
+        # 注意：模块内同名函数，这里用 mod. 前缀调用，避免与本工具递归
+        result = mod.suggest_breakpoints(_session, target, so_name or None)
+    except Exception as exc:            # noqa: BLE001 - 坏样本不该让工具崩
+        return _j({"error": f"{type(exc).__name__}: {exc}",
+                   "code": "SUGGEST_FAILED"})
+    return _j(result)
+
+
+@server.tool()
+@logged()
+def trace_timeline(events: list | None = None) -> str:
+    """把事件流整理成**函数级时间轴**——看"先调了 A，再调了 B"。
+
+    与 trace_aggregate 的区别：
+        trace_aggregate  按函数**汇总**（谁被执行最多）
+        trace_timeline   按**时间顺序**排列（执行先后关系）
+
+    不传 events 时自动取当前动态服务里已有的命中事件快照（只读，不推进游标）。
+    返回里的 runs 是"连续同名"的压缩视图：同一函数被连续命中 5 次会合成一条，
+    避免时间轴被重复项淹没。
+
+    (9) 第九次修改（2026-11-02）：本工具此前只有 dyn/bridge.py 的实现，
+        没注册成 MCP 工具，AI 侧完全调不到——做了却用不上。
+    """
+    mod, err = _load_dyn_module("dyn.bridge", "trace_to_timeline")
+    if err:
+        return _j(err)
+
+    raw = events
+    if raw is None:
+        raw, why = _snapshot_service_events()
+        if why:
+            return _j({"error": why, "code": "NO_EVENTS",
+                       "hint": "改用 events 参数显式传入事件列表"})
+    if not isinstance(raw, list):
+        return _j({"error": f"events 必须是列表，实际 {type(raw).__name__}",
+                   "code": "BAD_EVENTS"})
+    try:
+        mods = _runtime_modules_snapshot()
+        return _j(mod.trace_to_timeline(raw, _session, mods))
+    except Exception as exc:            # noqa: BLE001 - 坏数据不该让工具崩
+        return _j({"error": f"{type(exc).__name__}: {exc}",
+                   "code": "TIMELINE_FAILED"})
+
+
+@server.tool()
+@logged()
+def module_load_timeline(load_events: list) -> str:
+    """模块加载事件 → 加载顺序时间轴 + 区间异常检测。
+
+    传入形如 [{"name","base","size","ts"}, ...] 的**观测到的**加载事件
+    （通常来自真机 frida 的模块观察；本轮采集侧未实现，需自行提供数据）。
+
+    会检测：基址为 0、基址未对齐、size 非法、缺基址、缺名字、缺时间戳、
+    重名（dlopen 重载），以及**模块区间重叠**——重叠往往说明数据有问题
+    或存在特殊映射（如 JIT 区被误当成模块）。
+
+    (9) 第九次修改（2026-11-02）：此前未注册成 MCP 工具，AI 调不到。
+    """
+    mod, err = _load_dyn_module("dyn.bridge", "module_load_timeline")
+    if err:
+        return _j(err)
+    if not isinstance(load_events, list):
+        return _j({"error": f"load_events 必须是列表，实际 {type(load_events).__name__}",
+                   "code": "BAD_EVENTS"})
+    try:
+        return _j(mod.module_load_timeline(load_events))
+    except Exception as exc:            # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}",
+                   "code": "TIMELINE_FAILED"})
+
+
+@server.tool()
+@logged()
+def trace_module_load(serial: str, package: str = "", pid: int = 0,
+                      duration: float = 3.0, include_system: bool = False,
+                      keep_alive: bool = True, max_events: int = 500) -> str:
+    """**采集模块加载时间轴**——回答"这个 app 从启动到现在加载了什么、什么时候"。
+
+    两种模式（按传参自动选）：
+
+        spawn 模式：传 package="com.x.y"
+            在 app 启动**前**把它挂起 → 装好观察器 → resume 放行 →
+            从第一条指令开始记录。**能看到启动全过程**。
+            例："这个 app 启动时都加载了哪些 so"
+
+        attach 模式：传 pid=12345
+            附着到已在跑的进程，只记录**之后**的加载。
+            例："从现在开始它还会加载什么"
+
+    **为什么 spawn 才有启动时间轴**：attach 到已运行进程时，启动阶段的加载
+    早就发生完了。只有先 `spawn` 挂起、装好观察器、再 `resume`，
+    才能覆盖从进程创建那一刻起的加载。
+
+    ## 返回里最该看的字段
+
+        timeline       人类可读的时间轴（可直接转述给用户），形如：
+                         +0.000s 加载 miui.apk@classes.dex
+                         +0.034s (Δ+0.026s) 加载 Settings.apk@classes.dex
+        events[]       机器可读，每条 {kind, name, base, size, path, ts,
+                       delta_s（距上一条的秒数）, t_rel（距第一条的秒数）, seq}
+        first_load / last_load / load_span_s
+                       第一次/最后一次加载，以及总跨度
+        baseline_count 观察器就位时已加载的模块数（spawn 下是 zygote 基础库，
+                       不算"新增加载"）
+        dropped_system 被 include_system=False 过滤掉的系统模块数
+
+    ## 参数
+
+        duration       采集秒数；spawn 模式下**从 resume 那一刻开始计**
+        keep_alive     仅 spawn：采完是否保留 app 进程（True 方便接着下断点，
+                       False 则 kill，纯采集更干净）
+        include_system 是否保留 /system、/apex、/vendor、/product 下的模块
+                       （默认 False；壳样本自己的 so 通常在 /data 下，不受影响）
+
+    ## 实测样例（com.android.settings，spawn 3.5s）
+
+        mode=spawn  pid=4632  baseline=351  新增=14  过滤系统=21
+        +0.000s 加载 system@app@miui@miui.apk@classes.dex
+        +0.034s (Δ+0.026s) 加载 Settings.apk@classes.dex
+        +0.044s (Δ+0.010s) 卸载 Settings.apk@classes.dex
+        load_span_s=0.479
+
+    **已知限制**：同名 so 多实例（实测 libcutils.so 在进程里有两个基址）现在
+    能正确区分（基线用 name|base 组合键），不会再报假新增。
+    """
+    mod, err = _load_dyn_module("dyn.tracer", "start_trace_module_load")
+    if err:
+        return _j(err)
+    try:
+        result = mod.start_trace_module_load(
+            serial, pid=int(pid or 0), package=package,
+            include_system=bool(include_system),
+            max_events=int(max_events), duration=float(duration),
+            keep_alive=bool(keep_alive))
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}",
+                   "code": getattr(exc, "code", "TRACE_FAILED")})
+    return _j(result)
+
+
+@server.tool()
+@logged()
+def trace_app_startup(serial: str, package: str, symbols: list | None = None,
+                      breakpoints: list | None = None,
+                      duration: float = 3.0, include_system: bool = False,
+                      keep_alive: bool = True, max_events: int = 2000) -> str:
+    """**从 app 启动第一刻起**，同时采集「so 加载」和「函数调用」，合成一条时间轴。
+
+    这是回答「这个 app 启动时加载了什么、从哪加载、加载完多久才开始干活」
+    的**一站式工具**——一次调用拿到全程，不用分几步拼。
+
+    ## 为什么必须 spawn
+
+    attach 到已经在跑的进程时，启动阶段的 so 早已加载完、关键函数（malloc/
+    open/init/解密）也早跑过一轮。只有先 `spawn` 把 app 挂起 → 装观察器和 hook
+    → 再 `resume` 放行，才能覆盖**从零开始**的过程。
+
+    ## 参数
+
+        package   要分析的包名，如 "com.android.settings"
+        symbols   要 hook 的**导出符号名**列表，如 ["malloc","open","read"]。
+                  启动早期拿不到地址，所以只接受符号名。找不到的会列进
+                  failed_symbols，不静默忽略。
+                  对 open/openat/stat/access/dlopen/fopen 等路径类函数，
+                  **工具会自动把第一个字符串参数读出来**，直接显示打开了什么文件。
+
+        breakpoints 要按**静态地址**下断点的内部函数列表，格式：
+                      [{"so_name":"libsgmainso.so","static_addr":0x1234,
+                        "label":"可选的名字"}, ...]
+                  为什么需要它：symbols 只能 hook 导出符号，而加固样本的关键
+                  函数（解密、校验、VM 分发器）几乎都没有导出名。
+                  **支持延迟断点**：启动早期 app 自己的 so 往往还没加载，
+                  这类断点会挂起等待，等该 so 被 dlopen 时**自动补下**。
+                  结果在 static_breakpoints 里分开报告：
+                    placed        已就位（when=immediate 挂起时下的 / late 加载后补下的）
+                    pending_on_load  仍在等待对应 so 加载
+                    failed        下断失败的（含原因）
+                    late_placed   补下的详细记录（哪个模块触发了哪条断点）
+        duration  从 resume 那一刻开始的采集秒数
+        include_system  是否保留 /system、/apex、/vendor 下的模块加载事件
+        keep_alive      采集后是否保留 app 进程（True 便于接着下断点继续分析）
+        max_events      加载与调用**各自**的上限（互不挤占，见下）
+
+    ## 返回
+
+        timeline   人类可读，分两段（可直接转述）：
+                     【模块加载/卸载】共 14 条
+                     +0.008s 加载 miui.apk@classes.dex  ← /data/dalvik-cache/...
+                     【函数调用】共 150 条
+                     +0.008s 调用 open("/system/app/miui/miui.apk")
+        events[]   机器可读，两类统一带 ts / t_rel（距首条）/ delta_s（距上条）
+        stats      各类型计数、首个加载/首个调用的相对耗时、被截断的数量
+        hooked_symbols / failed_symbols / per_symbol_cap
+
+    ## 实测样例（com.android.settings，spawn 3 秒）
+
+        stats: {module_load: 14, call: 150, first_load_t_rel: 0.008,
+                first_call_t_rel: 0.0}
+        +0.000s 调用 open("/proc/self/cmdline")
+        +0.003s 调用 open("/system/framework/org.apache.http.legacy.jar")
+        +0.008s 加载 miui.apk@classes.dex  ← /data/dalvik-cache/arm64/...
+        +0.008s 调用 open("/system/app/miui/miui.apk")
+
+    ## 已知限制（如实标注）
+
+        · spawn 需要 app 允许调试；加固样本可能失败（返回 SPAWN_FAILED）
+        · 只 hook 导出符号；内部函数需先拿静态地址再走 set_breakpoint
+        · 加载与调用**分类限额**（默认每个符号最多 max_events/符号数/2 条），
+          避免 malloc 这类高频函数把加载事件挤出队列——这是实测踩到的坑：
+          原来共用总上限时，启动阶段 malloc 几万次会把 module_load 挤到 0 条
+    """
+    mod, err = _load_dyn_module("dyn.tracer", "trace_app_startup")
+    if err:
+        return _j(err)
+    try:
+        result = mod.trace_app_startup(
+            serial, package, symbols=symbols, breakpoints=breakpoints,
+            duration=float(duration), include_system=bool(include_system),
+            max_events=int(max_events), keep_alive=bool(keep_alive))
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}",
+                   "code": getattr(exc, "code", "TRACE_FAILED")})
+
+    # (19) 第十九次修改（2026-11-05）：把调用栈里的原始地址符号化。
+    #      bug 原因：tracer 层只返回运行时裸地址（它不该依赖 mda 的静态会话），
+    #                而 AI 看到 "0x7d18e5ae58" 完全无法判断是谁调的——
+    #                "像浏览器那样看堆栈"正是要这里给出 so!函数+偏移。
+    #      解决方案：用采集结束时带回的完整模块表，逐帧查 mda 静态模型；
+    #                查不到的保留原始地址并统计，不伪造函数名。
+    raw_mods = result.get("modules") or []
+    symbolized_frames = 0
+    unsymbolized_frames = 0
+    missing_sos: set[str] = set()
+
+    class _Mod:
+        __slots__ = ("name", "base", "size")
+
+        def __init__(self, name, base, size):
+            self.name = name
+            self.base = base
+            self.size = size
+
+    mods_obj = []
+    for m in raw_mods:
+        if not isinstance(m, dict):
+            continue
+        b = _as_int_addr(m.get("base"))
+        if b is None:
+            continue
+        mods_obj.append(_Mod(str(m.get("name") or ""), b,
+                             _as_int_addr(m.get("size")) or 0))
+
+    for ev in result.get("events") or []:
+        bt = ev.get("backtrace")
+        if not bt:
+            continue
+        frames = []
+        for raw in bt:
+            addr = _as_int_addr(raw)
+            if addr is None:
+                continue
+            info = _symbolize_frame(addr, mods_obj, _session)
+            # FUZZY 栈扫描会混入"栈上恰好长得像地址"的值：不落在任何模块内的
+            # 帧直接丢掉，宁可栈浅一点也不给错误归属（实测这类误报很常见）
+            if not info.get("so"):
+                continue
+            if info.get("function"):
+                symbolized_frames += 1
+            else:
+                unsymbolized_frames += 1
+                if info.get("so"):
+                    missing_sos.add(str(info["so"]))
+            fn_name = info.get("function")
+            so_name = info.get("so")
+            off = info.get("offset")
+            if fn_name and so_name:
+                symbol = f"{so_name}!{fn_name}" + (
+                    f"+{hex(off)}" if isinstance(off, int) else "")
+            elif so_name:
+                symbol = f"{so_name}+{hex(addr - 0)}" if False else f"{so_name} (无函数名)"
+            else:
+                symbol = hex(addr)
+            frames.append({
+                "runtime_addr": hex(addr),
+                "so": so_name,
+                "function": fn_name,
+                "offset": off,
+                "in_gap": info.get("in_gap"),
+                "symbol": symbol,
+            })
+        ev["frames"] = frames
+        ev["stack"] = [f["symbol"] for f in frames]
+        # 原始地址数组保留在 backtrace 里，方便调用方自行换算
+
+    # (19) 附加"带栈调用"的可读视图：直接看谁在什么时刻、从哪条链上被调起来。
+    stack_lines: list[str] = []
+    for ev in result.get("events") or []:
+        frames = ev.get("frames") or []
+        if not frames:
+            continue
+        rel = ev.get("t_rel")
+        rel_txt = f"+{rel:.3f}s" if isinstance(rel, (int, float)) else "+?"
+        head = f"{rel_txt} {ev.get('symbol')}"
+        if ev.get("str_arg"):
+            head += f'("{ev.get("str_arg")}")'
+        stack_lines.append(head)
+        for depth, f in enumerate(frames):
+            mark = "←" if depth == 0 else "↑"
+            stack_lines.append(f"    {mark} {f.get('symbol')}")
+        if len(stack_lines) > 200:
+            stack_lines.append("    …（栈输出已截断，完整数据见 events[].frames）")
+            break
+    if stack_lines:
+        result["stack_timeline"] = "\n".join(stack_lines)
+
+    result["symbolized_frames"] = symbolized_frames
+    result["unsymbolized_frames"] = unsymbolized_frames
+    if missing_sos:
+        result["hint"] = (
+            f"有 {len(missing_sos)} 个 so 的栈帧只解析到模块+偏移、没有函数名："
+            f"{sorted(missing_sos)[:6]}。用 load_so 载入这些 so 后重新采集即可"
+            "看到函数名（加载时文件名要与设备上一致）")
+    return _j(result)
+
+
+@server.tool()
+@logged()
+def trace_code(serial: str, pid: int, duration: float = 2.0,
+               threads: list | None = None, max_events: int = 2000) -> str:
+    """指令级**调用** trace：用 Stalker 采集"谁调用了谁"。
+
+    采集的是 **call 事件**（调用关系），不是逐条指令执行——指令级会把事件量
+    放大几个数量级，而"执行了哪些函数、调用链如何"通常才是要回答的问题。
+    事件里的 runtime_addr 可以直接喂 trace_aggregate 折回静态函数。
+
+    **重要前提**：依赖 `Process.enumerateThreads()` 能拿到线程。
+        实测多数 app（systemui/logd/zygote）返回 0 → 无法跟随，会返回 NO_THREAD；
+        system_server 正常（实测 224 个线程）。
+
+    ⚠️ **危险警告（务必先看这条）**：
+        对 **system_server 使用会导致系统重启**。实测两次，跟随其线程后
+        system_server 消失、zygote 与整个 Android 框架重启。
+        也就是说本能力目前**没有安全可用的常规目标**：
+        多数 app 枚举不到线程，唯一能枚举的 system_server 又会被搞崩。
+        除明确知悉风险并接受设备重启，不要调用本工具。
+
+    参数：
+        threads     要跟随的线程 id 列表；不传则自动挑非 running 的线程（最多 4 条）
+        duration    采集秒数（Python 侧计时，到点主动停）
+        max_events  事件上限
+
+    **开发中踩到的两个坑（已修，写在这里免得以后重犯）**：
+        1. 不能用 JS 的 `setTimeout` 来 unfollow——被 Stalker 跟踪的线程
+           无法执行该定时器，脚本会永远等不到停止信号（表现为卡死）。
+           必须由 Python 侧 `script.post()` 触发 `recv('stop')`。
+        2. 不能在 `onReceive` 回调里 `send()`——那是高频回调，发送会阻塞
+           导致脚本卡住。必须只在回调里累积，停止后再分批送出。
+
+    返回：ok / events / count / followed_threads / stopped_cleanly / method / limitations。
+    """
+    mod, err = _load_dyn_module("dyn.tracer", "start_trace_code")
+    if err:
+        return _j(err)
+    try:
+        result = mod.start_trace_code(
+            serial, pid, threads=threads, max_events=int(max_events),
+            duration=float(duration))
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}", "code": "TRACE_FAILED"})
+    return _j(result)
+
+
+@server.tool()
+@logged()
+def trace_read(serial: str, pid: int, addr: int, size: int = 8,
+               so_name: str = "", duration: float = 2.0,
+               max_events: int = 500) -> str:
+    """监控「谁**读**了这块内存」，返回每次读取的函数、地址与调用栈。
+
+    实现方式：hook libc 的内存函数（memcpy/memmove/memcmp/memchr/strlen/
+    strcmp/strncmp/strcpy/strncpy/strcat/strdup/__memcpy_chk），检查**源地址**
+    是否落在 [addr, addr+size) 内。实测能捕获到真实访问（strlen/memcpy 各一条）。
+
+    **为什么不用硬件观察点或 MemoryAccessMonitor**（都试过了）：
+        · `Thread.setHardwareWatchpoint` 能真的触发，但异常被 frida 内部吞掉，
+          `Process.setExceptionHandler` 收不到；且只有 4 个槽位、按线程生效；
+        · `MemoryAccessMonitor.enable()` 实测**会把目标进程搞崩**
+          （system_server 消失、Android 框架整体重启），绝不能再用于真机。
+
+    **能力边界**：只覆盖走这些函数的访问，编译器内联的直接 ldr/str 抓不到；
+    不记录访问字节数；目标进程必须真的执行到这些函数才会有事件。
+
+    addr 为运行时地址；若给静态地址并同时给 so_name，会自动换算。
+    失败给 {"error","code"}；采集不到事件时 count=0 但 ok=true（**不是错误**，
+    表示这段时间内没有走这些函数的访问）。
+    """
+    mod, err = _load_dyn_module("dyn.tracer", "start_trace_read")
+    if err:
+        return _j(err)
+    try:
+        result = mod.start_trace_read(
+            serial, pid, int(addr), size=int(size), so_name=so_name,
+            max_events=int(max_events), duration=float(duration))
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}", "code": "TRACE_FAILED"})
+    return _j(result)
+
+
+@server.tool()
+@logged()
+def trace_write(serial: str, pid: int, addr: int, size: int = 8,
+                so_name: str = "", duration: float = 2.0,
+                max_events: int = 500) -> str:
+    """监控「谁**写**了这块内存」，返回每次写入的函数、地址与调用栈。
+
+    与 trace_read 同源（hook libc 内存函数），区别是检查**目标地址**
+    是否落在 [addr, addr+size) 内。实测能捕获 memset/memcpy 的真实写入。
+
+    典型用途：定位"谁改了这个标志位""谁解密后写回了这段缓冲区"。
+    参数与限制同 trace_read。
+    """
+    mod, err = _load_dyn_module("dyn.tracer", "start_trace_write")
+    if err:
+        return _j(err)
+    try:
+        result = mod.start_trace_write(
+            serial, pid, int(addr), size=int(size), so_name=so_name,
+            max_events=int(max_events), duration=float(duration))
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}", "code": "TRACE_FAILED"})
+    return _j(result)
+
+
+def _runtime_modules_snapshot() -> list[dict]:
+    """取当前已附加目标的运行时模块表（只读，不发新请求时返回空）。
+
+    时间轴需要把运行时地址折回静态函数，而这一步依赖模块基址。
+    这里只做**内存快照**，不主动 attach 新进程——没有现成会话就返回空，
+    由调用方按静态模式处理（结果里 resolution 会体现）。
+    """
+    try:
+        from dyn.service import get_dyn
+
+        svc = get_dyn()
+        mods: list[dict] = []
+        for tgt in list(getattr(svc, "_targets", {}).values()):
+            rb = getattr(tgt, "rb", None)
+            cached = list(getattr(rb, "_modules", []) or [])
+            for m in cached:
+                mods.append({"name": getattr(m, "name", ""),
+                             "base": getattr(m, "base", 0),
+                             "size": getattr(m, "size", 0)})
+            if mods:
+                break       # 同一时刻只用一份模块表，跨目标基址不可混用
+        return mods
+    except Exception:                   # noqa: BLE001
+        return []
 
 
 # ---------------- 脚本通道 ----------------
