@@ -595,3 +595,105 @@ class Adb:
             )
         time.sleep(1.5)
         return self.find_app_pid(package) > 0
+
+    def probe_process_alive(self, pid: int, serial_ok: bool = True) -> dict:
+        """探测目标进程**是否还活着、是否还能被注入**。
+
+        (10) 第十次修改（2026-11-06）：新增。
+
+        bug 原因：probe_hits 返回 0 命中时，verdict 只说"这段代码没被执行"，
+                  但**另一种情况**是——进程已经死了/变成僵尸/失去可注入性，
+                  这时 frida 抛 ProcessNotFoundError，而调用方看到的是
+                  "0 命中"，很容易误判成"签名流程没走"。
+                  实测：adb ps 能看到 pid 1495，但 frida 枚举不到它，
+                  于是 probe_hits 抛 ProcessNotFoundError —— 两个工具给出
+                  互相矛盾的视角，用户无从判断。
+
+        解决方案：提供一个**独立于 frida 的活性探测**，同时用三条证据交叉验证：
+            ① adb /proc/<pid> 是否存在（进程在内核里还在不在）
+            ② /proc/<pid>/stat 的状态字符（R/S/T/Z/X，Z=僵尸）
+            ③ frida 能否枚举到它（能不能注入）
+        三者任一异常都在返回里如实说明，让调用方知道"0 命中"到底是
+        "代码没跑"还是"进程没了"。
+
+        ## 返回
+
+            alive          进程在内核里是否存在
+            status         /proc/<pid>/stat 的状态字符（R/S/D/T/t/Z/X）
+            status_meaning 该字符的中文含义
+            injectable     frida 能否看到并注入它
+            verdict        一句话结论
+            next_step      建议怎么做
+        """
+        result: dict = {
+            "pid": int(pid),
+            "alive": False,
+            "status": "",
+            "status_meaning": "",
+            "injectable": False,
+            "verdict": "",
+            "next_step": "",
+        }
+
+        # ① /proc/<pid> 是否存在 + ② 状态字符
+        try:
+            out = self._cmd("shell", "su", "-c",
+                            f"cat /proc/{int(pid)}/stat 2>/dev/null || echo MISSING",
+                            check=False)
+            text = (out or "").strip()
+        except Exception:                                 # noqa: BLE001
+            text = ""
+
+        if not text or "MISSING" in text:
+            result["alive"] = False
+            result["verdict"] = f"进程 {pid} 在内核里已不存在（/proc 无此条目）"
+            result["next_step"] = ("进程已退出。重新启动 app 后再 attach；"
+                                   "注意 pid 会变，不要复用旧 pid")
+            return result
+
+        result["alive"] = True
+        idx = text.rfind(")")
+        status = ""
+        if idx > 0:
+            rest = text[idx + 1:].strip()
+            status = rest.split()[0] if rest else ""
+        result["status"] = status
+        meanings = {
+            "R": "运行中", "S": "可中断睡眠", "D": "不可中断睡眠",
+            "T": "被 SIGSTOP 冻结", "t": "被调试器冻结",
+            "Z": "僵尸（已退出但未被回收）", "X": "已退出",
+            "I": "空闲内核线程",
+        }
+        result["status_meaning"] = meanings.get(status, f"未知状态 {status!r}")
+
+        # ③ frida 能否看到（能否注入）
+        try:
+            import frida
+
+            dev = frida.get_device(self.serial, timeout=10)
+            seen = any(p.pid == int(pid) for p in dev.enumerate_processes())
+            result["injectable"] = bool(seen)
+        except Exception as exc:                          # noqa: BLE001
+            result["injectable"] = False
+            result["frida_error"] = f"{type(exc).__name__}: {exc}"
+
+        # 结论
+        if status in ("Z", "X"):
+            result["verdict"] = (f"进程 {pid} 已是僵尸/已退出（状态 {status}"
+                                 f"={result['status_meaning']}）："
+                                 "它还在 /proc 里但不会执行任何代码")
+            result["next_step"] = "重新启动 app（pid 会变），不要复用旧 pid"
+        elif not result["injectable"]:
+            result["verdict"] = (f"进程 {pid} 在内核里存在（状态 {status}="
+                                 f"{result['status_meaning']}），但 frida 看不到它："
+                                 "**无法注入**，所有断点/探针都不可能生效")
+            result["next_step"] = ("该进程已失去可注入性（常见于被加固保护、"
+                                   "frida 被检出，或进程正处于崩溃恢复）。"
+                                   "重启 app 后重新 attach")
+        else:
+            result["verdict"] = (f"进程 {pid} 存活且可注入（状态 {status}="
+                                 f"{result['status_meaning']}）")
+            result["next_step"] = ("进程正常。若探针 0 命中，说明那段代码"
+                                   "在当前场景确实没被执行（可用 watch_module 确认）")
+
+        return result

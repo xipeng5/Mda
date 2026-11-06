@@ -883,7 +883,9 @@ def remove_breakpoint(bp_id: str) -> str:
 
 @server.tool()
 @logged()
-def hits(serial: str, pid: int) -> str:
+def hits(serial: str, pid: int, bp_id: str = "", limit: int = 0,
+         since_seq: int = 0, include_context: bool = True,
+         include_backtrace: bool = True, include_stack: bool = True) -> str:
     """取**断点命中历史**（完整现场），与 poll_events 是两份不同的数据。
 
     区别（很容易混）：
@@ -892,9 +894,38 @@ def hits(serial: str, pid: int) -> str:
         hits          命中现场列表（含 36 个寄存器 + 调用栈），
                       适合"停下来逐条复盘"
 
-    返回：{count, hits[], hits_discarded}
-        hits_discarded 是**因超出保留上限被丢掉的旧命中数**。保留上限 2000 条
-        （每条约 12KB），出现非零值说明你看到的不是全部历史。
+    ## ⚠️ 数据量很大，默认可能被截断
+
+    每条命中约 **12KB**（36 个寄存器 + 调用栈 + 栈快照 256B）。
+    2000 条就是 24MB——远超 MCP 单次返回上限，会被截断成残缺 JSON。
+    所以**强烈建议用下面的参数裁剪**，而不是无参数全取。
+
+    ## 参数（都是可选的，但建议至少给一个）
+
+        bp_id            只返回**这个断点**的命中（形如 "serial:pid:so:5b76c"）。
+                         这是最有效的裁剪方式——通常你只关心一个断点。
+        limit            只返回**最近 N 条**（0 = 不限）。历史越长越该设。
+        since_seq        只要 seq > 这个值的命中（增量拉取用）
+        include_context  false 时省略 36 个寄存器（省最多空间）
+        include_backtrace false 时省略调用栈
+        include_stack    false 时省略 256 字节栈快照
+
+    ## 返回
+
+        count            本次返回的条数
+        total_matched    过滤后**总共**匹配多少条（可能 > count，说明被 limit 截断）
+        hits[]           命中列表
+        hits_discarded   因超出保留上限被丢掉的旧命中数
+        fields_omitted   本次省略了哪些字段（让调用方知道数据不全）
+        size_hint        估算的 JSON 体积（KB），方便判断要不要再裁剪
+
+    ## 典型用法
+
+        # 只关心 malloc 那个断点，最近 5 条，不要寄存器
+        hits(bp_id="3e2ff172:22747:libc.so:48d3c", limit=5, include_context=False)
+
+        # 增量拉取
+        hits(since_seq=1000, limit=50)
     """
     from dyn.service import get_dyn
 
@@ -912,18 +943,89 @@ def hits(serial: str, pid: int) -> str:
         discarded = getattr(dbg, "_hits_discarded", None)
     except Exception:                                     # noqa: BLE001
         discarded = None
+
+    total_before = len(items)
+
+    # (24) 第二十四次修改（2026-11-06）：加过滤与裁剪，解决"数据太大被截断"。
+    #      bug 原因：hits 无条件返回全部命中，每条约 12KB；实测 250 条就
+    #               超过 3MB，MCP 返回被截断成**残缺 JSON**，调用方拿到的是
+    #               坏数据而且没有任何提示——这比报错更糟。
+    #      解决方案：① 支持按 bp_id / since_seq 过滤（最有效的裁剪）；
+    #                ② limit 只取最近 N 条；
+    #                ③ 可单独关掉 context / backtrace / stack 这些大字段；
+    #                ④ 返回里给 total_matched 与 fields_omitted，
+    #                   让调用方明确知道"这次拿到的不是全部"。
+    want_bp = str(bp_id or "").strip()
+    filtered: list = []
+    for h in items:
+        if since_seq and int(h.get("seq") or 0) <= int(since_seq):
+            continue
+        if want_bp:
+            h_addr = h.get("static_addr")
+            want_addr = None
+            try:
+                want_addr = int(want_bp.rsplit(":", 1)[-1], 16)
+            except (ValueError, IndexError):
+                want_addr = None
+            if want_addr is None or int(h_addr or -1) != want_addr:
+                continue
+        filtered.append(h)
+
+    total_matched = len(filtered)
+
+    if int(limit or 0) > 0:
+        filtered = filtered[-int(limit):]                 # 最近的 N 条
+
+    # 按需省略大字段
+    omitted: list[str] = []
+    trimmed: list = []
+    for h in filtered:
+        item = dict(h)
+        if not include_context:
+            item.pop("context", None)
+            if "context" not in omitted:
+                omitted.append("context")
+        if not include_backtrace:
+            item.pop("backtrace", None)
+            if "backtrace" not in omitted:
+                omitted.append("backtrace")
+        if not include_stack:
+            item.pop("stack", None)
+            item.pop("stack_hex", None)
+            if "stack" not in omitted:
+                omitted.append("stack")
+        trimmed.append(item)
+
     # 汇总所有命中的调用栈，找出没符号化的模块
     all_frames: list = []
-    for h in items:
+    for h in trimmed:
         all_frames.extend(h.get("backtrace") or [])
     hints = _backtrace_hints(all_frames)
+
+    # 估算体积（KB），让调用方自己判断要不要再裁
+    try:
+        size_kb = len(_j(trimmed)) // 1024
+    except Exception:                                     # noqa: BLE001
+        size_kb = None
+
     out = {
-        "count": len(items),
-        "hits": items,
+        "count": len(trimmed),
+        "total_matched": total_matched,
+        "hits": trimmed,
         "hits_discarded": discarded,
         "note": ("hits_discarded 非 0 表示更早的命中已因保留上限被丢弃；"
+                 "total_matched > count 说明被 limit 截断；"
                  "需要完整执行序列请用 poll_events 增量拉取"),
     }
+    if omitted:
+        out["fields_omitted"] = omitted
+    if size_kb is not None:
+        out["size_hint"] = f"{size_kb}KB"
+        if size_kb > 800:
+            out["hint"] = (f"本次返回约 {size_kb}KB，可能仍会被客户端截断；"
+                           "建议加 bp_id 过滤、设 limit，或关掉 include_context")
+    if total_matched > len(trimmed):
+        out["truncated_by_limit"] = True
     if hints:
         out["hints"] = hints
     return _j(out)
@@ -3757,3 +3859,229 @@ def decode_runtime_insn(serial: str, pid: int, so_name: str, static_addr: int,
     except Exception as exc:                              # noqa: BLE001
         return _j({"error": f"{type(exc).__name__}: {exc}",
                    "code": getattr(exc, "code", "DECODE_FAILED")})
+
+
+@server.tool()
+@logged()
+def probe_process(serial: str, pid: int = 0, package: str = "") -> str:
+    """探测目标 app **是否还在跑、是否闪退、还能不能注入**。
+
+    不用截图看界面，一条调用就能判断：
+
+        probe_process(package="com.taobao.idlefish")
+        → {"alive": true, "status": "S", "injectable": true,
+           "verdict": "进程 11705 存活且可注入（状态 S=可中断睡眠）"}
+
+    ## 什么时候用
+
+        · 分析中途发现断点没反应，先确认 app 有没有闪退
+        · 跑完一轮操作后，确认进程还是不是刚才那个
+        · 准备 attach 前，先确认它可注入
+        · 怀疑加固在偷偷杀进程
+
+    ## 三条证据交叉验证（不只看一个）
+
+        ① /proc/<pid> 是否存在      —— 进程在内核里还在不在
+        ② /proc/<pid>/stat 状态字符 —— R/S/D/T/Z/X（Z=僵尸，T=被冻结）
+        ③ frida 能否枚举到它        —— 能不能注入
+
+    **只信 ① 是不够的**：实测出现过 adb ps 能看到 pid、但进程其实已经
+    是僵尸的情况，也出现过 adb 看得到而 frida 枚举不到（不可注入）的情况。
+    三者都正常才算真的健康。
+
+    ## 参数
+
+        pid       直接给 pid
+        package   或者给包名（会自动找主进程；多个进程时列出全部）
+
+    ## 返回
+
+        alive            进程在内核里是否存在
+        status           R/S/D/T/t/Z/X/I
+        status_meaning   中文含义
+        injectable       frida 能否看到并注入
+        verdict          一句话结论
+        next_step        建议怎么做
+        matches[]        给 package 时，该包名下所有进程的 pid/name
+
+    ## 实测对照
+
+        死进程  → {"alive": false, "verdict": "在内核里已不存在（已退出/闪退）"}
+        僵尸    → {"alive": true, "status": "Z", "verdict": "已是僵尸，不会执行任何代码"}
+        不可注入 → {"alive": true, "injectable": false, "verdict": "存在但 frida 看不到"}
+        健康    → {"alive": true, "injectable": true, "verdict": "存活且可注入"}
+    """
+    from dyn.adb import Adb
+
+    adb = Adb(serial)
+    pkg = str(package or "").strip()
+
+    # 给包名时先找 pid
+    matches: list = []
+    target_pid = int(pid or 0)
+    if pkg:
+        try:
+            out = adb._cmd("shell", "ps", "-A", "-o", "PID,NAME", check=False) or ""
+        except Exception as exc:                          # noqa: BLE001
+            return _j({"error": f"枚举进程失败：{type(exc).__name__}: {exc}",
+                       "code": "PS_FAILED"})
+        for line in str(out).splitlines():
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            name = parts[-1]
+            if name == pkg or name.startswith(pkg + ":"):
+                try:
+                    matches.append({"pid": int(parts[0]), "name": name})
+                except ValueError:
+                    continue
+        # 优先主进程（名字与包名完全一致的那个）
+        main = [m for m in matches if m["name"] == pkg]
+        if main:
+            target_pid = main[0]["pid"]
+        elif matches:
+            target_pid = matches[0]["pid"]
+        elif not target_pid:
+            return _j({
+                "ok": True, "implemented": True,
+                "package": pkg, "alive": False, "matches": [],
+                "verdict": f"包 {pkg} 当前**没有任何进程**在跑（已退出或从未启动）",
+                "next_step": "用 monkey/adb am start 重新拉起，注意 pid 会变",
+            })
+
+    if not target_pid:
+        return _j({"error": "必须给 pid 或 package 之一", "code": "NEED_TARGET"})
+
+    try:
+        probe = adb.probe_process_alive(target_pid)
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}",
+                   "code": "PROBE_FAILED"})
+
+    out = {"ok": True, "implemented": True, "package": pkg or None}
+    out.update(probe)
+    if matches:
+        out["matches"] = matches
+        out["process_count"] = len(matches)
+    return _j(out)
+
+
+@server.tool()
+@logged()
+def find_jni_registrations(so_name: str, max_tables: int = 50) -> str:
+    """找 JNI **动态注册表**（`JNINativeMethod` 数组），把 Java 方法名映射到 so 内地址。
+
+    **纯静态，不需要设备。**
+
+    ## 为什么这个最有价值
+
+    `JNINativeMethod` 是 Java 与 native 的桥：
+
+        struct JNINativeMethod {
+            const char* name;        // "doCommandNative"
+            const char* signature;   // "(I[BI[B)Ljava/lang/String;"
+            void*       fnPtr;       // → so 内的函数地址
+        };
+
+    找到它 = **一次拿到所有 JNI 入口的名字 ↔ 地址映射**，不用再猜哪个
+    `sub_xxxx` 是 `doCommandNative`。
+
+    对导出表被抹的加固 so 尤其关键——它们只能靠动态注册被 Java 调到。
+
+    ## 实现要点
+
+    · 扫 .data / .rodata / .data.rel.ro，找连续 ≥3 组 24 字节的模式
+    · name 必须是合法 Java 标识符，signature 必须形如 `(...)...`
+    · **fnPtr 在文件里常为 0，靠 RELA 重定位填**——本工具会解析 PT_DYNAMIC
+      的 RELA/JMPREL 补上真实地址（不依赖节表，壳样本也能用）
+
+    ## 返回
+
+        tables[]        每张表 {table_static_addr, count, entries[]}
+        entries[]       {name, signature, fn_static_addr, fn_source, fn_name}
+                        fn_source: "rela"（重定位补的）/ "file"（文件里有值）/ "none"
+        relocations     重定位解析情况（含 Android 压缩重定位的支持边界）
+        note
+
+    ## 已知边界（如实标注）
+
+        · **表在运行时才构造**的话，静态找不到——返回空 + 四条证据说明，
+          不是"功能没实现"
+        · Android 压缩重定位（DT_ANDROID_RELA / DT_RELR）暂不解析，
+          会在 relocations.unparsed 里标注
+
+    ## 实测
+
+        sg_real.so（闲鱼壳）：0 张表——全文件 14680 个字符串里含 `Ljava`
+                              的为 0 个，JNI 签名根本不存在，表必是运行时构造
+        liblog / libbase / libcutils：0 张表，无误报
+        内存植入真表验证：正确检出 3 条目，RELA 补地址生效
+    """
+    mod, err = _load_dyn_module("dyn.jni", "find_jni_registrations")
+    if err:
+        return _j(err)
+    try:
+        so = _pick_so_by_name(_session, so_name)
+        if so is None:
+            return _j({"error": f"{so_name} 未加载到 mda；先调 load_so",
+                       "code": "SO_NOT_LOADED"})
+        return _j(mod.find_jni_registrations(so_name, so=so,
+                                             session=_session,
+                                             max_tables=int(max_tables)))
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}",
+                   "code": getattr(exc, "code", "JNI_SCAN_FAILED")})
+
+
+@server.tool()
+@logged()
+def find_dispatch_tables(so_name: str, max_tables: int = 200,
+                         min_entries: int = 3) -> str:
+    """全库扫描 so 里**所有 switch 跳转表**（一次性，不用一个地址问一次）。
+
+    **纯静态，不需要设备。**
+
+    ## 与 resolve_br / read_jump_table 的分工
+
+        resolve_br       给一个 br 地址，解开它指向哪
+        read_jump_table  给一个表地址，读出表内容
+        **find_dispatch_tables  不用给任何地址，全库找出所有表**
+
+    ## 识别的形态
+
+        A. adr/adrp + ldrsw + add + br    → signed_offset_4（4 字节有符号偏移）
+        B. adrp + ldr + br                → absolute_ptr_8（8 字节绝对地址）
+        C. adrp + ldrb + …                → byte_indexed
+
+    ## 返回
+
+        tables[]  {table_addr, found_at_br, enclosing_function, mode,
+                   entry_size, code_base, resolved_entries, targets[],
+                   targets_in_executable, confidence}
+        confidence: high（目标全在可执行段）/ medium / low（多越界，可能误报）
+
+    ## 实测（sg_real.so，3007 个函数）
+
+        找到 58 张表，耗时约 38 秒
+        例：table=0x25430 mode=signed_offset_4 entries=209 conf=high
+
+    ## 已知边界
+
+        · 只覆盖上述三种形态；其他索引方式（如 ldrh）未识别
+        · confidence=low 的条目可能是误报，自行判断
+        · 全库扫描较慢（3000 函数约 40 秒），属正常
+    """
+    mod, err = _load_dyn_module("dyn.dispatch", "find_dispatch_tables")
+    if err:
+        return _j(err)
+    try:
+        so = _pick_so_by_name(_session, so_name)
+        if so is None:
+            return _j({"error": f"{so_name} 未加载到 mda；先调 load_so",
+                       "code": "SO_NOT_LOADED"})
+        return _j(mod.find_dispatch_tables(so_name, so=so, session=_session,
+                                           max_tables=int(max_tables),
+                                           min_entries=int(min_entries)))
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}",
+                   "code": getattr(exc, "code", "DISPATCH_SCAN_FAILED")})

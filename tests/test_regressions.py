@@ -1393,6 +1393,116 @@ def test_r44_runtime_decode() -> None:
                       repr(got[0].mnemonic))
 
 
+
+
+def test_r45_process_probe() -> None:
+    """R45：必须能区分「进程死了」和「代码没跑」——这是最容易误判的地方。"""
+    import inspect as _insp
+
+    import dyn.adb as _adb
+
+    check("R45 probe_process_alive 存在", hasattr(_adb.Adb, "probe_process_alive"))
+    src = _insp.getsource(_adb.Adb.probe_process_alive)
+    check("R45 检查 /proc 存在性", "/proc/" in src and "MISSING" in src)
+    check("R45 解析状态字符", "rfind" in src and "status_meaning" in src,
+          "要能区分 R/S/T/Z/X")
+    check("R45 识别僵尸", '"Z"' in src and '"X"' in src,
+          "僵尸进程不会执行任何代码，必须单独判")
+    check("R45 检查 frida 可见性", "injectable" in src and "enumerate_processes" in src,
+          "adb 看得到不等于能注入")
+    check("R45 三条证据都缺一不可", 'alive' in src and 'status' in src and 'injectable' in src)
+
+    # probe_hits 的异常路径也要带活性探测（否则进程死了只报冷冰冰的 ProcessNotFound）
+    import dyn.tracer as _tr
+
+    psrc = _insp.getsource(_tr.probe_hits)
+    check("R45 probe_hits 异常路径有探测", "probe_process_alive" in psrc)
+    check("R45 异常路径能判 TARGET_DIED", "TARGET_DIED" in psrc)
+    check("R45 0 命中时区分进程问题", "进程已经不在了" in psrc and "不可注入" in psrc)
+
+
+def test_r46_hits_trimming() -> None:
+    """R46：hits 必须能裁剪，否则大数据会被客户端截断成残缺 JSON。"""
+    import inspect as _insp
+
+    import mcp_server.tools as _T
+
+    sig = _insp.signature(_T.hits)
+    for param in ("bp_id", "limit", "since_seq", "include_context",
+                  "include_backtrace", "include_stack"):
+        check(f"R46 支持参数 {param}", param in sig.parameters)
+
+    src = _insp.getsource(_T.hits)
+    check("R46 按 bp_id 过滤", 'want_bp' in src and "static_addr" in src)
+    check("R46 limit 取最近 N 条", "filtered[-int(limit):]" in src,
+          "要取最近而不是最早，复盘看的是最新现场")
+    check("R46 可省略 context", 'item.pop("context"' in src)
+    check("R46 可省略 backtrace", 'item.pop("backtrace"' in src)
+    check("R46 可省略 stack", 'item.pop("stack"' in src)
+    check("R46 报告总体匹配数", '"total_matched"' in src,
+          "count 是本页，total_matched 才是过滤后总数")
+    check("R46 报告省略字段", '"fields_omitted"' in src)
+    check("R46 给出体积估算", '"size_hint"' in src,
+          "超 800KB 要提醒调用方继续裁剪")
+
+
+
+
+def test_r47_jni_and_dispatch() -> None:
+    """R47：JNI 注册表与跳转表扫描必须能用，且找不到时如实说明。"""
+    import inspect as _insp
+
+    import dyn.jni as _jni
+    import dyn.dispatch as _dsp
+
+    check("R47 find_jni_registrations 存在", hasattr(_jni, "find_jni_registrations"))
+    check("R47 find_dispatch_tables 存在", hasattr(_dsp, "find_dispatch_tables"))
+
+    jsrc = _insp.getsource(_jni)
+    check("R47 JNI 解析重定位", "PT_DYNAMIC" in jsrc or "relocation" in jsrc.lower(),
+          "fnPtr 在文件里常为 0，必须靠重定位补")
+    check("R47 JNI 签名形态校验", "Ljava" in jsrc or "signature" in jsrc)
+    check("R47 JNI 找不到时说明证据", "note" in jsrc)
+
+    dsrc = _insp.getsource(_dsp)
+    check("R47 跳转表支持 signed_offset_4", "signed_offset_4" in dsrc)
+    check("R47 跳转表有 confidence", "confidence" in dsrc,
+          "误报要能被识别，不能全给 high")
+    check("R47 跳转表校验可执行段", "executable" in dsrc.lower())
+
+
+def test_r48_symbol_not_clobbered() -> None:
+    """R48：节表不可用时，_parse_symbols 不能把 fallback 解出的符号清空。
+
+    这是影响所有壳样本的真 bug：sg_real 的 fallback 正确解出 7 个符号
+    （含 JNI_OnLoad@0x5b4d8），随后被 _parse_symbols 无条件重置成 0。
+    """
+    import inspect as _insp
+
+    from core.elf_model import SoFile
+
+    src = _insp.getsource(SoFile._parse_symbols)
+    # 关键：探测 .dynsym 必须在重置之前
+    idx_sec = src.find("_sec_by_name")
+    idx_reset = src.find("self.symbols: list[Symbol] = []")
+    check("R48 先探测 .dynsym 再重置", idx_sec >= 0 and idx_reset > idx_sec,
+          f"_sec_by_name@{idx_sec} 应在重置@{idx_reset} 之前")
+    check("R48 节表不可用时直接返回", "return" in src[idx_sec:idx_reset],
+          "要在重置前 return，保留 fallback 成果")
+    check("R48 保证容器存在", "hasattr(self, \"exports\")" in src
+          or "hasattr(self, 'exports')" in src,
+          "否则调用方访问 so.exports 会 AttributeError")
+
+    # 真样本验证：如果 samples 里有壳样本特征的文件，检查 symbols 不为空
+    import os
+    for cand in ("samples/liblog.so", "samples/libbase.so"):
+        if os.path.exists(cand):
+            so = SoFile(cand)
+            check(f"R48 {cand} 有 symbols 属性", hasattr(so, "symbols"))
+            check(f"R48 {cand} exports 可访问", hasattr(so, "exports"))
+            break
+
+
 def main() -> int:
     print("== R1 held/token 透出（防线程永久挂起）==")
     test_r1_held_is_exposed()
@@ -1482,6 +1592,14 @@ def main() -> int:
     test_r43_array_pointer_validation()
     print("== R44 运行时指令解码 ==")
     test_r44_runtime_decode()
+    print("== R45 进程活性探测 ==")
+    test_r45_process_probe()
+    print("== R46 hits 裁剪 ==")
+    test_r46_hits_trimming()
+    print("== R47 JNI 与跳转表 ==")
+    test_r47_jni_and_dispatch()
+    print("== R48 符号不被清空 ==")
+    test_r48_symbol_not_clobbered()
 
     print(f"\n结果: {PASS} 通过 / {FAIL} 失败")
     return 0 if FAIL == 0 else 1

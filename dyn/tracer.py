@@ -3538,17 +3538,67 @@ def probe_hits(serial: str, pid: int, so_name: str, static_addr: int,
                 break
             _time.sleep(0.02)
     except Exception as exc:                              # noqa: BLE001
-        return {"ok": False, "implemented": True, "code": "PROBE_FAILED",
-                "error": f"{type(exc).__name__}: {exc}", "so_name": so_name}
+        # (26) 第二十六次修改（2026-11-06）：异常路径也要做活性探测。
+        #      bug 原因：dev.attach() 遇到死进程会抛 ProcessNotFoundError，
+        #               而它发生在**建立会话阶段**——根本走不到后面那段
+        #               "0 命中时探测进程"的逻辑。结果是：进程死了，
+        #               用户看到的仍然只有一句冷冰冰的 ProcessNotFoundError，
+        #               完全看不出"这是进程没了，不是代码没跑"。
+        #      解决方案：在异常处理里也调一次 probe_process_alive()，
+        #               把三条证据（/proc 存在性 / 状态字符 / frida 可见性）
+        #               一并带回，让调用方拿到可判断的信息。
+        probe = None
+        try:
+            from dyn.adb import Adb
+
+            probe = Adb(serial).probe_process_alive(int(pid))
+        except Exception as exc2:                         # noqa: BLE001
+            probe = {"verdict": f"活性探测也失败：{type(exc2).__name__}: {exc2}"}
+        msg = f"{type(exc).__name__}: {exc}"
+        if probe and probe.get("alive") is False:
+            msg += f"；并且进程 {pid} 在内核里已不存在（已退出/闪退）"
+        elif probe and probe.get("injectable") is False:
+            msg += f"；进程 {pid} 仍存在但已不可注入"
+        return {"ok": False, "implemented": True,
+                "code": ("TARGET_DIED"
+                         if (probe or {}).get("alive") is False else "PROBE_FAILED"),
+                "error": msg, "so_name": so_name,
+                "process_probe": probe}
     finally:
         _detach_async(sess)
 
     hits = int(box["hits"] or 0)
+
+    # (25) 第二十五次修改（2026-11-06）：0 命中时补一次**进程活性探测**。
+    #      bug 原因：原来 0 命中一律判为"这段代码没被执行"，但还有另一种情况——
+    #               进程已经死了/变僵尸/失去可注入性。实测 adb ps 还能看到
+    #               pid 1495，而 frida 已经枚举不到它，probe_hits 直接抛
+    #               ProcessNotFoundError；即便能跑，也可能因进程半死而 0 命中。
+    #               这时告诉用户"代码没跑到"是**错误结论**。
+    #      解决方案：0 命中时调 adb 层的 probe_process_alive()，用
+    #               /proc 存在性 + 状态字符 + frida 可见性三条证据判断，
+    #               把"进程没了"和"代码没跑"彻底分开。
+    proc_probe = None
+    if hits == 0:
+        try:
+            from dyn.adb import Adb
+
+            proc_probe = Adb(serial).probe_process_alive(int(pid))
+        except Exception as exc:                          # noqa: BLE001
+            proc_probe = {"verdict": f"活性探测失败：{type(exc).__name__}: {exc}",
+                          "alive": None, "injectable": None}
+
     if hits > 0:
         verdict = f"该地址在 {duration:g}s 内被执行 {hits} 次，断点机制可用"
+    elif proc_probe and proc_probe.get("alive") is False:
+        verdict = (f"该地址 0 命中，**但进程已经不在了**（{proc_probe.get('verdict')}）："
+                   "这个 0 不代表代码没跑，而是根本没机会跑")
+    elif proc_probe and proc_probe.get("injectable") is False:
+        verdict = (f"该地址 0 命中，**且进程已不可注入**（{proc_probe.get('verdict')}）："
+                   "探针挂上与否都无意义，先恢复进程再重试")
     else:
         verdict = (f"该地址在 {duration:g}s 内**一次都没执行**："
-                   "不是挂钩失败（已确认 Interceptor 挂上了），"
+                   "不是挂钩失败（已确认 Interceptor 挂上了，且进程存活可注入），"
                    "而是这段代码在当前场景下没有被走到")
     out = {
         "ok": True,
@@ -3562,6 +3612,7 @@ def probe_hits(serial: str, pid: int, so_name: str, static_addr: int,
         "hits": hits,
         "first_hit_ts": box["first_hit_ts"],
         "threads": box["threads"],
+        "process_probe": proc_probe,
         "verdict": verdict,
     }
     if box.get("notes"):

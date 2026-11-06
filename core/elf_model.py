@@ -321,12 +321,37 @@ class SoFile:
         }.get(m, Arch.UNKNOWN)
 
     def _parse_symbols(self) -> None:
+        """按节表解析符号。
+
+        (1) 第一次修改（2026-11-06）：
+            bug 原因：本方法开头**无条件**把 symbols/imports/exports 重置成空，
+                      然后才检查 .dynsym 节是否存在。而壳样本的节表被抹掉，
+                      `_sec_by_name` 返回 None 就直接 return——把
+                      `_parse_dynamic_fallback()` **刚刚从 PT_DYNAMIC 解出来的
+                      符号全部抹掉**了。
+                      实测：sg_real.so 的 fallback 正确解出 7 个符号
+                      （含 JNI_OnLoad@0x5b4d8），但随后被本方法清零，
+                      最终 symbols=0、exports=0，表现为"这个 so 没有导出任何符号"，
+                      进而导致 JNI 注册表分析、导出函数画像全部失效。
+            解决方案：先探测 .dynsym 节是否存在；**不存在就直接返回，
+                      保留 fallback 的成果**；存在才重置并重新解析。
+        """
+        # 确保三个容器一定存在——即便走的是"保留 fallback 结果"的分支。
+        # 否则调用方访问 so.exports 会 AttributeError。
+        if not hasattr(self, "symbols"):
+            self.symbols = []
+        if not hasattr(self, "imports"):
+            self.imports = {}
+        if not hasattr(self, "exports"):
+            self.exports = {}
+
+        dynsym = self._sec_by_name(".dynsym")
+        if dynsym is None:
+            # 节表不可用：保留 _parse_dynamic_fallback 已解析的结果，不清空
+            return
         self.symbols: list[Symbol] = []
         self.imports: dict[str, Symbol] = {}
         self.exports: dict[str, Symbol] = {}
-        dynsym = self._sec_by_name(".dynsym")
-        if dynsym is None:
-            return
         for sym in dynsym.iter_symbols():
             name = sym.name
             if not name:
