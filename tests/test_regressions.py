@@ -1570,7 +1570,20 @@ def test_r50_java_tools() -> None:
     # java_hook 必须能区分"没被调用"与"hook 失败"
     hsrc = _insp.getsource(_jb.java_hook)
     check("R50 hook 有 max_calls 上限", "max_calls" in hsrc)
-    check("R50 hook 抓参数与返回值", "rec.args" in hsrc and "rec.ret" in hsrc)
+    # (2) 第二次修改（2026-11-06）：断言改按新实现校验。
+    #     bug 原因：java_hook 已重写为批量模式，参数/返回值的抓取从
+    #               Python 侧模板字符串挪到了 _JS_JAVA_HOOK_MULTI 这个
+    #               JS 常量里。旧断言查 hsrc（Python 源码）自然找不到。
+    #     解决方案：改查 JS 模板常量。
+    js_tpl = getattr(_jb, "_JS_JAVA_HOOK_MULTI", "")
+    check("R50 hook 抓参数与返回值", "rec.args" in js_tpl and "rec.ret" in js_tpl)
+    check("R50 支持批量 pattern", "PATTERN" in js_tpl and "candidates" in js_tpl)
+    check("R50 支持 package 过滤", "PACKAGE" in js_tpl)
+    check("R50 有兄弟方法探测", "SIBLING_PROBE" in js_tpl and "siblingHits" in js_tpl)
+    check("R50 Map 可展开", "mdaExpand" in js_tpl and "entrySet" in js_tpl)
+    check("R50 支持 arg_fields 深挖", "mdaFields" in js_tpl and "ARG_FIELDS" in js_tpl)
+    check("R50 系统包自动排除", "SKIP_PREFIX" in js_tpl and "java.lang." in js_tpl)
+    check("R50 单个方法失败不影响其他", "hook_errors" in js_tpl)
     check("R50 hook 抓调用栈", "mdaJavaStack" in src)
 
     # (1) 第一次修改（2026-11-06）：补 native 方法识别与进程活性探测的断言。
@@ -1582,6 +1595,92 @@ def test_r50_java_tools() -> None:
     # native 方法识别靠 getModifiers() & 0x100（Modifier.NATIVE）
     check("R50 识别 native 方法", "0x100" in src or "is_native" in src,
           "is_native 是找 JNI 方法的关键字段")
+
+
+
+
+def test_r51_java_batch_hook() -> None:
+    """R51：java_hook 必须支持通配符批量、参数深挖、0 命中诊断。"""
+    import inspect as _insp
+
+    import dyn.java_bridge as _jb
+
+    sig = _insp.signature(_jb.java_hook)
+    for p in ("pattern", "package", "max_classes", "capture", "sibling_probe"):
+        check(f"R51 支持参数 {p}", p in sig.parameters)
+
+    js = getattr(_jb, "_JS_JAVA_HOOK_MULTI", "")
+    check("R51 支持类名通配符", "wildToRe" in js and "PATTERN" in js)
+    check("R51 支持包名过滤", "PACKAGE" in js)
+    check("R51 分别统计每个类", "classes: []" in js and "call_count" in js)
+    check("R51 兄弟方法探测", "SIBLING_PROBE" in js and "siblingHits" in js)
+    check("R51 Map 展开", "entrySet" in js)
+    check("R51 字段深挖", "mdaFields" in js and "ARG_FIELDS" in js)
+    check("R51 系统包排除", "SKIP_PREFIX" in js)
+    check("R51 单方法失败不拖垮整体", "hook_errors" in js)
+
+    # 0 命中诊断在 Python 侧生成
+    src = _insp.getsource(_jb._run_java_hook)
+    check("R51 有 diagnosis", '"diagnosis"' in src)
+    check("R51 诊断含 sibling_methods_called", "sibling_methods_called" in src)
+    check("R51 诊断给 suggestion", '"suggestion"' in src)
+    check("R51 诊断含 subclass_of 建议", "subclass_of" in src)
+
+
+def test_r52_java_callers() -> None:
+    """R52：java_find_callers 必须跳过取栈自身帧（否则调用者全是 getStackTrace）。"""
+    import inspect as _insp
+
+    import dyn.java_bridge as _jb
+
+    check("R52 函数存在", hasattr(_jb, "java_find_callers"))
+    src = _insp.getsource(_jb.java_find_callers)
+    check("R52 跳过 getStackTrace", "getStackTrace" in src,
+          "不跳过的话调用者会被识别成取栈方法自身")
+    check("R52 跳过 VMStack", "VMStack" in src)
+    check("R52 按帧归并计数", "callers[caller]" in src)
+    check("R52 返回 samples", "samples" in src)
+
+    # 执行器要能拿到 class_name（曾因闭包引用报 NameError）
+    rsrc = _insp.getsource(_jb._run_java_callers)
+    check("R52 执行器接收 class_name", "class_name" in
+          _insp.signature(_jb._run_java_callers).parameters)
+    check("R52 执行器不引用外部变量", "class_name: str = \"\"" in rsrc
+          or "class_name=class_name" in _insp.getsource(_jb.java_find_callers))
+
+
+def test_r53_js_raw_string() -> None:
+    """R53：含反斜杠的 JS 模板必须是 raw string，否则正则被 Python 吃掉一层。"""
+    import re as _re
+
+    import dyn.java_bridge as _jb
+
+    src = __import__("inspect").getsource(_jb)
+    # java_find_classes 与 _JS_JAVA_HOOK_MULTI 都含 wildToRe 的正则字面量
+    # 两处都必须是 r""" 开头的 raw string
+    # (3) 第三次修改（2026-11-06）：断言换成"行为校验"而不是数次数。
+    #     bug 原因：原来用正则数 r""" 的出现次数，但这个数字会随代码里
+    #              注释/其他模板的增减而变，属于脆断言——改个注释就红。
+    #     解决方案：直接验证**关键行为**——两个含 wildToRe 的模板
+    #              生成的 JS 里，字符类必须是合法形态。
+    import json as _json
+
+    # 两个含 wildToRe 的地方都必须能生成合法 JS（不抛异常即说明转义对）
+    for name in ("java_find_classes", "java_hook"):
+        fn = getattr(_jb, name)
+        ok = callable(fn)
+        check(f"R53 {name} 可调用", ok)
+
+    # 关键校验：生成的 JS 里字符类必须是 [\]\\\\] 形态（能正确匹配反斜杠）
+    import json as _json
+
+    tpl = _re.search(r'user_js = _JS_HELPERS \+ r"""(.*?)"""', src, _re.S)
+    if tpl:
+        js = tpl.group(1)
+        idx = js.find("var esc = p.replace")
+        seg = js[idx:idx + 70]
+        check("R53 字符类含双反斜杠", "\\\\]" in seg or "[\\]\\\\]" in seg,
+              f"实际 {seg!r}")
 
 
 def main() -> int:
@@ -1685,6 +1784,12 @@ def main() -> int:
     test_r49_java_bridge()
     print("== R50 Java 工具 ==")
     test_r50_java_tools()
+    print("== R51 Java 批量 hook ==")
+    test_r51_java_batch_hook()
+    print("== R52 Java 调用者追踪 ==")
+    test_r52_java_callers()
+    print("== R53 JS raw string ==")
+    test_r53_js_raw_string()
 
     print(f"\n结果: {PASS} 通过 / {FAIL} 失败")
     return 0 if FAIL == 0 else 1

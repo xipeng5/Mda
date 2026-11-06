@@ -4191,53 +4191,121 @@ def java_find_classes(serial: str, pid: int, pattern: str = "",
 
 @server.tool()
 @logged()
-def java_hook(serial: str, pid: int, class_name: str, method: str,
+def java_hook(serial: str, pid: int, class_name: str = "", method: str = "",
               overload: str = "", duration: float = 5.0, max_calls: int = 200,
-              include_stack: bool = True, stack_depth: int = 8) -> str:
-    """hook 一个 Java 方法，记录每次调用的**参数、返回值、调用栈**。
+              include_stack: bool = True, stack_depth: int = 8,
+              pattern: str = "", package: str = "", max_classes: int = 20,
+              capture: dict | None = None, sibling_probe: bool = True) -> str:
+    """hook Java 方法——支持**通配符批量**、参数深挖、0 命中诊断。
 
-    这是 mda 从「只看 native」跨到「Java 层可见」的关键能力。
+    ## 最常用：不知道 hook 哪个类时用通配符
+
+        java_hook(pattern="*NetworkConverter*", method="convert*",
+                  max_classes=20, duration=15)
+        → 一次 hook 所有匹配的类，**分别统计命中数**，
+          直接告诉你哪个类真的被调用了
+
+    这比"猜一个类 → 等 16 秒 → 没命中 → 再猜"快一个数量级。
+
+    ## 三种定位方式（可组合，取交集）
+
+        class_name="com.x.Y"      精确类名
+        pattern="*Converter*"     类名通配符（* 和 ?）
+        package="mtopsdk"         包名前缀
 
     ## 参数
 
-        class_name    全限定类名
-        method        方法名
-        overload      重载签名（可选），如 "(Ljava/lang/String;)V"；
-                      不传则 hook **所有**同名重载
-        duration      采集秒数
-        max_calls     最多记录多少次（防高频方法打爆内存，上限 5000）
-        include_stack 是否抓 Java 调用栈
-        stack_depth   栈深度
+        method        方法名，也支持通配符（"convert*"）。空 = 该类所有方法
+        max_classes   最多 hook 多少个类（默认 20，上限 200）
+        max_calls     每个方法最多记录多少条
+        capture       参数深挖：{"args": true, "ret": true,
+                      "arg_fields": ["url","headers"], "expand_map": true}
+                      Map/List 会自动展开成键值对；arg_fields 从参数对象取字段
+        sibling_probe 方法 0 命中时，**自动探测同类其他方法**有没有被调用
 
     ## 返回
 
-        hooked       实际 hook 上的重载签名列表
-        calls[]      {seq, ts, thread, args[], ret, stack[], threw?}
-        call_count   调用次数（可能 > len(calls)，被 max_calls 截断）
-        truncated    是否因 max_calls 截断
-        verdict      一句话结论：区分「hook 上但没被调」与「调了多少次」
+        classes[]   每个类：{class, call_count, hooked_methods, method_exists,
+                    subclass_of}，按命中数降序
+        call_count  合计
+        diagnosis   0 命中时给出（最有价值的部分）：
+                      class_loaded / method_exists /
+                      sibling_methods_called / suggestion
+        verdict     一句话结论
 
-    ## 已知边界（如实标注）
+    ## 0 命中时的诊断长这样
 
-        · 参数按 `String(v)` 转字符串并截断 200 字符——**对象只给摘要**
-        · ART 的 JIT 内联可能让 hook 失效（已知限制）
-        · 加固 app 可能阻断 `Java.perform`，这时返回 NOT_READY 并说明
+        {"class_loaded": true, "method_exists": true,
+         "sibling_methods_called": [{"method": "X.convertNetworkStats","hits": 12}],
+         "suggestion": "方法存在但零调用：...；同类里 X.convertNetworkStats
+                        被调了 12 次——真正干活的很可能是它"}
 
-    ## 典型用法
+    ## 已知边界
 
-        java_hook(class_name="com.taobao.security.Sign", method="doCommand",
-                  duration=8)
-        → 期间操作 app，回来就能看到每次调用的参数和返回值
+        · java.lang.* / dalvik.* 等系统包已在注入前自动排除（hook 后易崩）
+        · final 可 hook；被 JIT 内联的会漏
+        · 通配符只在**已加载类**里匹配
     """
     mod, err = _load_dyn_module("dyn.java_bridge", "java_hook")
     if err:
         return _j(err)
     try:
-        return _j(mod.java_hook(serial, int(pid), class_name, method,
-                                overload=overload, duration=float(duration),
-                                max_calls=int(max_calls),
-                                include_stack=bool(include_stack),
-                                stack_depth=int(stack_depth)))
+        return _j(mod.java_hook(
+            serial, int(pid), class_name=class_name, method=method,
+            overload=overload, duration=float(duration),
+            max_calls=int(max_calls), include_stack=bool(include_stack),
+            stack_depth=int(stack_depth), pattern=pattern, package=package,
+            max_classes=int(max_classes), capture=capture,
+            sibling_probe=bool(sibling_probe)))
     except Exception as exc:                              # noqa: BLE001
         return _j({"error": f"{type(exc).__name__}: {exc}",
                    "code": "JAVA_HOOK_FAILED"})
+
+
+@server.tool()
+@logged()
+def java_find_callers(serial: str, pid: int, class_name: str, method: str,
+                      overload: str = "", duration: float = 8.0,
+                      max_samples: int = 30, stack_depth: int = 12) -> str:
+    """找出**谁调用了**某个 Java 方法，返回调用栈样本。
+
+    当 `java_hook` 说"这个方法没被调用"时，下一步该问的是
+    **"那到底谁在干活"**——可能是父类、兄弟方法，或完全另一个类。
+    追调用栈比逐个猜快得多。
+
+    ## 与 java_hook 的分工
+
+        java_hook         看"被调时参数/返回值是什么"
+        java_find_callers 看"**被谁**调用"（只要调用链，不抓参数）
+
+    ## 返回
+
+        callers[]   按次数降序：{frame, hits}
+                    frame 是 "类.方法(文件:行)" 形式的上层帧
+        samples[]   原始调用栈样本（最多 max_samples 条）
+        call_count  总调用次数
+        verdict
+
+    ## 典型用法
+
+        java_find_callers("mtopsdk...ANetworkConverter", "convertRequest")
+        → callers: [{"frame": "mtopsdk.mtop...HttpCallImpl.execute", "hits": 12}]
+        这样能把 mtopsdk → anetwork → tnet 的链路串起来
+
+    ## 已知边界
+
+        · 只抓 **Java 层**栈；native 调用者要配合 trace_call_tree
+        · 栈帧按"类.方法(文件:行)"归并——同一方法的不同调用点会被分开统计，
+          这是刻意的（能看出具体哪个分支）
+    """
+    mod, err = _load_dyn_module("dyn.java_bridge", "java_find_callers")
+    if err:
+        return _j(err)
+    try:
+        return _j(mod.java_find_callers(
+            serial, int(pid), class_name, method, overload=overload,
+            duration=float(duration), max_samples=int(max_samples),
+            stack_depth=int(stack_depth)))
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}",
+                   "code": "CALLERS_FAILED"})
