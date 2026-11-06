@@ -1573,6 +1573,16 @@ def test_r50_java_tools() -> None:
     check("R50 hook 抓参数与返回值", "rec.args" in hsrc and "rec.ret" in hsrc)
     check("R50 hook 抓调用栈", "mdaJavaStack" in src)
 
+    # (1) 第一次修改（2026-11-06）：补 native 方法识别与进程活性探测的断言。
+    #     bug 原因：Java 工具的异常路径原来只报 ProcessNotFoundError，
+    #               与 probe_hits 当初的坑一样——分不清"进程没了"和"Java 层有问题"。
+    #     解决方案：异常路径也调 probe_process_alive，并改用 TARGET_DIED。
+    check("R50 异常路径有活性探测", "probe_process_alive" in src)
+    check("R50 能判 TARGET_DIED", "TARGET_DIED" in src)
+    # native 方法识别靠 getModifiers() & 0x100（Modifier.NATIVE）
+    check("R50 识别 native 方法", "0x100" in src or "is_native" in src,
+          "is_native 是找 JNI 方法的关键字段")
+
 
 def main() -> int:
     print("== R1 held/token 透出（防线程永久挂起）==")

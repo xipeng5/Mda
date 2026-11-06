@@ -595,9 +595,27 @@ def _run_java_script(serial: str, pid: int, user_js: str,
                         "hint": "目标可能卡在 Java.perform（ART 未就绪或已加固阻断）"}
         return box, None
     except Exception as exc:                              # noqa: BLE001
-        return {}, {"ok": False, "implemented": True,
-                    "code": "JAVA_CALL_FAILED",
-                    "error": f"{type(exc).__name__}: {exc}"}
+        # (4) 第四次修改（2026-11-06）：异常时补进程活性探测。
+        #     bug 原因：死进程只抛 ProcessNotFoundError，调用方看不出
+        #               "是进程没了"还是"Java bridge 有问题"——与 probe_hits
+        #               当初踩的坑完全一样。
+        #     解决方案：调 adb 层的 probe_process_alive，把三条证据带回去。
+        probe = None
+        try:
+            from dyn.adb import Adb
+
+            probe = Adb(serial).probe_process_alive(int(pid))
+        except Exception:                                 # noqa: BLE001
+            probe = None
+        msg = f"{type(exc).__name__}: {exc}"
+        code = "JAVA_CALL_FAILED"
+        if probe and probe.get("alive") is False:
+            code = "TARGET_DIED"
+            msg += f"；并且进程 {pid} 在内核里已不存在（已退出/闪退）"
+        elif probe and probe.get("injectable") is False:
+            msg += f"；进程 {pid} 仍存在但已不可注入"
+        return {}, {"ok": False, "implemented": True, "code": code,
+                    "error": msg, "process_probe": probe}
     finally:
         _detach_async(sess)
 
@@ -676,8 +694,20 @@ def _run_java_hook(serial: str, pid: int, user_js: str,
                 break
             _time.sleep(0.02)
     except Exception as exc:                              # noqa: BLE001
-        return {"ok": False, "implemented": True, "code": "JAVA_HOOK_FAILED",
-                "error": f"{type(exc).__name__}: {exc}"}
+        probe = None
+        try:
+            from dyn.adb import Adb
+
+            probe = Adb(serial).probe_process_alive(int(pid))
+        except Exception:                                 # noqa: BLE001
+            probe = None
+        msg = f"{type(exc).__name__}: {exc}"
+        code = "JAVA_HOOK_FAILED"
+        if probe and probe.get("alive") is False:
+            code = "TARGET_DIED"
+            msg += f"；并且进程 {pid} 在内核里已不存在（已退出/闪退）"
+        return {"ok": False, "implemented": True, "code": code,
+                "error": msg, "process_probe": probe}
     finally:
         _detach_async(sess)
 
