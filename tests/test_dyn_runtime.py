@@ -176,7 +176,11 @@ def main() -> int:
     check("真的调到 dbg.remove_breakpoint", len(dbg.removed) == 1,
           f"实际 {dbg.removed}")
 
-    bp2 = S.set_breakpoint(serial, pid, "libtarget.so", 0x2345, hold=False)
+    # (3) 第三次修改（2026-11-06）：0x2345 -> 0x2344。
+    #     bug 原因：service 新增了 AArch64 的 4 字节对齐校验，0x2345 会被
+    #               BAD_ALIGNMENT 拒绝。本处只是"再下一个断点"的上下文，
+    #               对齐与否不影响被测语义，改成对齐地址即可。
+    bp2 = S.set_breakpoint(serial, pid, "libtarget.so", 0x2344, hold=False)
 
     class _NoRemove(StubDebugger):
         """模拟「debugger 尚未实现撤销接口」：属性真的不存在。
@@ -208,7 +212,7 @@ def main() -> int:
         def wait_hits(self, timeout=10.0):
             return list(self.hits)
 
-    bp3 = S.set_breakpoint(serial, pid, "libtarget.so", 0x3456, hold=False)
+    bp3 = S.set_breakpoint(serial, pid, "libtarget.so", 0x3454, hold=False)
     S._targets[f"{serial}:{pid}"].dbg = _Bare(dbg)
     rm3 = S.remove_breakpoint(bp3["id"])
     check("无撤销接口时标注 partial", rm3.get("partial") is True,

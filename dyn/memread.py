@@ -1440,3 +1440,306 @@ def probe_vm_from_hits(serial: str, pid: int, hits: list,
             rb.detach()
         except Exception:                                 # noqa: BLE001
             pass
+
+
+def decode_runtime_insn(serial: str, pid: int, so_name: str,
+                        static_addr: int, count: int = 1,
+                        context: dict | None = None,
+                        rb=None) -> dict:
+    """从**目标进程内存**读出指令并按 ARM64 解码，可选配寄存器现场。
+
+    (22) 第二十二次修改（2026-11-06）：新增。
+
+    解决什么问题：动态侧原来只给"运行到哪个地址"，不给"那条指令是什么"。
+    AI 拿到 `pc=0x7bcf4a1b28` 还得自己减基址、自己想办法反汇编；
+    而且**被 patch 过的指令**（断点、CRC 自校验还原、运行时解密的代码）
+    在静态文件里看到的是初始值，与实际执行的不一样。
+
+    本工具读的是**运行时内存**——所以能看到真实执行的那条指令。
+
+    ## 与静态反汇编的区别
+
+        disassemble(so_name, addr)     读**本地文件**，是加载时的原始字节
+        decode_runtime(...)            读**进程内存**，是此刻真正在跑的字节
+
+    断点处、自解密代码、被 hook 过的地址，两者会不一样。
+
+    ## 参数
+
+        so_name       mda 里的 so 键（用于把静态偏移换成运行时地址）
+        static_addr   静态偏移（4 字节对齐）
+        count         连续解几条（1..64）
+        context       可选：命中现场的寄存器字典（{"x0": "0x...", ...}）。
+                      给了就把指令涉及到的寄存器值一并标出来，
+                      AI 不用自己再去 context 里翻。
+        rb            可选 Rebase（复用会话）
+
+    ## 返回
+
+        instructions[]  {addr, runtime_addr, raw_hex, mnemonic, op_str,
+                         is_branch, branch_kind, reg_values}
+        patched         运行时字节 ≠ 文件字节时为 True（说明被改过）
+        note
+
+    ## 已知边界
+
+        · 只解 ARM64 定长 4 字节指令；static_addr 必须是 4 的倍数
+        · context 里没有的寄存器不会出现在 reg_values 里（不编造）
+    """
+    import struct as _struct
+
+    try:
+        import capstone
+
+        md = capstone.Cs(capstone.CS_ARCH_ARM64, capstone.CS_MODE_LITTLE_ENDIAN)
+        md.detail = True
+    except Exception as exc:                              # noqa: BLE001
+        return {"ok": False, "code": "NO_CAPSTONE",
+                "error": f"capstone 不可用：{exc}"}
+
+    if int(static_addr) % 4 != 0:
+        return {"ok": False, "code": "BAD_ALIGNMENT",
+                "error": (f"static_addr {int(static_addr):#x} 不是 4 字节对齐；"
+                          "AArch64 指令起点必须 4 字节对齐"),
+                "suggested": [int(static_addr) - int(static_addr) % 4,
+                              int(static_addr) - int(static_addr) % 4 + 4]}
+
+    n = max(1, min(int(count), 64))
+    size = n * 4
+
+    own_rb = rb is None
+    if own_rb:
+        try:
+            from dyn.rebase import Rebase
+
+            rb = Rebase.attach(serial, int(pid))
+        except Exception as exc:                          # noqa: BLE001
+            return {"ok": False, "code": "ATTACH_FAILED",
+                    "error": f"attach 失败：{exc}"}
+
+    try:
+        # 1) 找模块，算运行时地址
+        # (23) 第二十三次修改（2026-11-06）：模块名匹配走候选列表 + 双指纹。
+        #      bug 原因：只做精确名比较时，本地文件名（sg_real.so）与设备名
+        #               （libsgmainso-6.7.260202.so）对不上就报 MODULE_NOT_LOADED，
+        #               而这个工具恰恰是给"运行时分析"用的，最需要它工作。
+        #      解决方案：复用 _module_name_candidates + 两个函数入口的字节指纹，
+        #               与 verify_breakpoint / watch_module 保持同一套匹配口径。
+        mods = list(getattr(rb, "_modules", []) or [])
+        if not mods:
+            mods = list(rb.refresh_modules())
+        base = None
+        real_name = None
+        try:
+            from dyn.tracer import _module_name_candidates
+
+            cands = set(_module_name_candidates(so_name))
+        except Exception:                                 # noqa: BLE001
+            cands = {str(so_name)}
+        for m in mods:
+            nm = getattr(m, "name", "") or ""
+            if nm in cands or nm.rsplit("/", 1)[-1] in cands:
+                base = int(m.base)
+                real_name = nm
+                break
+        if base is None:
+            # 双指纹反查
+            so_probe = _find_so_for_runtime(so_name)
+            if so_probe is not None:
+                fps = []
+                try:
+                    fns = getattr(so_probe, "functions", {}) or {}
+                    vals = fns.values() if isinstance(fns, dict) else list(fns)
+                    offs0 = sorted({int(getattr(f, "addr", 0) or 0)
+                                    for f in vals})[:2]
+                    for o in offs0:
+                        b2 = _read_so_bytes_raw(so_probe, o, 16)
+                        if b2 and len(b2) == 16:
+                            fps.append((o, b2.hex()))
+                except Exception:                         # noqa: BLE001
+                    fps = []
+                if fps:
+                    need = max(o for o, _h in fps)
+                    for m in mods:
+                        if int(getattr(m, "size", 0) or 0) <= need:
+                            continue
+                        ok = True
+                        for o, want in fps:
+                            got2 = rb.read_memory(int(m.base) + o, 16)
+                            if not got2 or got2.hex() != want:
+                                ok = False
+                                break
+                        if ok:
+                            base = int(m.base)
+                            real_name = getattr(m, "name", "")
+                            break
+        if base is None:
+            return {"ok": False, "code": "MODULE_NOT_LOADED",
+                    "error": f"进程里找不到模块 {so_name!r}（候选名与双指纹都未命中）",
+                    "hint": "用 runtime_modules 确认目标进程里该 so 的真实名字"}
+
+        runtime = base + int(static_addr)
+
+        # 2) 读运行时字节
+        raw = rb.read_memory(runtime, size)
+        if not raw or len(raw) < size:
+            return {"ok": False, "code": "READ_FAILED",
+                    "error": f"运行时地址 {runtime:#x} 读不到 {size} 字节",
+                    "runtime_addr": hex(runtime)}
+
+        # 3) 静态字节（用于对比是否被 patch 过）
+        static_raw = b""
+        try:
+            so = _find_so_for_runtime(so_name)
+            if so is not None:
+                static_raw = _read_so_bytes_raw(so, int(static_addr), size)
+        except Exception:                                 # noqa: BLE001
+            static_raw = b""
+        patched = bool(static_raw) and static_raw != raw
+
+        # 4) 解码 + 配上寄存器值
+        ctx = {}
+        if isinstance(context, dict):
+            for k, v in context.items():
+                try:
+                    ctx[str(k).lower()] = (int(v, 16) if isinstance(v, str) else int(v))
+                except (TypeError, ValueError):
+                    continue
+
+        out = []
+        for ins in md.disasm(raw, runtime):
+            off = int(ins.address) - runtime
+            # (24) 第二十四次修改（2026-11-06）：修正寄存器提取的三处漏判。
+            #      bug 原因（自查实测）：
+            #        ① `stp x29, x30, [sp, #-0x60]!` 里的 sp 被漏掉——
+            #           原逻辑只认 x/w 开头的编号寄存器，sp/fp/lr 全被过滤；
+            #        ② `cmp w8, #2` 里 w8 直接用了 x8 的完整值，
+            #           而 w8 只是 x8 的**低 32 位**，值该截断；
+            #        ③ `[x8, #0x28]` 中基址寄存器应标注为"被读"，
+            #           而不是让人以为也被写了。
+            #      解决方案：① 显式支持 sp / fp / lr / xzr / wzr 命名寄存器；
+            #                ② w 系列取低 32 位；
+            #                ③ reg_values 只给"此刻的值"，不猜读写语义
+            #                   （语义交给 mnemonic，避免编造）。
+            regs = {}
+            try:
+                named = {"sp", "fp", "lr", "pc", "xzr", "wzr"}
+                for tok in (ins.op_str or "").replace(",", " ").replace(
+                        "[", " ").replace("]", " ").split():
+                    t = tok.strip().rstrip("!")
+                    if not t:
+                        continue
+                    low = t.lower()
+                    if low in ("xzr", "wzr"):             # 零寄存器恒为 0
+                        regs[t] = "0x0"
+                        continue
+                    if low in named or low in ctx:
+                        if low in ctx:
+                            regs[t] = hex(ctx[low])
+                        continue
+                    # x0..x30 / w0..w30
+                    if len(low) > 1 and low[0] in "xw" and low[1:].isdigit():
+                        idx = low[1:]
+                        if low[0] == "w":
+                            key = "x" + idx
+                            if key in ctx:
+                                regs[t] = hex(ctx[key] & 0xFFFFFFFF)
+                        elif low in ctx:
+                            regs[t] = hex(ctx[low])
+            except Exception:                             # noqa: BLE001
+                regs = {}
+
+            mnem = ins.mnemonic
+            out.append({
+                "addr": hex(int(ins.address)),
+                "static_addr": hex(int(static_addr) + off),
+                "offset_in_seq": off // 4,
+                "raw_hex": bytes(ins.bytes).hex(),
+                "mnemonic": mnem,
+                "op_str": ins.op_str or "",
+                "is_branch": mnem in ("b", "bl", "br", "blr", "ret",
+                                      "cbz", "cbnz", "tbz", "tbnz",
+                                      "braa", "braaz", "blraa", "blraaz"),
+                "branch_kind": _branch_kind(mnem),
+                "reg_values": regs,
+            })
+
+        return {
+            "ok": True,
+            "implemented": True,
+            "so_name": so_name,
+            "module": real_name,
+            "module_base": hex(base),
+            "static_addr": hex(int(static_addr)),
+            "runtime_addr": hex(runtime),
+            "count": len(out),
+            "instructions": out,
+            "patched": patched,
+            "note": ("读的是**运行时内存**，因此能看到断点/自解密/hook 之后的真实指令；"
+                     "patched=true 表示与本地文件字节不同"),
+        }
+    finally:
+        if own_rb:
+            try:
+                rb.detach()
+            except Exception:                             # noqa: BLE001
+                pass
+
+
+def _branch_kind(mnemonic: str) -> str:
+    """把 ARM64 分支助记符归成直白类别，供 AI 判断控制流。
+
+    (22) 第二十二次修改（2026-11-06）：新增，配合 decode_runtime_insn。
+        为什么要分类：`b`/`br`/`ret` 在控制流分析里语义完全不同，
+        让 AI 自己去记助记符不如直接给类别。
+    """
+    if mnemonic in ("bl", "blr", "blraa", "blraaz"):
+        return "call"                    # 调用，会返回
+    if mnemonic in ("ret",):
+        return "return"
+    if mnemonic in ("br", "braa", "braaz"):
+        return "indirect_jump"           # 间接跳转，目标来自寄存器
+    if mnemonic in ("cbz", "cbnz", "tbz", "tbnz"):
+        return "cond_jump"
+    if mnemonic == "b":
+        return "jump"
+    return ""
+
+
+def _find_so_for_runtime(so_name: str):
+    """在 MCP 会话里找 SoFile（尽力而为，找不到返回 None）。"""
+    try:
+        from mcp_server.tools import get_session
+
+        sess = get_session()
+        mods = getattr(sess, "modules", {}) or {}
+        if so_name in mods:
+            return mods[so_name]
+        for k, v in mods.items():
+            if k.rsplit("/", 1)[-1] == str(so_name).rsplit("/", 1)[-1]:
+                return v
+        return None
+    except Exception:                                     # noqa: BLE001
+        return None
+
+
+def _read_so_bytes_raw(so, offset: int, size: int) -> bytes:
+    """读 so 静态文件里的原始字节（按段换算文件偏移）。
+
+    (22) 第二十二次修改（2026-11-06）：新增，用于判断运行时指令是否被改过。
+    """
+    path = getattr(so, "path", "") or ""
+    if not path:
+        return b""
+    try:
+        with open(path, "rb") as fh:
+            for seg in (getattr(so, "_segments", None) or []):
+                va = int(getattr(seg, "vaddr", 0) or 0)
+                memsz = int(getattr(seg, "memsz", 0) or 0)
+                if va <= offset < va + max(memsz, 1):
+                    fh.seek(int(getattr(seg, "offset", 0) or 0) + (offset - va))
+                    return fh.read(int(size))
+            fh.seek(int(offset))
+            return fh.read(int(size))
+    except Exception:                                     # noqa: BLE001
+        return b""

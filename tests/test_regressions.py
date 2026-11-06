@@ -1338,6 +1338,61 @@ def test_r43_array_pointer_validation() -> None:
     check("R43 超界地址被拒", not ok(0x123456789ABCD))
 
 
+
+
+def test_r44_runtime_decode() -> None:
+    """R44：运行时指令解码必须支持 ARM64 定长、分支分类、对齐校验。"""
+    import inspect as _insp
+
+    import dyn.memread as _mr
+
+    src = _insp.getsource(_mr.decode_runtime_insn)
+    check("R44 函数存在", hasattr(_mr, "decode_runtime_insn"))
+    check("R44 校验 4 字节对齐", "% 4 != 0" in src and "BAD_ALIGNMENT" in src,
+          "AArch64 定长指令，非对齐地址解不出东西")
+    check("R44 读运行时内存", "rb.read_memory" in src)
+    check("R44 与静态字节对比", "patched" in src and "_read_so_bytes_raw" in src,
+          "能看出断点/自解密/hook 改动")
+    check("R44 配寄存器现场", "reg_values" in src and "context" in src)
+    check("R44 数量有上限", "min(int(count), 64)" in src)
+
+    # 分支分类（纯函数，可离线验证）
+    from dyn.memread import _branch_kind
+
+    cases = [("bl", "call"), ("blr", "call"), ("blraa", "call"),
+             ("ret", "return"), ("br", "indirect_jump"), ("braa", "indirect_jump"),
+             ("b", "jump"), ("cbz", "cond_jump"), ("cbnz", "cond_jump"),
+             ("tbz", "cond_jump"), ("tbnz", "cond_jump"), ("add", "")]
+    for mnem, want in cases:
+        check(f"R44 分支分类 {mnem}", _branch_kind(mnem) == want,
+              f"得到 {_branch_kind(mnem)!r}，期望 {want!r}")
+
+    # 真字节解码（离线，用仓库自带样本；没有就跳过）
+    import os
+    sample = None
+    for cand in ("samples/liblog.so", "samples/libbase.so"):
+        if os.path.exists(cand):
+            sample = cand
+            break
+    if sample:
+        import capstone
+        from core.elf_model import SoFile
+
+        so = SoFile(sample)
+        fns = so.function_list
+        if fns and fns[0].size >= 16:
+            target = fns[0].addr
+            code = so.read(target, 16)
+            md = capstone.Cs(capstone.CS_ARCH_ARM64,
+                             capstone.CS_MODE_LITTLE_ENDIAN)
+            got = list(md.disasm(code, target))
+            check("R44 真样本能解出指令", len(got) > 0,
+                  f"{sample} 在 {hex(target)} 解出 {len(got)} 条")
+            if got:
+                check("R44 解出的指令有助记符", bool(got[0].mnemonic),
+                      repr(got[0].mnemonic))
+
+
 def main() -> int:
     print("== R1 held/token 透出（防线程永久挂起）==")
     test_r1_held_is_exposed()
@@ -1425,6 +1480,8 @@ def main() -> int:
     test_r42_hits_fallback()
     print("== R43 数组指针校验 ==")
     test_r43_array_pointer_validation()
+    print("== R44 运行时指令解码 ==")
+    test_r44_runtime_decode()
 
     print(f"\n结果: {PASS} 通过 / {FAIL} 失败")
     return 0 if FAIL == 0 else 1

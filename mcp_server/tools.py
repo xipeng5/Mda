@@ -3691,3 +3691,69 @@ def trace_call_tree(serial: str, pid: int, so_name: str, entries: list,
     except Exception as exc:                              # noqa: BLE001
         return _j({"error": f"{type(exc).__name__}: {exc}",
                    "code": getattr(exc, "code", "TRACE_FAILED")})
+
+
+@server.tool()
+@logged()
+def decode_runtime_insn(serial: str, pid: int, so_name: str, static_addr: int,
+                        count: int = 1, context: dict | None = None) -> str:
+    """从**目标进程内存**读出 ARM64 指令并解码，可选配上寄存器现场。
+
+    ## 与 disassemble 的关键区别
+
+        disassemble(so_name, addr)   读**本地文件**——是 so 加载时的原始字节
+        decode_runtime_insn(...)     读**进程内存**——是此刻真正在跑的字节
+
+    以下场景两者不一样，只有本工具能看到真相：
+        · 断点处（frida 可能改了指令）
+        · 运行时自解密的代码段
+        · 被 hook / inline patch 过的函数
+        · 壳的 CRC 自校验还原后的代码
+
+    返回里的 `patched: true` 就是明确告诉你「这条指令与文件不一样」。
+
+    ## 参数
+
+        so_name      mda 里的 so 键（用于把静态偏移换成运行时地址）
+        static_addr  静态偏移，**必须 4 字节对齐**（AArch64 定长指令）
+        count        连续解几条，1..64
+        context      可选：命中现场的寄存器字典（`{"x0": "0x...", ...}`）。
+                     给了就把指令涉及到的寄存器值一并标出来，
+                     AI 不用自己再去 context 里翻。
+
+    ## 返回
+
+        instructions[]  {addr, static_addr, raw_hex, mnemonic, op_str,
+                         is_branch, branch_kind, reg_values}
+        patched         运行时字节 ≠ 文件字节时为 true
+        module / module_base / runtime_addr
+
+    ## branch_kind 的取值
+
+        call            bl / blr        → 调用，会返回
+        return          ret
+        jump            b               → 直接跳转
+        indirect_jump   br / braa       → 目标在寄存器里，静态不可知
+        cond_jump       cbz / cbnz / tbz / tbnz
+
+    ## 典型用法
+
+        # 命中后看"我停在哪条指令上、寄存器此刻是多少"
+        hits(...) → 取 context
+        decode_runtime_insn(so_name, pc_静态偏移, context=命中.context)
+
+    ## 已知边界
+
+        · 只解 ARM64 定长 4 字节指令
+        · context 里没有的寄存器不会出现在 reg_values 里（不编造）
+    """
+    mod, err = _load_dyn_module("dyn.memread", "decode_runtime_insn")
+    if err:
+        return _j(err)
+    try:
+        return _j(mod.decode_runtime_insn(serial, int(pid), so_name,
+                                          int(static_addr), count=int(count),
+                                          context=context))
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}",
+                   "code": getattr(exc, "code", "DECODE_FAILED")})

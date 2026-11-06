@@ -204,7 +204,24 @@ class DynamicService:
 
     def set_breakpoint(self, serial: str, pid: int, so_name: str,
                        static_addr: int, hold: bool = False) -> dict:
-        """下断点并持有它的脚本，返回断点 id（同一地址重复下返回既有 id）。"""
+        """下断点并持有它的脚本，返回断点 id（同一地址重复下返回既有 id）。
+
+        (11) 第十一次修改（2026-11-06）：增加 **4 字节对齐校验**。
+            bug 原因：AArch64 是**定长指令集**，所有指令必须 4 字节对齐、
+                      且低 2 位恒为 0。原来对 static_addr 不做任何校验，
+                      在 0x5bc49 这种地址下断点会返回 set=True（看起来成功），
+                      但这块内存根本不是一个指令起点，断点必然永远不命中——
+                      用户会以为是"断点失效"或"代码没执行"，属于最难排查的一类假成功。
+            解决方案：下断点前校验 `static_addr % 4 == 0`，不满足直接抛 BAD_ALIGNMENT，
+                      把问题挡在最前面。硬断点（BRK 指令）和 Interceptor 都受此约束。
+        """
+        if int(static_addr) % 4 != 0:
+            raise DynError(
+                "BAD_ALIGNMENT",
+                f"断点地址 {int(static_addr):#x} 不是 4 字节对齐；"
+                "AArch64 是定长指令集，指令起点必须 4 字节对齐，"
+                f"最近的合法地址是 {int(static_addr) - int(static_addr) % 4:#x} "
+                f"或 {int(static_addr) - int(static_addr) % 4 + 4:#x}")
         bp_id = f"{serial}:{pid}:{so_name}:{static_addr:x}"   # 不含 '#'，可直接进 URL
         tgt = self.attach(serial, pid)
         with self._lock:
