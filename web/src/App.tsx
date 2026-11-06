@@ -361,7 +361,7 @@ export default function App() {
       }}
     >
       <header className="topbar">
-        <div className="brand"><span className="mark" />MDA<small>0.2.7 · web</small></div>
+        <div className="brand"><span className="mark" />MDA<small>0.2.8 · web</small></div>
         <div className="divider" />
         <div className="so-tabs">
           {modules.map((m, i) => (

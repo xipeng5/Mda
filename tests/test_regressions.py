@@ -1309,6 +1309,35 @@ def test_r42_hits_fallback() -> None:
     check("R42 无数据时给 hint", "NO_HITS" in src)
 
 
+
+
+def test_r43_array_pointer_validation() -> None:
+    """R43：VM 上下文里的数组指针校验必须能拦住假指针，又不能误杀合法地址。"""
+    import inspect as _insp
+
+    import dyn.memread as _mr
+
+    src = _insp.getsource(_mr.probe_vm_from_hits)
+    check("R43 有去 tag 处理", "0x00FFFFFFFFFFFFFF" in src,
+          "Android 堆指针带 MTE tag，不去掉会把合法地址全拒")
+    check("R43 检查上限 2^48", "(1 << 48)" in src,
+          "用户态地址超过 2^48 必为垃圾")
+    check("R43 没有强制 8 字节对齐", "& 0x7) != 0" not in src,
+          "实测指令数组是 4 字节对齐，加强制对齐会误杀真数组")
+
+    # 复刻校验逻辑，验证四类输入
+    def ok(v) -> bool:
+        a = v & 0x00FFFFFFFFFFFFFF
+        return not (a < 0x1000 or a >= (1 << 48))
+
+    check("R43 真指令数组通过", ok(0x7C86DDB5AC), hex(0x7C86DDB5AC))
+    check("R43 Android 堆指针通过", ok(0xB400007C5F0DC6C0), "带 tag 的堆地址")
+    check("R43 ASCII 垃圾被拒", not ok(0x6369000000000003),
+          "实测 x0 结构里读到 0x6369000000000003（ASCII 'ci' + 垃圾）")
+    check("R43 小整数被拒", not ok(0xFFF))
+    check("R43 超界地址被拒", not ok(0x123456789ABCD))
+
+
 def main() -> int:
     print("== R1 held/token 透出（防线程永久挂起）==")
     test_r1_held_is_exposed()
@@ -1394,6 +1423,8 @@ def main() -> int:
     test_r41_trace_call_tree()
     print("== R42 命中记录回退 ==")
     test_r42_hits_fallback()
+    print("== R43 数组指针校验 ==")
+    test_r43_array_pointer_validation()
 
     print(f"\n结果: {PASS} 通过 / {FAIL} 失败")
     return 0 if FAIL == 0 else 1

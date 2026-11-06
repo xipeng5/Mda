@@ -1361,7 +1361,26 @@ def probe_vm_from_hits(serial: str, pid: int, hits: list,
                 arr_i = int(arr, 16) if isinstance(arr, str) else int(arr)
             except (TypeError, ValueError):
                 continue
-            if arr_i < 0x1000:
+            # (21) 第二十一次修改（2026-11-06）：数组指针校验大幅收紧。
+            #      bug 原因：原来只判 `arr_i < 0x1000` 就放过。实测 x0 指向的
+            #               结构里，[ctx+0x1a0] 读出来是 0x6369000000000003——
+            #               那其实是 ASCII "ci" 加垃圾（把字符串/数据当成了指针），
+            #               它 >0x1000 所以顺利通过校验，被当成合法候选返回，
+            #               最后读 1024 字节失败，报"指令数组不可读"。
+            #               用户看到的就是"解码失败"，而根因是**假指针没被拦住**。
+            #      解决方案：按 arm64 用户态地址空间的实际范围校验——
+            #      解决方案：按 arm64 用户态地址空间判别，但**要放过 tagged pointer**。
+            #               实测 Android 堆指针形如 0xb400007c5f0dc6c0——
+            #               高 8 位 0xb4 是 MTE/tag 标记，去掉后才是真地址
+            #               0x0000007c5f0dc6c0。所以不能简单要求"高16位为0"，
+            #               否则会把合法堆指针全拒掉。
+            #               判据改为：去掉高 8 位 tag 后，地址落在 [0x1000, 2^48)。
+            #               · 0x6369000000000003 -> 去tag后 0x69000000000003 超 2^48，拒绝
+            #               · 0xb400007c5f0dc6c0 -> 去tag后 0x7c5f0dc6c0，通过
+            #               **不要求对齐**：实测指令数组地址 0x7c86ddb5ac 是 4 字节
+            #               对齐而非 8 字节，加对齐要求会把真数组也误杀。
+            arr_untagged = arr_i & 0x00FFFFFFFFFFFFFF
+            if arr_untagged < 0x1000 or arr_untagged >= (1 << 48):
                 continue
             ok_list.append({"ptr": c["ptr"], "reg": c["reg"], "seq": c["seq"],
                             "so_name": c["so_name"], "count": int(cnt),
