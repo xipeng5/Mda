@@ -1683,6 +1683,73 @@ def test_r53_js_raw_string() -> None:
               f"实际 {seg!r}")
 
 
+
+
+def test_r54_hits_register_filter() -> None:
+    """R54：hits 必须支持按寄存器值过滤（2000 条里精准挑出想要的）。"""
+    import inspect as _insp
+
+    import mcp_server.tools as _T
+
+    sig = _insp.signature(_T.hits)
+    for p in ("filter", "group_by", "group_top"):
+        check(f"R54 支持参数 {p}", p in sig.parameters)
+
+    h = {"context": {"x2": "0x5", "x0": "0x20", "lr": "0x2000"}}
+    cases = [
+        ({"x2": 5}, True, "等于整数"),
+        ({"x2": "0x5"}, True, "等于hex字符串"),
+        ({"x2": 4}, False, "等于不符"),
+        ({"x2": {"eq": 5}}, True, "显式eq"),
+        ({"x2": {"ne": 4}}, True, "ne"),
+        ({"x2": {"in": [1, 4, 5]}}, True, "in集合"),
+        ({"x2": {"not_in": [5]}}, False, "not_in"),
+        ({"x2": {"min": 1, "max": 10}}, True, "闭区间内"),
+        ({"x2": {"min": 10}}, False, "区间外"),
+        ({"x2": 5, "x0": 0x20}, True, "多条件AND"),
+        ({"x2": 5, "x0": 0x30}, False, "AND有一项不符"),
+        ({"xBAD": 5}, False, "寄存器不存在要拒绝"),
+    ]
+    for flt, want, desc in cases:
+        got = _T._hit_matches_filter(h, flt)
+        check(f"R54 过滤 {desc}", got == want, f"{flt} -> {got}，期望 {want}")
+
+    # 寄存器别名：fp/x29、lr/x30 双向可查
+    ctx = {"x29": "0x1000", "x30": "0x2000"}
+    check("R54 fp 走 x29", _T._reg_value(ctx, "fp") == 0x1000)
+    check("R54 lr 走 x30", _T._reg_value(ctx, "lr") == 0x2000)
+    check("R54 大小写不敏感", _T._reg_value({"x2": "0x5"}, "X2") == 5)
+
+
+def test_r55_hits_group_by() -> None:
+    """R55：hits 必须支持聚合统计——比返回 2000 条原始数据有用得多。"""
+    import mcp_server.tools as _T
+
+    items = [{"context": {"x2": "0x1"}}, {"context": {"x2": "0x1"}},
+             {"context": {"x2": "0x4"}}, {"context": {"x2": "0x5"}},
+             {"context": {}}]
+    g = _T._group_hits(items, "x2", top=10)
+    check("R55 聚合总数正确", g["total"] == 4, str(g["total"]))
+    check("R55 去重计数正确", g["distinct"] == 3, str(g["distinct"]))
+    check("R55 取不到值的计入 unparsed", g["unparsed"] == 1, str(g["unparsed"]))
+    check("R55 按次数降序", g["groups"][0] == {"value": "0x1", "count": 2},
+          str(g["groups"][0]))
+    check("R55 top 限制生效",
+          len(_T._group_hits(items, "x2", top=2)["groups"]) == 2)
+
+    # 普通字段也能聚合
+    items2 = [{"so_name": "a.so"}, {"so_name": "a.so"}, {"so_name": "b.so"}]
+    g2 = _T._group_hits(items2, "so_name")
+    check("R55 支持普通字段聚合", g2["distinct"] == 2, str(g2["groups"]))
+
+    # 给了 group_by 时不应返回全量 hits（那正是要避免的数据量）
+    import inspect as _insp
+
+    src = _insp.getsource(_T.hits)
+    check("R55 group_by 时只留样本", "trimmed = filtered[:3]" in src)
+    check("R55 group_by 时清掉大字段", 'h.pop("backtrace"' in src)
+
+
 def main() -> int:
     print("== R1 held/token 透出（防线程永久挂起）==")
     test_r1_held_is_exposed()
@@ -1790,6 +1857,10 @@ def main() -> int:
     test_r52_java_callers()
     print("== R53 JS raw string ==")
     test_r53_js_raw_string()
+    print("== R54 hits 寄存器过滤 ==")
+    test_r54_hits_register_filter()
+    print("== R55 hits 聚合统计 ==")
+    test_r55_hits_group_by()
 
     print(f"\n结果: {PASS} 通过 / {FAIL} 失败")
     return 0 if FAIL == 0 else 1

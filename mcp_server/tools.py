@@ -881,11 +881,164 @@ def remove_breakpoint(bp_id: str) -> str:
                    "code": getattr(exc, "code", "REMOVE_FAILED")})
 
 
+def _reg_value(context: dict, name: str):
+    """从命中现场取某个寄存器的整数值；取不到返回 None。
+
+    (26) 第二十六次修改（2026-11-06）：新增。
+
+    为什么要这个包装：context 里的值是 "0x..." 字符串，键名大小写不定
+    （有的是 fp 有的是 x29），直接比较容易踩空。这里统一成 int 再比。
+    """
+    if not isinstance(context, dict) or not name:
+        return None
+    key = str(name).strip().lower()
+    raw = context.get(key)
+    if raw is None:
+        # fp/lr 与 x29/x30 互为别名，双向兜一下
+        alias = {"fp": "x29", "x29": "fp", "lr": "x30", "x30": "lr"}
+        alt = alias.get(key)
+        if alt:
+            raw = context.get(alt)
+    if raw is None:
+        return None
+    try:
+        return int(raw, 16) if isinstance(raw, str) else int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _hit_matches_filter(hit: dict, flt: dict) -> bool:
+    """判断一条命中是否满足寄存器过滤条件（多条件 AND）。
+
+    (26) 第二十六次修改（2026-11-06）：新增。
+
+    支持的条件形态：
+        5                           等于（整数或 "0x.." 字符串）
+        {"eq": 5}                   等于
+        {"ne": 5}                   不等于
+        {"in": [1, 4, 5]}           值在集合里
+        {"not_in": [1]}             值不在集合里
+        {"min": 1, "max": 10}       闭区间
+        {"gt": .., "lt": .., "ge": .., "le": ..}   其它比较
+
+    寄存器取不到时**视为不匹配**（而不是放行）——否则一个写错的寄存器名
+    会悄悄把所有命中都放回来，看起来像"过滤没生效"。
+    """
+    ctx = hit.get("context") or {}
+    for reg, cond in (flt or {}).items():
+        val = _reg_value(ctx, str(reg))
+        if val is None:
+            return False
+        if not isinstance(cond, dict):
+            # 直接给值 = 等于
+            try:
+                want = int(cond, 16) if isinstance(cond, str) else int(cond)
+            except (TypeError, ValueError):
+                return False
+            if val != want:
+                return False
+            continue
+
+        def _as_int(x):
+            try:
+                return int(x, 16) if isinstance(x, str) else int(x)
+            except (TypeError, ValueError):
+                return None
+
+        if "eq" in cond and val != _as_int(cond["eq"]):
+            return False
+        if "ne" in cond and val == _as_int(cond["ne"]):
+            return False
+        if "in" in cond:
+            pool = [ _as_int(x) for x in (cond["in"] or []) ]
+            if val not in pool:
+                return False
+        if "not_in" in cond:
+            pool = [ _as_int(x) for x in (cond["not_in"] or []) ]
+            if val in pool:
+                return False
+        if "min" in cond:
+            m = _as_int(cond["min"])
+            if m is not None and val < m:
+                return False
+        if "max" in cond:
+            m = _as_int(cond["max"])
+            if m is not None and val > m:
+                return False
+        if "gt" in cond:
+            m = _as_int(cond["gt"])
+            if m is not None and not val > m:
+                return False
+        if "lt" in cond:
+            m = _as_int(cond["lt"])
+            if m is not None and not val < m:
+                return False
+        if "ge" in cond:
+            m = _as_int(cond["ge"])
+            if m is not None and not val >= m:
+                return False
+        if "le" in cond:
+            m = _as_int(cond["le"])
+            if m is not None and not val <= m:
+                return False
+    return True
+
+
+def _group_hits(items: list, field: str, top: int = 50) -> dict:
+    """按某个字段/寄存器分组计数，返回降序分布。
+
+    (26) 第二十六次修改（2026-11-06）：新增。
+
+    为什么这个比原始数据有用：2000 条命中的原始 JSON 没法看，但
+    "x2 的分布是 {0x1: 523, 0x4: 437, 0x5: 210}" 一眼就能定位到
+    你要找的那个命令号。
+
+    field 支持：
+        · 寄存器名（x0..x30 / sp / pc / lr / fp）—— 从 context 取
+        · 命中记录里的普通字段：so_name / thread_id / seq / ts
+        · 特殊值 "thread_id" 直接归并线程
+
+    取不到值的命中计入 unparsed（如实报告，不丢弃也不假装是 0）。
+    """
+    counts: dict = {}
+    unparsed = 0
+    plain_fields = {"so_name", "thread_id", "seq", "static_addr",
+                    "runtime_addr", "tid"}
+    is_plain = field in plain_fields
+
+    for h in items or []:
+        if is_plain:
+            v = h.get(field)
+            if field == "tid":
+                v = h.get("thread_id")
+        else:
+            v = _reg_value(h.get("context") or {}, field)
+        if v is None:
+            unparsed += 1
+            continue
+        counts[v] = counts.get(v, 0) + 1
+
+    ordered = sorted(counts.items(), key=lambda kv: -kv[1])
+    groups = []
+    for k, n in ordered[:max(1, int(top))]:
+        groups.append({"value": hex(k) if isinstance(k, int) else str(k),
+                       "count": n})
+    return {
+        "field": field,
+        "groups": groups,
+        "total": sum(counts.values()),
+        "distinct": len(counts),
+        "unparsed": unparsed,
+    }
+
+
 @server.tool()
 @logged()
 def hits(serial: str, pid: int, bp_id: str = "", limit: int = 0,
          since_seq: int = 0, include_context: bool = True,
-         include_backtrace: bool = True, include_stack: bool = True) -> str:
+         include_backtrace: bool = True, include_stack: bool = True,
+         filter: dict | None = None, group_by: str = "",
+         group_top: int = 50) -> str:
     """取**断点命中历史**（完整现场），与 poll_events 是两份不同的数据。
 
     区别（很容易混）：
@@ -909,6 +1062,28 @@ def hits(serial: str, pid: int, bp_id: str = "", limit: int = 0,
         include_context  false 时省略 36 个寄存器（省最多空间）
         include_backtrace false 时省略调用栈
         include_stack    false 时省略 256 字节栈快照
+
+    ## 按寄存器值过滤（P0）—— 从 2000 条里精准挑出你要的那几条
+
+        filter={"x2": 5}                    只要 x2 == 5 的命中
+        filter={"x0": "0x20", "x2": 5}      多个寄存器同时满足（AND）
+        filter={"x2": {"in": [1, 4, 5]}}    值在集合里
+        filter={"x2": {"min": 1, "max": 10}} 值在区间内（闭区间）
+
+    支持的比较：等于（直接给值）/ "ne" 不等于 / "in" 集合 /
+    "min"/"max" 区间 / "not_in" 不在集合。
+
+    **典型场景**：2000 条命中里想找"命令号为 5"的那批，直接
+    `filter={"x2": 5}`，不用取回来自己筛。
+
+    ## 聚合统计（P1）—— 比返回原始数据有用得多
+
+        group_by="x2"     → {"0x1": 523, "0x4": 437, "0x5": 210, ...}
+        group_by="lr"     → 看哪个调用点最频繁
+        group_by="thread_id" → 看是哪个线程在干活
+
+    给了 group_by 时**不返回 hits 数组**（那正是你要避免的 3MB 数据），
+    只返回聚合结果 + 少量样本。用 group_top 控制返回多少个桶（默认 50）。
 
     ## 返回
 
@@ -971,6 +1146,28 @@ def hits(serial: str, pid: int, bp_id: str = "", limit: int = 0,
                 continue
         filtered.append(h)
 
+    # (26) 第二十六次修改（2026-11-06）：加寄存器值过滤（P0）。
+    #      bug 原因：2000 条命中里想找"x2 == 5"那批，只能先取回 3 条
+    #               （受返回体积限制）再自己看，根本筛不出想要的。
+    #               寄存器是判断"这次调用是什么命令/什么分支"最直接的依据。
+    #      解决方案：filter 支持按寄存器值筛选，比较方式包含等于 /
+    #               不等 / 集合 / 区间；多条件是 AND。
+    #               在 limit 之前执行——先筛再截，否则截完再筛就漏了。
+    reg_filter = filter if isinstance(filter, dict) else None
+    if reg_filter:
+        filtered = [h for h in filtered if _hit_matches_filter(h, reg_filter)]
+        if not filtered:
+            return _j({
+                "ok": True, "count": 0, "total_matched": 0, "hits": [],
+                "filter": reg_filter,
+                "total_before_filter": total_matched,
+                "verdict": (f"共有 {total_matched} 条命中，但**没有一条**满足 "
+                            f"filter={reg_filter}"),
+                "hint": ("可用 group_by 先看这个寄存器有哪些值："
+                         "hits(group_by='x2') 会给出值分布，"
+                         "照着分布改 filter 即可"),
+            })
+
     total_matched = len(filtered)
 
     if int(limit or 0) > 0:
@@ -996,10 +1193,29 @@ def hits(serial: str, pid: int, bp_id: str = "", limit: int = 0,
                 omitted.append("stack")
         trimmed.append(item)
 
-    # 汇总所有命中的调用栈，找出没符号化的模块
-    all_frames: list = []
-    for h in trimmed:
-        all_frames.extend(h.get("backtrace") or [])
+    # (26) 第二十六次修改（2026-11-06）：加聚合统计（P1）。
+    #      为什么：调用方真正想知道的是"这个寄存器的值都是什么分布"，
+    #              而不是 2000 条原始 JSON。聚合后一次调用就能看出
+    #              哪个命令号最常见、哪个调用点最热。
+    #      设计：给了 group_by 就**不返回 hits 数组**——那正是要避免的数据量。
+    #              但仍然给少量样本（最多 3 条），便于对照聚合结果。
+    group_result = None
+    if str(group_by or "").strip():
+        group_result = _group_hits(filtered, str(group_by).strip(),
+                                   int(group_top or 50))
+        # 只留几条样本，不返回全量
+        trimmed = filtered[:3] if filtered else []
+        for h in trimmed:
+            h.pop("backtrace", None)
+            h.pop("stack", None)
+            h.pop("stack_hex", None)
+        size_kb = None
+        all_frames = []
+    else:
+        # 汇总所有命中的调用栈，找出没符号化的模块
+        all_frames = []
+        for h in trimmed:
+            all_frames.extend(h.get("backtrace") or [])
     hints = _backtrace_hints(all_frames)
 
     # 估算体积（KB），让调用方自己判断要不要再裁
@@ -1017,6 +1233,19 @@ def hits(serial: str, pid: int, bp_id: str = "", limit: int = 0,
                  "total_matched > count 说明被 limit 截断；"
                  "需要完整执行序列请用 poll_events 增量拉取"),
     }
+    if group_result is not None:
+        out["group_by"] = group_result["field"]
+        out["groups"] = group_result["groups"]
+        out["group_total"] = group_result["total"]
+        out["group_distinct"] = group_result["distinct"]
+        out["hits"] = trimmed
+        out["count"] = len(trimmed)
+        out["note"] = ("这是**聚合结果**，hits 只给了 3 条样本；"
+                       "要原始数据就不要再传 group_by")
+        if group_result.get("unparsed"):
+            out["group_unparsed"] = group_result["unparsed"]
+    if reg_filter:
+        out["filter"] = reg_filter
     if omitted:
         out["fields_omitted"] = omitted
     if size_kb is not None:
