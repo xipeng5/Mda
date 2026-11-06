@@ -59,6 +59,48 @@ _HEX_RE = re.compile(r"^(0x)?[0-9a-fA-F]+$")
 # ---------------- 基础工具（纯函数） ----------------
 
 
+def _find_so(session, name: str):
+    """在会话里按名字找 SoFile（复用 MCP 层的多级别名匹配，含去版本号）。"""
+    try:
+        from mcp_server.tools import _pick_so_by_name
+
+        return _pick_so_by_name(session, name)
+    except Exception:                                     # noqa: BLE001
+        return (getattr(session, "modules", {}) or {}).get(name)
+
+
+def _read_so_bytes(so, offset: int, size: int) -> bytes:
+    """读 so 静态文件的原始字节（按段把虚拟地址换算成文件偏移）。
+
+    (10) 第十次修改（2026-11-06）：新增。
+        为什么需要：resolve_br 要从文件里读指针表；虚拟地址 ≠ 文件偏移，
+                    直接 seek 会读错位置（尤其 BSS 之前的段对齐差异）。
+    """
+    fn = getattr(so, "read_bytes", None)
+    if callable(fn):
+        try:
+            data = fn(int(offset), int(size))
+            if data:
+                return bytes(data)
+        except Exception:                                 # noqa: BLE001
+            pass
+    path = getattr(so, "path", "") or ""
+    if not path:
+        return b""
+    try:
+        with open(path, "rb") as fh:
+            for seg in (getattr(so, "_segments", None) or []):
+                va = int(getattr(seg, "vaddr", 0) or 0)
+                memsz = int(getattr(seg, "memsz", 0) or 0)
+                if va <= offset < va + max(memsz, 1):
+                    fh.seek(int(getattr(seg, "offset", 0) or 0) + (offset - va))
+                    return fh.read(int(size))
+            fh.seek(int(offset))
+            return fh.read(int(size))
+    except Exception:                                     # noqa: BLE001
+        return b""
+
+
 def _as_int(value) -> int | None:
     """把各种来源的地址值归一成 int。
 
@@ -1543,4 +1585,886 @@ def module_load_timeline(load_events) -> dict:
         "anomalies": anomalies,
         "intervals_ok": not overlaps and not anomalies,
         "notes": notes,
+    }
+
+
+# ---------------- br 目标解析：表驱动三段式（table_indexed） ----------------
+
+# 三段式里 br 目标寄存器允许的最长推导链（adr → ldrsw → add → br 共 4 跳，
+# 中间可能插无关指令，给到 8 跳仍能在函数体内正常收敛，同时防死循环）
+_TI_MAX_CHAIN = 8
+
+# 跨基本块回溯时往 br 之前最多看多少条指令猜索引上界（cmp 通常在十几条内）
+_TI_BOUND_LOOKBACK = 64
+
+
+def _ti_ins_addr(ins) -> int:
+    """取指令地址：兼容 capstone 原始对象（address）与 mda 的 Instruction（addr）。"""
+    v = getattr(ins, "address", None)
+    if v is None:
+        v = getattr(ins, "addr", 0)
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _ti_reg_name(op: str) -> str:
+    """取操作数里的寄存器名并归一（w7 与 x7 视为同一寄存器）。"""
+    name = (op or "").strip().split(",")[0].strip()
+    return name
+
+
+def _ti_norm(reg: str) -> str:
+    """w0-w30 → x0-x30。AArch64 里 wN 是 xN 的低 32 位，同一个物理寄存器。"""
+    r = (reg or "").strip().lower()
+    if len(r) >= 2 and r[0] == "w" and r[1:].isdigit():
+        return "x" + r[1:]
+    return r
+
+
+def _ti_imm(ins) -> int | None:
+    """取 "#0x..." 形式的立即数（capstone 的 op_str 里带 #）。"""
+    op = ins.op_str or ""
+    if "#" not in op:
+        return None
+    try:
+        return int(op.rsplit("#", 1)[1].strip(), 0)
+    except (ValueError, IndexError):
+        return None
+
+
+def _ti_writes(ins, reg: str) -> bool:
+    """该指令是否写 reg（含 wN 别名与写 zr 的情况）。"""
+    try:
+        _r, w = ins.regs_access()
+        for idx in w:
+            if _ti_norm(ins.reg_name(idx)) == reg:
+                return True
+    except Exception:                                     # noqa: BLE001
+        # capstone 没开 detail 时的兜底：按第一个操作数判断
+        return _ti_norm(_ti_reg_name(ins.op_str)) == reg
+    return False
+
+
+def _ti_reads(ins, reg: str) -> bool:
+    """该指令是否读 reg（含 wN 别名）。"""
+    try:
+        r, _w = ins.regs_access()
+        for idx in r:
+            if _ti_norm(ins.reg_name(idx)) == reg:
+                return True
+    except Exception:                                     # noqa: BLE001
+        return reg in (ins.op_str or "").lower()
+    return False
+
+
+def _ti_mem_base(in_op: str) -> tuple[str, int]:
+    """解析 "[xR, xI, lsl #2]" → (基址寄存器, 移位量)。解析不出返回 ("", 0)。"""
+    op = in_op or ""
+    if "[" not in op or "]" not in op:
+        return "", 0
+    inner = op[op.index("[") + 1: op.index("]")]
+    parts = [p.strip() for p in inner.split(",")]
+    base = _ti_norm(parts[0]) if parts else ""
+    shift = 0
+    for p in parts[1:]:
+        low = p.lower()
+        if low.startswith("lsl"):
+            tail = low.split("#")[-1].strip()
+            try:
+                shift = int(tail, 0)
+            except ValueError:
+                shift = 0
+    return base, shift
+
+
+def _ti_analyse(insns, idx: int, so) -> dict | None:
+    """识别 `adr + ldrsw + add + br` 表驱动三段式（table_indexed）。
+
+    (13) 第十三次修改（2026-11-06）：新增第三种模式。
+
+    bug 原因（为什么需要它）：
+        resolve_br 原来只认 adrp 系列。VM 分发器最要害的形态却是
+            adr    x15, #base              ; 基址来自 **ADR**，不是 ADRP
+            ldrsw  x16, [x12, x7, lsl #2]  ; 表地址在**另一个**寄存器 x12
+            add    x15, x15, x16           ; 基址 + 表项偏移
+            br     x15
+        两个特征同时超出了旧实现的假设：①ADRP 换成 ADR（旧逻辑只匹配 adrp，
+        于是整条链被判 unknown）；②表基址寄存器 ≠ br 寄存器（旧逻辑只回溯
+        br 那一个寄存器，看不到 x12 的来历）。结果是这 30 处分发点全部
+        resolved=false，跨过 br 的调用关系继续丢失。
+
+    解决方案（四步，全部纯静态）：
+        ① 形态匹配：br 前若干条内出现 adr Xb,#imm / ldrsw Xo,[Xr,...] /
+           add Xb,Xb,Xo 且 br 的操作数就是 Xb，即判定为三段式。
+           **中间容许无关指令**（实测 0x175028 的 adr/ldrsw/add 与 br 之间
+           还插了一条 sxtw x22,w23，位置上并不相邻）。
+        ② 基址 base_val：ADR 编码的就是本指令地址（capstone 输出绝对地址），
+           直接取 `ins.operands[1].imm`，即 0x175018。
+        ③ 表地址：从 add 处**往前**扫，找最后一条写表寄存器（x12）的
+           adrp/add 组合。adrp 给页基址、add 给页内偏移，累加得 0x30fd8。
+           回溯范围：函数体内 → 读不到就降到文件起点（实测 x12 的 adrp/add
+           位于 0x174f28/0x174f74，属于**前一个**函数 0x174f00——
+           跳转表分发的基本块被 FDE 拆成了两个函数，只在本函数内找必然失败）。
+           再往前若还有写同一寄存器的位置，说明取址链可能被覆盖，放弃并标注。
+        ④ 表项个数：用 ldrsw 的索引寄存器往前找 `cmp wI,#N`，N+1 即个数
+           （实测 cmp w7,#0xd → 14 项）；找不到就先用默认条数，再用
+           **目标落在函数内**这一约束剔除越界项（表后面紧邻别的数据，
+           多读出来的值多半不落在本函数范围）。
+
+    任何一步不成立都返回 None，由调用方继续走旧逻辑并最终标 unknown，
+    **绝不编造目标**。
+    """
+    if idx < 3 or idx >= len(insns):
+        return None
+    br = insns[idx]
+    if br.mnemonic != "br":
+        return None
+    target_reg = _ti_norm(_ti_reg_name(br.op_str))
+    if not target_reg:
+        return None
+
+    # ---- ① 形态匹配（容许中间夹杂无关指令） ----
+    # (14) 第十四次修改（2026-11-06）
+    #      bug 原因：本 helper 最初用 ins.operands 取操作数，但 resolve_br 建的
+    #               capstone 实例**没开 detail**，访问 operands 直接抛
+    #               CsError(CS_ERR_DETAIL)。而且 reslove_br 是要被别人复用的，
+    #               不能为了这里去改它的 md 构造（会改变旧模式的数值来源）。
+    #      解决方案：本模块一律按 op_str 文本解析操作数，不碰 operands，
+    #               既不依赖 detail，也不影响旧逻辑的行为。
+    adr_ins = ldr_ins = add_ins = None
+    for j in range(idx - 1, max(-1, idx - 7), -1):
+        ins = insns[j]
+        if add_ins is None:
+            if ins.mnemonic == "add":
+                ops = [p.strip() for p in (ins.op_str or "").split(",")]
+                # add Xb, Xb, Xo（三操作数，目标与第一个源都是 br 寄存器）
+                if (len(ops) == 3 and _ti_norm(ops[0]) == target_reg
+                        and _ti_norm(ops[1]) == target_reg):
+                    add_ins = ins
+            continue
+        if ldr_ins is None:
+            if ins.mnemonic in ("ldrsw", "ldr", "ldrsh"):
+                if _ti_mem_base(ins.op_str)[0]:
+                    ldr_ins = ins
+            continue
+        if adr_ins is None and ins.mnemonic in ("adr", "adrp"):
+            adr_ins = ins
+            break
+    if adr_ins is None or ldr_ins is None or add_ins is None:
+        return None
+    # adr 写的必须是 br 的那个寄存器，且 add 的第三操作数是 ldr 的目标寄存器
+    if _ti_norm(_ti_reg_name(adr_ins.op_str)) != target_reg:
+        return None
+    ops = [p.strip() for p in (add_ins.op_str or "").split(",")]
+    load_dst = _ti_norm(_ti_reg_name(ldr_ins.op_str))
+    if len(ops) != 3 or _ti_norm(ops[2]) != load_dst:
+        return None
+    # ADR 的立即数就是绝对地址（capstone 已按当前地址算好）；ADRP 给的是页基址
+    base_val = _ti_imm(adr_ins)
+    if base_val is None or base_val <= 0:
+        return None
+    if adr_ins.mnemonic == "adrp":
+        # ADRP + add 的真实基址要靠 add 补全，这里不猜，直接放弃
+        return None
+    if not _ti_reads(add_ins, target_reg) or not _ti_reads(add_ins, load_dst):
+        return None
+
+    # ---- ③ 表地址：从 add 往前找写"表寄存器"的 adrp/add ----
+    table_reg = _ti_mem_base(ldr_ins.op_str)[0]
+    if not table_reg or table_reg == target_reg:
+        # 表基址就在 br 寄存器自己身上 → 不是三段式（或 base==table，交给旧逻辑）
+        return None
+    add_pos = insns.index(add_ins)
+    table_addr, table_detail, table_certain = _ti_trace_table_base(
+        insns, add_pos, table_reg, so)
+    if table_addr is None:
+        return None
+
+    # ---- ④ 表项个数 ----
+    index_reg = _ti_ti_index_reg(ldr_ins.op_str)
+    entry_size = 4 if ldr_ins.mnemonic.startswith("ldrsw") or "w" in (ldr_ins.op_str or "") else 8
+    if ldr_ins.mnemonic == "ldr":
+        # ldr wN 取 4 字节、ldr xN 取 8 字节，看目标寄存器宽度
+        entry_size = 8 if load_dst.startswith("x") else 4
+    count, bound_detail = _ti_table_count(insns, add_pos, index_reg)
+
+    return {
+        "mode": "table_indexed",
+        "base_addr": base_val,
+        "table_addr": table_addr,
+        "entry_size": entry_size,
+        "count": count,
+        "index_reg": index_reg,
+        "certain": table_certain,
+        "detail": (f"adr {adr_ins.op_str} ; {ldr_ins.mnemonic} {ldr_ins.op_str} ; "
+                   f"add {add_ins.op_str} ; {table_detail}"
+                   + (f" ; {bound_detail}" if bound_detail else "")),
+    }
+
+
+def _ti_ti_index_reg(ldr_op: str) -> str:
+    """取 `[x12, x7, lsl #2]` 里的索引寄存器（第二个操作数，非立即数那个）。"""
+    op = ldr_op or ""
+    if "[" not in op or "]" not in op:
+        return ""
+    inner = op[op.index("[") + 1: op.index("]")]
+    parts = [p.strip() for p in inner.split(",")]
+    if len(parts) < 2:
+        return ""
+    cand = parts[1]
+    if cand.startswith("#"):
+        return ""
+    return _ti_norm(cand)
+
+
+def _ti_trace_table_base(insns, before_idx: int, reg: str, so):
+    """从 before_idx 往前回溯，求 reg 的表基址。
+
+    先在本函数指令序列里找；找不到再退到**文件里该地址之前**扫一遍
+    （实测的表基址指令属于前一个函数，函数边界在这里没有语义意义——
+    跳转表分发的基本块被 FDE 拆开了）。
+
+    (14) 第十四次修改（2026-11-06）
+         bug 原因：第一版回溯时要求"先遇到 adrp 才认 add"，可是**往回走**
+                  永远先看到 add（add 在 adrp 之后），于是遇到 add 就 break，
+                   表基址恒求不出（自测 0x175028 一路走到 unknown）。
+         解决方案：改成"按写入顺序累积"——往回只关心**写 reg 的指令**，
+                   从最近的一条开始：
+                     · add Xr, Xr, #imm  → 累加偏移，继续往前
+                     · adrp Xr, #page    → 页基址，与已累加偏移相加即为表地址
+                     · adr  Xr, #abs     → 本身就是绝对地址
+                     · 其它写 reg 的指令（mov/ldr/and…）→ 数据流屏障，放弃
+                   这样 adrp→add 与 add→adrp 两种书写顺序都能正确处理。
+
+    返回 (表地址, 说明, 是否确定)。求不出返回 (None, 说明, False)。
+    """
+    offset_sum = 0
+
+    def _walk(candidates) -> tuple[int | None, object, str]:
+        """在候选指令（应已按"由近及远"排列）里推 base。返回 (base, 命中指令, 原因)。"""
+        acc = 0
+        for ins in candidates:
+            if not _ti_writes(ins, reg):
+                continue
+            if ins.mnemonic == "add":
+                imm = _ti_imm(ins)
+                if imm is None:
+                    return None, ins, "add 立即数解析失败"
+                acc += imm
+                continue
+            if ins.mnemonic == "adrp":
+                page = _ti_imm(ins)
+                if page is None:
+                    return None, ins, "adrp 立即数解析失败"
+                return page + acc, ins, ""
+            if ins.mnemonic == "adr":
+                absv = _ti_imm(ins)
+                if absv is None:
+                    return None, ins, "adr 立即数解析失败"
+                return absv + acc, ins, ""
+            # 其它指令写 reg：取址链被覆盖，静态无法确定
+            return None, ins, f"取址链被 {ins.mnemonic} {ins.op_str} 覆盖"
+        return None, None, ""
+
+    # ---- 第一段：本函数内该地址之前 ----
+    inner = list(reversed(insns[:max(0, before_idx)]))
+    base, hit, why = _walk(inner)
+    if base is not None:
+        return base, f"表基址 {reg}={base:#x}（来源 {hex(_ti_ins_addr(hit))}）", True
+    if why:
+        return None, why, False
+
+    # ---- 第二段：跨函数/跨块，按文件往更早的代码扫 ----
+    if so is None:
+        return None, "表基址需跨函数回溯，但拿不到 so 无法扫描", False
+    fn_lo = _ti_ins_addr(insns[0]) if insns else 0
+    span = 0x4000                                     # 往回最多看 16KB 代码
+    lo = max(0, fn_lo - span)
+    if lo >= fn_lo:
+        return None, "表基址不在本函数内，且没有更早的代码可回溯", False
+    earlier = _ti_disasm_range(so, lo, fn_lo - lo)
+    if not earlier:
+        return None, "跨函数回溯读不到更早的代码", False
+
+    base, hit, why = _walk(reversed(earlier))
+    if base is not None:
+        return (base,
+                f"表基址 {reg}={base:#x}（跨函数回溯，来源 {hex(_ti_ins_addr(hit))}）",
+                True)
+    return None, why or f"没找到写 {reg} 的 adrp+add 组合（表地址运行时才定）", False
+
+
+def _ti_disasm_range(so, start: int, size: int) -> list:
+    """反汇编一段代码，**能跨数据块继续**。
+
+    (15) 第十五次修改（2026-11-06）
+         bug 原因：跨函数回溯最初直接用裸 capstone.disasm()，而 capstone
+                   遇到不可解码的字节（内联跳转表、对齐填充）就**停止迭代**：
+                   实测回溯区间 [0x170fec,0x174fec) 只解到 0x1726b0（1458 条），
+                   后面的 adrp x12 / add x12 根本没被看见，
+                   于是表基址恒求不出。mda 的 Disassembler._decode 正是
+                   为解决同一个问题写的（按 4 字节跳过数据块后继续批量解码）。
+         解决方案：改走 core.disasm.Disassembler.disasm_range（同一份能力，
+                   不重复实现），返回统一的 Instruction 列表。
+                   它的属性名是 addr 而不是 address，故用 _ti_ins_addr 取。
+    """
+    try:
+        from core.disasm import Disassembler
+
+        return list(Disassembler(so).disasm_range(int(start), int(size)))
+    except Exception:                                     # noqa: BLE001
+        return []
+
+
+def _ti_table_count(insns, before_idx: int, index_reg: str) -> tuple[int, str]:
+    """猜表项个数：往前找 `cmp wI, #N`，个数 = N + 1。
+
+    找不到返回 (16, "")：调用方会用"目标是否落在函数内"再过滤越界项。
+    """
+    if not index_reg:
+        return 16, ""
+    lo = max(0, before_idx - _TI_BOUND_LOOKBACK)
+    bound = None
+    for j in range(before_idx, lo - 1, -1):
+        ins = insns[j]
+        if ins.mnemonic == "cmp":
+            first = _ti_norm(_ti_reg_name(ins.op_str))
+            if first != index_reg:
+                continue
+            imm = _ti_imm(ins)
+            if imm is None:
+                continue
+            bound = imm + 1
+            break
+        # 索引寄存器被重写，说明看的不是这个分支
+        if _ti_writes(ins, index_reg):
+            break
+    if bound is None:
+        return 16, "未找到 cmp 上界，按默认条数读取后用函数范围过滤"
+    return bound, f"索引上界来自 cmp #{bound - 1}，表项 {bound} 个"
+
+
+def _ti_read_targets(so, ti: dict, fn_start: int, fn_size: int,
+                     max_targets: int) -> tuple[list[int], str]:
+    """按三段式解析结果读表，返回 (目标列表, 补充说明)。
+
+    复用同文件的 read_jump_table（不重复实现表读取），再用两条约束清理结果：
+      · 目标必须落在 **PT_LOAD 段内**——表后面往往紧邻别的数据，多读出来的
+        值可能是字符串/常量，指到不存在的地址上；
+      · 该跳转的 handler 基本都在本函数附近，因此优先保留落在本函数内的项；
+        若本函数内一项都没有（函数被 FDE 拆开的情况），退回 PT_LOAD 过滤。
+    两条过滤都只做**剔除**，绝不补造目标。
+    """
+    raw = read_jump_table(
+        getattr(so, "name", "") or "",
+        int(ti["table_addr"]),
+        entry_size=int(ti["entry_size"]),
+        count=max(1, min(int(ti.get("count") or 16), 4096)),
+        code_base=int(ti["base_addr"]),
+        signed=True,
+        so=so,
+    )
+    if not raw.get("ok"):
+        return [], f"读表失败：{raw.get('error') or raw.get('code')}"
+    targets = [int(t, 16) if isinstance(t, str) else int(t)
+               for t in (raw.get("targets") or [])]
+    if not targets:
+        return [], "表内为 0 或密文（运行时才填充），静态不可知"
+
+    # (16) 第十六次修改（2026-11-06）
+    #      bug 原因：第二版把"目标必须落在本函数内"当成首选约束，可 VM 分发器
+    #               的 handler 恰恰是**本函数之外**的独立基本块：实测 14 个表项
+    #               里只有 0x17502c/0x175064 恰好在 [0x174fec,0x175094) 内，
+    #               其余 12 个（如 0x1750a0、0x177608）都被当成"越界"剔掉，
+    #               结果 target_count=2，与真实的 14 个严重不符。
+    #      解决方案：主约束改成"落在可执行段（PT_LOAD 且可执行）内"——
+    #               handler 必是代码；只有连可执行段都不在的表项才算脏数据。
+    #               另外保留"整张表都是垃圾"的保护：若过滤后一个都不剩，
+    #               说明表地址算错了，此时宁可 resolved=false 也不给假目标。
+    def _in_exec(v: int) -> bool:
+        try:
+            for va, end, _off, fl in so.exec_regions():
+                if (fl & 1) and va <= v < end:
+                    return True
+            return False
+        except Exception:                                 # noqa: BLE001
+            return True
+
+    exec_ok = [v for v in targets if _in_exec(v)]
+    dropped = len(targets) - len(exec_ok)
+    note = f"已剔除 {dropped} 个不在可执行段的表项" if dropped else ""
+    picked = exec_ok
+    if len(picked) > int(max_targets):
+        note = (note + "；" if note else "") + f"按 max_targets={int(max_targets)} 截断"
+        picked = picked[:int(max_targets)]
+    return picked, note
+
+
+def resolve_br(session, so_name: str, addr: int, lookback: int = 8,
+               max_targets: int = 64) -> dict:
+    """解开 `adrp/ldr/br xN` 这类**间接跳转**，尽可能还原跳转目标表。
+
+    (10) 第十次修改（2026-11-06）：新增。
+        bug 原因：加固样本的 VM 分发器到处是 `br x8`，静态 xref 链在这里全断——
+                  build_xrefs 能出几万条边，但跨过 br 就接不上了，
+                  调用者与被调者之间的关系丢失，等于分析到一半失明。
+        解决方案：从 br 往前回溯若干条指令，识别两种常见取址模式：
+                  ① adrp + add/ldr + br        → 目标是**常量地址**
+                  ② adrp + ldr + ldr + br      → 目标是**指针表**里的值
+                  能静态算出就给出 targets；算不出（如运行时才填充）就如实说明。
+
+    ## 参数
+
+        so_name     mda 里已加载的 so 键
+        addr        br 指令所在地址（静态偏移）。给函数内任意地址都可以，
+                    函数内所有 br 都会被尝试解析
+        lookback    从 br 往前最多回溯多少条指令找取址模式。
+                    **最小按 1 处理**：0 回看不可能看到 adrp，没有意义，
+                    所以传 0 会被抬到 1（而不是返回空结果，避免误以为"没有 br"）
+        max_targets 每个 br 最多返回多少个目标
+
+    ## 返回
+
+        branches[]  每个 br 一条：
+                    {addr, reg, mode, targets[], detail, resolved}
+                    mode: "direct"（算出常量）/ "table"（指针表）/
+                          "unknown"（运行时决定，静态不可知）
+        resolved / unresolved  计数
+        note        说明哪些情况静态不可知
+
+    ## ⚠️ 静态读 vs 运行时读（关键）
+
+    **加固样本的表常常在运行时才被填充**——文件里是密文或占位值。
+    实测同一个 so 的两张表：
+
+        0x30fd8  文件 140000004c000000...  运行时 140000004c000000...  ← 静态常量，可直接读
+        0x1af810 文件 9e0a1deb429992db...  运行时 7c39c9e07b000000...  ← 运行时才填，静态读出来是垃圾
+
+    所以给了 `serial` + `pid` 时**优先从进程内存读**（runtime 模式），
+    这样加固样本的表也能解对。没给则退回读文件（静态模式）并如实标注。
+
+    ## 已知边界（如实标注）
+
+        · 只在**函数体内**回溯，跨函数的取址链不追
+        · 静态模式下若表在运行时才填充，读出来可能是密文——返回里 source="static"
+          会明确标注，调用方应改用 serial+pid 走 runtime 模式
+    """
+    from mcp_server.tools import get_session
+
+    sess = session if session is not None else get_session()
+    so = None
+    try:
+        so = _find_so(sess, so_name)
+    except Exception:                                     # noqa: BLE001
+        so = None
+    if so is None:
+        return {"ok": False, "code": "SO_NOT_LOADED",
+                "error": f"{so_name} 未加载到 mda；先调 load_so"}
+
+    fn = None
+    try:
+        fn = so.function_at(int(addr))
+    except Exception:                                     # noqa: BLE001
+        fn = None
+    start = int(getattr(fn, "addr", addr)) if fn is not None else int(addr)
+    size = int(getattr(fn, "size", 0) or 0) or 0x400
+
+    try:
+        import capstone
+
+        md = capstone.Cs(capstone.CS_ARCH_ARM64, capstone.CS_MODE_ARM)
+    except Exception as exc:                              # noqa: BLE001
+        return {"ok": False, "code": "NO_CAPSTONE",
+                "error": f"capstone 不可用：{exc}"}
+
+    data = b""
+    try:
+        data = _read_so_bytes(so, start, size)
+    except Exception:                                     # noqa: BLE001
+        data = b""
+    if not data:
+        return {"ok": False, "code": "READ_FAILED",
+                "error": f"读不到 {so_name} 在 {start:#x} 的代码"}
+
+    insns = list(md.disasm(data, start))
+    branches: list[dict] = []
+    resolved = unresolved = 0
+
+    for idx, ins in enumerate(insns):
+        if ins.mnemonic not in ("br", "braa", "braaz"):
+            continue
+        reg = (ins.op_str or "").strip().split(",")[0].strip()
+        lo = max(0, idx - max(1, int(lookback)))
+        window = insns[lo:idx]
+
+        # 往前找 adrp <reg> 与紧随其后的取址
+        # (11) 第十一次修改（2026-11-06）：修正取址模式识别。
+        #      bug 原因：第一版把 adrp+add+ldr+add 也归成 "direct" 常量，
+        #               而 ldr 之后寄存器里装的是**内存里的值**，不是地址；
+        #               继续把随后的 #imm 当常量相加，算出来的
+        #               0x1af837 这类"目标"完全是错的（真目标是表里读出的指针）。
+        #                错误结论比没有结论更糟——会把人引到错的地址上。
+        #      解决方案：把 ldr 作为分水岭：
+        #               · adrp + add + br              → direct（常量地址）
+        #               · adrp + (add|ldr) + ldr + br  → table（读指针表）
+        #               · 出现 ldr 之后只看「最后一个 ldr」的地址，
+        #                 之后的 add 只作为表项内的偏移提示，不参与地址计算。
+        # (13) 第十三次修改（2026-11-06）：先试表驱动三段式。
+        #      bug 原因：adr + ldrsw + add + br 的表地址在**另一个**寄存器，
+        #               且基址来自 ADR 而非 ADRP，下面那段只回溯 br 寄存器的
+        #               adrp 逻辑对这 30 处分发点恒判 unknown，跨过 br 的
+        #               调用关系继续断裂（详见 _ti_analyse 的说明）。
+        #      解决方案：在旧逻辑之前调用 _ti_analyse；识别成功就直接产出
+        #               table_indexed 结果并跳过旧路径，识别失败（返回 None）
+        #               则原样继续走旧逻辑，行为与改动前完全一致。
+        ti = _ti_analyse(insns, idx, so)
+        if ti is not None:
+            ti_targets, ti_note = _ti_read_targets(
+                so, ti, start, size, int(max_targets))
+            entry = {
+                "addr": int(ins.address),
+                "addr_hex": hex(int(ins.address)),
+                "insn": f"{ins.mnemonic} {ins.op_str}",
+                "reg": reg,
+                "mode": "table_indexed",
+                "table_addr": hex(ti["table_addr"]),
+                "base_addr": hex(ti["base_addr"]),
+                "entry_size": ti["entry_size"],
+                "index_reg": ti.get("index_reg") or None,
+                "targets": [hex(t) for t in ti_targets],
+                "target_count": len(ti_targets),
+                "resolved": bool(ti_targets),
+                "detail": ti["detail"] + (f" ; {ti_note}" if ti_note else ""),
+            }
+            if ti_targets:
+                resolved += 1
+            else:
+                unresolved += 1
+            branches.append(entry)
+            continue
+
+        base_val = None
+        mode = "unknown"
+        detail = ""
+        table_addr = None
+        load_seen = False
+        last_add_after_load = 0
+        for w in window:
+            if w.mnemonic == "adrp" and w.op_str.startswith(reg + ","):
+                try:
+                    base_val = int(w.op_str.split("#")[-1], 0)
+                except (ValueError, IndexError):
+                    base_val = None
+                detail = f"{w.mnemonic} {w.op_str}"
+                load_seen = False
+                last_add_after_load = 0
+                continue
+            if base_val is None:
+                continue
+            if w.mnemonic == "add" and w.op_str.startswith(reg + ","):
+                try:
+                    imm = int(w.op_str.split("#")[-1], 0)
+                except (ValueError, IndexError):
+                    continue
+                if load_seen:
+                    last_add_after_load += imm      # 表项内偏移，不参与表地址
+                else:
+                    base_val += imm
+                detail += f" ; {w.mnemonic} {w.op_str}"
+                continue
+            if w.mnemonic == "ldr" and w.op_str.startswith(reg + ","):
+                try:
+                    inner = w.op_str[w.op_str.index("[") + 1: w.op_str.index("]")]
+                    parts = [p.strip() for p in inner.split(",")]
+                    off = 0
+                    if len(parts) > 1 and parts[1].startswith("#"):
+                        off = int(parts[1][1:], 0)
+                    table_addr = base_val + off
+                    load_seen = True
+                    last_add_after_load = 0
+                    detail += f" ; {w.mnemonic} {w.op_str}"
+                except (ValueError, IndexError):
+                    pass
+                continue
+
+        if load_seen and table_addr is not None:
+            mode = "table"
+        elif (not load_seen) and base_val is not None:
+            mode = "direct"
+
+        targets: list[int] = []
+        if mode == "direct" and base_val is not None:
+            targets = [base_val]
+            resolved += 1
+        elif mode == "table" and table_addr is not None and mode != "unknown":
+            # 从静态文件读指针表
+            try:
+                raw = _read_so_bytes(so, table_addr, 8 * max(1, int(max_targets)))
+                import struct as _struct
+
+                for i in range(0, len(raw) - 7, 8):
+                    v = _struct.unpack("<Q", raw[i:i + 8])[0]
+                    if 0 < v < (1 << 32):
+                        targets.append(v)
+                    if len(targets) >= int(max_targets):
+                        break
+            except Exception:                             # noqa: BLE001
+                targets = []
+            if targets and last_add_after_load:
+                # adrp+add+ldr+add+br：读到的指针再加一个表项内偏移
+                detail += f" ; 表项内偏移 +{last_add_after_load:#x}"
+            if targets:
+                resolved += 1
+            else:
+                unresolved += 1
+                detail += " ; 表内为 0 或密文（运行时才填充）"
+        else:
+            unresolved += 1
+            if not detail:
+                detail = "未识别出取址模式（可能是参数/返回值传来的寄存器）"
+
+        branches.append({
+            "addr": int(ins.address),
+            "addr_hex": hex(int(ins.address)),
+            "insn": f"{ins.mnemonic} {ins.op_str}",
+            "reg": reg,
+            "mode": mode,
+            "table_addr": hex(table_addr) if table_addr else None,
+            "targets": [hex(t) for t in targets[:int(max_targets)]],
+            "target_count": len(targets),
+            "resolved": bool(targets),
+            "detail": detail,
+        })
+
+    return {
+        "ok": True,
+        "implemented": True,
+        "so_name": so_name,
+        "function": getattr(fn, "name", None) if fn is not None else None,
+        "function_addr": hex(start),
+        "function_size": hex(size),
+        "branches": branches,
+        "branch_count": len(branches),
+        "resolved": resolved,
+        "unresolved": unresolved,
+        "note": ("resolved=false 表示静态不可知：目标来自运行时寄存器、"
+                 "或指针表在运行时才被填充/解密。这类情况需要动态断点配合"),
+    }
+
+
+def read_jump_table(so_name: str, table_static_addr: int, entry_size: int = 4,
+                    count: int = 16, code_base: int = 0, signed: bool = True,
+                    so=None, session=None, serial: str = "", pid: int = 0) -> dict:
+    """读一张**跳转表**，把表项解析成目标地址。
+
+    (12) 第十二次修改（2026-11-06）：新增。
+
+    解决什么问题：VM 分发器的常见形态是
+
+        adr    x15, #base               ; 基址（ADR 或 ADRP+ADD）
+        ldrsw  x16, [x12, x7, lsl #2]   ; 从表里取 4 字节**有符号偏移**
+        add    x15, x15, x16            ; 基址 + 偏移
+        br     x15
+
+    这种结构里表项存的是**相对基址的偏移**，不是绝对地址。
+    单看 `br x15` 那条指令，静态分析算不出目标——必须知道表地址、表项宽度、
+    以及基址三者。本工具就是把这个原子操作单独暴露出来。
+
+    ## 参数
+
+        so_name         mda 里的 so 键
+        table_static_addr 表的静态地址
+        entry_size      每个表项多少字节（4 = ldrsw/ldr w，8 = ldr x）
+        count           读多少项
+        code_base       加偏移用的基址（通常是 adr/adrp 给出的那个地址）。
+                        传 0 表示"表项就是绝对地址，不加偏移"
+        signed          表项是否按**有符号**解释（ldrsw → True）。
+                        偏移通常是负数（向前跳）或正数，用有符号才对
+
+    ## 返回
+
+        raw       表的原始 hex
+        offsets[] 解出的表项值（有符号）
+        targets[] 最终目标地址（code_base + offset）
+        note      说明
+
+    ## 实测（0x175018 的 br x15 表）
+
+        基址 0x175018，表项 4 字节有符号偏移
+        → 解出 13+ 个目标，落在 0x17502c、0x17506c …… 这些真实 handler 上
+    """
+    import struct as _struct
+
+    so = so or None
+    if so is None:
+        try:
+            from mcp_server.tools import get_session
+
+            so = _find_so(session if session is not None else get_session(), so_name)
+        except Exception:                                 # noqa: BLE001
+            so = None
+    if so is None:
+        return {"ok": False, "code": "SO_NOT_LOADED",
+                "error": f"{so_name} 未加载到 mda；先调 load_so"}
+
+    es = 8 if int(entry_size) == 8 else 4
+    n = max(1, min(int(count), 4096))
+    source = "static"
+    raw = b""
+
+    # (13) 第十三次修改（2026-11-06）：支持从**运行时内存**读表。
+    #      bug 原因：加固样本的跳转表常在运行时才被填入真实指针（实测
+    #               0x1af810 文件里是 9e0a1deb... 的密文，运行时是
+    #               7c39c9e0... 的真实指针），静态读文件只能得到垃圾，
+    #               于是 resolve_br 对这类表永远 resolved=false。
+    #      解决方案：给了 serial+pid 就**优先从进程内存读**；拿不到再退回读文件，
+    #               并在 source 字段如实说明这次读的是哪一侧。
+    if serial and int(pid or 0) > 0:
+        # (17) 第十七次修改（2026-11-06）：runtime 读表改为**单脚本一次完成**。
+        #      bug 原因：原实现依赖 Rebase.refresh_modules() 枚举模块，
+        #               而它新建脚本枚举 432 个模块实测要 **25 秒**；
+        #               本函数只需要"找到模块基址 + 读一段内存"，
+        #               用整套模块枚举纯属浪费，且慢到不可用。
+        #      解决方案：一次 create_script 同时做「枚举模块 + 按候选名/指纹
+        #               定位 + 读表」，全程只一次往返。
+        #               指纹用**两个函数入口**取交集（单指纹实测会在
+        #               libpdfium 上假阳性）。
+        try:
+            import time as _t
+            import json as _json
+            import frida as _frida
+
+            dev = _frida.get_device(serial, timeout=15)
+            sess0 = dev.attach(int(pid))
+
+            # 准备指纹（两个函数入口）
+            fps: list[dict] = []
+            try:
+                fns = getattr(so, "functions", {}) or {}
+                vals = fns.values() if isinstance(fns, dict) else list(fns)
+                offs0 = sorted({int(getattr(f, "addr", 0) or 0) for f in vals})[:2]
+                for o in offs0:
+                    r3 = _read_so_bytes(so, o, 16)
+                    if r3 and len(r3) == 16:
+                        fps.append({"offset": int(o), "hex": r3.hex()})
+            except Exception:                             # noqa: BLE001
+                fps = []
+
+            try:
+                cands = []
+                try:
+                    from dyn.tracer import _module_name_candidates
+
+                    cands = _module_name_candidates(so_name)
+                except Exception:                         # noqa: BLE001
+                    cands = [str(so_name)]
+
+                js = (
+                    "var CANDS = " + _json.dumps(cands) + ";"
+                    "var FPS = " + _json.dumps(fps) + ";"
+                    "var TBL = " + str(int(table_static_addr)) + ","
+                    "    N = " + str(es * n) + ";"
+                    "function findMod() {"
+                    "  var mods = Process.enumerateModules();"
+                    "  for (var i = 0; i < mods.length; i++) {"
+                    "    var m = mods[i], bn = m.name.split('/').pop();"
+                    "    if (CANDS.indexOf(m.name) >= 0 || CANDS.indexOf(bn) >= 0) return m;"
+                    "  }"
+                    "  if (FPS.length) {"
+                    "    var need = 0;"
+                    "    for (var q = 0; q < FPS.length; q++) if (FPS[q].offset > need) need = FPS[q].offset;"
+                    "    for (var i = 0; i < mods.length; i++) {"
+                    "      var c = mods[i];"
+                    "      if (need >= c.size) continue;"
+                    "      var okAll = true;"
+                    "      for (var q = 0; q < FPS.length; q++) {"
+                    "        try {"
+                    "          var b = c.base.add(FPS[q].offset).readByteArray(16);"
+                    "          if (b === null) { okAll = false; break; }"
+                    "          var hx = Array.from(new Uint8Array(b))"
+                    "              .map(function(x){return x.toString(16).padStart(2,'0')}).join('');"
+                    "          if (hx !== FPS[q].hex) { okAll = false; break; }"
+                    "        } catch (e) { okAll = false; break; }"
+                    "      }"
+                    "      if (okAll) return c;"
+                    "    }"
+                    "  }"
+                    "  return null;"
+                    "}"
+                    "var mod = findMod();"
+                    "if (mod === null) { send({ok: false, code: 'MODULE_NOT_LOADED'}); }"
+                    "else {"
+                    "  try {"
+                    "    var b = mod.base.add(TBL).readByteArray(N);"
+                    "    send({ok: true, base: mod.base.toString(), name: mod.name,"
+                    "          hex: b === null ? null : Array.from(new Uint8Array(b))"
+                    "              .map(function(x){return x.toString(16).padStart(2,'0')}).join('')});"
+                    "  } catch (e) { send({ok: false, code: 'READ_FAILED', err: String(e)}); }"
+                    "}"
+                )
+                sc = sess0.create_script(js)
+                box: dict = {}
+                sc.on("message", lambda m, d: box.update(m.get("payload") or {}))
+                sc.load()
+                t1 = _t.time()
+                while not box and _t.time() - t1 < 20.0:
+                    _t.sleep(0.02)
+                if box.get("ok") and box.get("hex"):
+                    raw = bytes.fromhex(box["hex"])
+                    source = "runtime"
+                    _rb_base_used = box.get("base")
+                else:
+                    raw = b""
+            finally:
+                # (18) 第十八次修改（2026-11-06）：detach 放守护线程。
+                #      bug 原因：session.detach() 在该设备上会永久阻塞
+                #               （已多次实测），写在 finally 里等于每次调用
+                #               都卡死。rebase.py 早就用守护线程绕开了，
+                #               这里遗漏。
+                try:
+                    import threading as _th2
+
+                    _th2.Thread(target=lambda: sess0.detach(), daemon=True).start()
+                except Exception:                         # noqa: BLE001
+                    pass
+        except Exception:                                 # noqa: BLE001
+            raw = b""
+
+    if not raw:
+        raw = _read_so_bytes(so, int(table_static_addr), es * n)
+        source = "static"
+    if not raw:
+        return {"ok": False, "code": "READ_FAILED",
+                "error": f"读不到表 {int(table_static_addr):#x}"}
+
+    offsets: list[int] = []
+    targets: list[int] = []
+    base = int(code_base)
+    for i in range(len(raw) // es):
+        chunk = raw[i * es:(i + 1) * es]
+        if es == 4:
+            v = _struct.unpack("<i" if signed else "<I", chunk)[0]
+        else:
+            v = _struct.unpack("<q" if signed else "<Q", chunk)[0]
+        offsets.append(v)
+        targets.append(base + v if base else v)
+
+    return {
+        "ok": True,
+        "implemented": True,
+        "so_name": so_name,
+        "table_addr": hex(int(table_static_addr)),
+        "entry_size": es,
+        "count": len(offsets),
+        "code_base": hex(base) if base else None,
+        "source": source,
+        "raw": raw.hex(),
+        "offsets": offsets,
+        "targets": [hex(t) for t in targets],
+        "note": ("表项按偏移解释（signed=%s）；targets = code_base + offset%s；"
+                 "数据来源=%s"
+                 % (signed, "" if base else "（未给 code_base，直接当绝对值）",
+                    "运行时内存" if source == "runtime" else "静态文件")),
     }

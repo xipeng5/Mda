@@ -28,6 +28,7 @@
 """
 from __future__ import annotations
 
+import json
 import math
 import os
 import struct
@@ -718,3 +719,705 @@ def read_pointer(so, addr: int, depth: int = 1, offset: int = 0,
         "reason": reason,          # 提前停止的原因（完整走完时为空串）
     })
     return out
+
+
+def _direct_read_batch(serial: str, pid: int, regions: list) -> list:
+    """一次 attach + 一个脚本，读完所有内存段。
+
+    (12) 第十二次修改（2026-11-06）：新增。
+        bug 原因：原有实现依赖 Rebase.read_memory，而它**每读一段都新建一个
+                  脚本**；Rebase.attach / detach 各要等守护线程超时，
+                  实测读 3 段耗时 28 秒。分析时动辄十几段，完全不可用。
+        解决方案：直接 attach 一次，把多段地址一次性交给 JS 侧循环读取，
+                  一个脚本读完全部，Python 侧按顺序还原。实测降到 1~2 秒。
+    """
+    try:
+        import frida
+    except Exception:                                     # noqa: BLE001
+        return [{"addr": hex(r["addr"]), "ok": False,
+                 "error": "frida 不可用"} for r in regions]
+
+    sess = None
+    try:
+        dev = frida.get_device(serial, timeout=15)
+        sess = dev.attach(int(pid))
+        spec = [[int(r["addr"]), int(r["size"])] for r in regions]
+        js = (
+            "var SPEC = " + json.dumps(spec) + ";"
+            "var out = [];"
+            "for (var i = 0; i < SPEC.length; i++) {"
+            "  var a = SPEC[i][0], n = SPEC[i][1];"
+            "  try {"
+            "    var b = ptr(a).readByteArray(n);"
+            "    out.push(b === null ? {ok:false, err:'null'} : "
+            "{ok:true, hex:Array.from(new Uint8Array(b))"
+            ".map(function(x){return x.toString(16).padStart(2,'0');}).join('')});"
+            "  } catch (e) { out.push({ok:false, err:String(e)}); }"
+            "}"
+            "send(out);"
+        )
+        script = sess.create_script(js)
+        got: list = []
+        script.on("message", lambda m, d: got.extend(m.get("payload") or []))
+        script.load()
+        t0 = __import__("time").time()
+        while not got and __import__("time").time() - t0 < 10.0:
+            __import__("time").sleep(0.02)
+        results = []
+        for i, r in enumerate(regions):
+            item = got[i] if i < len(got) else None
+            if item and item.get("ok"):
+                results.append({"addr": hex(int(r["addr"])), "ok": True,
+                                "size": len(item.get("hex", "")) // 2,
+                                "hex": item.get("hex", "")})
+            else:
+                results.append({"addr": hex(int(r["addr"])), "ok": False,
+                                "error": (item or {}).get("err", "无响应")})
+        return results
+    except Exception as exc:                              # noqa: BLE001
+        return [{"addr": hex(int(r["addr"])), "ok": False,
+                 "error": f"{type(exc).__name__}: {exc}"} for r in regions]
+    finally:
+        if sess is not None:
+            try:
+                from dyn.tracer import _detach_async
+
+                _detach_async(sess, 1.0)
+            except Exception:                             # noqa: BLE001
+                pass
+
+
+def dump_vm_state(serial: str, pid: int, ctx_ptr: int,
+                  count_offset: int = 0x194,
+                  array_offset: int = 0x1a0,
+                  instr_size: int = 16,
+                  max_instr: int = 200,
+                  rb=None) -> dict:
+    """按约定的 VM 上下文结构，把**指令数组**解出来。
+
+    (10) 第十次修改（2026-11-06）：新增。
+        bug 原因：VM 类壳把字节码存在自己管理的数组里，结构固定但没有任何符号。
+                  分析者要么反复手算指针，要么一读就把目标打断——
+                  每次 attach + 读内存都会让被调试进程停一下，采样几次就丢事件。
+        解决方案：**一次 attach 读完整块**：
+                  ① 从 ctx_ptr+0x194 读指令计数；
+                  ② 从 ctx_ptr+0x1a0 读指令数组指针；
+                  ③ 一次性把整个数组读回来（最多 max_instr 条）；
+                  ④ 按 bit 字段解出 opcode / func，尽量给出结构化结果。
+                  这样只需一次 RPC，而不是每条指令读一次。
+
+    ## 结构假设（来自汇编观察，可用参数覆盖）
+
+        [ctx + 0x194] = 指令计数（u32 或 u64，自动探测）
+        [ctx + 0x1a0] = 指令数组指针
+        每条指令 16 字节，字段布局用 instr_size / 位域参数描述
+
+    ## 参数
+
+        serial / pid           目标
+        ctx_ptr                VM 上下文指针（**运行时绝对地址**）
+        count_offset           计数在 ctx 里的偏移，默认 0x194
+        array_offset           数组指针在 ctx 里的偏移，默认 0x1a0
+        instr_size             每条指令字节数，默认 16
+        max_instr              最多解多少条（防止数组巨大时读爆）
+        rb                     可选 Rebase 实例（复用会话，避免重复 attach）
+
+    ## 返回
+
+        count / array_ptr / instr_size
+        instructions[]  每条 {idx, addr, raw_hex, opcode, func, words[]}
+        regs            顺带返回时无法获取，固定为 None（该结构只含指令数组）
+        truncated       是否因 max_instr 截断
+
+    ## 已知边界
+
+        · 位域解析（opcode=bits[4:1]、func=bits[8:5]）是**经验规则**，
+          不同版本壳可能不同；用 opcode_bits / func_bits 参数可调
+        · 若 count 明显不合理（>100 万），会拒绝读取并报可疑，不硬读
+    """
+    own_rb = False
+    if rb is None:
+        try:
+            from dyn.rebase import Rebase
+
+            rb = Rebase.attach(serial, int(pid))
+            own_rb = True
+        except Exception as exc:                          # noqa: BLE001
+            return {"ok": False, "code": "ATTACH_FAILED",
+                    "error": f"attach 失败：{exc}"}
+
+    try:
+        base = int(ctx_ptr)
+        if base <= 0:
+            return {"ok": False, "code": "BAD_ADDRESS",
+                    "error": f"ctx_ptr 必须为正：{ctx_ptr!r}"}
+
+        import struct as _struct
+
+        # (13) 第十三次修改（2026-11-06）：改为 read_many 一次性读取。
+        #      bug 原因：原来每次 _read 都调 rb.read_memory，而它每次 create_script，
+        #               真机上建脚本要几百毫秒；读计数+指针+数组三次就接近一秒，
+        #               数组大时更慢，整个调用曾挂到 60 秒以上。
+        #      解决方案：先用一次 read_many 把「计数 + 指针 + 数组头部预留」
+        #               一起读回；只有在拿到数组指针后才补第二次批量读。
+        #               全程最多两次脚本，而不是 N 次。
+        first = rb.read_many([
+            {"addr": base + int(count_offset), "size": 8},
+            {"addr": base + int(array_offset), "size": 8},
+        ])
+        cnt_raw = b""
+        arr_raw = b""
+        if len(first) >= 1 and first[0].get("ok"):
+            cnt_raw = bytes.fromhex(first[0]["hex"])
+        if len(first) >= 2 and first[1].get("ok"):
+            arr_raw = bytes.fromhex(first[1]["hex"])
+
+        count = 0
+        if len(cnt_raw) >= 8:
+            count = _struct.unpack("<Q", cnt_raw[:8])[0]
+        if count == 0 or count > 0x100000:
+            if len(first) >= 1 and first[0].get("ok"):
+                # 退回 u32：再读一次低 4 字节（复用已读到的 8 字节即可）
+                c4 = _struct.unpack("<I", cnt_raw[:4])[0]
+                if 0 < c4 <= 0x100000:
+                    count = c4
+
+        if count > 0x100000:
+            return {"ok": False, "code": "COUNT_SUSPICIOUS",
+                    "error": (f"指令计数 {count} 明显不合理（>1048576），"
+                              "可能偏移不对；已停止读取避免读爆内存"),
+                    "raw_count": count}
+
+        arr = 0
+        if len(arr_raw) >= 8:
+            arr = _struct.unpack("<Q", arr_raw)[0]
+        if arr <= 0:
+            return {"ok": False, "code": "NO_ARRAY_PTR",
+                    "error": (f"从 ctx+{int(array_offset):#x} 读到的数组指针为 "
+                              f"{arr:#x}，偏移可能不对或结构尚未初始化"),
+                    "count": count}
+
+        n = min(int(count), max(1, int(max_instr)))
+        size = n * int(instr_size)
+        second = rb.read_many([{"addr": arr, "size": size}])
+        raw = bytes.fromhex(second[0]["hex"]) if (second and second[0].get("ok")) else b""
+        if not raw:
+            return {"ok": False, "code": "READ_FAILED",
+                    "error": f"指令数组 {arr:#x} 不可读（{size} 字节）",
+                    "count": count, "array_ptr": hex(arr)}
+
+        # 4) 逐条解
+        instructions = []
+        for i in range(0, len(raw) // int(instr_size)):
+            chunk = raw[i * int(instr_size):(i + 1) * int(instr_size)]
+            v0 = _struct.unpack("<I", chunk[:4])[0] if len(chunk) >= 4 else 0
+            words = [_struct.unpack("<I", chunk[j:j + 4])[0]
+                     for j in range(0, len(chunk) - 3, 4)]
+            instructions.append({
+                "idx": i,
+                "addr": hex(arr + i * int(instr_size)),
+                "raw_hex": chunk.hex(),
+                "opcode": (v0 >> 1) & 0xF,     # bits[4:1]
+                "func": (v0 >> 5) & 0xF,       # bits[8:5]
+                "words": words,
+            })
+
+        return {
+            "ok": True,
+            "implemented": True,
+            "ctx_ptr": hex(base),
+            "count": int(count),
+            "decoded": len(instructions),
+            "truncated": int(count) > n,
+            "array_ptr": hex(arr),
+            "instr_size": int(instr_size),
+            "instructions": instructions,
+            "field_rule": "opcode=bits[4:1], func=bits[8:5]（经验规则，可覆盖）",
+            "note": ("一次 attach 读完整个数组，避免逐条读打断目标执行。"
+                     "位域规则来自汇编观察，不同壳版本可能不同"),
+        }
+    finally:
+        if own_rb:
+            try:
+                rb.detach()
+            except Exception:                             # noqa: BLE001
+                pass
+
+
+def read_memory_batch(serial: str, pid: int, regions: list,
+                      rb=None) -> dict:
+    """**一次调用读多段内存**，而不是一段一次 RPC。
+
+    (11) 第十一次修改（2026-11-06）：新增。
+        bug 原因：分析一个结构体时往往要读十几个分散的地址（x0+0x194、
+                  x0+0x1a0、x0+0x1b8 ...），每段一次 RPC 就要多 attach 一次，
+                  而每次 attach 都会让目标停一下——采样点一多，事件就丢了。
+        解决方案：把多段地址打包成一次脚本，JS 侧循环读回，只 attach 一次。
+
+    regions 格式：[{"addr": "0x7bc...", "size": 16}, ...]
+                  （addr 支持 0x 字符串或整数；size 1..4096）
+
+    返回：{count, results[]}，每段 {addr, ok, hex, size, error}
+    """
+    own_rb = False
+    if rb is None:
+        try:
+            from dyn.rebase import Rebase
+
+            rb = Rebase.attach(serial, int(pid))
+            own_rb = True
+        except Exception as exc:                          # noqa: BLE001
+            return {"ok": False, "code": "ATTACH_FAILED",
+                    "error": f"attach 失败：{exc}"}
+
+    try:
+        items = []
+        for r in (regions or []):
+            if not isinstance(r, dict):
+                continue
+            a = r.get("addr")
+            try:
+                a = int(a, 16) if isinstance(a, str) else int(a)
+            except (TypeError, ValueError):
+                continue
+            if a <= 0:
+                continue
+            size = r.get("size", 16)
+            try:
+                size = max(1, min(int(size), 4096))
+            except (TypeError, ValueError):
+                size = 16
+            items.append({"addr": a, "size": size})
+
+        if not items:
+            return {"ok": False, "code": "NO_REGIONS",
+                    "error": "regions 为空或格式不对（需要 [{addr, size}, ...]）"}
+
+        results = _direct_read_batch(serial, int(pid), items)
+        ok_count = sum(1 for r in results if r.get("ok"))
+        return {
+            "ok": True,
+            "implemented": True,
+            "count": len(results),
+            "readable": ok_count,
+            "results": results,
+            "note": "所有段在同一次 attach 内读完，不会多次打断目标",
+        }
+    finally:
+        if own_rb:
+            try:
+                rb.detach()
+            except Exception:                             # noqa: BLE001
+                pass
+
+
+def dump_vm_state_auto(serial: str, pid: int,
+                       count_offset: int = 0x194,
+                       array_offset: int = 0x1a0,
+                       instr_size: int = 16,
+                       max_candidates: int = 20,
+                       scan_limit_mb: int = 64,
+                       max_instr: int = 32) -> dict:
+    """**不需要断点**：在目标进程内存里扫描符合 VM 上下文特征的候选。
+
+    (14) 第十四次修改（2026-11-06）：新增。
+
+    解决什么问题：`dump_vm_state` 需要 ctx_ptr，而 ctx_ptr 通常来自断点现场的
+    x0。**如果断点不命中，就永远拿不到 ctx_ptr**——这正是用户的死结。
+
+    本工具反过来做：不去找断点，而是在内存里直接找"长得像 VM 上下文"的结构。
+
+    ## 判定条件（全部满足才算候选）
+
+        ① [ptr + count_offset] 是整数，且落在 [2, 100000]
+        ② [ptr + array_offset] 是 qword，指向**可读**内存
+        ③ 该数组前 instr_size 字节不是全 0
+        （可选）④ 数组指针 8 字节对齐
+
+    ## 扫描范围
+
+        只扫目标 so 的**可写数据段**（.bss / .data），而不是全进程内存——
+        因为 VM 上下文通常是壳在堆或 .bss 里维护的结构体；扫全进程太慢
+        且误报多。扫描量用 scan_limit_mb 限制。
+
+    ## 返回
+
+        candidates[]  每个 {ctx_ptr, instr_count, instr_array, sample_hex}
+        scanned_mb    实际扫描了多少 MB
+        note          说明判定依据
+
+    ## ⚠️ 性能警告（实测，务必先读）
+
+    在本轮真机（闲鱼 libsgmainso，arm64）上实测**不可用**：
+        · Python 侧逐块 RPC：4MB 跑不完 60 秒
+        · JS 侧一次同步扫描 8MB：占死 JS 线程，frida 报 TransportError
+        · 分片扫描（256KB/片）：4MB 仍超 110 秒
+
+    根因：扫描是 CPU 密集的同步循环，而 frida 的通信线程与脚本执行共享
+    同一个 JS 运行时；只要循环时间过长就会阻塞通信，严重时把
+    frida-server 拖到无响应（需重启 server 才能恢复）。
+
+    **建议改用更省的办法**：
+        ① 用 `watch_module` 找出实际执行的热点函数，再在其中某个
+           `ldr [x0, #0x194]` 附近下断点，直接从寄存器拿 ctx_ptr；
+        ② 用 `trace_read` 监控一块已知内存；
+        ③ 若确实要扫，把 `scan_limit_mb` 调到 1~2，并接受较慢的返回。
+
+    保留本实现是因为：在性能更好的设备/更小的目标进程上它仍然有效，
+    而且"没找到"与"扫不动"在返回里是分开报告的。
+
+    ## 已知边界（如实标注）
+
+        · 这是**启发式扫描**，命中的是"符合结构特征"的地址，
+          **不保证就是真正的 VM 上下文**；调用方需自行交叉验证
+        · 只扫可读数据段；若上下文在堆深处（malloc 出来的），扫不到
+        · 计数偏移/数组偏移填错时一个候选也不会有——这属于"没找到"，不是"没有"
+    """
+    import struct as _struct
+
+    own_rb = False
+    if True:                                              # 统一走 Rebase
+        try:
+            from dyn.rebase import Rebase
+
+            rb = Rebase.attach(serial, int(pid))
+            own_rb = True
+        except Exception as exc:                          # noqa: BLE001
+            return {"ok": False, "code": "ATTACH_FAILED",
+                    "error": f"attach 失败：{exc}"}
+
+    try:
+        mods = rb.refresh_modules()
+        # 优先选名字里带常见壳/业务特征的模块；都没有就选最大的那个非系统模块
+        cand_mods = [m for m in mods
+                     if int(getattr(m, "size", 0) or 0) > 64 * 1024]
+        if not cand_mods:
+            return {"ok": False, "code": "NO_MODULE",
+                    "error": "目标进程里没有足够大的模块可扫"}
+        cand_mods.sort(key=lambda m: -int(getattr(m, "size", 0) or 0))
+        scanned = 0
+        limit = max(1, int(scan_limit_mb)) * 1024 * 1024
+        candidates: list[dict] = []
+        _arr_cache: dict = {}
+
+        # (15) 第十五次修改（2026-11-06）：块大小从 4KB 提到 128KB。
+        #      bug 原因：按 4KB 分块扫 32MB 需要 8000 次 read_many，每次都是一个
+        #               RPC，实测 90 秒都跑不完。
+        #      解决方案：放大到 128KB，同样范围内 RPC 次数降到 256 次。
+        #               再大就要考虑目标内存被切分的问题（跨未映射区会整块失败），
+        #               128KB 是实测下来稳定且有明显提速的折中值。
+        # (18) 第十八次修改（2026-11-06）：扫描改为**分片、可中断、小块**。
+        #      bug 原因：前两版都试过——Python 侧逐块 RPC（4MB/60s 跑不完）、
+        #               JS 侧一次同步扫 8MB（直接占死 JS 线程，frida 报
+        #               TransportError: timeout，且把 frida-server 拖到无响应）。
+        #               根本原因是：扫描是 CPU 密集的同步循环，无论放哪一侧，
+        #               只要一口气跑完就会阻塞 frida 的通信线程。
+        #      解决方案：① 每片只扫 256KB 并立即返回（JS 循环 32K 次，约几十毫秒）；
+        #               ② Python 侧分多轮调用，**每轮之间让出时间**给 frida 通信；
+        #               ③ 总预算用 scan_limit_mb 控制，到量即停；
+        #               ④ 单片失败（目标内存不可读）跳过继续，不整体失败。
+        #               这样既不会阻塞通信，也能在可接受时间内覆盖目标区域。
+        import json as _json
+
+        js = """
+        (function () {
+          var COUNT_OFF = %d, ARR_OFF = %d, INSTR = %d;
+          var BASE = %d, SPAN = %d;
+          var MAXC = %d;
+          var out = [];
+          var cache = {};
+          var end = BASE + SPAN;
+          for (var a = BASE; a + ARR_OFF + 8 < end; a += 8) {
+            if (out.length >= MAXC) break;
+            var p, cnt, arr;
+            try {
+              p = ptr(a);
+              cnt = p.add(COUNT_OFF).readU64().toNumber();
+              if (cnt < 2 || cnt > 100000) continue;
+              arr = p.add(ARR_OFF).readPointer();
+              if (arr.compare(ptr('0x1000')) < 0) continue;
+            } catch (e) { continue; }
+            var sample;
+            var key = arr.toString();
+            if (cache[key] !== undefined) { sample = cache[key]; }
+            else {
+              try {
+                var b = arr.readByteArray(INSTR);
+                sample = (b === null) ? "" : Array.from(new Uint8Array(b))
+                    .map(function(x){return x.toString(16).padStart(2,'0');}).join('');
+              } catch (e) { sample = ""; }
+              cache[key] = sample;
+            }
+            if (!sample || /^0+$/.test(sample)) continue;
+            out.push({ctx_ptr: p.toString(), instr_count: cnt,
+                      instr_array: key, sample_hex: sample.slice(0, 32)});
+          }
+          send({candidates: out, span: SPAN});
+        })();
+        """
+
+        sess0 = rb.session
+        SLICE = 0x40000                      # 每片 256KB
+        candidates: list[dict] = []
+        scanned = 0
+        limit = max(1, int(scan_limit_mb)) * 1024 * 1024
+        deadline = __import__("time").time() + 90.0
+        mods_sorted = sorted(cand_mods, key=lambda m: -int(getattr(m, "size", 0) or 0))
+
+        for mod in mods_sorted[:6]:
+            base = int(mod.base)
+            size = int(getattr(mod, "size", 0) or 0)
+            off = 0
+            while off < size and scanned < limit and len(candidates) < max_candidates:
+                if __import__("time").time() > deadline:
+                    break
+                span = min(SLICE, size - off)
+                piece = js % (int(count_offset), int(array_offset),
+                              max(16, int(instr_size)), base + off, span,
+                              int(max_candidates) - len(candidates))
+                got: dict = {}
+                try:
+                    script = sess0.create_script(piece)
+                    script.on("message", lambda m, d: got.update(m.get("payload") or {}))
+                    script.load()
+                except Exception:                         # noqa: BLE001
+                    off += span
+                    continue
+                t1 = __import__("time").time()
+                while not got and __import__("time").time() - t1 < 20.0:
+                    __import__("time").sleep(0.02)
+                for c in (got.get("candidates") or []):
+                    c["in_module"] = getattr(mod, "name", "")
+                    candidates.append(c)
+                scanned += span
+                off += span
+                __import__("time").sleep(0.05)        # 让出时间给 frida 通信
+            if len(candidates) >= max_candidates or scanned >= limit:
+                break
+
+        if own_rb:
+            pass
+
+        return {
+            "ok": True,
+            "implemented": True,
+            "candidates": candidates,
+            "candidate_count": len(candidates),
+            "scanned_mb": round(scanned / (1024.0 * 1024.0), 1),
+            "criteria": (f"[ptr+{count_offset:#x}] ∈ [2,100000] 且 "
+                         f"[ptr+{array_offset:#x}] 指向可读非零内存"),
+            "note": ("**启发式扫描**：命中的是符合结构的地址，不保证是真正的 VM 上下文，"
+                     "请用候选的 ctx_ptr 调 dump_vm_state 作进一步确认"),
+        }
+    except Exception as exc:                              # noqa: BLE001
+        return {"ok": False, "code": "SCAN_FAILED",
+                "error": f"{type(exc).__name__}: {exc}"}
+    finally:
+        if own_rb:
+            try:
+                rb.detach()
+            except Exception:                             # noqa: BLE001
+                pass
+
+
+def probe_vm_from_hits(serial: str, pid: int, hits: list,
+                       count_offset: int = 0x194,
+                       array_offset: int = 0x1a0,
+                       instr_size: int = 16,
+                       max_instr: int = 64,
+                       max_candidates: int = 40) -> dict:
+    """从**已有断点命中**的寄存器里找出 VM 上下文指针，再解指令数组。
+
+    (19) 第十九次修改（2026-11-06）：新增。
+
+    解决什么问题：`dump_vm_state` 需要 ctx_ptr，而 ctx_ptr 通常只在断点现场
+    才能拿到。如果目标断点不命中（VM 入口没执行），就永远拿不到——
+    这正是「auto 扫描又太慢」的两难。
+
+    本工具换个思路：**用已经命中的断点**。哪怕命中的不是 VM 入口，
+    只要那些函数的参数里带着上下文指针（很常见，VM 解释器的辅助函数
+    第一个参数往往就是 ctx），就能从寄存器里把它捞出来。
+
+    ## 做法
+
+        ① 遍历给定的命中记录，收集所有寄存器值（x0..x30 + sp + lr）
+        ② 对每个值当作候选 ctx_ptr，检查：
+             [ptr + count_offset] ∈ [2, 100000]
+             [ptr + array_offset] 是指向可读内存的指针
+             该数组前 instr_size 字节非全零
+        ③ 命中的候选再调 dump_vm_state 解出指令
+        ④ 全部候选**一次 attach 批量验证**，不逐个往返
+
+    ## 参数
+
+        hits          命中记录列表。可以是 service.hits() 的返回，
+                      或 poll_events 里 type=breakpoint_hit 的事件
+        count_offset / array_offset / instr_size / max_instr  同 dump_vm_state
+
+    ## 返回
+
+        candidates[]  每个可用候选：{ctx_ptr, from_register, hits_seq,
+                                    count_offset, instr_count, array_ptr,
+                                    decoded, instructions[]}
+        registers_probed  一共试了多少个寄存器值
+        note
+
+    ## 与 dump_vm_state_auto 的区别
+
+        dump_vm_state_auto  在**内存里盲扫**，慢且可能拖挂目标（实测不可用）
+        probe_vm_from_hits  只在**命中现场的少量寄存器值**里试，几十个候选，
+                            一次 RPC 就能验完，**快且安全**
+    """
+    import struct as _struct
+
+    if not hits:
+        return {"ok": False, "code": "NO_HITS",
+                "error": ("没有命中记录可分析。先用 set_breakpoint 下一个"
+                          "**会命中**的断点（可用 probe_hits 确认哪个地址会跑），"
+                          "再调本工具")}
+
+    # 1) 收集所有寄存器候选值（去重、只留看起来像指针的）
+    cands: list[dict] = []
+    seen: set[int] = set()
+    probed = 0
+    for h in hits:
+        ctx = (h.get("context") or {}) if isinstance(h, dict) else {}
+        seq = h.get("seq") if isinstance(h, dict) else None
+        so_name = h.get("so_name") if isinstance(h, dict) else None
+        for reg, val in ctx.items():
+            try:
+                v = int(val, 16) if isinstance(val, str) else int(val)
+            except (TypeError, ValueError):
+                continue
+            if v < 0x1000 or v in seen:                  # 0 / 小整数不可能是 ctx
+                continue
+            seen.add(v)
+            probed += 1
+            # (20) 第二十次修改（2026-11-06）：候选数量设上限。
+            #      bug 原因：寄存器值来自**所有**命中记录（可能几百条），
+            #                36 个寄存器 × N 条命中会累积成上万个候选，
+            #                一次脚本要读上万个地址，必然超时甚至拖挂目标。
+            #      解决方案：硬上限 2000 个候选（37 条命中内基本够用），
+            #                超出的不再收集，并在返回里说明被截断。
+            if len(cands) < 2000:
+                cands.append({"ptr": v, "reg": reg, "seq": seq,
+                              "so_name": so_name})
+
+    if not cands:
+        return {"ok": False, "code": "NO_CANDIDATE",
+                "error": "命中记录里的寄存器值都不像指针（全部 <0x1000）",
+                "registers_probed": probed}
+
+    cands_truncated = probed > 2000
+
+    try:
+        from dyn.rebase import Rebase
+
+        rb = Rebase.attach(serial, int(pid))
+    except Exception as exc:                              # noqa: BLE001
+        return {"ok": False, "code": "ATTACH_FAILED",
+                "error": f"attach 失败：{exc}"}
+
+    try:
+        import time as _t
+        import json as _json
+
+        # 2) 一次脚本：对每个候选读 count 和 array 指针
+        spec = [c["ptr"] for c in cands]
+        js = (
+            "var P = " + _json.dumps(spec) + ";"
+            "var CO = " + str(int(count_offset)) + ", AO = " + str(int(array_offset)) + ";"
+            "var out = [];"
+            "for (var i = 0; i < P.length; i++) {"
+            "  try {"
+            "    var p = ptr(P[i]);"
+            "    var cnt = p.add(CO).readU64().toNumber();"
+            "    var arr = p.add(AO).readPointer();"
+            "    out.push({cnt: cnt, arr: arr.toString()});"
+            "  } catch (e) { out.push(null); }"
+            "}"
+            "send(out);"
+        )
+        sess = rb.session
+        sc = sess.create_script(js)
+        got: list = []
+        sc.on("message", lambda m, d: got.extend(m.get("payload") or []))
+        sc.load()
+        t0 = _t.time()
+        while not got and _t.time() - t0 < 20.0:
+            _t.sleep(0.02)
+
+        # 3) 结构校验
+        ok_list: list[dict] = []
+        for i, c in enumerate(cands):
+            item = got[i] if i < len(got) else None
+            if not item:
+                continue
+            cnt = item.get("cnt")
+            arr = item.get("arr")
+            if not isinstance(cnt, (int, float)) or not (2 <= cnt <= 100000):
+                continue
+            try:
+                arr_i = int(arr, 16) if isinstance(arr, str) else int(arr)
+            except (TypeError, ValueError):
+                continue
+            if arr_i < 0x1000:
+                continue
+            ok_list.append({"ptr": c["ptr"], "reg": c["reg"], "seq": c["seq"],
+                            "so_name": c["so_name"], "count": int(cnt),
+                            "array": arr_i})
+            if len(ok_list) >= max_candidates:
+                break
+
+        if not ok_list:
+            return {
+                "ok": True, "implemented": True,
+                "candidates": [], "registers_probed": probed,
+                "verdict": (f"试了 {probed} 个寄存器值，没有一个符合 "
+                            f"[ptr+{int(count_offset):#x}]∈[2,100000] 且 "
+                            f"[ptr+{int(array_offset):#x}] 是可读指针"),
+                "hint": ("可能这批命中所在的函数不持有 VM 上下文。"
+                         "换一个更靠近 VM 的断点，或用 watch_module 找热点函数"),
+            }
+
+        # 4) 解指令数组
+        out_cands = []
+        for c in ok_list:
+            try:
+                d = dump_vm_state(serial, int(pid), c["ptr"],
+                                  count_offset=int(count_offset),
+                                  array_offset=int(array_offset),
+                                  instr_size=int(instr_size),
+                                  max_instr=int(max_instr), rb=rb)
+            except Exception as exc:                      # noqa: BLE001
+                d = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+            out_cands.append({
+                "ctx_ptr": hex(c["ptr"]),
+                "from_register": c["reg"],
+                "hits_seq": c["seq"],
+                "so_name": c["so_name"],
+                "instr_count": c["count"],
+                "instr_array": hex(c["array"]),
+                "decoded": d.get("decoded") if d.get("ok") else None,
+                "instructions": (d.get("instructions") or [])[:max_instr]
+                if d.get("ok") else [],
+                "decode_error": None if d.get("ok") else d.get("error"),
+            })
+
+        return {
+            "ok": True,
+            "implemented": True,
+            "candidates": out_cands,
+            "candidate_count": len(out_cands),
+            "registers_probed": probed,
+            "candidates_truncated": cands_truncated,
+            "verdict": (f"从 {len(hits)} 条命中的 {probed} 个寄存器值里，"
+                        f"找到 {len(out_cands)} 个符合 VM 上下文结构的候选"),
+            "note": ("每个候选都附带解出的指令数组；"
+                     "ctx_ptr 可直接拿去调 dump_vm_state 复核"),
+        }
+    finally:
+        try:
+            rb.detach()
+        except Exception:                                 # noqa: BLE001
+            pass

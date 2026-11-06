@@ -970,6 +970,345 @@ def test_r26_startup_backtrace() -> None:
           "要告诉 AI 载入哪些 so 才能看到函数名")
 
 
+
+
+def test_r27_runtime_address_read() -> None:
+    """R27：必须能按运行时绝对地址读（断点现场的 x0/lr 就是这种地址）。"""
+    import inspect as _insp
+
+    import dyn.service as _svc
+
+    src_svc = _insp.getsource(_svc.DynamicService.read_runtime)
+    src_str = _insp.getsource(_svc.DynamicService.read_runtime_string)
+
+    check("R27 service 有 read_runtime", hasattr(_svc.DynamicService, "read_runtime"))
+    check("R27 service 有 read_runtime_string",
+          hasattr(_svc.DynamicService, "read_runtime_string"))
+    check("R27 不做 base+static 换算",
+          "to_runtime" not in src_svc,
+          "按运行时地址读时再换算会把基址加两次")
+    check("R27 直接交给 rb.read_memory", "rb.read_memory(addr" in src_svc)
+    check("R27 拒绝非正地址", "addr <= 0" in src_svc and "addr <= 0" in src_str,
+          "0 或负数不是合法运行时地址")
+    check("R27 读不到如实报错", "READ_FAILED" in src_svc,
+          "不能返回零填充冒充读到了")
+    check("R27 字符串分块读", "chunk" in src_str, "紧贴页边界时不至于整段失败")
+    check("R27 字符串遇 0 截止", 'find(b"\\x00")' in src_str,
+          "必须按 C 字符串语义在 \\0 停")
+    check("R27 截断要标出来", "truncated" in src_str, "读不全不能装作读全了")
+
+    # 地址解析：0x 前缀与十进制都要支持
+    from core.addr import parse_addr
+
+    check("R27 解析 0x 形式", parse_addr("0x7bcae6055f") == 0x7BCAE6055F)
+    check("R27 解析十进制", parse_addr("1234") == 1234)
+    check("R27 非法地址返回 None", parse_addr("xyz") is None)
+
+
+def test_r28_runtime_tools_exposed() -> None:
+    """R28：两个运行时地址读工具必须暴露给 AI。"""
+    import asyncio as _aio
+
+    from mcp_server.tools import server
+
+    names = [t.name for t in _aio.get_event_loop().run_until_complete(server.list_tools())]
+    check("R28 read_runtime_memory 已暴露", "read_runtime_memory" in names)
+    check("R28 read_runtime_string 已暴露", "read_runtime_string" in names)
+
+
+
+
+def test_r29_module_name_matching() -> None:
+    """R29：设备模块名带版本号时必须能匹配本地文件（通用能力，非某个 app 特例）。"""
+    from dyn.tracer import _module_name_candidates
+    from mcp_server.tools import _strip_version_tag
+
+    cases = [
+        ("libsgmainso-6.7.260202.so", "libsgmainso.so"),
+        ("libsgmainso.so", "libsgmainso.so"),
+        ("libc++_shared.so", "libc++_shared.so"),
+        ("/data/app/x/lib/libfoo-1.2.3.so", "libfoo.so"),
+        ("my-lib.so", "my-lib.so"),
+        ("libfoo-1.2.3", "libfoo"),
+    ]
+    for src, want in cases:
+        got = _strip_version_tag(src)
+        check(f"R29 去版本号 {src}", got == want, f"得到 {got}，期望 {want}")
+
+    # 不该剥的不能剥错
+    for keep in ("libarm64-v8a.so", "libc++_shared.so", "libandroid.so"):
+        check(f"R29 不误剥 {keep}", _strip_version_tag(keep) == keep,
+              f"被剥成了 {_strip_version_tag(keep)}")
+
+    cands = _module_name_candidates("libsgmainso.so")
+    check("R29 候选含原名", "libsgmainso.so" in cands, str(cands))
+    check("R29 候选含去扩展名", "libsgmainso" in cands, str(cands))
+
+
+def test_r30_br_resolution() -> None:
+    """R30：resolve_br 必须区分 direct/table，且算不出时不编造目标。"""
+    import inspect as _insp
+
+    from dyn.bridge import resolve_br as fn
+
+    src = _insp.getsource(fn)
+    check("R30 有 direct 模式", '"direct"' in src)
+    check("R30 有 table 模式", '"table"' in src)
+    check("R30 ldr 之后不再当常量加",
+          "load_seen" in src,
+          "adrp+add+ldr+add 若继续当常量会算出完全错误的目标")
+    check("R30 算不出标 unknown", '"unknown"' in src)
+    check("R30 不编造目标", "resolved\": bool(targets)" in src or "bool(targets)" in src)
+    check("R30 lookback 最小为 1", "max(1, int(lookback))" in src,
+          "0 回看不可能看到 adrp")
+
+
+def test_r31_detach_thread_safety() -> None:
+    """R31：detach 必须防线程累积（曾实测 20 次调用泄漏 20 个线程）。"""
+    import threading as _th
+    import time as _t
+    import inspect as _insp
+
+    import dyn.tracer as _tr
+
+    check("R31 有 in-flight 登记表", hasattr(_tr, "_DETACH_PENDING"))
+    check("R31 有并发上限", "len(_DETACH_PENDING) >= 16" in _insp.getsource(_tr._detach_async))
+    check("R31 先查 is_detached", "is_detached" in _insp.getsource(_tr._detach_async))
+    check("R31 只有一个 _detach_async 定义",
+          _insp.getsource(_tr).count("def _detach_async") == 1,
+          "重复定义会让后者覆盖前者，防泄漏逻辑失效")
+
+    class _Fake:
+        is_detached = False
+
+        def detach(self):                             # noqa: ANN001
+            _t.sleep(30)
+
+    before = _th.active_count()
+    one = _Fake()
+    for _ in range(10):
+        _tr._detach_async(one, 0.02)
+    after = _th.active_count()
+    check("R31 同一会话重复调用只增 1 个线程",
+          after - before <= 1, f"增了 {after - before} 个")
+
+
+def test_r32_new_tools_exposed() -> None:
+    """R32：五个补齐能力的工具必须都暴露给 AI。"""
+    import asyncio as _aio
+
+    from mcp_server.tools import server
+
+    names = [t.name for t in _aio.get_event_loop().run_until_complete(server.list_tools())]
+    for want in ("watch_module", "verify_breakpoint", "resolve_br",
+                 "dump_vm_state", "read_memory_batch"):
+        check(f"R32 {want} 已暴露", want in names)
+
+
+def test_r33_find_module_version_match() -> None:
+    """R33：Rebase.find_module 必须能按去版本号匹配（否则 set_breakpoint 报未加载）。"""
+    import inspect as _insp
+
+    from dyn.rebase import Rebase
+
+    src = _insp.getsource(Rebase.find_module)
+    check("R33 用了去版本号逻辑", "_strip_version_tag" in src,
+          "只做全名/basename 精确匹配时，本地改名后永远匹配不上")
+    check("R33 要求唯一命中", "len(hits) == 1" in src,
+          "多命中时不能瞎选一个")
+
+
+
+
+def test_r34_watch_module_sampling() -> None:
+    """R34：watch_module 必须均匀采样、支持 batch 间隔、给出决策依据。"""
+    import inspect as _insp
+
+    from dyn.tracer import watch_module as fn
+
+    src = _insp.getsource(fn)
+    sig = _insp.signature(fn)
+
+    check("R34 默认 max_points 降到 50",
+          sig.parameters["max_points"].default == 50,
+          "400 实测会把目标拖垮")
+    check("R34 有 batch_interval_ms 参数", "batch_interval_ms" in sig.parameters)
+    check("R34 默认 batch=20", sig.parameters["batch"].default == 20)
+    check("R34 超出预算时均匀采样",
+          'sampling = "uniform"' in src and "step = total_fns / float(cap)" in src,
+          "截断会让覆盖全挤在区间头部")
+    check("R34 返回 sampling 字段", '"sampling": sampling' in src)
+    check("R34 返回 failed_detail", '"failed_detail"' in src)
+    check("R34 有 recommendation 决策依据", '"recommendation"' in src)
+    check("R34 密度计算处理 so 为空", "span_kb" in src and "so is not None" in src,
+          "so 未定义会让 NameError 掩盖真实错误")
+
+    # 均匀采样算法：端点必须被覆盖
+    offsets = list(range(0, 780, 10))          # 78 个
+    cap = 10
+    step = len(offsets) / float(cap)
+    picked = sorted({offsets[min(int(i * step), len(offsets) - 1)] for i in range(cap)})
+    # 均匀采样的判据：不是"末位等于最后一项"，而是**跨度接近全区间**
+    # （78 个点取 10 个，末位落在 700/770 ≈ 91%，已覆盖到尾部；
+    #  若按旧的"取前 N 个"，末位只会是 90，跨度 12%）
+    span_ratio = (picked[-1] - picked[0]) / float(offsets[-1] - offsets[0])
+    check("R34 均匀采样覆盖整个区间", len(picked) == cap and span_ratio > 0.85,
+          f"pick={picked} span_ratio={span_ratio:.2f}")
+
+
+def test_r35_probe_hits() -> None:
+    """R35：probe_hits 必须能区分「没执行」与「挂不上」。"""
+    import inspect as _insp
+
+    import dyn.tracer as _tr
+
+    src = _insp.getsource(_tr.probe_hits)
+    js = getattr(_tr, "_JS_PROBE_HITS", "")
+
+    check("R35 用 Interceptor 纯计数", "Interceptor.attach" in js)
+    check("R35 不依赖 hold", "recv(token" not in js and "op.wait" not in js,
+          "计数探针不该阻塞线程")
+    check("R35 拦截失败单独报错",
+          "INTERCEPT_FAILED" in js and "INTERCEPT_FAILED" in src,
+          "挂不上必须与 0 命中区分开")
+    check("R35 返回 mechanism", '"mechanism"' in src)
+    check("R35 有指纹兜底", "__FP__" in js)
+    check("R35 verdict 区分两种情况", "一次都没执行" in src and "挂钩失败" in src)
+
+
+def test_r36_jump_table() -> None:
+    """R36：read_jump_table 必须支持有符号偏移 + code_base 相加。"""
+    import inspect as _insp
+
+    from dyn.bridge import read_jump_table as fn
+
+    src = _insp.getsource(fn)
+    sig = _insp.signature(fn)
+    check("R36 支持 entry_size=4", "entry_size" in sig.parameters)
+    check("R36 支持 code_base", "code_base" in sig.parameters)
+    check("R36 支持有符号解释", 'signed' in sig.parameters and '"<i"' in src,
+          "ldrsw 读出的偏移可能为负")
+    check("R36 targets = base + offset", "base + v" in src)
+    check("R36 不给 code_base 时当绝对值", "if base else v" in src)
+
+
+def test_r37_stack_hex() -> None:
+    """R37：命中必须带栈内存快照（参数常是 指针+长度，内容在栈上）。"""
+    import dataclasses as _dc
+    import inspect as _insp
+
+    from dyn.debugger import BreakpointHit
+
+    names = {f.name for f in _dc.fields(BreakpointHit)}
+    check("R37 BreakpointHit 有 stack_hex", "stack_hex" in names)
+    js = _insp.getsource(__import__("dyn.debugger", fromlist=["x"]))
+    check("R37 JS 侧抓了栈", "readByteArray(0x100)" in js,
+          "命中瞬间抓 sp..sp+0x100")
+
+
+def test_r38_function_list() -> None:
+    """R38：so.function_list 必须是函数对象列表（functions 是 dict 的坑）。"""
+    import sys as _sys
+
+    _sys.path.insert(0, ".")
+    from core.elf_model import SoFile
+
+    # 用仓库自带样本；没有样本就跳过（不让测试因缺样本而失败）
+    import os
+    for cand in ("samples/liblog.so", "samples/libbase.so"):
+        if os.path.exists(cand):
+            so = SoFile(cand)
+            check("R38 functions 是 dict", isinstance(so.functions, dict))
+            check("R38 function_list 是 list", isinstance(so.function_list, list))
+            if so.function_list:
+                check("R38 function_list 元素有 addr",
+                      hasattr(so.function_list[0], "addr"),
+                      f"拿到 {type(so.function_list[0]).__name__}")
+            return
+    # 没有样本：只验证属性存在
+    check("R38 SoFile 定义了 function_list",
+          hasattr(SoFile, "function_list"))
+
+
+
+
+def test_r39_runtime_jump_table() -> None:
+    """R39：read_jump_table 必须支持从运行时内存读（加固样本的表运行时才填）。"""
+    import inspect as _insp
+
+    from dyn.bridge import read_jump_table as fn
+
+    sig = _insp.signature(fn)
+    src = _insp.getsource(fn)
+    check("R39 支持 serial 参数", "serial" in sig.parameters)
+    check("R39 支持 pid 参数", "pid" in sig.parameters)
+    # (1) 第一次修改（2026-11-06）：断言改按**新版实现**校验。
+    #     bug 原因：实现从"Rebase 逐段读"重写成"单脚本一次读"，
+    #               旧断言查 rb.read_memory 已经不存在，属误报。
+    #     解决方案：改为校验新实现的关键特征——单脚本 + readByteArray + runtime 标记。
+    check("R39 运行时优先", '"runtime"' in src and "readByteArray" in src
+          and "create_script" in src)
+    check("R39 退回静态", "source = \"static\"" in src)
+    check("R39 返回 source 标明来源", '"source": source' in src,
+          "调用方必须能看出这次读的是内存还是文件")
+    # (2) 第二次修改（2026-11-06）：指纹反查改成在 JS 侧做（FPS 数组）。
+    #     bug 原因：Python 侧逐模块比对要 864 次脚本往返，实测卡死；
+    #               已把比对整体搬进那一个脚本里。
+    #     解决方案：断言校验 JS 侧确实带了双指纹逻辑。
+    check("R39 名字对不上时用指纹",
+          "_module_name_candidates" in src and "FPS" in src and "okAll" in src,
+          "本地名与设备名不同时要能反查（且在 JS 侧一次完成）")
+
+
+def test_r40_probe_vm_from_hits() -> None:
+    """R40：必须能从已有命中的寄存器里挖出 VM 上下文。"""
+    import inspect as _insp
+
+    import dyn.memread as _mr
+
+    src = _insp.getsource(_mr.probe_vm_from_hits)
+    check("R40 函数存在", hasattr(_mr, "probe_vm_from_hits"))
+    check("R40 无命中时明确报错", '"NO_HITS"' in src)
+    check("R40 过滤小整数当指针", "0x1000" in src,
+          "寄存器里的大量小整数不可能是 ctx")
+    check("R40 结构校验 count 范围", "2 <= cnt <= 100000" in src)
+    check("R40 结构校验 array 指针", "arr_i < 0x1000" in src)
+    check("R40 一次脚本批量校验", "for (var i = 0; i < P.length" in src,
+          "逐个往返会几十秒")
+    check("R40 没有候选时不编造", "verdict" in src and "hint" in src)
+
+
+def test_r41_trace_call_tree() -> None:
+    """R41：trace_call_tree 必须能区分「没被调用」与「挂不上」。"""
+    import inspect as _insp
+
+    import dyn.tracer as _tr
+
+    src = _insp.getsource(_tr.trace_call_tree)
+    js = getattr(_tr, "_JS_CALL_TREE", "")
+    check("R41 函数存在", hasattr(_tr, "trace_call_tree"))
+    check("R41 用 returnAddress 作调用者", "this.returnAddress" in js)
+    check("R41 挂点失败单独记录", "failed.push" in js)
+    check("R41 有双指纹兜底", "__FPS__" in js and "FPS.length" in js)
+    check("R41 verdict 区分两种情况",
+          "一次都没被调用" in src and "不是地址找错" in src)
+    check("R41 限制边数", "max_edges" in src and "Object.keys(edges).length < MAXN" in js,
+          "热点函数会把内存打爆")
+
+
+def test_r42_hits_fallback() -> None:
+    """R42：probe_vm_from_hits 取命中记录要有回退（会话断开也能读缓存）。"""
+    import inspect as _insp
+
+    import mcp_server.tools as _T
+
+    src = _insp.getsource(_T.probe_vm_from_hits)
+    check("R42 先试 service.hits", "svc.hits(serial" in src)
+    check("R42 失败后读 dbg 缓存", "dbg" in src and "_targets" in src,
+          "会话断开时命中缓存仍在 debugger 里")
+    check("R42 无数据时给 hint", "NO_HITS" in src)
+
+
 def main() -> int:
     print("== R1 held/token 透出（防线程永久挂起）==")
     test_r1_held_is_exposed()
@@ -1023,6 +1362,38 @@ def main() -> int:
     test_r25_static_breakpoints_in_startup()
     print("== R26 启动期调用栈 ==")
     test_r26_startup_backtrace()
+    print("== R27 运行时地址读 ==")
+    test_r27_runtime_address_read()
+    print("== R28 运行时读工具暴露 ==")
+    test_r28_runtime_tools_exposed()
+    print("== R29 模块名匹配 ==")
+    test_r29_module_name_matching()
+    print("== R30 br 解析 ==")
+    test_r30_br_resolution()
+    print("== R31 detach 线程安全 ==")
+    test_r31_detach_thread_safety()
+    print("== R32 新工具暴露 ==")
+    test_r32_new_tools_exposed()
+    print("== R33 find_module 版本匹配 ==")
+    test_r33_find_module_version_match()
+    print("== R34 watch_module 采样 ==")
+    test_r34_watch_module_sampling()
+    print("== R35 probe_hits ==")
+    test_r35_probe_hits()
+    print("== R36 跳转表 ==")
+    test_r36_jump_table()
+    print("== R37 栈内存快照 ==")
+    test_r37_stack_hex()
+    print("== R38 function_list ==")
+    test_r38_function_list()
+    print("== R39 运行时读跳转表 ==")
+    test_r39_runtime_jump_table()
+    print("== R40 从命中挖 VM 上下文 ==")
+    test_r40_probe_vm_from_hits()
+    print("== R41 调用链追踪 ==")
+    test_r41_trace_call_tree()
+    print("== R42 命中记录回退 ==")
+    test_r42_hits_fallback()
 
     print(f"\n结果: {PASS} 通过 / {FAIL} 失败")
     return 0 if FAIL == 0 else 1

@@ -231,6 +231,51 @@ PYINSTALLER_CONFIG_DIR=$PWD/.pyinstaller .venv/bin/pyinstaller packaging/mda.spe
 open dist/MDA.app
 ```
 
+### 打包后必须自检：确认依赖真的进包了
+
+**只用 `.venv/bin/pyinstaller` 打包**。用错 Python 就会出现「打包成功、运行时缺模块」——
+因为 PyInstaller 只收集**打包所用解释器**能 import 到的依赖。
+
+这台机器上有两个容易混淆的 Python：
+
+| 路径 | 版本 | 有 pyelftools |
+|---|---|---|
+| `/usr/bin/python3` | 3.9.6 | ❌（macOS 系统自带） |
+| `/opt/homebrew/bin/python3.11` | 3.11.15 | 看装没装 |
+| `.venv/bin/python` | 3.11.15 | ✅（基于 homebrew） |
+
+打包日志里出现 `/opt/homebrew/Cellar/python@3.11/...` 是**正常的**——那是
+homebrew Python 的框架路径，`.venv` 就建在它上面，并不代表用了系统 python3。
+真正的判据是日志里这一行：
+
+```
+Python environment: /Users/<you>/.../mda/.venv
+```
+
+**自检命令**（不打开 GUI，直接问打包版它自己加载了什么）：
+
+```bash
+# 注意一定要加 sleep：stdio 模式下 stdin 一 EOF 进程就退出，长调用来不及回
+( printf '%s\n' \
+'{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}' \
+'{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+'{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"run_script","arguments":{"code":"import sys,importlib.util; m=importlib.util.find_spec(\"elftools\"); result={\"python\":sys.version.split()[0],\"frozen\":getattr(sys,\"frozen\",False),\"elftools\":(m.origin if m else \"MISSING\")}"}}}' ; sleep 6 ) \
+| ./dist/MDA.app/Contents/MacOS/MDA --mcp-stdio 2>/dev/null | grep '"id":2'
+```
+
+期望看到（`python` 是 3.11.x、`frozen` 为 true、`elftools` 指向 app 包内）：
+
+```json
+{"python":"3.11.15","frozen":true,"elftools":".../MDA.app/Contents/Frameworks/elftools/__init__.py"}
+```
+
+看到 `"elftools":"MISSING"` 就说明打错了 Python，必须用 `.venv/bin/pyinstaller` 重打。
+
+> 实测记录（2026-11-05，0.2.3）：曾怀疑「用系统 python3 打包导致缺 pyelftools」，
+> 查证为误判——打包日志是 `.venv`，app 内探测到 3.11.15 且 elftools 在
+> `Contents/Frameworks/elftools/`，`load_so` 对 2.8MB 壳样本正常返回 3007 个函数。
+> 误解来源是日志里 homebrew 的 Python 路径看着像「系统的」。
+
 产物 `dist/MDA.app`（约 154MB，其中 frida 运行库占 94MB）；分发包建议压成 zip（约 67MB）：
 
 ```bash

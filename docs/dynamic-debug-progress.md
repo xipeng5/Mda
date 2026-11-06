@@ -1509,3 +1509,291 @@ test_regressions 152 / 0   ← 142 → 152（新增 R26，10 项检查）
 ```
 
 工具仍 **62** 个。
+
+---
+
+## 二十二、打包依赖排查（2026-11-05）
+
+### 22.1 提出的疑问
+
+> 「app 是用系统 python3 打包的，而 pyelftools 只装在 .venv 里」
+
+如果成立，后果是致命的：mda 的 ELF 解析全靠 pyelftools，缺了它 `load_so` 直接不可用。
+
+### 22.2 查证：不成立
+
+**证据一：打包日志**
+
+```
+59  INFO: Python: 3.11.15
+71  INFO: Python environment: /Users/waterclean/Desktop/ProJect/mac/mda/.venv
+```
+
+PyInstaller 用的是 `.venv`，不是系统 Python。
+
+**证据二：`.venv` 的基础解释器**
+
+```
+home = /opt/homebrew/opt/python@3.11/bin
+version = 3.11.15
+```
+
+`.venv` 建在 homebrew 的 3.11 上，**不是** macOS 自带的 `/usr/bin/python3`（那个是 3.9.6）。
+
+**证据三：打包版内部探测**（`run_script` 在 app 里跑）
+
+```json
+{"python": "3.11.15",
+ "frozen": true,
+ "elftools": ".../MDA.app/Contents/Frameworks/elftools/__init__.py"}
+```
+
+**证据四：实功能验证**
+
+`load_so` 对 2.8MB 壳样本返回 `{"loaded": "libsgmainso.so", "functions": 3007}`
+——能解析 ELF，说明依赖在包里。
+
+### 22.3 误解从哪来
+
+打包日志里出现 `/opt/homebrew/Cellar/python@3.11/...`，看着像"系统的"，
+实际是 homebrew Python 的框架路径，`.venv` 就建在它上面。
+
+这台机器上有三个 Python 容易混：
+
+| 路径 | 版本 | 有 pyelftools |
+|---|---|---|
+| `/usr/bin/python3` | 3.9.6 | ❌ macOS 自带 |
+| `/opt/homebrew/bin/python3.11` | 3.11.15 | 看装没装 |
+| `.venv/bin/python` | 3.11.15 | ✅ 基于 homebrew |
+
+### 22.4 已落到 README 的自检方法
+
+在 README「打包」章节加了**打包后自检命令**：用 `--mcp-stdio` 直接问打包版
+自己加载了什么，期望 `python=3.11.x` / `frozen=true` / `elftools` 指向 app 包内。
+看到 `MISSING` 就说明打错了 Python。
+
+顺带记一个坑：stdio 模式下 stdin 一 EOF 进程就退出，**长调用来不及回**，
+所以自检命令必须包一层 `( ... ; sleep 6 )`，否则只能拿到握手响应。
+
+### 22.5 一个需要澄清的矛盾：spec 被改过，但 0.2.3 包并不缺模块
+
+排查中发现 `packaging/mda.spec` 被修改（不是我改的，另有 `mda.spec.bak` 备份，
+时间 17:48，晚于我 17:28 打包）。改动内容是显式声明三个模块：
+
+```python
++ ["dyn.tracer", "dyn.bridge", "dyn.memread"]
+```
+
+注释给出的理由是：
+
+> `collect_submodules("dyn")` 在 PyInstaller 6.22.3 下虽然返回 11 个子模块，
+> 但 `dyn.tracer` / `dyn.bridge` / `dyn.memread` 分析阶段被跳过（PYZ 里只有 8 个），
+> 导致运行期 `trace_*` / `suggest_breakpoints` / `read_typed` 报 MODULE_UNAVAILABLE。
+
+**但实测 0.2.3 的包并不缺模块**（用 `run_script` 在打包版内部探测）：
+
+```json
+{"dyn.tracer": "OK", "dyn.bridge": "OK", "dyn.memread": "OK",
+ "dyn.stepper": "OK", "dyn.frida_server": "OK", "dyn.pending": "OK"}
+```
+
+而这个包是我在 **17:28 用改前的 spec** 打出来的。
+
+所以三者必有一处与实际不符，目前无法确定是哪一处：
+
+1. `collect_submodules("dyn")` 其实能正常收集（注释的判断有误）；
+2. 或者漏收集只发生在某些条件下（增量构建、缓存、特定 PyInstaller 小版本）；
+3. 或者用户看到的 `dyn.memread 不可用` 来自更早的 0.2.1 / 0.2.2 包。
+
+**已确认的事实**：
+- 0.2.3 包内六个 dyn 模块齐全，`load_so` 可解析 2.8MB 壳样本（3007 函数）
+- 打包用的是 `.venv` 的 Python 3.11.15（不是系统 python3 3.9.6）
+- pyelftools 在包内 `Contents/Frameworks/elftools/`
+
+**待确认**：显式声明那三行是否必要。建议下次打包后跑一次上面的模块自检；
+若显式声明与不声明结果相同，说明是 `collect_submodules` 的偶发问题，
+保留显式声明（成本为零，可防回归）比删掉更稳妥。
+
+---
+
+## 二十三、按运行时地址读内存（2026-11-05）
+
+### 23.1 问题是怎么暴露的
+
+断点命中后，现场里最有价值的往往是 `x0` / `x1` / `lr` / `sp` 这些**运行时绝对地址**。
+但当时所有读内存的工具都只接受**静态地址**：
+
+```
+read_process_memory(so_name, static_addr)     内部 base + static
+read_typed(..., source="runtime")             同上，也要静态地址
+```
+
+拿现场的 `x0` 去读，只会得到：
+
+```
+ADDR_UNMAPPED: 静态地址 0x7d270ed5cc 超出 libc.so 的范围 [0, 0x31e000)；
+source='runtime' 的 addr 必须是静态地址
+```
+
+而 `x0` 指向的通常是**堆上的对象**（字符串、结构体），根本不在任何 so 里，
+换算这条路走不通。
+
+### 23.2 顺带澄清一个之前的错误判断
+
+原以为「hold 挂住后就不能读内存」，于是要靠「命中瞬间抢时间读」。
+实测否定了这个担心：
+
+```
+命中并挂起 | tid: 23706 | x0 = 0x1b48
+【挂起状态下读内存】耗时 0.02s
+结果: {"hex": "f1f11416fd7bbea9f30b00f9fd030091", "size": 16}
+```
+
+**挂起期间读内存完全可用**。真实原因不是 `recv().wait()` 会让出执行权
+（`dyn/debugger.py` 第 917 行原注释的说法），而是 `dyn/rebase.py` 的
+`read_memory` **每次调用都新建一个独立脚本**，压根不经过被挂住的那个调试脚本。
+
+原因写错了，结论碰巧对。这条注释已按实测更正。
+
+### 23.3 新增两个工具
+
+| 工具 | 用途 |
+|---|---|
+| `read_runtime_memory(serial, pid, runtime_addr, size)` | 按运行时绝对地址读原始字节 |
+| `read_runtime_string(serial, pid, runtime_addr, max_length)` | 按运行时绝对地址读 C 字符串 |
+
+实现要点：
+- **不做 base+static 换算**（再换算一次会把基址加两遍）
+- 直接交给 `rb.read_memory(addr, size)`，它内部就是 `ptr(addr)`
+- 字符串**分 64 字节块读**：目标紧贴页边界时不会整段失败
+- 遇 `\0` 停、读不全标 `truncated`，**绝不伪造内容**
+
+### 23.4 实测（systemui，open 断点，hold 挂起中）
+
+```
+断点 open@0x977b8 → 命中并挂起
+x0 = 0x7bcae6055f                      ← 运行时绝对地址
+
+read_runtime_string(x0) → "/data/system/mcd/df"
+  {"length": 19, "terminated": true, "truncated": false,
+   "raw_hex": "2f646174612f73797374656d2f6d63642f6466"}
+
+read_runtime_memory(x0, 16) → 2f646174612f73797374656d2f6d6364
+                              （就是 "/data/system/mcd"）
+```
+
+**在挂起状态下直接读，不需要抢时机。**
+
+### 23.5 工具数与回归
+
+工具 **62 → 64**。
+
+```
+test_e2e          14 / 0
+test_shell_sample  9 / 0
+test_dyn_runtime  26 / 0
+test_regressions 166 / 0   ← 152 → 166（新增 R27/R28，14 项检查）
+合计             215 / 0
+```
+
+---
+
+## 二十四、2026-11-06 能力升级（按自查想法）
+
+### 24.1 一个影响全局的性能炸弹：script.unload()
+
+自查时对比发现：
+
+```
+手写 frida: create_script + enumerateModules  = 0.0 秒
+Rebase.refresh_modules()                      = 25.0 秒
+```
+
+同一个操作差 25 秒。定位到 `dyn/rebase.py` 的 `refresh_modules()` 末尾有
+`script.unload()`——而 `unload()` 在本环境会**永久阻塞**（此前在多处实测过，
+但这一处漏改）。
+
+因为 `refresh_modules` 被 `find_module` / `to_runtime` / `state` / `hits`
+等大量路径调用，这 25 秒是**全局性的隐性开销**。
+
+去掉 unload（本脚本只读一次模块表、无 hook，不 unload 无副作用）：
+
+```
+refresh_modules: 25.0s → 0.04s    （快 625 倍）
+```
+
+### 24.2 运行时读跳转表（read_jump_table 升级）
+
+**发现**：同一个 so 的两张表性质完全不同。
+
+| 表 | 文件里 | 运行时 | 性质 |
+|---|---|---|---|
+| `0x30fd8` | `140000004c...` | `140000004c...` | 静态常量 |
+| `0x1af810` | `9e0a1deb42...` | `7c39c9e07b...` | **运行时才填** |
+
+`0x1af810` 在运行时被写成真实指针（`0x7bcf49e97c`），再经 `add #0x28`
+恰好落到 `br` 的下一条指令——这是**用「运行时填表 + br」实现的混淆顺序跳转**。
+
+所以新增 `serial` / `pid` 参数：给了就**从进程内存读**，不读文件。
+返回里用 `source: "runtime" | "static"` 如实标注数据来源。
+
+实测：`0.14s`，读到 `7c1972ca7b000000...` 的真实指针。
+
+### 24.3 probe_vm_from_hits：绕开「拿不到 ctx_ptr」
+
+这是本轮最有价值的工具。原来的两难：
+- `dump_vm_state` 要 ctx_ptr，但没有
+- `dump_vm_state_auto` 盲扫内存，实测 110 秒且拖挂 frida-server
+
+**换思路**：用**已经命中的断点**。命中的函数里，寄存器很可能就持有 VM 上下文。
+
+实测：
+
+```
+命中 3 次 → 从 37 个寄存器值里找到 1 个候选
+ctx=0x78ba4316a0  reg=fp  count=124  → 成功解出 64 条指令
+```
+
+关键是**一次脚本批量校验**：把几十个候选地址打包给 JS 一次读完，
+而不是逐个 RPC（逐个会被几十秒）。
+
+### 24.4 trace_call_tree：回答「这条路到底有没有被调用」
+
+某函数断点 0 命中时，分不清是"上层没调"还是"地址错了"。
+本工具同时给出**被调次数**和**调用者返回地址**。
+
+用它验证那个悬了很久的问题：
+
+```
+挂点 4 个全部成功（failed: 0）
+0x174F00  → 0 次
+0x174FEC  → 0 次
+0x175018  → 0 次
+0x5bc48   → 18 次      ← 同模块正常
+```
+
+**结论**：VM 的那三个入口确实一次都没被调用，不是地址找错。
+
+### 24.5 自查发现并修掉的资源风险
+
+| 风险 | 修法 |
+|---|---|
+| `probe_vm_from_hits` 候选无上限（36 寄存器 × N 条命中可达上万） | 硬上限 2000 + 截断标记 |
+| `trace_call_tree` 的 entries 无上限（传 1000 个会挂 1000 个探针） | 硬上限 200 + 截断说明 |
+| `read_jump_table` 的 detach 写在 finally 里（会卡死） | 改守护线程 |
+| `trace_call_tree` 硬编码取 MCP 全局会话（dyn 层直调时为空） | 加 `so_hint` 参数 |
+
+### 24.6 工具变化
+
+**71 → 73**：新增 `probe_vm_from_hits`、`trace_call_tree`；
+`read_jump_table` 扩展 `serial`/`pid` 参数。
+
+### 24.7 回归
+
+```
+test_e2e          14 / 0
+test_shell_sample  9 / 0
+test_dyn_runtime  26 / 0
+test_regressions 242 / 0   ← 220 → 242（新增 R39-R42，22 项检查）
+合计             291 / 0
+```

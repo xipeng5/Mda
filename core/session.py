@@ -107,11 +107,39 @@ class Session:
         return so
 
     def xref(self, name: str) -> Xref:
-        """取引用图。**不**自动全量构建（避免每次调用付 20-30 秒）。
+        """取**引用图对象**（Xref 实例），不是引用列表，也**不**自动全量构建。
 
-        需要全量数据显式调 ensure_xrefs()/build_xrefs()；
-        只查单个函数用 ensure_function()，成本从 O(全库) 降到 O(该函数)。
+        (1) 第一次修改（2026-11-06）：
+            bug 原因：返回值类型容易误解——调用方常以为 `session.xref(so)`
+                      返回"这个 so 的引用列表"或"某个函数对象"，实际返回的是
+                      Xref 图对象；直接 print 会看到对象地址，无法判断怎么用。
+                      另外传入未加载的名字时只抛 KeyError，信息量不足。
+            解决方案：① docstring 写清"返回 Xref 对象"及典型用法；
+                      ② 未加载时抛**带解释的** KeyError（列出可用名字）；
+                      ③ 补 use 示例，说明"只查单个函数用 ensure_function"。
+
+        ## 返回的是什么
+
+        `Xref` 是**某个 so 的引用图**，常用方法：
+            xref.xrefs_to(addr)      -> list[int]   谁引用了这个地址
+            xref.xrefs_from(fn_addr) -> list[Instruction]  这个函数引用了谁
+            xref.progress()          -> dict        构建进度
+
+        ## 三种用法（按成本从低到高）
+
+            session.xref(so).xrefs_to(addr)            # 已建好图时，直接查
+            session.ensure_function(so, addr)          # 只补一个函数，O(该函数)
+            session.ensure_xrefs(so)                   # 全量构建，20-30 秒
+
+        ## 注意
+
+        直接调 `xref()` **不会**触发构建。图还没建时查 xrefs_to 可能返回空，
+        这时先用 ensure_function 或 ensure_xrefs 补数据——**空结果不等于没有引用**。
         """
+        if name not in self._xrefs:
+            raise KeyError(
+                f"未加载的 so: {name}。当前已加载: {list(self._xrefs)}。"
+                "先用 session.load(path) 加载，再调 xref(name)")
         return self._xrefs[name]
 
     def strings(self, name: str) -> StringAnalyzer:

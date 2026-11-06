@@ -808,6 +808,188 @@ _DEPENDS_ON = {
 }
 
 
+def _find_loaded_so(session, name: str):
+    """在 mda 会话里按名字找已加载的 SoFile（复用 MCP 层的多级别名匹配）。
+
+    找不到返回 None。这里做一层薄封装，是为了让 dyn 层不必重复实现
+    "设备名 ↔ 本地名"的匹配规则（那套规则在 mcp_server.tools._pick_so_by_name）。
+    """
+    try:
+        from mcp_server.tools import _pick_so_by_name
+
+        return _pick_so_by_name(session, name)
+    except Exception:                                     # noqa: BLE001
+        mods = getattr(session, "modules", {}) or {}
+        return mods.get(name)
+
+
+_DETACH_PENDING: set = set()
+_DETACH_LOCK = __import__("threading").Lock()
+
+
+def _detach_async(sess, timeout: float = 3.0) -> None:
+    """在**守护线程**里 detach/close 会话，主流程最多等 timeout 秒。
+
+    (16) 第十六次修改（2026-11-06）：新增。
+        bug 原因：实测 frida 17.23.3 + 该设备上，一旦 attach 过脚本，
+                  session.detach() 与 script.unload() 都会**永久阻塞**
+                  （不是慢，是完全不返回）。而它们原本写在 finally 里，
+                  导致整个工具函数卡死——表现成「MCP 调用永不返回」。
+                  这不是本 app 特例，是所有 trace/watch 类工具共有的缺陷。
+        解决方案：把 detach 放到守护线程里做，主线程 wait 有限时间就返回。
+
+    (17) 第十七次修改（2026-11-06）：**防止阻塞线程无限累积**。
+        自查发现的问题：上一版每次调用都会留下一个永久阻塞的守护线程
+        （实测连续 20 次调用 → 线程数从 1 涨到 21）。MCP 服务是常驻进程，
+        反复调用 trace_* / watch_module 会把线程资源耗尽。
+        解决方案：
+          ① 先用 `session.is_detached` 判断是否已断开，已断开直接跳过；
+          ② 用一个集合登记"正在 detach 的会话 id"，同一个会话不重复起线程；
+          ③ 集合本身有上限，超出就放弃登记新线程（宁可让 frida 侧自然回收，
+             也不让本地线程无界增长）。
+    """
+    import threading as _th
+
+    if sess is None:
+        return
+    # 已经断开就不用再折腾
+    try:
+        if getattr(sess, "is_detached", False):
+            return
+    except Exception:                                     # noqa: BLE001
+        pass
+
+    key = id(sess)
+    with _DETACH_LOCK:
+        if key in _DETACH_PENDING:
+            return                                        # 同一会话已在处理
+        # 上限：只允许同时存在有限个阻塞中的 detach 线程
+        if len(_DETACH_PENDING) >= 16:
+            return                                        # 超限就放弃，交给 frida 回收
+        _DETACH_PENDING.add(key)
+
+    done = _th.Event()
+
+    def _worker() -> None:
+        try:
+            sess.detach()
+        except Exception:                                 # noqa: BLE001
+            pass
+        finally:
+            with _DETACH_LOCK:
+                _DETACH_PENDING.discard(key)
+            done.set()
+
+    th = _th.Thread(target=_worker, name="mda-detach", daemon=True)
+    th.start()
+    try:
+        done.wait(max(0.1, float(timeout)))
+    except Exception:                                     # noqa: BLE001
+        pass
+
+
+def _find_loaded_so(session, name: str):
+    """在 mda 会话里按名字找已加载的 SoFile（复用 MCP 层的多级别名匹配）。
+
+    找不到返回 None。这里做一层薄封装，是为了让 dyn 层不必重复实现
+    "设备名 ↔ 本地名"的匹配规则（那套规则在 mcp_server.tools._pick_so_by_name）。
+    """
+    try:
+        from mcp_server.tools import _pick_so_by_name
+
+        return _pick_so_by_name(session, name)
+    except Exception:                                     # noqa: BLE001
+        mods = getattr(session, "modules", {}) or {}
+        return mods.get(name)
+
+
+def _read_static_bytes(so, offset: int, size: int) -> bytes:
+    """从已加载的 SoFile 读原始文件字节（用于生成指纹 / 校验断点是否被 patch）。
+
+    (15) 第十五次修改（2026-11-06）：新增。
+        为什么需要：① 模块名对不上时要靠字节指纹反查；
+                  ② 断点自检要把"内存里的字节"与"文件里的原始字节"对比，
+                     才能判断这个地址到底有没有被 patch。
+    """
+    # SoFile 可能提供 read_bytes；没有就退回直接读文件
+    fn = getattr(so, "read_bytes", None)
+    if callable(fn):
+        try:
+            data = fn(int(offset), int(size))
+            if data:
+                return bytes(data)
+        except Exception:                                 # noqa: BLE001
+            pass
+    path = getattr(so, "path", "") or getattr(so, "_path", "")
+    if not path:
+        return b""
+    try:
+        with open(path, "rb") as fh:
+            # 偏移是虚拟地址，需要按段换算成文件偏移
+            segs = getattr(so, "_segments", None) or []
+            for seg in segs:
+                va = int(getattr(seg, "vaddr", 0) or 0)
+                memsz = int(getattr(seg, "memsz", 0) or 0)
+                if va <= offset < va + max(memsz, 1):
+                    file_off = int(getattr(seg, "offset", 0) or 0) + (offset - va)
+                    fh.seek(file_off)
+                    return fh.read(int(size))
+            fh.seek(int(offset))
+            return fh.read(int(size))
+    except Exception:                                     # noqa: BLE001
+        return b""
+
+
+def _module_name_candidates(name: str) -> list[str]:
+    """把一个模块名展开成「可能对应的若干个名字」，供设备侧按候选匹配。
+
+    (14) 第十四次修改（2026-11-06）：新增。
+        bug 原因：本地分析的 so 文件名与设备上加载的模块名经常不一致
+                  （libsgmainso.so ↔ libsgmainso-6.7.260202.so），
+                  按单一名字在 Process.enumerateModules() 里找不到，
+                  表现成 MODULE_NOT_LOADED，但 so 明明就在进程里。
+        解决方案：生成候选列表，JS 侧按顺序逐个比对。候选只做**无损规范化**：
+                  原名 → basename → 去版本号 → 去 lib 前缀，不做模糊猜测。
+
+    例：
+        libsgmainso.so              -> ["libsgmainso.so", "libsgmainso"]
+        libsgmainso-6.7.260202.so   -> ["libsgmainso-6.7.260202.so",
+                                        "libsgmainso-6.7.260202",
+                                        "libsgmainso.so", "libsgmainso"]
+    """
+    import re as _re
+
+    raw = str(name or "").strip()
+    if not raw:
+        return []
+    base = raw.rsplit("/", 1)[-1]
+    out: list[str] = []
+
+    def _add(v: str) -> None:
+        if v and v not in out:
+            out.append(v)
+
+    _add(raw)
+    _add(base)
+    # 去扩展名
+    stem = base
+    for ext in (".so", ".dylib"):
+        idx = stem.find(ext)
+        if idx > 0:
+            stem = stem[:idx]
+            break
+    _add(stem)
+    # 去版本号尾巴
+    core = _re.sub(r"-\d+(?:\.\d+)*$", "", stem)
+    _add(core)
+    if core:
+        _add(core + ".so")
+    # 去 lib 前缀（部分壳会加/去这个前缀）
+    if core.startswith("lib"):
+        _add(core[3:])
+    return out
+
+
 def _trace_pending(feature: str, hint: str, extra: dict | None = None) -> dict:
     """构造 trace 采集入口的占位返回。
 
@@ -1023,10 +1205,7 @@ def start_trace_code(
                               hint=f"采集期间出错：{exc}",
                               extra={"serial": serial, "pid": pid})
     finally:
-        try:
-            sess.detach()
-        except Exception:                                 # noqa: BLE001
-            pass
+        _detach_async(sess)
 
     raw_events = box["events"]
     out_events = []
@@ -1310,10 +1489,7 @@ def _trace_memory_access(
                               hint=f"采集期间出错：{exc}",
                               extra={"serial": serial, "pid": pid})
     finally:
-        try:
-            sess.detach()      # detach 会自动摘掉 Interceptor
-        except Exception:                                 # noqa: BLE001
-            pass
+        _detach_async(sess)
 
     return {
         "ok": True,
@@ -1592,11 +1768,7 @@ def start_trace_module_load(
             "package": pkg, "pid": pid,
         }
     finally:
-        try:
-            if sess is not None:
-                sess.detach()
-        except Exception:                                 # noqa: BLE001
-            pass
+        _detach_async(sess)
         # spawn 出来又不想留着的进程要收掉，别给用户留个半死的 app
         if use_spawn and not keep_alive and spawned_pid:
             try:
@@ -2107,11 +2279,7 @@ def trace_app_startup(
         return {"ok": False, "implemented": True, "code": "TRACE_FAILED",
                 "error": f"{type(exc).__name__}: {exc}", "package": pkg, "pid": pid}
     finally:
-        try:
-            if sess is not None:
-                sess.detach()
-        except Exception:                                 # noqa: BLE001
-            pass
+        _detach_async(sess)
         if not keep_alive and pid:
             try:
                 dev.kill(pid)
@@ -2283,4 +2451,1421 @@ def trace_app_startup(
         out["killed_after"] = True
     if box.get("errors"):
         out["errors"] = box["errors"]
+    return out
+
+
+_JS_WATCH_MODULE = r"""
+(function () {
+    var mod = null;
+    var cands = __SO_NAME__;          // 候选名列表，按优先级
+    var mods = Process.enumerateModules();
+    for (var ci = 0; ci < cands.length && mod === null; ci++) {
+        var want = cands[ci];
+        for (var mi = 0; mi < mods.length; mi++) {
+            var m = mods[mi];
+            var bn = m.name.split('/').pop();
+            if (m.name === want || bn === want) { mod = m; break; }
+        }
+    }
+    // (15) 第十五次修改（2026-11-06）：候选名全失败时，用**字节指纹**反查真实模块。
+    //      bug 原因：本地文件被改名成与设备名毫无关系的名字时（如 sg_real.so），
+    //               任何名字规范化都救不回来。此前只能报 MODULE_NOT_LOADED，
+    //               用户得先去设备上查真实模块名——等于把通用问题丢回给人。
+    //      解决方案：由 Python 侧提供「该 so 里某函数的原始机器码」作为指纹，
+    //               在进程内各模块的对应偏移处比对字节，命中即认定是同一个模块。
+    //               指纹取 16 字节 + 偏移，碰撞概率极低；不命中就不猜。
+    var FINGERPRINTS = __FINGERPRINTS__;
+    if (mod === null && FINGERPRINTS.length > 0) {
+        var all = Process.enumerateModules();
+        for (var fi = 0; fi < FINGERPRINTS.length && mod === null; fi++) {
+            var fp = FINGERPRINTS[fi];
+            for (var ai = 0; ai < all.length; ai++) {
+                var cand = all[ai];
+                if (fp.offset >= cand.size) { continue; }
+                try {
+                    var got = cand.base.add(fp.offset).readByteArray(fp.hex.length / 2);
+                    if (got === null) { continue; }
+                    var hex = Array.from(new Uint8Array(got))
+                        .map(function (x) { return x.toString(16).padStart(2, '0'); })
+                        .join('');
+                    if (hex === fp.hex) {
+                        mod = cand;
+                        send({ kind: 'note',
+                               message: '按字节指纹匹配到模块 ' + cand.name });
+                        break;
+                    }
+                } catch (e) { /* 该模块不可读，跳过 */ }
+            }
+        }
+    }
+
+    if (mod === null) {
+        send({ kind: 'error', code: 'MODULE_NOT_LOADED',
+               message: '进程里找不到模块（试过 ' + cands.join(', ')
+                        + '；字节指纹比对也未命中）' });
+        return;
+    }
+
+    // (13) 第十三次修改（2026-11-06）：模块内函数级执行观察。
+    //      bug 原因：用户断点下在函数入口却 0 命中，无法判断是「地址错」还是
+    //                「这段代码根本没跑」。此前用 765 个探测点做实验，
+    //                直接把目标进程搞崩（frida 连接断开、app 退出）。
+    //      解决方案：① 只在**函数入口**下点（不按页撒点），密度低一个数量级；
+    //                ② 分批 attach（每批之间让出执行权），避免一次性 patch 过多；
+    //                ③ 只记录**偏移→次数**，不在 onEnter 里做任何重活；
+    //                ④ 硬上限 max_points；超出预算时由 Python 侧**均匀采样**，
+    //                   而不是截断（截断会让覆盖全部挤在区间头部）。
+    //               ⑤ 每批之间 sleep BATCH_GAP_MS，避免密集 patch 时目标抖动。
+    var TARGETS = __TARGETS__;
+    var BATCH = __BATCH__;
+    var BATCH_GAP_MS = __BATCH_GAP_MS__;
+    var counts = {};
+    var placed = 0, failed = 0;
+    var failedDetail = [];      // 记录每个挂不上的点及原因，便于定位
+    var listeners = [];
+
+    function placeBatch(start) {
+        var end = Math.min(start + BATCH, TARGETS.length);
+        for (var i = start; i < end; i++) {
+            var off = TARGETS[i];
+            try {
+                (function (o) {
+                    listeners.push(Interceptor.attach(mod.base.add(o), {
+                        onEnter: function () {
+                            counts[o] = (counts[o] || 0) + 1;
+                        }
+                    }));
+                })(off);
+                placed++;
+            } catch (e) {
+                failed++;
+                if (failedDetail.length < 20) {
+                    failedDetail.push({offset: off, error: String(e).slice(0, 120)});
+                }
+            }
+        }
+        return end;
+    }
+
+    var cursor = 0;
+    function step() {
+        cursor = placeBatch(cursor);
+        if (cursor < TARGETS.length) {
+            setTimeout(step, BATCH_GAP_MS);   // 批次间留间隔，避免密集 patch 拖垮目标
+        } else {
+            send({ kind: 'ready', module: mod.name,
+                   base: mod.base.toString(), size: mod.size,
+                   placed: placed, failed: failed, total: TARGETS.length,
+                   failed_detail: failedDetail });
+        }
+    }
+    step();
+
+    recv('stop', function () {
+        listeners.forEach(function (l) {
+            try { if (l && typeof l.detach === 'function') { l.detach(); } } catch (e) {}
+        });
+        send({ kind: 'stopped', counts: counts, placed: placed, failed: failed });
+    });
+})();
+"""
+
+
+# 目标进程消失时 frida 抛出的异常文本特征（大小写不敏感匹配）。
+# 为什么要单列：这类失败与"钩子装不上"是完全不同的两回事——
+# 前者说明进程已经没了，重试、换参数都没意义；后者才需要调探针策略。
+# 若都归到 WATCH_FAILED，调用方会误以为"还可以再试一次"。
+_TARGET_GONE_MARKERS = (
+    "ProcessNotFound",
+    "process is gone",
+    "Process crashed",
+    "no such process",
+    "terminated",
+    "unable to find process",
+)
+
+
+def _is_target_gone(exc: BaseException) -> bool:
+    """判断异常是否表示"目标进程已退出/崩溃"。
+
+    同时看异常**类名**与文本：frida 抛的是 ProcessNotFoundError，
+    str(exc) 里未必带 "ProcessNotFound"，把类型名一并拼进来才不会漏判。
+    """
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return any(m.lower() in text for m in _TARGET_GONE_MARKERS)
+
+
+def _summarize_failed(failed_detail: list) -> dict:
+    """按错误文本把"挂不上的探针"归类计数。
+
+    为什么需要：failed_detail 是逐点明细，几十条时人眼看不出主要矛盾。
+    实测失败大头是 frida 对"函数内部块"报的
+    `unable to intercept function ... please file a bug`——这类点根本
+    不是真入口，换个区间就能消掉，因此值得单独一个计数。
+
+    只统计明细里出现过的条目；明细被 JS 侧截断（上限 20 条）时，
+    这里的和会**小于 failed 总数**，故额外给 detail_count 让调用方看得出差距。
+    """
+    out = {"intercept_unsupported": 0, "other": 0, "detail_count": 0}
+    for item in failed_detail or ():
+        err = ""
+        if isinstance(item, dict):
+            err = str(item.get("error") or "")
+        else:
+            err = str(item or "")
+        out["detail_count"] += 1
+        if "unable to intercept" in err.lower():
+            out["intercept_unsupported"] += 1
+        else:
+            out["other"] += 1
+    return out
+
+
+def watch_module(
+    serial: str,
+    pid: int,
+    so_name: str,
+    duration: float = 5.0,
+    max_points: int = 50,
+    offset_range: list | None = None,
+    batch: int = 20,
+    batch_interval_ms: int = 200,
+) -> dict:
+    """观察某个 so 里**哪些函数真的被执行过**，回答「代码到底跑没跑到这里」。
+
+    (13) 第十三次修改（2026-11-06）：新增本函数。
+
+    为什么需要它：断点下在函数入口却一次都不命中时，有两种截然不同的原因——
+        ① 地址算错了（静态偏移 / 模块基址 / 装错文件）
+        ② 这段代码在当前场景下**根本没被执行**
+    光看"命中 0 次"分不清是哪一种。本工具在模块内**所有函数入口**下轻量探针，
+    直接给出"实际被执行的是哪几个偏移、各多少次"，把①和②区分开。
+
+    ## 与 trace_code 的区别
+
+        trace_code   用 Stalker 跟随线程，采集"谁调用了谁"，开销大、易把目标拖垮
+        watch_module 只在函数入口挂 Interceptor，只数次数，**开销小得多**；
+                     代价是只看得到"函数级"粒度，看不到具体调用边
+
+    ## 参数
+
+        so_name       模块名（`libfoo.so` 或完整路径都行，按 basename 匹配）
+        duration      观察秒数
+        max_points    最多下多少个探针（默认 400）。函数特别多时按地址升序取前 N 个
+        offset_range  可选 [起始偏移, 结束偏移]，只观察这段地址内的函数
+        batch         每批 attach 多少个探针（默认 50）。分批是为了让出执行权，
+                      一次性挂几百个探针会把目标拖垮（实测 765 个直接崩进程）
+
+    ## 返回
+
+        hot[]       按次数降序，每条 {offset, offset_hex, hits}
+        executed    被执行过的函数数
+        placed/failed/total  探针布置情况（**失败数非 0 要当心**）
+        verdict     一句话结论：
+                    "观察到 N 个函数被执行" / "整段时间内所有探针 0 命中"
+
+    ## 已知限制
+
+        · 只覆盖**函数入口**：只有被调的函数的**第一条指令**会命中；函数内部
+          的某段代码被执行不代表入口被执行（尤其 VM 分发器）
+        · max_points 截断时，只观察地址最小的那批函数，结论可能不全
+        · 探针越多越可能影响目标性能，长 duration 请配合较小 max_points
+    """
+    import time as _time
+
+    try:
+        import frida
+    except Exception as exc:                              # noqa: BLE001
+        return _trace_pending("watch_module", hint=f"frida 不可用：{exc}",
+                              extra={"so_name": so_name})
+
+    name = str(so_name or "").strip()
+    if not name:
+        return {"ok": False, "implemented": True, "code": "NO_SO_NAME",
+                "error": "必须给 so_name"}
+    # (14) 第十四次修改（2026-11-06）：不再要求调用方传「设备上的名字」。
+    #      bug 原因：上一版加了 device_name 参数，等于让用户手工填别名——
+    #               那是给单个 app 打补丁，换个样本还得再填一次。
+    #      解决方案：JS 侧按**候选列表**匹配（原名 + 去版本号名 + 去 lib 前缀名），
+    #               与 mcp_server 层的 _pick_so_by_name 同一套思路；
+    #               调用方只需给 mda 里的键。
+    cand_names = _module_name_candidates(name)
+
+    # 目标偏移从 mda 的静态模型里取（函数入口），比 JS 侧枚举更可靠
+    offsets: list[int] = []
+    # (19) 第十九次修改（2026-11-06）：so 必须在 try 之外先初始化。
+    #      bug 原因：so 原本只在 try 块内赋值，一旦取会话/遍历函数表抛异常，
+    #               后面的"函数密度"计算（用到 so.size）就会抛
+    #               NameError: name 'so' is not defined——报错信息与真实
+    #               原因完全无关，极难排查。
+    #      解决方案：进 try 之前先置 None；后续所有对 so 的使用都做 None 判断。
+    so = None
+    try:
+        from mcp_server.tools import get_session
+
+        sess0 = get_session()
+        for key, mod in (getattr(sess0, "modules", {}) or {}).items():
+            if key == name or key.rsplit("/", 1)[-1] == name.split("/")[-1]:
+                so = mod
+                break
+        if so is not None:
+            fns = getattr(so, "functions", {}) or {}
+            vals = fns.values() if isinstance(fns, dict) else list(fns)
+            offs = sorted({int(getattr(f, "addr", 0) or 0) for f in vals})
+            offs = [o for o in offs if o > 0]
+            if offset_range and len(offset_range) == 2:
+                lo, hi = int(offset_range[0]), int(offset_range[1])
+                offs = [o for o in offs if lo <= o < hi]
+            offsets = offs
+    except Exception:                                     # noqa: BLE001
+        offsets = []
+
+    if not offsets:
+        return {
+            "ok": False, "implemented": True, "code": "NO_FUNCTION_TABLE",
+            "error": (f"mda 里没有 {name} 的函数表；先 load_so 载入该 so"
+                      "（载入后本工具才知道该在哪些偏移下探针）"),
+            "so_name": name,
+        }
+
+    total_fns = len(offsets)
+    cap = max(1, min(int(max_points), 4000))
+    truncated = total_fns > cap
+
+    # (14) 第十四次修改（2026-11-06）：探针点改为**均匀采样**，并支持分批间隔。
+    #      bug 原因：① 原实现 `offsets[:cap]` 只取地址最小的 N 个——
+    #                  带 offset_range 观察 VM 解释器时，区间里函数极密集
+    #                  （实测 12KB 内 78 个入口，平均 92 字节一个），
+    #                  取前 N 个会全部挤在区间头部，越靠后越没有覆盖，
+    #                  得出的"哪些函数被执行"结论严重偏斜；
+    #               ② 一次性 attach 全部探针会让目标抖动，某些 frida 版本
+    #                  在密集 patch 时直接崩溃（实测 max_points=400 时崩过）；
+    #               ③ 探针点里混入了"函数内部块"（非真正入口），frida 对这类
+    #                  地址会报 "unable to intercept function ... please file a bug"，
+    #                  本次实测 78 个点里 19 个挂不上。
+    #      解决方案：① 超出预算时按**等间隔取样**（保留首尾），而不是截断；
+    #                ② 每批之间 sleep batch_interval_ms，给目标喘息；
+    #                ③ 记录每个点失败的具体原因，并在返回里如实上报
+    #                   placed / failed / failed_detail，让调用方看得见。
+    if total_fns > cap:
+        step = total_fns / float(cap)
+        picked = [offsets[min(int(i * step), total_fns - 1)] for i in range(cap)]
+        targets = sorted(set(picked))
+        sampling = "uniform"
+    else:
+        targets = list(offsets)
+        sampling = "full"
+
+    # 字节指纹：名字完全对不上时用它反查模块（取前 2 个函数入口的机器码即可）
+    fingerprints: list[dict] = []
+    if so is not None:
+        for off in targets[:2]:
+            try:
+                raw = _read_static_bytes(so, off, 16)
+                if raw and len(raw) == 16:
+                    fingerprints.append({"offset": int(off), "hex": raw.hex()})
+            except Exception:                             # noqa: BLE001
+                continue
+
+    js = (_JS_WATCH_MODULE
+          .replace("__SO_NAME__", json.dumps(cand_names))
+          .replace("__FINGERPRINTS__", json.dumps(fingerprints))
+          .replace("__TARGETS__", json.dumps(targets))
+          .replace("__BATCH__", str(max(1, min(int(batch), 200))))
+          .replace("__BATCH_GAP_MS__", str(max(0, min(int(batch_interval_ms), 5000)))))
+
+    box: dict = {"ready": False, "stopped": False, "counts": {},
+                 "placed": 0, "failed": 0, "module": "", "base": "",
+                 "size": 0, "err": "", "failed_detail": []}
+    dev = None
+    sess = None
+    try:
+        dev = frida.get_device(serial, timeout=15)
+        sess = dev.attach(int(pid))
+
+        def _on_msg(msg, data):
+            payload = msg.get("payload")
+            if not isinstance(payload, dict):
+                return
+            kind = payload.get("kind")
+            if kind == "ready":
+                box["ready"] = True
+                box["placed"] = int(payload.get("placed") or 0)
+                box["failed"] = int(payload.get("failed") or 0)
+                box["failed_detail"] = payload.get("failed_detail") or []
+                box["module"] = payload.get("module") or ""
+                box["base"] = payload.get("base") or ""
+                box["size"] = payload.get("size") or 0
+                return
+            if kind == "stopped":
+                box["stopped"] = True
+                box["counts"] = payload.get("counts") or {}
+                return
+            if kind == "note":
+                box.setdefault("notes", []).append(payload.get("message") or "")
+                return
+            if kind == "error":
+                box["err"] = payload.get("message") or payload.get("code") or "error"
+
+        script = sess.create_script(js)
+        script.on("message", _on_msg)
+        script.load()
+
+        t0 = _time.time()
+        while not box["ready"] and not box["err"] and _time.time() - t0 < 20.0:
+            _time.sleep(0.02)
+        if box["err"]:
+            return {"ok": False, "implemented": True, "code": "WATCH_FAILED",
+                    "error": box["err"], "so_name": name}
+        if not box["ready"]:
+            return {"ok": False, "implemented": True, "code": "NOT_READY",
+                    "error": "探针布置 20 秒内未完成（探针可能过多）",
+                    "so_name": name, "placed": box["placed"]}
+
+        _time.sleep(max(0.1, float(duration)))
+        try:
+            script.post({"type": "stop"})
+        except Exception:                                 # noqa: BLE001
+            pass
+        for _ in range(50):
+            if box["stopped"]:
+                break
+            _time.sleep(0.02)
+    except Exception as exc:                              # noqa: BLE001
+        # (22) 第二十二次修改（2026-11-06）：区分"目标进程没了"与"钩子装不上"。
+        #      bug 原因：采集期间任何异常都返回 WATCH_FAILED，于是目标崩溃/退出
+        #                这种**不可重试**的失败，与钩子冲突这类**可重试**的失败
+        #                长得一模一样，调用方会拿同一套策略反复重试白费时间。
+        #      解决方案：按异常类名+文本判定目标是否已消失，是则返回 TARGET_DIED
+        #                并说明"探针随进程消失"；其余仍归 WATCH_FAILED。
+        if _is_target_gone(exc):
+            return {"ok": False, "implemented": True, "code": "TARGET_DIED",
+                    "error": (f"目标进程已退出/崩溃，探针随进程消失："
+                              f"{type(exc).__name__}: {exc}"),
+                    "so_name": name, "pid": int(pid),
+                    "placed": box["placed"], "failed": box["failed"],
+                    "failed_detail": box.get("failed_detail") or [],
+                    "failed_summary": _summarize_failed(box.get("failed_detail") or []),
+                    "hint": "重新 attach 前先确认进程还在（PID 会变）；"
+                            "若反复崩溃，多半是探针过多，降低 max_points 或缩小 offset_range"}
+        return {"ok": False, "implemented": True, "code": "WATCH_FAILED",
+                "error": f"{type(exc).__name__}: {exc}", "so_name": name}
+    finally:
+        _detach_async(sess)
+
+    counts = box["counts"] or {}
+    hot = []
+    for k, v in counts.items():
+        try:
+            off = int(k)
+        except (TypeError, ValueError):
+            continue
+        if v:
+            hot.append({"offset": off, "offset_hex": hex(off), "hits": int(v)})
+    hot.sort(key=lambda x: -x["hits"])
+
+    executed = len(hot)
+    sample_note = "（均匀采样）" if sampling == "uniform" else ""
+    if executed:
+        verdict = (f"观察到 {executed} 个函数被执行（共下 {box['placed']} 个探针{sample_note}），"
+                   f"最热的是 {hot[0]['offset_hex']}（{hot[0]['hits']} 次）")
+    else:
+        verdict = (f"整段观察期内 {box['placed']} 个函数入口{sample_note}**全部 0 命中**："
+                   "要么该模块在当前场景没有执行，要么探针没覆盖到真正跑的代码")
+
+    out = {
+        "ok": True,
+        "implemented": True,
+        "so_name": name,
+        "module": box["module"],
+        "base": box["base"],
+        "size": box["size"],
+        "pid": int(pid),
+        "duration": duration,
+        "placed": box["placed"],
+        "failed": box["failed"],
+        "total_functions": total_fns,
+        "sampling": sampling,
+        "truncated": truncated,
+        "executed": executed,
+        "hot": hot[:200],
+        "failed_detail": box.get("failed_detail") or [],
+        # (22) 第二十二次修改（2026-11-06）：failed 的聚合分类。
+        #      bug 原因：failed_detail 是逐点明细，几十条时看不出主要矛盾；
+        #                实测大头是 frida 对"函数内部块"的
+        #                "unable to intercept"——这类点不是真入口，
+        #                换个区间就能消掉，与其它错误该分开看。
+        #      解决方案：按 error 文本归类计数，附 detail_count 说明明细
+        #                是否被 JS 侧截断（上限 20 条），避免数量对不上时误解。
+        "failed_summary": _summarize_failed(box.get("failed_detail") or []),
+        "verdict": verdict,
+        "note": ("探针只下在**函数入口**；函数内部某段被执行不代表入口被执行。"
+                 "failed 非 0 说明有探针没挂上，结论可能不全"),
+    }
+
+    # (22) 第二十二次修改（2026-11-06）：给"部分布上 / 一个都没布上"语义化 code。
+    #      bug 原因：原来只返回 ok:True + placed/failed 两个数字，调用方（AI/前端）
+    #                看到 ok:True 就当采集成功，容易忽略"80 个点只挂上 12 个"，
+    #                据此下结论会错得毫无察觉；而 placed==0 时更是彻底空转，
+    #                却与正常成功长得一模一样。
+    #      解决方案：成功路径按 placed/failed 分三档——
+    #                ① placed>0 且 failed>0 → partial:True + PLACED_PARTIAL
+    #                ② placed==0 且 failed>0 → PLACED_NONE（完全失败）
+    #                ③ 全成功 → 不加 code，保持与旧调用方兼容
+    #                verdict 同步说清"只布上多少、多少失败"，结论不被高估。
+    _placed = int(box["placed"] or 0)
+    _failed = int(box["failed"] or 0)
+    if _placed <= 0 and _failed > 0:
+        out["code"] = "PLACED_NONE"
+        out["partial"] = True
+        verdict = (f"**一个探针都没布上**（{_failed} 个全部失败）：本次没有采到任何执行数据，"
+                   "失败明细见 failed_detail / failed_summary。"
+                   "多为选中的点不是可挂钩的函数入口，建议缩小 offset_range，"
+                   "或先用 probe_hits 逐个验证真入口")
+        out["verdict"] = verdict
+    elif _failed > 0:
+        out["code"] = "PLACED_PARTIAL"
+        out["partial"] = True
+        verdict = (f"{verdict}。但**只布上 {_placed} 个探针、{_failed} 个失败**，"
+                   f"覆盖不全，结论可能遗漏未被观察到的函数")
+        out["verdict"] = verdict
+    if box.get("notes"):
+        out["notes"] = box["notes"]
+
+    # (17) 第十七次修改（2026-11-06）：把"要不要加大探针数"的判断依据交给 AI。
+    #      bug 原因：原来 max_points 是个固定默认值，AI 不知道当前这个 so
+    #               函数有多密、加多少会崩，只能瞎猜——猜大了崩进程，猜小了没覆盖。
+    #      解决方案：返回里附 recommendation：
+    #               ① 当前区间的**函数密度**（每 KB 多少个入口）；
+    #               ② 失败率（挂不上的比例）——失败率高说明点选得不好或太密；
+    #               ③ 一个**安全上限估计**（按密度和失败率推算）；
+    #               ④ 明确的下一步建议（缩小 range / 增大 max_points / 保持）。
+    #                AI 拿着这些数就能自己决定下一次的 max_points。
+    # 密度：分母优先用 offset_range 宽度，其次用 so.size；两者都没有就给 None
+    span_kb = None
+    if offset_range and len(offset_range) == 2:
+        span_kb = max(1e-9, (int(offset_range[1]) - int(offset_range[0])) / 1024.0)
+    elif so is not None:
+        span_kb = max(1e-9, int(getattr(so, "size", 0) or 0) / 1024.0)
+    density = (total_fns / span_kb) if span_kb else None
+    fail_rate = (box["failed"] / float(box["placed"] + box["failed"])
+                 if (box["placed"] + box["failed"]) else 0.0)
+    rec: dict = {
+        "function_density_per_kb": round(density, 2),
+        "fail_rate": round(fail_rate, 3),
+        "placed": box["placed"],
+        "failed": box["failed"],
+    }
+    if fail_rate > 0.15:
+        rec["advice"] = (f"失败率 {fail_rate:.0%} 偏高：这些多是被选中但无法挂钩的"
+                         "函数内部块。建议缩小 offset_range 到更精确的区间，"
+                         "或换用 probe_hits 逐个验证真入口")
+        rec["suggested_max_points"] = max(10, int(box["placed"] * 0.8))
+    elif truncated:
+        step_ms = 1000.0 * (cap * max(1, int(batch_interval_ms)) / 1000.0) / max(1, cap)
+        rec["advice"] = (f"已均匀采样（覆盖全区间）。若要在同一区间提高覆盖率，"
+                         f"可把 max_points 提到 {min(cap * 4, 1600)}；"
+                         "经验上每个探针约增加数百微秒开销，"
+                         "密集区间建议配 batch<=20、batch_interval_ms>=200")
+        rec["suggested_max_points"] = min(cap * 4, 1600)
+    else:
+        rec["advice"] = "当前已全覆盖该区间，无需加大 max_points"
+        rec["suggested_max_points"] = cap
+    out["recommendation"] = rec
+
+    if truncated:
+        out["truncated_note"] = (
+            f"函数共 {total_fns} 个，按**均匀采样**观察了 {cap} 个"
+            "（不是只取地址最小的那些）；用 offset_range 缩小范围可提高针对性")
+    return out
+
+
+_JS_VERIFY_BP = r"""
+(function () {
+    var RUNTIME = ptr(__RUNTIME__);
+    var out = {};
+    // 1) 当前内存字节
+    try {
+        var cur = RUNTIME.readByteArray(16);
+        out.current_hex = cur === null ? null : Array.from(new Uint8Array(cur))
+            .map(function (x) { return x.toString(16).padStart(2, '0'); }).join('');
+    } catch (e) {
+        out.current_hex = null;
+        out.read_error = String(e);
+    }
+    // 2) frida 是否真的在这个地址上装了钩子：
+    //    用 Interceptor.attach 同一个地址，若能成功即说明地址可挂钩。
+    //    更直接的判据是看该地址首字节是否为 frida 的跳转指令（通常被替换）。
+    //    但 frida 会"透明"地让我们读到原始字节，所以不能用字节判断，
+    //    改为报告 Interceptor 的内部计数：attach 一次再 detach，看是否触发。
+    out.probe_ok = true;
+    out.runtime = RUNTIME.toString();
+
+    // 3) 该地址是否在 frida 的 hook 表里 —— 通过重新 attach 同名地址的
+    //    InvocationListener 观察是否抛 "already attached"
+    try {
+        var l = Interceptor.attach(RUNTIME, { onEnter: function () {} });
+        out.already_hooked = false;
+        try { l.detach(); } catch (e) {}
+    } catch (e) {
+        var msg = String(e);
+        out.already_hooked = msg.indexOf('already') >= 0 || msg.indexOf('busy') >= 0;
+        out.attach_error = msg;
+    }
+    send(out);
+})();
+"""
+
+
+def verify_breakpoint(serial: str, pid: int, so_name: str, static_addr: int,
+                      bp_id: str = "") -> dict:
+    """检查一个断点**到底有没有真的生效**，以及它所在位置是否会被执行。
+
+    (17) 第十七次修改（2026-11-06）：新增。
+        为什么需要：`set_breakpoint` 返回 `set: true` 只说明"静态地址换算成功、
+        frida 接受了挂钩请求"，**不代表断点真的 armed，更不代表那段代码会被执行**。
+        实测就出现过：断点返回成功、程序确实在跑，但一次都不命中——
+        原因是该地址所在的函数根本没有被执行（VM 分发器的入口桩）。
+
+    ## 返回里每一项的含义
+
+        current_hex     该地址当前的内存字节（用于与文件原始字节对比）
+        original_hex    从本地 so 文件读到的原始字节
+        bytes_match     两者是否一致。**注意**：frida 会让我们读到"原始字节"，
+                        所以一致**不代表没挂钩**，只能说明读到的内容正确
+        already_hooked  该地址是否已被装过钩子（frida 报 already attached）
+        hits_since_set  这个 bp_id 自设置以来的命中数（0 说明一次都没进）
+        executed_hint   结合 watch_module 语境的提示（有 hits 才可能被执行）
+
+    ## 怎么用这个结果判断问题
+
+        hits > 0                        → 断点正常工作
+        hits == 0 且 already_hooked     → 钩子装上了，但这段代码没被执行
+                                          （用 watch_module 看真正在跑的是哪些偏移）
+        hits == 0 且 not already_hooked → 钩子没装上，检查地址/模块是否正确
+        bytes_match == false            → 地址对应错了文件（或文件版本不同）
+
+    参数：
+        so_name       mda 里的 so 键（支持与设备名自动匹配）
+        static_addr   静态偏移
+        bp_id         可选，形如 "serial:pid:so:5b76c"；给了就查它的命中数
+    """
+    import time as _time
+
+    try:
+        import frida
+    except Exception as exc:                              # noqa: BLE001
+        return _trace_pending("verify_breakpoint", hint=f"frida 不可用：{exc}",
+                              extra={"so_name": so_name})
+
+    result: dict = {
+        "ok": True, "implemented": True,
+        "so_name": so_name, "static_addr": int(static_addr),
+        "static_hex": hex(int(static_addr)),
+    }
+
+    # 1) 从 mda 静态模型取原始字节
+    so = None
+    try:
+        from mcp_server.tools import get_session
+
+        so = _find_loaded_so(get_session(), so_name)
+        raw = _read_static_bytes(so, int(static_addr), 16) if so is not None else b""
+        result["original_hex"] = raw.hex() if raw else None
+        result["mda_key"] = getattr(so, "name", None) if so is not None else None
+    except Exception:                                     # noqa: BLE001
+        result["original_hex"] = None
+
+    # 2) 运行时地址
+    dev = None
+    sess = None
+    try:
+        dev = frida.get_device(serial, timeout=15)
+        # (18) 第十八次修改（2026-11-06）：模块枚举没有 Python 便捷 API。
+        #      bug 原因：先写成 Device.enumerate_modules 又写成
+        #               Session.enumerate_modules，两个都不存在（frida 17 里
+        #               模块枚举只能在 JS 侧做 Process.enumerateModules()），
+        #               导致探测直接抛 AttributeError。
+        #      解决方案：复用项目里已经实现好的 dyn.rebase.Rebase——它就是
+        #               用 JS 枚举模块的；按候选名 + basename 双向比对。
+        # (18) 第十八次修改（2026-11-06）：模块枚举走 JS，不用 Rebase。
+        #      bug 原因：先写成 Device.enumerate_modules、又写成
+        #               Session.enumerate_modules，两者都不存在；改用 Rebase 后
+        #               它内部又 device.attach 一次（本函数已经 attach 过），
+        #               双重 attach 让耗时涨到 28 秒。
+        #      解决方案：直接在**已建立的会话**里跑 Process.enumerateModules()，
+        #               既避免重复 attach，也避免依赖 Rebase 的生命周期。
+        mod = None
+        cands = _module_name_candidates(so_name)
+        sess = dev.attach(int(pid))
+        mods_box: dict = {}
+
+        def _list_modules() -> None:
+            try:
+                sc = sess.create_script(
+                    "send(Process.enumerateModules().map(function(m){"
+                    "return {name:m.name, base:m.base.toString(), size:m.size};}));")
+                got: list = []
+                sc.on("message", lambda m, d: got.extend(m.get("payload") or []))
+                sc.load()
+                t1 = _time.time()
+                while not got and _time.time() - t1 < 5.0:
+                    _time.sleep(0.02)
+                mods_box["list"] = got
+            except Exception as exc:                      # noqa: BLE001
+                mods_box["error"] = f"{type(exc).__name__}: {exc}"
+
+        _list_modules()
+        all_mods = mods_box.get("list") or []
+
+        # (23) 第二十三次修改（2026-11-06）：
+        #      bug 原因：目标已被 set_breakpoint 占用会话时，这里再 dev.attach 一次
+        #                会在部分 frida 版本上拿不到可用脚本 → 模块列表为空 →
+        #                报 MODULE_NOT_LOADED，把"已经下好断点"的现场判成"模块没加载"。
+        #                实测：先 set_breakpoint 再 verify_breakpoint 必现。
+        #      解决方案：枚举失败时改用 **service 里已有会话**的模块表（rb 里就有缓存），
+        #                不依赖新建的第二个 attach；两者都没有才如实报错。
+        if not all_mods:
+            try:
+                from dyn.service import get_dyn
+
+                svc0 = get_dyn()
+                tgt0 = svc0._targets.get(f"{serial}:{int(pid)}")   # noqa: SLF001 - 只读
+                rb0 = getattr(tgt0, "rb", None) if tgt0 is not None else None
+                if rb0 is not None:
+                    cached = list(getattr(rb0, "_modules", []) or [])
+                    if not cached:
+                        cached = rb0.refresh_modules()
+                    all_mods = [{"name": getattr(m, "name", ""),
+                                 "base": hex(int(getattr(m, "base", 0) or 0)),
+                                 "size": int(getattr(m, "size", 0) or 0)}
+                                for m in cached]
+                    if all_mods:
+                        result["modules_from"] = "existing_session"
+            except Exception:                             # noqa: BLE001
+                pass
+        for m in all_mods:
+            nm = str(m.get("name") or "")
+            bn = nm.rsplit("/", 1)[-1]
+            if nm in cands or bn in cands:
+                mod = m
+                break
+        # (19) 第十九次修改（2026-11-06）：名字匹配失败时用**字节指纹**反查。
+        #      bug 原因：本地文件被改名成与设备名无关的名字（sg_real.so）时，
+        #               _module_name_candidates 生成的候选里根本没有
+        #               libsgmainso，名字匹配必然全失败——verify_breakpoint
+        #               于是拿不到模块，只能返回 None，表现为"探测什么都没做"。
+        #               watch_module 早已有指纹兜底，这里补齐，保持两个工具一致。
+        #      解决方案：把该静态偏移处的原始 16 字节，与每个候选模块同偏移处
+        #               的内存字节比对，一致即认定为同一模块（不猜、不模糊匹配）。
+        # (24) 第二十四次修改（2026-11-06）：指纹比对改为**一次脚本批量读**。
+        #      bug 原因：上一版对每个候选模块各 create_script + load 一次，
+        #                441 个模块就是 441 次脚本往返，实测超过 60 秒才走完，
+        #                实际表现为"验证超时 → 报 MODULE_NOT_LOADED"，
+        #                看起来像模块真的没加载，其实是比对太慢。
+        #      解决方案：把「所有候选模块基址 + 偏移」打包成一个 JS 脚本一次读完，
+        #                在 Python 侧做字节比对；只建一个脚本。
+        # (25) 第二十五次修改（2026-11-06）：指纹改为**两个偏移取交集**。
+        #      bug 原因：单个 16 字节指纹并不唯一——实测 sg_real.so 在 0x5bc48
+        #                处的 16 字节，在 libpdfium.so 的同一偏移处**字节完全相同**，
+        #                于是指纹先把错误的模块认了下来，断点验证对着错模块做，
+        #                必然得出"找不到模块/字节不匹配"的荒唐结论。
+        #      解决方案：取同两个不同函数入口的 16 字节，**两个都命中**才算同一模块。
+        #                实测单指纹有 1 个假阳性（libpdfium），双指纹交集只剩
+        #                libsgmainso-6.7.260202.so，唯一命中。
+        if mod is None and so is not None:
+            try:
+                fns_all = getattr(so, "functions", {}) or {}
+                fvals = fns_all.values() if isinstance(fns_all, dict) else list(fns_all)
+                offs = sorted({int(getattr(f, "addr", 0) or 0) for f in fvals})
+                offs = [o for o in offs if o > 0][:2]
+                fps = []
+                for o in offs:
+                    r2 = _read_static_bytes(so, o, 16)
+                    if r2 and len(r2) == 16:
+                        fps.append((o, r2.hex()))
+            except Exception:                             # noqa: BLE001
+                fps = []
+            if fps and all_mods:
+                need = max(o for o, _h in fps)
+                probes = []
+                for m in all_mods:
+                    try:
+                        m_base = m.get("base")
+                        m_base = int(m_base, 16) if isinstance(m_base, str) else int(m_base)
+                        m_size = int(m.get("size") or 0)
+                    except (TypeError, ValueError):
+                        continue
+                    if need >= m_size:
+                        continue
+                    probes.append((m, m_base))
+                if probes:
+                    try:
+                        addrs = []
+                        for _m, b in probes:
+                            for o, _h in fps:
+                                addrs.append(b + o)
+                        sc2 = sess.create_script(
+                            "var A = " + json.dumps(addrs) + ";"
+                            "var out = [];"
+                            "for (var i = 0; i < A.length; i++) {"
+                            "  try { var b = ptr(A[i]).readByteArray(16);"
+                            "    out.push(b === null ? null : Array.from(new Uint8Array(b))"
+                            ".map(function(x){return x.toString(16).padStart(2,'0');}).join(''));"
+                            "  } catch (e) { out.push(null); }"
+                            "}"
+                            "send(out);")
+                        buf: list = []
+                        sc2.on("message", lambda mm, d: buf.extend(mm.get("payload") or []))
+                        sc2.load()
+                        t2 = _time.time()
+                        while not buf and _time.time() - t2 < 10.0:
+                            _time.sleep(0.02)
+                        nf = len(fps)
+                        for idx, _m in enumerate(probes):
+                            ok_all = True
+                            for k in range(nf):
+                                pos = idx * nf + k
+                                if pos >= len(buf) or not buf[pos] or buf[pos] != fps[k][1]:
+                                    ok_all = False
+                                    break
+                            if ok_all:
+                                mod = probes[idx][0]
+                                result["matched_by"] = "fingerprint(multi)"
+                                break
+                    except Exception:                     # noqa: BLE001
+                        pass
+        if mod is None:
+            result.update({"ok": False, "code": "MODULE_NOT_LOADED",
+                           "error": f"进程里找不到模块（试过 {cands}）"})
+            return result
+        m_base = mod.get("base")
+        m_base = int(m_base, 16) if isinstance(m_base, str) else int(m_base)
+        runtime = m_base + int(static_addr)
+        result["module_name"] = mod.get("name")
+        result["module_base"] = hex(m_base)
+        result["runtime_addr"] = hex(runtime)
+
+        js = _JS_VERIFY_BP.replace("__RUNTIME__", str(runtime))
+        box: dict = {}
+        script = sess.create_script(js)
+        script.on("message", lambda m, d: box.update(m.get("payload") or {}))
+        script.load()
+        t0 = _time.time()
+        while not box and _time.time() - t0 < 10.0:
+            _time.sleep(0.02)
+        for key in ("current_hex", "read_error", "already_hooked",
+                    "attach_error", "probe_ok"):
+            if key in box:
+                result[key] = box[key]
+    except Exception as exc:                              # noqa: BLE001
+        result["probe_error"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        _detach_async(sess)
+
+    # 3) 字节比对
+    cur, orig = result.get("current_hex"), result.get("original_hex")
+    if cur and orig:
+        result["bytes_match"] = (cur == orig)
+    else:
+        result["bytes_match"] = None
+
+    # 4) 命中数
+    # (20) 第二十次修改（2026-11-06）：命中数改为直接读 debugger 的命中缓存。
+    #      bug 原因：原来调 service.poll_events 统计，而它要求**该目标已 attach**；
+    #                verify_breakpoint 自身不建立 service 会话，于是必然抛
+    #               NOT_ATTACHED，命中数永远是 None，verdict 也就永远说
+    #               "未提供 bp_id"。用户明明给了 bp_id。
+    #      解决方案：直接读 service 里已有目标的 dbg.hits（只读，不建立新会话）；
+    #               没有会话就如实说明"该目标当前未 attach，无法统计命中"。
+    #
+    # (22) 第二十二次修改（2026-11-06）：改为调用 service.hit_count_for，且**不再要求 bp_id**。
+    #      bug 原因：① 上一版仍自己访问 svc._targets 并遍历 dbg.hits——那是私有字段，
+    #                  debugger 内部把 hits 改成 @property 后这类写法随时会崩；
+    #               ② 不传 bp_id 时完全拿不到命中数，而 (so_name, static_addr)
+    #                  本身就足以定位"这个断点命中了几次"。
+    #      解决方案：统一走 service.hit_count_for(serial, pid, so_name, static_addr)，
+    #                由它负责取缓存与兼容各种 debugger 形态；
+    #                bp_id 变成**可选**——给了就额外回报 bp_id 便于对账，
+    #                没给也照样按地址统计。
+    hits = None
+    try:
+        from dyn.service import get_dyn
+
+        svc = get_dyn()
+        stat = svc.hit_count_for(serial, int(pid), so_name, int(static_addr)) or {}
+        if stat.get("ok"):
+            hits = int(stat.get("hits") or 0)
+            result["hits_since_set"] = hits
+            result["hits_scope"] = ("该 (so_name, static_addr) 在本会话命中缓存里的条数")
+            if stat.get("total_hits") is not None:
+                result["total_hits_all_addrs"] = int(stat["total_hits"])
+            if stat.get("discarded") is not None:
+                result["hits_discarded"] = int(stat["discarded"])
+            if bp_id:
+                result["bp_id"] = str(bp_id)
+        else:
+            # 取不到就说清楚原因，不伪造 0
+            result["hits_error"] = stat.get("reason") or stat.get("code") or "取不到命中数"
+    except Exception as exc:                              # noqa: BLE001
+        result["hits_error"] = f"{type(exc).__name__}: {exc}"
+
+    # 5) 结论
+    armed = not result.get("already_hooked")
+    if hits is None:
+        if result.get("hits_error"):
+            # (21) 第二十一次修改（2026-11-06）：命中数取不到时要说**真实原因**。
+            #      bug 原因：原来无论为什么取不到，verdict 都写"未提供 bp_id"——
+            #               用户明明提供了，却被说成没提供，属于误导性结论。
+            #      解决方案：区分"没给 bp_id"与"给了但取不到"，后者直接透传原因。
+            verdict = (f"地址可挂钩性已探明，但命中数取不到：{result['hits_error']}")
+        elif bp_id:
+            verdict = "已探明地址可挂钩；命中数统计失败"
+        elif result.get("current_hex"):
+            verdict = "已探明地址是否可挂钩；未提供 bp_id，无法统计命中数"
+        else:
+            verdict = "探测失败，见 probe_error"
+    elif hits > 0:
+        verdict = f"断点正常工作：已命中 {hits} 次"
+    elif result.get("already_hooked"):
+        verdict = ("钩子已装在目标地址上，但**一次都没命中**——"
+                   "说明这段代码在当前场景下没有执行。"
+                   "用 watch_module 看真正在跑的是哪些函数偏移")
+    else:
+        verdict = ("钩子未装上（frida 未报 already attached），"
+                   "检查地址换算或模块是否选错")
+    result["armed"] = bool(armed)
+    result["verdict"] = verdict
+    return result
+
+
+_JS_PROBE_HITS = r"""
+(function () {
+    var mod = null;
+    var cands = __CANDS__;
+    var mods = Process.enumerateModules();
+    for (var ci = 0; ci < cands.length && mod === null; ci++) {
+        for (var mi = 0; mi < mods.length; mi++) {
+            var m = mods[mi], bn = m.name.split('/').pop();
+            if (m.name === cands[ci] || bn === cands[ci]) { mod = m; break; }
+        }
+    }
+    // (16) 第十六次修改（2026-11-06）：名字匹配失败时用字节指纹反查。
+    //      bug 原因：本地文件名与设备名毫无字面关系时（sg_real.so），
+    //               任何候选名都匹配不上，probe_hits 直接报 MODULE_NOT_LOADED，
+    //               而 watch_module 早已有指纹兜底——两个工具行为不一致。
+    //      解决方案：把该偏移处文件里的原始 16 字节作为指纹，
+    //               在各模块同偏移处比对，命中即认定（不猜）。
+    var FP = __FP__;
+    if (mod === null && FP) {
+        var all = Process.enumerateModules();
+        for (var ai = 0; ai < all.length && mod === null; ai++) {
+            var c = all[ai];
+            if (__OFFSET__ >= c.size) { continue; }
+            try {
+                var got = c.base.add(__OFFSET__).readByteArray(16);
+                if (got === null) { continue; }
+                var hex = Array.from(new Uint8Array(got))
+                    .map(function (x) { return x.toString(16).padStart(2, '0'); })
+                    .join('');
+                if (hex === FP) {
+                    mod = c;
+                    send({ kind: 'note', message: '按字节指纹匹配到 ' + c.name });
+                }
+            } catch (e) {}
+        }
+    }
+
+    if (mod === null) {
+        send({ kind: 'error', code: 'MODULE_NOT_LOADED',
+               message: '找不到模块（试过 ' + cands.join(', ') + '；字节指纹也未命中）' });
+        return;
+    }
+    var target = mod.base.add(__OFFSET__);
+    var hits = 0, firstTs = null;
+    var threads = {};
+    var mechanism = 'Interceptor';
+    var attached = false;
+    try {
+        Interceptor.attach(target, {
+            onEnter: function () {
+                hits++;
+                if (firstTs === null) { firstTs = Date.now() / 1000; }
+                threads[this.threadId] = (threads[this.threadId] || 0) + 1;
+            }
+        });
+        attached = true;
+    } catch (e) {
+        send({ kind: 'error', code: 'INTERCEPT_FAILED',
+               message: 'Interceptor 挂不上：' + String(e).slice(0, 200),
+               runtime: target.toString(), mechanism: 'Interceptor' });
+        return;
+    }
+    send({ kind: 'ready', module: mod.name, base: mod.base.toString(),
+           runtime: target.toString(), mechanism: mechanism });
+    recv('stop', function () {
+        send({ kind: 'stopped', hits: hits, first_hit_ts: firstTs,
+               threads: Object.keys(threads).map(Number) });
+    });
+})();
+"""
+
+
+def probe_hits(serial: str, pid: int, so_name: str, static_addr: int,
+               duration: float = 5.0) -> dict:
+    """**纯计数探针**：只统计某地址被进入多少次，不挂起、不依赖 hold。
+
+    (15) 第十五次修改（2026-11-06）：新增。
+
+    为什么需要它：`set_breakpoint(hold=True)` 走的是完整断点链路（登记、策略、
+    RPC、事件流）。当用户只想回答"这个地址到底跑不跑"时，那条链路太重，
+    而且任何一环出问题都会表现为"0 命中"，分不清是没执行还是没挂钩。
+    本工具用**最直接的方式**验：一个 Interceptor、一个计数器，成功挂上才谈命中。
+
+    ## 与 verify_breakpoint 的分工
+
+        verify_breakpoint  查"断点有没有真的 armed"（字节、hook 状态）
+        probe_hits         查"这段代码到底跑不跑"（纯计数，不挂起）
+
+    ## 返回
+
+        hits            命中次数（0 表示这段时间没执行）
+        first_hit_ts    首次命中的时间戳（没有命中为 null）
+        threads         命中过该地址的线程 id 列表
+        mechanism       实际使用的机制（当前固定 Interceptor）
+        runtime         换算出的运行时地址
+
+    ## 关键：拦截失败会明确报错
+
+    frida 对某些地址会抛 `unable to intercept function ... please file a bug`
+    （实测同一区间 78 个入口里 19 个挂不上，它们多是函数内部块而非真入口）。
+    这种情况返回 INTERCEPT_FAILED，**不会伪装成"0 命中"**。
+    """
+    import time as _time
+
+    try:
+        import frida
+    except Exception as exc:                              # noqa: BLE001
+        return _trace_pending("probe_hits", hint=f"frida 不可用：{exc}",
+                              extra={"so_name": so_name})
+
+    cands = _module_name_candidates(so_name)
+    if not cands:
+        return {"ok": False, "implemented": True, "code": "NO_SO_NAME",
+                "error": "必须给 so_name"}
+
+    # 指纹：用该偏移处文件里的原始 16 字节（名字对不上时用于反查模块）
+    fp_hex = ""
+    try:
+        so = None
+        from mcp_server.tools import get_session
+
+        so = _find_loaded_so(get_session(), so_name)
+        if so is not None:
+            raw = _read_static_bytes(so, int(static_addr), 16)
+            if raw and len(raw) == 16:
+                fp_hex = raw.hex()
+    except Exception:                                     # noqa: BLE001
+        fp_hex = ""
+
+    js = (_JS_PROBE_HITS
+          .replace("__CANDS__", json.dumps(cands))
+          .replace("__OFFSET__", str(int(static_addr)))
+          .replace("__FP__", json.dumps(fp_hex)))
+
+    box: dict = {"ready": False, "stopped": False, "hits": 0,
+                 "first_hit_ts": None, "threads": [],
+                 "module": "", "runtime": "", "mechanism": "",
+                 "err": "", "err_code": ""}
+    sess = None
+    try:
+        dev = frida.get_device(serial, timeout=15)
+        sess = dev.attach(int(pid))
+
+        def _on_msg(msg, data):
+            payload = msg.get("payload")
+            if not isinstance(payload, dict):
+                return
+            kind = payload.get("kind")
+            if kind == "ready":
+                box["ready"] = True
+                box["module"] = payload.get("module") or ""
+                box["runtime"] = payload.get("runtime") or ""
+                box["mechanism"] = payload.get("mechanism") or "Interceptor"
+                return
+            if kind == "stopped":
+                box["stopped"] = True
+                box["hits"] = int(payload.get("hits") or 0)
+                box["first_hit_ts"] = payload.get("first_hit_ts")
+                box["threads"] = payload.get("threads") or []
+                return
+            if kind == "note":
+                box.setdefault("notes", []).append(payload.get("message") or "")
+                return
+            if kind == "error":
+                box["err"] = payload.get("message") or payload.get("code") or "error"
+                box["err_code"] = payload.get("code") or "PROBE_FAILED"
+                if payload.get("mechanism"):
+                    box["mechanism"] = payload["mechanism"]
+
+        script = sess.create_script(js)
+        script.on("message", _on_msg)
+        script.load()
+
+        t0 = _time.time()
+        while not box["ready"] and not box["err"] and _time.time() - t0 < 10.0:
+            _time.sleep(0.02)
+        if box["err"]:
+            return {"ok": False, "implemented": True,
+                    "code": box["err_code"] or "PROBE_FAILED",
+                    "error": box["err"], "so_name": so_name,
+                    "static_addr": hex(int(static_addr)),
+                    "mechanism": box["mechanism"] or "Interceptor",
+                    "hint": ("frida 对某些地址无法安全挂钩（常见于函数内部块）。"
+                             "换一个真正的函数入口再试；"
+                             "用 watch_module 能看到哪些入口是可挂的")}
+        if not box["ready"]:
+            return {"ok": False, "implemented": True, "code": "NOT_READY",
+                    "error": "探针 10 秒内未就位", "so_name": so_name}
+
+        _time.sleep(max(0.1, float(duration)))
+        try:
+            script.post({"type": "stop"})
+        except Exception:                                 # noqa: BLE001
+            pass
+        for _ in range(50):
+            if box["stopped"]:
+                break
+            _time.sleep(0.02)
+    except Exception as exc:                              # noqa: BLE001
+        return {"ok": False, "implemented": True, "code": "PROBE_FAILED",
+                "error": f"{type(exc).__name__}: {exc}", "so_name": so_name}
+    finally:
+        _detach_async(sess)
+
+    hits = int(box["hits"] or 0)
+    if hits > 0:
+        verdict = f"该地址在 {duration:g}s 内被执行 {hits} 次，断点机制可用"
+    else:
+        verdict = (f"该地址在 {duration:g}s 内**一次都没执行**："
+                   "不是挂钩失败（已确认 Interceptor 挂上了），"
+                   "而是这段代码在当前场景下没有被走到")
+    out = {
+        "ok": True,
+        "implemented": True,
+        "so_name": so_name,
+        "static_addr": hex(int(static_addr)),
+        "module": box["module"],
+        "runtime": box["runtime"],
+        "mechanism": box["mechanism"] or "Interceptor",
+        "duration": duration,
+        "hits": hits,
+        "first_hit_ts": box["first_hit_ts"],
+        "threads": box["threads"],
+        "verdict": verdict,
+    }
+    if box.get("notes"):
+        out["notes"] = box["notes"]
+    return out
+
+
+_JS_CALL_TREE = r"""
+(function () {
+    var mod = null;
+    var cands = __CANDS__;
+    var mods = Process.enumerateModules();
+    for (var ci = 0; ci < cands.length && mod === null; ci++) {
+        for (var mi = 0; mi < mods.length; mi++) {
+            var m = mods[mi], bn = m.name.split('/').pop();
+            if (m.name === cands[ci] || bn === cands[ci]) { mod = m; break; }
+        }
+    }
+    // (21) 第二十一次修改（2026-11-06）：名字匹配失败时用**双字节指纹**反查。
+    //      bug 原因：本地文件名与设备名毫无字面关系时（sg_real.so vs
+    //               libsgmainso-6.7.260202.so），候选名全不命中，直接报
+    //               MODULE_NOT_LOADED——但 so 明明就在进程里。
+    //      解决方案：与 verify_breakpoint 同一套双指纹（两个偏移取交集），
+    //                实测单指纹会在 libpdfium.so 上假阳性，双指纹唯一。
+    var FPS = __FPS__;
+    if (mod === null && FPS && FPS.length > 0) {
+        var all = Process.enumerateModules();
+        for (var ai = 0; ai < all.length && mod === null; ai++) {
+            var c = all[ai];
+            var need = 0;
+            for (var q = 0; q < FPS.length; q++) { if (FPS[q].offset > need) need = FPS[q].offset; }
+            if (need >= c.size) { continue; }
+            var okAll = true;
+            for (var q = 0; q < FPS.length; q++) {
+                try {
+                    var b = c.base.add(FPS[q].offset).readByteArray(16);
+                    if (b === null) { okAll = false; break; }
+                    var hx = Array.from(new Uint8Array(b))
+                        .map(function (x) { return x.toString(16).padStart(2, '0'); })
+                        .join('');
+                    if (hx !== FPS[q].hex) { okAll = false; break; }
+                } catch (e) { okAll = false; break; }
+            }
+            if (okAll) { mod = c; }
+        }
+    }
+
+    if (mod === null) {
+        send({ kind: 'error', code: 'MODULE_NOT_LOADED',
+               message: '找不到模块（试过 ' + cands.join(', ') + '；双指纹也未命中）' });
+        return;
+    }
+    var base = mod.base;
+    var ROOTS = __ROOTS__;          // 要追踪的入口偏移
+    var MAXN = __MAXN__;
+    var edges = {};                 // "from->to" -> count
+    var entryHits = {};
+    var placed = 0, failed = [];
+
+    // (20) 第二十次修改（2026-11-06）：调用链追踪。
+    //      为什么需要：反复出现"某个函数断点不命中，但不知道是上层没调它、
+    //      还是地址找错了"。只看单点命中是 0 分不清；看它被谁调用、
+    //      调用了几次，才能判断这条路径到底走没走。
+    //      做法：在给定入口挂 Interceptor，onEnter 里取返回地址（lr）作为"调用者"，
+    //            记录 调用者lr -> 本函数 的边与次数。开销远小于 Stalker。
+    function place(off) {
+        try {
+            Interceptor.attach(base.add(off), {
+                onEnter: function () {
+                    entryHits[off] = (entryHits[off] || 0) + 1;
+                    try {
+                        var caller = this.returnAddress;
+                        if (caller !== null) {
+                            var c = caller.sub(base).toInt32();
+                            if (c >= 0) {
+                                var key = c + '->' + off;
+                                if (Object.keys(edges).length < MAXN) {
+                                    edges[key] = (edges[key] || 0) + 1;
+                                }
+                            }
+                        }
+                    } catch (e) {}
+                }
+            });
+            placed++;
+        } catch (e) {
+            if (failed.length < 10) {
+                failed.push({offset: off, error: String(e).slice(0, 100)});
+            }
+        }
+    }
+    ROOTS.forEach(place);
+
+    send({ kind: 'ready', module: mod.name, base: base.toString(),
+           placed: placed, failed: failed, total: ROOTS.length });
+    recv('stop', function () {
+        send({ kind: 'stopped', entry_hits: entryHits, edges: edges });
+    });
+})();
+"""
+
+
+def trace_call_tree(serial: str, pid: int, so_name: str,
+                    entries: list, duration: float = 5.0,
+                    max_edges: int = 500, so_hint=None) -> dict:
+    """追踪一组函数入口的**调用者**，回答「这条路径到底有没有被调用」。
+
+    (20) 第二十次修改（2026-11-06）：新增。
+
+    解决什么问题：某函数断点 0 命中时，有两种完全不同的原因——
+        · 上层根本没有调用它（这条路在当前场景没走）
+        · 地址/模块找错了
+    只看"0 命中"分不清。本工具同时给出：**这个函数被调了几次**、
+    **是被谁（哪个返回地址）调的**。
+
+    ## 与 watch_module 的区别
+
+        watch_module     在整个 so 的所有函数入口撒点，看"谁被执行了"（广度）
+        trace_call_tree  针对**指定的少数几个入口**，看"谁调用了它"（深度）
+
+    ## 参数
+
+        entries       要追踪的函数入口静态偏移列表，如 [0x174F00, 0x175018]
+        duration      观察秒数
+        max_edges     最多记录多少条调用边（防止热点函数把内存打爆）
+
+    ## 返回
+
+        entry_hits    {offset: 被调用次数}
+        edges         [{caller_static, callee_static, count}] 按次数降序
+        placed/failed 挂点情况
+        verdict       一句话结论
+
+    ## 已知边界
+
+        · 用 `this.returnAddress`（lr）作为调用者，**只能拿到直接调用者的返回地址**；
+          经 PLT/尾调用跳转过来的可能落在桩上
+        · 调用者地址若不在本 so 内，会标 `caller_in_module=false`
+        · 开销远小于 Stalker，但仍建议 duration ≤ 30 秒、entries ≤ 50 个
+    """
+    import time as _time
+
+    try:
+        import frida
+    except Exception as exc:                              # noqa: BLE001
+        return _trace_pending("trace_call_tree", hint=f"frida 不可用：{exc}",
+                              extra={"so_name": so_name})
+
+    # (22) 第二十二次修改（2026-11-06）：入口数量设上限。
+    #      bug 原因：entries 直接原样挂探针，调用方若传上千个（比如把整个函数表
+    #                都塞进来），就会在同一瞬间 patch 上千个地址——实测这种
+    #                密度会把目标拖垮（watch_module 的教训：765 个直接崩）。
+    #      解决方案：硬上限 200 个入口，超出只取前 200 并在返回里声明截断。
+    MAX_ENTRIES = 200
+    offs = []
+    dropped_entries = 0
+    for e in (entries or []):
+        try:
+            v = int(e, 16) if isinstance(e, str) else int(e)
+        except (TypeError, ValueError):
+            continue
+        if len(offs) >= MAX_ENTRIES:
+            dropped_entries += 1
+            continue
+        offs.append(v)
+    if not offs:
+        return {"ok": False, "implemented": True, "code": "NO_ENTRIES",
+                "error": "必须给 entries（函数入口静态偏移列表）"}
+
+    cands = _module_name_candidates(so_name)
+    # 双指纹（两个函数入口），名字对不上时用于反查模块
+    # (23) 第二十三次修改（2026-11-06）：指纹来源改为**可选参数**。
+    #      bug 原因：原来硬编码去取 mcp_server 的全局会话，而 dyn 层被直接调用时
+    #               （测试脚本、别的调用方）那个会话可能是空的，于是指纹为空、
+    #               模块匹配失败、整个函数返回 None——报错信息还完全不相关。
+    #      解决方案：① 新增 so 参数，调用方可直接传 SoFile；
+    #                ② 没传才退回全局会话；都拿不到就不做指纹（只按名字匹配），
+    #                   并把这一情况体现在失败信息里，而不是静默返回 None。
+    fps: list[dict] = []
+    try:
+        so = so_hint
+        if so is None:
+            so = _find_loaded_so(
+                __import__("mcp_server.tools", fromlist=["x"]).get_session(), so_name)
+        if so is not None:
+            fns = getattr(so, "functions", {}) or {}
+            vals = fns.values() if isinstance(fns, dict) else list(fns)
+            offs0 = sorted({int(getattr(f, "addr", 0) or 0) for f in vals})[:2]
+            for o in offs0:
+                raw = _read_static_bytes(so, o, 16)
+                if raw and len(raw) == 16:
+                    fps.append({"offset": int(o), "hex": raw.hex()})
+    except Exception:                                     # noqa: BLE001
+        fps = []
+    js = (_JS_CALL_TREE
+          .replace("__CANDS__", json.dumps(cands))
+          .replace("__FPS__", json.dumps(fps))
+          .replace("__ROOTS__", json.dumps(offs))
+          .replace("__MAXN__", str(max(10, int(max_edges)))))
+
+    box: dict = {"ready": False, "stopped": False, "module": "", "base": "",
+                 "placed": 0, "failed": [], "entry_hits": {}, "edges": {},
+                 "err": "", "err_code": ""}
+    sess = None
+    try:
+        dev = frida.get_device(serial, timeout=15)
+        sess = dev.attach(int(pid))
+
+        def _on_msg(msg, data):
+            payload = msg.get("payload")
+            if not isinstance(payload, dict):
+                return
+            kind = payload.get("kind")
+            if kind == "ready":
+                box["ready"] = True
+                box["module"] = payload.get("module") or ""
+                box["base"] = payload.get("base") or ""
+                box["placed"] = int(payload.get("placed") or 0)
+                box["failed"] = payload.get("failed") or []
+                return
+            if kind == "stopped":
+                box["stopped"] = True
+                box["entry_hits"] = payload.get("entry_hits") or {}
+                box["edges"] = payload.get("edges") or {}
+                return
+            if kind == "error":
+                box["err"] = payload.get("message") or "error"
+                box["err_code"] = payload.get("code") or "TRACE_FAILED"
+
+        script = sess.create_script(js)
+        script.on("message", _on_msg)
+        script.load()
+
+        t0 = _time.time()
+        while not box["ready"] and not box["err"] and _time.time() - t0 < 15.0:
+            _time.sleep(0.02)
+        if box["err"]:
+            return {"ok": False, "implemented": True, "code": box["err_code"],
+                    "error": box["err"], "so_name": so_name}
+        if not box["ready"]:
+            return {"ok": False, "implemented": True, "code": "NOT_READY",
+                    "error": "追踪点 15 秒内未就位", "so_name": so_name}
+
+        _time.sleep(max(0.1, float(duration)))
+        try:
+            script.post({"type": "stop"})
+        except Exception:                                 # noqa: BLE001
+            pass
+        for _ in range(50):
+            if box["stopped"]:
+                break
+            _time.sleep(0.02)
+    except Exception as exc:                              # noqa: BLE001
+        return {"ok": False, "implemented": True, "code": "TRACE_FAILED",
+                "error": f"{type(exc).__name__}: {exc}", "so_name": so_name}
+    finally:
+        _detach_async(sess)
+
+    entry_hits = {}
+    for k, v in (box["entry_hits"] or {}).items():
+        try:
+            entry_hits[hex(int(k))] = int(v)
+        except (TypeError, ValueError):
+            continue
+
+    edges = []
+    for k, v in (box["edges"] or {}).items():
+        try:
+            caller_s, callee_s = str(k).split("->")
+            edges.append({"caller_static": hex(int(caller_s)),
+                          "callee_static": hex(int(callee_s)),
+                          "count": int(v)})
+        except (TypeError, ValueError):
+            continue
+    edges.sort(key=lambda e: -e["count"])
+
+    total_hits = sum(entry_hits.values())
+    if total_hits:
+        top = max(entry_hits.items(), key=lambda kv: kv[1])
+        verdict = (f"这 {len(entries)} 个入口共被调用 {total_hits} 次，"
+                   f"最频繁的是 {top[0]}（{top[1]} 次）")
+    else:
+        verdict = (f"这 {len(entry_hits) or len(entries)} 个入口在 {duration:g}s 内"
+                   "**一次都没被调用**：说明上层路径在当前场景没有走到它们，"
+                   "不是地址找错（挂点已成功 " + str(box["placed"]) + " 个）")
+
+    out = {
+        "ok": True,
+        "implemented": True,
+        "so_name": so_name,
+        "module": box["module"],
+        "base": box["base"],
+        "duration": duration,
+        "placed": box["placed"],
+        "failed": box["failed"],
+        "entry_hits": entry_hits,
+        "edges": edges[:200],
+        "total_hits": total_hits,
+        "verdict": verdict,
+        "note": ("caller_static 来自 lr（直接调用者的返回地址）；"
+                 "若落在桩或 so 外，说明是跨模块/经 PLT 调用"),
+    }
+    if dropped_entries:
+        out["entries_truncated"] = (
+            f"入参给了 {len(entries)} 个入口，只挂了前 {MAX_ENTRIES} 个"
+            f"（丢弃 {dropped_entries} 个）：一次挂太多会把目标拖垮")
     return out

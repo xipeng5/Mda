@@ -35,6 +35,15 @@ hiddenimports = (
     + collect_submodules("mcp", filter=lambda n: not n.startswith("mcp.cli"))
     + collect_submodules("webview")      # pywebview 按平台动态选后端
     + collect_submodules("dyn")          # 动态分析按需 import，静态扫不到
+    # (2) 第二次修改（2026-11-05）：
+    #     bug 原因：collect_submodules("dyn") 在 PyInstaller 6.22.3 下
+    #              虽然返回 11 个子模块，但 dyn.tracer / dyn.bridge / dyn.memread
+    #              分析阶段被跳过（PYZ 里只有 8 个），导致运行期
+    #              trace_* / suggest_breakpoints / read_typed 报 MODULE_UNAVAILABLE。
+    #              典型现象：源码 .venv 里 `import dyn.tracer` 成功，
+    #              但打包后 PYZ 缺这三个模块。
+    #     解决方案：显式声明这三个模块，不依赖 collect_submodules 的隐式收集。
+    + ["dyn.tracer", "dyn.bridge", "dyn.memread"]
     # (1) 第一次修改（2026-10-30）：显式声明 mcp_server 子模块。
     #     bug 原因：mcp_server.link 是在工具包装器里用 `from mcp_server import link`
     #               运行期动态导入的，PyInstaller 静态分析扫不到，打包后

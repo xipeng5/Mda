@@ -57,6 +57,14 @@ _HIT_FIELDS = ("so_name", "static_addr", "runtime_addr", "thread_id",
 #               不放进对 AI 暴露的事件里，仍由 resume() 统一放行。
 _HIT_OPTIONAL_FIELDS = ("held", "token")
 
+# (13) 第十三次修改（2026-11-06）：断点机制名，供 set_breakpoint 如实回报。
+#     目前 dyn/debugger.py 的 set_breakpoint 只走 frida 的 Interceptor.attach
+#     这一条路径，所以只会是 "Interceptor"。
+#     **未实现**：hw_breakpoint（ARMv8 硬件观察点，仅 4 个槽位且按线程生效）、
+#               soft_bp（把目标指令改成 BRK 的软断点）。
+#     将来 debugger 真支持了，应改由 debugger 回报实际机制，而不是在这里加常量。
+BREAKPOINT_MECHANISM = "Interceptor"
+
 
 @dataclass
 class Target:
@@ -174,7 +182,7 @@ class DynamicService:
                     "pending_events": self._pending_locked(tgt),
                     "last_seq": tgt.polled_seq,
                     "breakpoints": list(tgt.breakpoints.values()),
-                    "hits": len(getattr(tgt.dbg, "hits", []) or []),
+                    "hits": len(_dbg_hits(tgt.dbg)),
                 })
             return {"targets": targets, "seq": self._seq}
 
@@ -204,10 +212,29 @@ class DynamicService:
                 return {**tgt.breakpoints[bp_id], "existing": True}
         mod = self._require_module(tgt, so_name)
         runtime_addr = tgt.rb.to_runtime(static_addr, mod)
-        ok = tgt.dbg.set_breakpoint(so_name, static_addr,
+        # (10) 第十次修改（2026-11-06）：
+        # bug 原因：下断点时把**用户传入的本地名**（sg_real.so）传给 debugger，
+        #          而 debugger 内部又用它去 rb.find_module 二次解析；名字对不上时
+        #          即使 service 层已经靠指纹找到了模块，debugger 那一步照样失败，
+        #          最终报 BREAKPOINT_FAILED。
+        # 解决方案：把**解析出来的真实运行时模块名**传下去（mod.name），
+        #          保证 debugger 侧一定能找到同一个模块。断点记录里同时保留
+        #          原始名，方便用户按自己习惯的名字检索。
+        real_name = getattr(mod, "name", so_name) or so_name
+        ok = tgt.dbg.set_breakpoint(real_name, static_addr,
                                     policy="hold" if hold else "resume")
         if not ok:
             raise DynError("BREAKPOINT_FAILED", f"{so_name}+{static_addr:#x} 下断点失败")
+        # (13) 第十三次修改（2026-11-06）：断点记录补 mechanism / armed。
+        #     为什么：调用方只能看到 set=True，既不知道这次下断用的是哪种机制，
+        #             也分不清"请求被接受"与"钩子真的装上"。verify_breakpoint
+        #             这类工具正需要这两个字段做判断。
+        #     mechanism 必须如实反映实现：目前 dyn/debugger.py 只有 Interceptor
+        #     一种路径（Interceptor.attach），hw_breakpoint（硬件断点）与
+        #     soft_bp（BRK 指令软断点）**都尚未实现**，因此这里固定 "Interceptor"。
+        #     将来若新增机制，须由 debugger 回报真实值，不能在此处猜。
+        #     armed 恒为 True：能走到这一行说明 dbg.set_breakpoint 已返回 ok=True
+        #     （否则上面已 raise BREAKPOINT_FAILED），即钩子安装请求成功。
         bp = {
             "id": bp_id,
             "serial": serial,
@@ -216,11 +243,14 @@ class DynamicService:
             "static_addr": static_addr,
             "runtime_addr": runtime_addr,
             "hold": bool(hold),
+            "mechanism": BREAKPOINT_MECHANISM,
+            "armed": True,
         }
         with self._lock:
             tgt.breakpoints[bp_id] = bp
         self._emit(tgt, "breakpoint_set", bp_id=bp_id, so_name=so_name,
-                   static_addr=static_addr, hold=bool(hold))
+                   static_addr=static_addr, hold=bool(hold),
+                   mechanism=BREAKPOINT_MECHANISM, armed=True)
         return {**bp, "existing": False}
 
     def remove_breakpoint(self, bp_id: str) -> dict:
@@ -353,7 +383,98 @@ class DynamicService:
 
     def hits(self, serial: str, pid: int) -> list[dict]:
         tgt = self._target(serial, pid)
-        return [_hit_dict(h) for h in list(getattr(tgt.dbg, "hits", []) or [])]
+        return [_hit_dict(h) for h in _dbg_hits(tgt.dbg)]
+
+    def hit_count_for(self, serial: str, pid: int, so_name: str = "",
+                      static_addr: int = -1) -> dict:
+        """按 (static_addr[, so_name]) 统计某个目标的命中次数（只读）。
+
+        给 dyn/tracer.py 的 verify_breakpoint 用：它需要回答"这个断点到底进没进过"，
+        而 bp_id 在 debugger 侧没有对应关系，只能靠静态地址回查命中缓存。
+
+        (13) 第十三次修改（2026-11-06）：新增本方法。
+             为什么：verify_breakpoint 早先自己摸 svc._targets 再拼地址字符串
+                     （`int(bp_id.rsplit(":", 1)[-1], 16)`）来算命中数，
+                     既依赖私有字段、又把"取 bp_id 里的地址"这种易错解析
+                     散在调用方。收敛到这里，签名稳定、只读、不建立新会话。
+
+        参数：
+            so_name      非空时除地址外再按模块名过滤；为空则只按地址统计
+            static_addr  >= 0 按地址精确匹配；< 0 表示"不按地址过滤"（统计全部）
+
+        返回：
+            ok=False 只有一种原因——该目标当前未 attach（或已 detach），
+            此时 hits 为 None，并给出中文 reason；**不返回 0 冒充"没命中过"**，
+            因为"取不到"与"确实是 0 次"是两件不同的事。
+            discarded 取 debugger 的 _hits_discarded（因保留上限被丢弃的旧命中数），
+            debugger 没提供时为 None（表示"不知道"，同样不编 0）。
+        """
+        tgt = self._targets.get(f"{serial}:{pid}")
+        # 已 detach 的墓碑不能当活会话：dbg 已关闭，命中缓存不再有意义
+        if tgt is None or tgt.state == STATE_DETACHED:
+            return {"ok": False, "code": "NOT_ATTACHED", "hits": None,
+                    "reason": "该目标当前未 attach"}
+        dbg = getattr(tgt, "dbg", None)
+        if dbg is None:
+            return {"ok": False, "code": "NOT_ATTACHED", "hits": None,
+                    "reason": "该目标当前未 attach（debugger 不可用）"}
+        all_hits = _dbg_hits(dbg)
+        want_addr = int(static_addr)
+        want_so = (so_name or "").strip()
+
+        def _match_so(h) -> bool:
+            """命中记录的模块名是否与请求的一致（全路径或 basename 任一匹配）。"""
+            h_so = getattr(h, "so_name", "") or ""
+            if not want_so:
+                return True
+            return h_so == want_so or h_so.rsplit("/", 1)[-1] == want_so
+
+        cnt = 0
+        addr_only = 0
+        so_matched = 0
+        for h in all_hits:
+            # 地址优先：<0 表示不按地址过滤，只按模块名
+            if want_addr >= 0:
+                try:
+                    if int(getattr(h, "static_addr", -1)) != want_addr:
+                        continue
+                except (TypeError, ValueError):
+                    continue
+                addr_only += 1
+            if want_so and not _match_so(h):
+                continue
+            so_matched += 1
+            cnt += 1
+
+        # (15) 第十五次修改（2026-11-06）：
+        #      bug 原因：调用方传的常常是**本地文件名**（sg_real.so），而命中缓存里
+        #                记的是**设备上的真实模块名**（libsgmainso-6.7.260202.so），
+        #                两者字符串对不上 → 明明有命中却统计成 0，
+        #                看起来像"断点没命中"，实际是过滤条件把结果筛没了。
+        #      解决方案：模块名一条都没匹配上、但按地址**确有**命中时，
+        #                退回到"只按地址"的计数，并用 so_name_matched=false
+        #                如实标注"这次统计没有按模块名过滤"，
+        #                让调用方知道这个数的口径，而不是被一个 0 误导。
+        used_addr_only = False
+        if want_so and so_matched == 0 and addr_only > 0:
+            cnt = addr_only
+            used_addr_only = True
+
+        out = {
+            "ok": True,
+            "hits": cnt,
+            "total_hits": len(all_hits),
+            # getattr 兜底：debugger 没有该字段时给 None（"不知道"），不伪造 0
+            "discarded": getattr(dbg, "_hits_discarded", None),
+        }
+        if want_so:
+            out["so_name_matched"] = not used_addr_only
+            if used_addr_only:
+                out["match_note"] = (
+                    f"命中缓存里没有模块名为 {want_so!r} 的记录，"
+                    "已退回到只按地址统计；若同时存在多个 so 的同一偏移，"
+                    "这个数可能包含它们")
+        return out
 
     # ---------- 放行 ----------
 
@@ -449,6 +570,87 @@ class DynamicService:
         return {"static_addr": static_addr, "runtime_addr": runtime,
                 "hex": data.hex(), "size": len(data)}
 
+    def read_runtime(self, serial: str, pid: int, runtime_addr: int,
+                     size: int = 32) -> dict:
+        """按**运行时绝对地址**读内存。
+
+        (6) 第六次修改（2026-11-05）：新增。
+            bug 原因：原有 read_memory 只接受「静态地址 + so 名」，内部再 base+static
+                      换算。但断点命中现场的 x0 / lr / sp 都是**运行时绝对地址**，
+                      而且常常指向堆上的对象（不在任何 so 里），
+                      调 read_memory 会报 "addr 必须是静态地址"，根本读不到。
+            解决方案：直接把运行时地址交给 rb.read_memory（它内部就是 ptr(addr)），
+                      不做任何换算；地址合法性只做基本校验，读不到如实报错。
+
+        为什么可以放心在 hold 挂起时调用：rb.read_memory 每次新建独立脚本，
+        不走被 recv().wait() 挂住的调试脚本，实测挂起期间读 16 字节耗时 0.02s。
+        """
+        if not (1 <= size <= 4096):
+            raise DynError("BAD_REQUEST", "size 必须在 1..4096")
+        addr = int(runtime_addr)
+        if addr <= 0:
+            raise DynError("BAD_ADDRESS", f"运行时地址必须为正：{runtime_addr!r}")
+        tgt = self.attach(serial, pid)
+        data = tgt.rb.read_memory(addr, size)
+        if not data:
+            raise DynError("READ_FAILED",
+                           f"运行时地址 {addr:#x} 不可读或超时（可能未映射或权限不足）")
+        return {"runtime_addr": addr, "hex": data.hex(), "size": len(data)}
+
+    def read_runtime_string(self, serial: str, pid: int, runtime_addr: int,
+                            max_length: int = 256) -> dict:
+        """按**运行时绝对地址**读一个 C 字符串（遇 \0 截止）。
+
+        分块读而不是一次性读满：目标字符串可能紧贴页边界，一次性读会整段失败；
+        分块时某一页读不到就停在那里，把已读到的部分返回（并标 truncated）。
+        """
+        limit = max(1, min(int(max_length), 4096))
+        addr = int(runtime_addr)
+        if addr <= 0:
+            raise DynError("BAD_ADDRESS", f"运行时地址必须为正：{runtime_addr!r}")
+        tgt = self.attach(serial, pid)
+        chunk = 64
+        buf = bytearray()
+        truncated = False
+        readable_until = 0
+        while len(buf) < limit:
+            want = min(chunk, limit - len(buf))
+            try:
+                data = tgt.rb.read_memory(addr + len(buf), want)
+            except Exception:                             # noqa: BLE001 - 读失败按截断处理
+                data = b""
+            if not data:
+                # 这一段读不到：如果还没读到任何字节，说明地址本身无效
+                if not buf:
+                    raise DynError("READ_FAILED",
+                                   f"运行时地址 {addr:#x} 不可读（未映射或权限不足）")
+                truncated = True
+                break
+            nul = data.find(b"\x00")
+            if nul >= 0:
+                buf.extend(data[:nul])
+                readable_until = addr + len(buf)
+                break
+            buf.extend(data)
+            readable_until = addr + len(buf)
+            if len(data) < want:
+                truncated = True
+                break
+        raw = bytes(buf)
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            text = raw.decode("utf-8", errors="replace")
+        return {
+            "runtime_addr": addr,
+            "string": text,
+            "length": len(raw),
+            "raw_hex": raw.hex(),
+            "terminated": not truncated,
+            "truncated": truncated,
+            "end_addr": readable_until,
+        }
+
     # ---------- 内部 ----------
 
     def _target(self, serial: str, pid: int) -> Target:
@@ -462,12 +664,116 @@ class DynamicService:
         return tgt
 
     def _require_module(self, tgt: Target, so_name: str):
-        """按名字取运行时模块，取不到给明确的 MODULE_NOT_LOADED。"""
+        """按名字取运行时模块；名字对不上时用**字节指纹**反查。
+
+        (7) 第七次修改（2026-11-06）：
+            bug 原因：本地分析的 so 常被改名（sg_real.so），与设备上的
+                      libsgmainso-6.7.260202.so 毫无字面关系，任何名字规范化
+                      都救不回来，set_breakpoint 只能报 MODULE_NOT_LOADED。
+                      这不是某个 app 的特例——凡是从 APK 抽出 so 后重命名、
+                      或分析多个版本并存的情况都会撞上。
+            解决方案：名字匹配失败后，用 mda 里该 so 的函数表取一个函数的
+                      **原始机器码**，在目标进程各已加载模块的同偏移处比对字节，
+                      命中即认定为同一模块。不命中就如实报错，绝不猜。
+        """
         mod = tgt.rb.find_module(so_name)
-        if mod is None:
-            raise DynError("MODULE_NOT_LOADED",
-                           f"{so_name} 未加载到进程 {tgt.pid}（先调 modules() 确认）")
-        return mod
+        if mod is not None:
+            return mod
+
+        # 指纹反查
+        try:
+            from mcp_server.tools import _pick_so_by_name, _strip_version_tag
+
+            sess = getattr(self, "_session_obj", None)
+            so = None
+            try:
+                from mcp_server.tools import get_session
+
+                so = _pick_so_by_name(get_session(), so_name)
+            except Exception:                             # noqa: BLE001
+                so = None
+            if so is not None:
+                fp = self._module_fingerprint(tgt, so)
+                if fp is not None:
+                    return fp
+        except Exception:                                 # noqa: BLE001
+            pass
+
+        raise DynError("MODULE_NOT_LOADED",
+                       f"{so_name} 未加载到进程 {tgt.pid}（先调 modules() 确认；"
+                       "若本地文件名与设备名不同，确认该 so 已在 mda 里 load_so）")
+
+    def _module_fingerprint(self, tgt: Target, so):
+        """用字节指纹为目标进程里的模块做反查，命中返回 RuntimeModule。
+
+        (7) 第七次修改（2026-11-06）：新增，配合 _require_module 使用。
+            取 so 里第一个函数的入口 16 字节作为指纹，与进程内各模块同偏移处
+            内存逐一比对。**命中即认定**，全不命中返回 None——绝不猜。
+
+        (8) 第八次修改（2026-11-06）：改成**一个脚本一次读完**。
+            bug 原因：初版对每个模块各调一次 rb.read_memory，而它每次调用都
+                      create_script；370 个模块就是 370 次脚本往返，实测超过 60 秒。
+            解决方案：把「模块基址 + 指纹偏移」列表一次性交给 JS 循环读回，
+                      只建一个脚本。模块枚举也复用 rb 已有缓存。
+        """
+        import json as _json
+        import time as _time
+
+        try:
+            from dyn.tracer import _read_static_bytes
+
+            fns = getattr(so, "functions", {}) or {}
+            vals = fns.values() if isinstance(fns, dict) else list(fns)
+            offs = sorted({int(getattr(f, "addr", 0) or 0) for f in vals})[:2]
+            fps = []
+            for off in offs:
+                try:
+                    raw = _read_static_bytes(so, off, 16)
+                except Exception:                         # noqa: BLE001
+                    raw = b""
+                if raw and len(raw) == 16:
+                    fps.append((off, raw.hex()))
+            if not fps:
+                return None
+
+            off0, want0 = fps[0]
+            # (9) 第九次修改（2026-11-06）：优先用 Rebase 的**已有缓存**。
+            #     bug 原因：每次都 refresh_modules() 会新建脚本重新枚举 370 个模块，
+            #               叠加指纹读取后整个 set_breakpoint 要 50 秒。
+            #     解决方案：缓存非空就直接用（这些模块在进程生命周期内基本不变），
+            #               缓存为空才枚举一次。
+            cache = list(getattr(tgt.rb, "_modules", []) or [])
+            mods = [m for m in (cache or tgt.rb.refresh_modules())
+                    if int(getattr(m, "size", 0) or 0) > off0]
+            if not mods:
+                return None
+
+            addrs = [int(m.base) + off0 for m in mods]
+            js = (
+                "var A = " + _json.dumps(addrs) + ";"
+                "var out = [];"
+                "for (var i = 0; i < A.length; i++) {"
+                "  try { var b = ptr(A[i]).readByteArray(16);"
+                "    out.push(b === null ? null : Array.from(new Uint8Array(b))"
+                ".map(function(x){return x.toString(16).padStart(2,'0');}).join(''));"
+                "  } catch (e) { out.push(null); }"
+                "}"
+                "send(out);"
+            )
+            sess = tgt.rb.session
+            script = sess.create_script(js)
+            got: list = []
+            script.on("message", lambda m, d: got.extend(m.get("payload") or []))
+            script.load()
+            t0 = _time.time()
+            while not got and _time.time() - t0 < 10.0:
+                _time.sleep(0.02)
+            for i, hexval in enumerate(got):
+                if hexval and hexval == want0 and i < len(mods):
+                    return mods[i]
+            return None
+        except Exception:                                 # noqa: BLE001
+            return None
 
     def _sync_hits(self, tgt: Target) -> int:
         """把 dbg.hits 里尚未转成事件的新命中补成 breakpoint_hit 事件。
@@ -486,7 +792,9 @@ class DynamicService:
                       ③ 命中没给 held（老 debugger）→ 退回 bp.hold 兜底
                       这样「明确没挂」不会被误判为挂起，「没说明」才靠记录猜。
         """
-        hits = list(getattr(tgt.dbg, "hits", []) or [])
+        # (13) 第十三次修改（2026-11-06）：改走 _dbg_hits，兼容 hits 为
+        #      property / 方法 / 裸 list 三种形态（debugger 正被重写）。
+        hits = _dbg_hits(tgt.dbg)
         with self._lock:
             # debugger 若清空过 hits，游标要跟着回退，否则会漏事件
             start = tgt.hit_cursor if tgt.hit_cursor <= len(hits) else 0
@@ -622,6 +930,15 @@ def _hit_dict(hit) -> dict:
         "thread_id": getattr(hit, "thread_id", 0),
         "context": getattr(hit, "context", {}) or {},
         "backtrace": getattr(hit, "backtrace", []) or [],
+        # (11) 第十一次修改（2026-11-06）：把栈内存快照一起带出去。
+        #      为什么：寄存器只有"指针 + 长度"，真正的内容在栈上；
+        #      没有它，AI 拿到 sp 也读不出东西。
+        "stack_hex": getattr(hit, "stack_hex", "") or "",
+        # (12) 第十二次修改（2026-11-06）：一并带出结构化栈。
+        #      为什么：stack_hex 是裸字节串，看不出起始地址；
+        #      stack 明确给出 [{addr, bytes_hex, size}]，AI 才知道
+        #      这段字节对应哪段内存。
+        "stack": getattr(hit, "stack", []) or [],
         "ts": getattr(hit, "ts", None) or time.time(),
     }
     for k in _HIT_OPTIONAL_FIELDS:
@@ -703,6 +1020,39 @@ def _resolve_held(hit_dict: dict, bp: dict | None) -> bool:
         # 显式值优先；注意 None 表示"不确定"，仍按挂起处理（安全侧）
         return hit_dict.get("held") is not False
     return bool(bp and bp.get("hold"))
+
+
+def _dbg_hits(dbg) -> list:
+    """安全取 debugger 的命中列表，兼容三种形态（返回 list，取不到给 []）。
+
+    (13) 第十三次修改（2026-11-06）：新增本函数。
+         bug 原因：debugger.py 正被重写，`hits` 在版本之间换过形态——
+                   裸 list 属性 → @property → 普通方法。原代码统一写
+                   `getattr(dbg, "hits", [])`，一旦它变成方法，拿到的就是
+                   **绑定方法对象**而不是列表：len() 会抛 TypeError，
+                   遍历会抛 "method is not iterable"。这类错误发生在
+                   state()/hits()/命中统计等热路径上，表现为工具整体不可用。
+         解决方案：集中一处取数——拿到值后若是 callable 就调用一次，
+                   再要求结果可迭代，否则退回 []。异常一律吞掉给 []，
+                   绝不返回假数据（[] 表示"确实取不到"）。
+    (14) 第十四次修改（2026-11-06）：getattr 本身也要包进 try。
+         bug 原因：上一版把 `getattr(dbg, "hits", None)` 写在 try 外面，
+                   但当 hits 是 **会抛异常的 property**（例如 debugger 内部
+                   状态损坏、或重写期间命中了未初始化字段）时，异常在
+                   getattr 取值那一刻就抛出来了，根本没机会进 try，
+                   于是 state()/hits()/hit_count_for 全部连带崩掉。
+                   这与本函数注释承诺的"异常一律吞掉"自相矛盾。
+         解决方案：把整个取值（含 getattr）放进同一个 try，任何异常都退回 []。
+    """
+    try:
+        val = getattr(dbg, "hits", None)
+        if callable(val):
+            val = val()
+        if val is None:
+            return []
+        return list(val)
+    except Exception:                                  # noqa: BLE001 - debugger 形态不定
+        return []
 
 
 def _dbg_state(dbg) -> str:

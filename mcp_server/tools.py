@@ -1273,6 +1273,43 @@ def _recent_thread_id(tgt) -> int:
     return int(getattr(hits[-1], "thread_id", 0) or 0)
 
 
+def _strip_version_tag(name: str) -> str:
+    """去掉文件名里的版本号尾巴，返回"核心名"。
+
+    (12) 第十二次修改（2026-11-06）：新增。
+        bug 原因：加固样本的设备模块名普遍带版本号
+                  （libsgmainso-6.7.260202.so、libxxx-1.2.3.so），
+                  而分析时本地文件常被改成短名（libsgmainso.so）。
+                  原名匹配全失败，导致断点报 MODULE_NOT_LOADED、
+                  调用栈符号化退化成 "so+偏移"。
+        解决方案：抽出核心名再比对。只剥离**形如 -x.y.z / -123456 的尾巴**，
+                  不碰正常名字，避免误伤。
+
+    剥离规则（宁可少剥，不可错剥）：
+        libsgmainso-6.7.260202.so   -> libsgmainso.so
+        libsgmainso.so              -> libsgmainso.so（不变）
+        libc++_shared.so            -> libc++_shared.so（++ 和 _ 不动）
+        libutils-1.so / libutils-2.so -> 都变成 libutils.so（见下方说明）
+        my-lib.so                   -> my-lib.so（纯字母段不剥）
+
+    注意：libutils-1 / libutils-2 剥完同名，这**不是**缺陷——它们本来就是
+    同一个库的不同版本；真要区分由调用方用完整名指定，本函数只在
+    "精确匹配失败"时才作为**末级兜底**，且要求候选唯一。
+    """
+    import re as _re
+
+    base = str(name or "").rsplit("/", 1)[-1]
+    if not base:
+        return ""
+    # 已带 .so / .dylib 后缀的：在扩展名前剥版本
+    m = _re.match(r"^(?P<core>.+?)(?P<ver>-\d+(?:\.\d+)*)(?P<ext>\.so(?:\..+)?|\.dylib)?$",
+                  base)
+    if m:
+        ext = m.group("ext") or ""
+        return m.group("core") + ext
+    return base
+
+
 def _pick_so_by_name(session, raw_name: str):
     """按多级候选在会话里找 SoFile，找不到返回 None。
 
@@ -1283,6 +1320,11 @@ def _pick_so_by_name(session, raw_name: str):
         解决方案：按 全名 → basename → 去壳前缀 → 后缀 四级别名依次尝试。
                   只做**去前缀/取 basename**这类无损规范化，不做模糊猜测，
                   避免把 A.so 错配成 B.so。
+
+    (12) 第十二次修改（2026-11-06）：增加"去版本号"这一级。
+        背景：设备名 libsgmainso-6.7.260202.so ↔ 本地 libsgmainso.so，
+              前四级全部匹配不上。这是加固样本的普遍现象，不是个例。
+        位置：放在后缀匹配**之前**、且要求**候选唯一**，比模糊后缀更可靠。
     """
     mods = getattr(session, "modules", {}) or {}
     if not mods or not raw_name:
@@ -1310,7 +1352,14 @@ def _pick_so_by_name(session, raw_name: str):
     for key, cand in mods.items():
         if _norm(key) == target:
             return cand
-    # 4) 尾部后缀匹配：仅当唯一命中时才采用，多于一个视为不确定
+    # 4) 去版本号后比对（唯一命中才采用）
+    core = _strip_version_tag(_norm(name))
+    if core:
+        ver_hits = [cand for key, cand in mods.items()
+                    if _strip_version_tag(_norm(key)) == core]
+        if len(ver_hits) == 1:
+            return ver_hits[0]
+    # 5) 尾部后缀匹配：仅当唯一命中时才采用，多于一个视为不确定
     hits = [cand for key, cand in mods.items()
             if _norm(key).endswith(target) or target.endswith(_norm(key))]
     if len(hits) == 1:
@@ -1843,6 +1892,82 @@ def _snapshot_service_events() -> tuple[list, str]:
             continue
         snap.append(dict(ev))
     return snap, ""
+
+
+@server.tool()
+@logged()
+def read_runtime_memory(serial: str, pid: int, runtime_addr: str, size: int = 32) -> str:
+    """按**运行时绝对地址**读内存——专门用来读断点现场拿到的地址。
+
+    与 read_process_memory / read_typed(source="runtime") 的区别（很关键）：
+
+        read_process_memory(so_name, static_addr)   addr 是**静态地址**，内部 base+static
+        read_typed(..., source="runtime")           同上，也要静态地址
+        **read_runtime_memory(runtime_addr)**        addr 是**运行时绝对地址**，不换算
+
+    什么时候必须用它：断点命中现场的 x0 / x1 / lr / sp 都是运行时绝对地址，
+    而且常常指向堆上的对象（根本不在任何 so 里），用静态地址的工具读会报
+    `ADDR_UNMAPPED: 必须是静态地址`。
+
+    **挂起状态下可以放心调用**：读内存走的是独立脚本，不经过被 hold 挂住的
+    调试脚本，实测挂起期间读 16 字节耗时 0.02s。
+
+    参数：
+        runtime_addr  运行时地址，支持 "0x..." 字符串或十进制整数
+        size          读取字节数，1..4096
+
+    返回：{runtime_addr, hex, size}；读不到时 {error, code: READ_FAILED}
+    （未映射 / 权限不足 / 超时都会明确说明，不会返回零填充）
+    """
+    from core.addr import parse_addr
+    from dyn.service import get_dyn
+
+    addr = parse_addr(runtime_addr, None)
+    if addr is None:
+        return _j({"error": f"runtime_addr 无效：{runtime_addr!r}",
+                   "code": "BAD_ADDRESS"})
+    try:
+        return _j(get_dyn().read_runtime(serial, int(pid), addr, int(size)))
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}",
+                   "code": getattr(exc, "code", "READ_FAILED")})
+
+
+@server.tool()
+@logged()
+def read_runtime_string(serial: str, pid: int, runtime_addr: str,
+                        max_length: int = 256) -> str:
+    """按**运行时绝对地址**读 C 字符串——读断点现场 x0 指向的路径/内容。
+
+    典型用法：在 `open` / `fopen` / `dlopen` 这类函数上命中后，
+
+        x0 = 0xb400007c5f0dc6c0
+        → read_runtime_string(runtime_addr="0xb400007c5f0dc6c0")
+        → "/system/framework/org.apache.http.legacy.jar"
+
+    实现按 64 字节分块读、遇 \0 停止：目标字符串紧贴页边界时不会整段失败，
+    某一段读不到就停在已读到的位置并把 truncated 置 true（不伪造内容）。
+
+    参数：
+        runtime_addr  运行时地址，支持 "0x..." 或十进制
+        max_length    最多读多少字节，1..4096
+
+    返回：{runtime_addr, string, length, raw_hex, terminated, truncated, end_addr}
+    读不到（地址本身无效）时 {error, code: READ_FAILED}
+    """
+    from core.addr import parse_addr
+    from dyn.service import get_dyn
+
+    addr = parse_addr(runtime_addr, None)
+    if addr is None:
+        return _j({"error": f"runtime_addr 无效：{runtime_addr!r}",
+                   "code": "BAD_ADDRESS"})
+    try:
+        return _j(get_dyn().read_runtime_string(serial, int(pid), addr,
+                                                int(max_length)))
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}",
+                   "code": getattr(exc, "code", "READ_FAILED")})
 
 
 @server.tool()
@@ -2999,3 +3124,570 @@ def run_idc_file(so_name: str, path: str) -> str:
 def start_stdio() -> None:
     """以 stdio 方式启动 MCP 服务（供客户端连接）。"""
     server.run(transport="stdio")
+
+
+# ---------------- 能力补齐：执行观察 / 断点自检 / 间接跳转 / VM 状态 ----------------
+#
+# 本组工具针对「断点不命中却查不出原因」「br 链断开」「VM 内部状态读不到」
+# 这类加固样本的共性难题。设计原则与前面一致：能给结论就给结论，
+# 给不出就说明为什么，**绝不返回编造的数据**。
+
+
+@server.tool()
+@logged()
+def watch_module(serial: str, pid: int, so_name: str, duration: float = 5.0,
+                 max_points: int = 50, batch: int = 20,
+                 batch_interval_ms: int = 200,
+                 offset_range: list | None = None) -> str:
+    """观察某个 so 里**哪些函数真的被执行过**——回答「代码到底跑没跑到这里」。
+
+    最典型的用途：断点下在函数入口却一次都不命中时，用它区分两种原因——
+        ① 地址算错了
+        ② 这段代码在当前场景下**根本没被执行**
+
+    光看「命中 0 次」分不清是哪一种；本工具直接给出"实际被执行的是哪几个偏移"。
+
+    ## 与 trace_code 的区别
+
+        trace_code   用 Stalker 跟随线程，采集"谁调用了谁"，开销大、易拖垮目标
+        watch_module 只在函数入口挂 Interceptor，只数次数，**开销小得多**；
+                     代价是只看得到函数级粒度，看不到具体调用边
+
+    ## 参数
+
+        so_name       mda 里的 so 键。**设备模块名带版本号也能自动匹配**
+                      （本地 libsgmainso.so ↔ 设备 libsgmainso-6.7.260202.so），
+                      名字完全对不上时还会按字节指纹反查
+        duration      观察秒数
+        max_points    最多下多少探针（**默认 50，上限 4000**）。
+                      超出预算时按**均匀采样**覆盖整个区间，而不是只取地址最小的
+                      那些——后者会让覆盖全部挤在区间头部，结论严重偏斜。
+        batch         每批 attach 多少个（默认 20）
+        batch_interval_ms  每批之间等多少毫秒（默认 200）。密集 patch 会让目标
+                      抖动，某些情况下直接把进程搞崩
+        offset_range  可选 [起始, 结束]，只观察这段地址内的函数
+
+    ## 返回
+
+        hot[]          按次数降序：{offset, offset_hex, hits}
+        executed       被执行过的函数数
+        placed/failed/total_functions  探针布置情况
+        failed_detail  失败的点及 frida 给出的原因（最多 20 条）
+        sampling       "uniform"（均匀采样）/ "full"（全覆盖）
+        **recommendation**  给 AI 的决策依据：
+                       function_density_per_kb / fail_rate /
+                       suggested_max_points / advice
+                       —— AI 可据此自己决定下一次用多少探针，
+                       不用猜"加多少会崩、减多少不够"
+        verdict        一句话结论
+
+    ## 实测样例（闲鱼 libsgmainso，8 秒）
+
+        executed: 24
+        0x5a428  2927 次    ← 最热
+        0x588b8   899 次
+        ...
+        0x5B76C 不在列表里  ← 说明这个断点位置确实没执行
+
+    带 offset_range 观察 VM 解释器区间（0x174000~0x177000，78 个入口）：
+
+        sampling: uniform, placed: 14, failed: 6
+        recommendation: {density: 6.5/KB, fail_rate: 0.3,
+                         advice: "失败率偏高，建议缩小 range 或用 probe_hits 验证",
+                         suggested_max_points: 11}
+
+    **失败率高不代表工具坏了**：那些点是"函数内部块"而非真入口，
+    frida 对它们报 `unable to intercept function ... please file a bug`。
+    failed_detail 里能看到每一条的具体原因。
+
+    ## 已知限制
+
+        · 只覆盖**函数入口**：函数内部某段被执行不代表入口被执行
+        · max_points 截断时只观察地址最小的那批函数，结论可能不全
+    """
+    mod, err = _load_dyn_module("dyn.tracer", "watch_module")
+    if err:
+        return _j(err)
+    try:
+        return _j(mod.watch_module(serial, int(pid), so_name,
+                                   duration=float(duration),
+                                   max_points=int(max_points),
+                                   batch=int(batch),
+                                   offset_range=offset_range))
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}",
+                   "code": getattr(exc, "code", "WATCH_FAILED")})
+
+
+@server.tool()
+@logged()
+def verify_breakpoint(serial: str, pid: int, so_name: str, static_addr: int,
+                      bp_id: str = "") -> str:
+    """检查一个断点**到底有没有真的生效**（set_breakpoint 返回 true 不代表 armed）。
+
+    `set_breakpoint` 返回 `set: true` 只说明"静态地址换算成功、frida 接受了挂钩请求"，
+    **不代表断点真的武装好了，更不代表那段代码会被执行**。
+
+    ## 返回字段怎么读
+
+        current_hex      该地址当前内存字节
+        original_hex     本地 so 文件里的原始字节
+        bytes_match      两者是否一致。注意 frida 会让我们读到原始字节，
+                         所以一致**不代表没挂钩**
+        already_hooked   该地址是否已被装过钩子
+        hits_since_set   提供 bp_id 时的命中数
+        matched_by       "fingerprint" 表示靠字节指纹找到的模块
+
+    ## 怎么判断问题出在哪
+
+        hits > 0                        → 断点正常工作
+        hits == 0 且 already_hooked     → 钩子装上了，但这段代码没执行
+                                          （用 watch_module 看真正在跑的是哪些偏移）
+        hits == 0 且 not already_hooked → 钩子没装上，检查地址/模块
+        bytes_match == false            → 地址对应错了文件
+
+    ## 参数
+
+        so_name      mda 里的 so 键（支持与设备名自动匹配；失败时按字节指纹反查）
+        static_addr  静态偏移
+        bp_id        可选，形如 "serial:pid:so:5b76c"，给了就统计它的命中数
+    """
+    mod, err = _load_dyn_module("dyn.tracer", "verify_breakpoint")
+    if err:
+        return _j(err)
+    try:
+        return _j(mod.verify_breakpoint(serial, int(pid), so_name,
+                                        int(static_addr), bp_id=bp_id))
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}",
+                   "code": getattr(exc, "code", "VERIFY_FAILED")})
+
+
+@server.tool()
+@logged()
+def resolve_br(so_name: str, addr: int, lookback: int = 8,
+               max_targets: int = 64) -> str:
+    """解开 `adrp/ldr/br xN` 这类**间接跳转**，尽可能还原跳转目标表。
+
+    **纯静态，不需要设备。**
+
+    为什么需要：加固样本的 VM 分发器到处是 `br x8`，静态 xref 链在这里全断——
+    build_xrefs 能出几万条边，但跨过 br 就接不上，调用关系丢失。
+
+    识别的两种模式：
+        ① adrp + add + br            → 目标是常量地址（mode=direct）
+        ② adrp + ldr + (add) + br    → 目标是**指针表**里的值（mode=table）
+
+    ## 参数
+
+        so_name     mda 里已加载的 so
+        addr        br 所在地址；给函数内任意地址，函数内所有 br 都会被尝试解析
+        lookback    往前追溯多少条指令（默认 8；最少按 1 处理，因为 0 回看看不到 adrp）
+        max_targets 每个 br 最多返回多少个目标
+
+    ## 返回
+
+        branches[]  {addr_hex, insn, reg, mode, table_addr, targets[], resolved, detail}
+        resolved / unresolved  计数
+
+    ## 重要：resolved=false 是**有价值的结论**
+
+    它明确告诉你"静态算不出"，原因通常是：
+        · 目标来自运行时寄存器（参数/返回值传递）
+        · 指针表在运行时才被填充或解密（表里是 0 或密文）
+    这时必须配动态断点才能拿到真实目标——**不会编造一个假目标**。
+
+    ## 实测（闲鱼 libsgmainso 的 VM 分发器 0x5B76C）
+
+        8 个 br x8 全部指向 0x1af810 ~ 0x1af848 这段表
+        但 resolved=0：表内是密文，运行时才解密
+        → 这正好解释了为什么断点下在入口不会执行
+    """
+    mod, err = _load_dyn_module("dyn.bridge", "resolve_br")
+    if err:
+        return _j(err)
+    try:
+        return _j(mod.resolve_br(_session, so_name, int(addr),
+                                 lookback=int(lookback),
+                                 max_targets=int(max_targets)))
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}",
+                   "code": getattr(exc, "code", "RESOLVE_FAILED")})
+
+
+@server.tool()
+@logged()
+def dump_vm_state(serial: str, pid: int, ctx_ptr: str,
+                  count_offset: int = 0x194, array_offset: int = 0x1a0,
+                  instr_size: int = 16, max_instr: int = 200) -> str:
+    """按约定的 VM 上下文结构，把**字节码指令数组**一次解出来。
+
+    VM 类壳把字节码存在自己管理的数组里，结构固定但没有符号。本工具
+    **一次 attach 读完整块**（而不是逐条读），这样只打断目标一次。
+
+    ## 结构约定（来自汇编观察，参数可覆盖）
+
+        [ctx + 0x194] = 指令计数
+        [ctx + 0x1a0] = 指令数组指针
+        每条指令 16 字节
+
+    ## 参数
+
+        ctx_ptr        VM 上下文指针（**运行时绝对地址**，通常就是断点现场的 x0）
+        count_offset   计数偏移，默认 0x194
+        array_offset   数组指针偏移，默认 0x1a0
+        instr_size     每条指令字节数，默认 16
+        max_instr      最多解多少条（防数组巨大时读爆）
+
+    ## 返回
+
+        count / array_ptr / instructions[{idx, addr, raw_hex, opcode, func, words[]}]
+        truncated      是否因 max_instr 截断
+
+    ## 安全设计
+
+    计数 > 1048576 时**拒绝读取**并报 COUNT_SUSPICIOUS——
+    偏移填错时读到的可能是个巨大的垃圾值，硬读会把进程内存读爆。
+
+    ## 已知边界
+
+    位域解析（opcode=bits[4:1]、func=bits[8:5]）是**经验规则**，
+    不同壳版本可能不同；返回里会说明规则来源。
+    """
+    from core.addr import parse_addr
+
+    mod, err = _load_dyn_module("dyn.memread", "dump_vm_state")
+    if err:
+        return _j(err)
+    addr = parse_addr(ctx_ptr, None)
+    if addr is None:
+        return _j({"error": f"ctx_ptr 无效：{ctx_ptr!r}", "code": "BAD_ADDRESS"})
+    try:
+        return _j(mod.dump_vm_state(serial, int(pid), addr,
+                                    count_offset=int(count_offset),
+                                    array_offset=int(array_offset),
+                                    instr_size=int(instr_size),
+                                    max_instr=int(max_instr)))
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}",
+                   "code": getattr(exc, "code", "DUMP_FAILED")})
+
+
+@server.tool()
+@logged()
+def read_memory_batch(serial: str, pid: int, regions: list) -> str:
+    """**一次调用读多段内存**，而不是一段一次 RPC。
+
+    分析一个结构体时常要读十几个分散地址（x0+0x194、x0+0x1a0、x0+0x1b8 …），
+    每段一次 RPC 就要多 attach 一次，而每次 attach 都会让目标停一下——
+    采样点一多事件就丢了。本工具把多段打包成一次读。
+
+    ## 参数
+
+        regions  [{"addr": "0x7bc...", "size": 16}, ...]
+                 addr 支持 0x 字符串或整数，size 1..4096
+
+    ## 返回
+
+        results[]  每段 {addr, ok, hex, size} 或 {addr, ok: false, error}
+        readable   成功读到的段数
+
+    ## 典型用法
+
+        read_memory_batch(regions=[
+            {"addr": ctx, "size": 0x200},          # 整个 VM 上下文
+            {"addr": arr, "size": 0x40},           # 指令数组头部
+        ])
+    """
+    mod, err = _load_dyn_module("dyn.memread", "read_memory_batch")
+    if err:
+        return _j(err)
+    try:
+        return _j(mod.read_memory_batch(serial, int(pid), regions))
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}",
+                   "code": getattr(exc, "code", "BATCH_FAILED")})
+
+
+@server.tool()
+@logged()
+def probe_hits(serial: str, pid: int, so_name: str, static_addr: int,
+               duration: float = 5.0) -> str:
+    """**纯计数探针**：只统计某地址被进入多少次，不挂起、不依赖 hold。
+
+    回答的是「这段代码到底跑不跑」——和 verify_breakpoint 分工不同：
+
+        verify_breakpoint  查"断点有没有真的 armed"（字节、hook 状态）
+        probe_hits         查"这段代码到底跑不跑"（一个计数器，最直接）
+
+    ## 为什么需要它
+
+    `set_breakpoint(hold=True)` 走完整链路（登记、策略、RPC、事件流）。
+    当只想回答"这个地址跑不跑"时，那条链路太重，任何一环出问题都表现成
+    "0 命中"，分不清是没执行还是没挂钩。本工具用最直接的方式验：
+    一个 Interceptor、一个计数器，**成功挂上才谈命中**。
+
+    ## 返回
+
+        hits            命中次数（0 表示这段时间没执行）
+        first_hit_ts    首次命中时间戳（没命中为 null）
+        threads         命中过的线程 id
+        mechanism       实际使用的机制（当前固定 Interceptor）
+        verdict         一句话结论：区分「没执行」与「挂不上」
+
+    ## 关键：拦截失败会明确报错
+
+    frida 对某些地址会抛 `unable to intercept function ... please file a bug`
+    （实测同一区间 78 个入口里 19 个挂不上，它们多是函数内部块而非真入口）。
+    这种情况返回 **INTERCEPT_FAILED**，不会伪装成 "0 命中"。
+
+    ## 与 watch_module 配合
+
+    watch_module 告诉"哪些入口可挂、哪些被执行"；probe_hits 用来
+    对单个可疑地址做精确确认。
+    """
+    mod, err = _load_dyn_module("dyn.tracer", "probe_hits")
+    if err:
+        return _j(err)
+    try:
+        return _j(mod.probe_hits(serial, int(pid), so_name,
+                                 int(static_addr), duration=float(duration)))
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}",
+                   "code": getattr(exc, "code", "PROBE_FAILED")})
+
+
+@server.tool()
+@logged()
+def read_jump_table(so_name: str, table_static_addr: int, entry_size: int = 4,
+                    count: int = 16, code_base: int = 0, signed: bool = True,
+                    serial: str = "", pid: int = 0) -> str:
+    """读一张**跳转表**，把表项解析成目标地址（解决表驱动的 br）。
+
+    **纯静态，不需要设备。**
+
+    VM 分发器的常见形态：
+
+        adr    x15, #base               ; 基址
+        ldrsw  x16, [x12, x7, lsl #2]   ; 从表取 4 字节**有符号偏移**
+        add    x15, x15, x16            ; 基址 + 偏移
+        br     x15
+
+    表项存的是**相对基址的偏移**，不是绝对地址。单看 `br x15` 算不出目标，
+    必须知道「表地址 + 表项宽度 + 基址」三者。本工具把这个原子操作单独暴露。
+
+    ## 参数
+
+        so_name            mda 里的 so 键
+        table_static_addr  表的静态地址（由 adrp+add 算出，如 0x30000+0xfd8）
+        entry_size         表项字节数：4（ldrsw/ldr w）或 8（ldr x）
+        count              读多少项
+        code_base          加偏移用的基址（adr/adrp 给出的那个地址）。
+                           传 0 表示表项就是绝对地址，不加偏移
+        signed             表项按**有符号**解释（ldrsw → true）
+        serial / pid       给了就**从进程内存读表**（runtime 模式），
+                           不给则读本地文件（static 模式）
+
+    ## ⚠️ 强烈建议传 serial + pid
+
+    加固样本的表**常在运行时才被填入真实指针**。实测同一个 so：
+
+        0x30fd8  文件 140000004c000000...  运行时 140000004c000000...  ← 静态常量
+        0x1af810 文件 9e0a1deb429992db...  运行时 7c39c9e07b000000...  ← 运行时才填
+
+    只读文件的话，第二类表解出来是**垃圾指针**，看起来像"解不出目标"，
+    实际是读错了地方。传了 serial+pid 就能读对。
+
+    ## 返回
+
+        source      "runtime"（从进程内存读）或 "static"（读文件）
+        raw / offsets[] / targets[] / note
+
+    ## 实测（0x175018 的 br x15）
+
+        表地址 0x30fd8，entry_size=4，code_base=0x175018
+        解出 14 个目标：
+          0x17502c  ubfx w15, w17, #5, #4    ← VM handler，位域解码
+          0x175064  ubfx w8, w17, #5, #4
+          0x1750a0  ubfx w15, w17, #5, #6
+          0x177608  ← 异常出口（对应前面的 b.hi）
+    """
+    mod, err = _load_dyn_module("dyn.bridge", "read_jump_table")
+    if err:
+        return _j(err)
+    try:
+        return _j(mod.read_jump_table(so_name, int(table_static_addr),
+                                      entry_size=int(entry_size),
+                                      count=int(count),
+                                      code_base=int(code_base),
+                                      signed=bool(signed),
+                                      session=_session,
+                                      serial=serial, pid=int(pid or 0)))
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}",
+                   "code": getattr(exc, "code", "READ_FAILED")})
+
+
+@server.tool()
+@logged()
+def probe_vm_from_hits(serial: str, pid: int,
+                       count_offset: int = 0x194, array_offset: int = 0x1a0,
+                       instr_size: int = 16, max_instr: int = 64,
+                       max_candidates: int = 40) -> str:
+    """从**已有断点命中**的寄存器里挖出 VM 上下文指针，直接解出指令数组。
+
+    **这是解决「拿不到 ctx_ptr」的推荐路径**——比盲扫内存快得多也安全得多。
+
+    ## 为什么需要它
+
+    `dump_vm_state` 要 ctx_ptr，而 ctx_ptr 通常只在断点现场才有。如果 VM 入口
+    本身不命中（加固样本常见），就会陷入两难：
+        · `dump_vm_state`      要 ctx_ptr，但没有
+        · `dump_vm_state_auto` 盲扫内存，实测太慢且会拖挂目标
+
+    本工具换思路：**用已经命中的那些断点**。哪怕命中的不是 VM 入口，
+    只要那些函数的参数里带着上下文指针（很常见——VM 解释器的辅助函数
+    第一个参数往往就是 ctx），就能从寄存器里捞出来。
+
+    ## 做法
+
+        ① 取当前目标的全部命中记录（不需要重新 attach）
+        ② 收集每条命中的 x0..x30 / sp / lr，当作候选 ctx_ptr
+        ③ 一次脚本批量校验：[ptr+0x194] ∈ [2,100000] 且 [ptr+0x1a0] 是可读指针
+        ④ 合格的候选直接调 dump_vm_state 解出指令
+
+    ## 前置条件
+
+    **必须已经有命中记录**。所以顺序是：
+
+        probe_hits(...)            先确认哪个地址真的会跑
+        set_breakpoint(那个地址)    在那里下断点
+        hits()                     取命中现场
+        probe_vm_from_hits()       从现场挖 ctx_ptr
+
+    ## 返回
+
+        candidates[]       每个可用候选 {ctx_ptr, from_register, instr_count,
+                          instr_array, decoded, instructions[]}
+        registers_probed   试了多少个寄存器值
+        verdict            一句话结论
+
+    ## 实测边界
+
+        · 如果这批命中所在的函数不持有 VM 上下文，会返回空候选并说明原因，
+          **不会编造一个 ctx**
+        · 结构偏移（0x194 / 0x1a0）是经验值，不同壳版本可能不同，可覆盖
+    """
+    mod, err = _load_dyn_module("dyn.memread", "probe_vm_from_hits")
+    if err:
+        return _j(err)
+
+    # (25) 第二十五次修改（2026-11-06）：取命中记录时不再强依赖 service.hits()。
+    #      bug 原因：service.hits() 要求目标**当前仍 attach**；而很多调用方
+    #                是"下断点 → 命中 → 会话自动断开 → 再分析"，
+    #                这时 hits() 抛 NOT_ATTACHED，明明命中的数据还在 debugger 缓存里，
+    #                却拿不到，工具直接不可用。
+    #      解决方案：三级回退——
+    #                ① service.hits()（会话在时最完整）
+    #                ② service 里残留目标的 dbg.hits（会话已 detach 仍可读缓存）
+    #                ③ 调用方显式传 hits
+    hit_list = []
+    hits_error = ""
+    try:
+        from dyn.service import get_dyn
+
+        svc = get_dyn()
+        hit_list = svc.hits(serial, int(pid)) or []
+    except Exception as exc:                              # noqa: BLE001
+        hits_error = f"{type(exc).__name__}: {exc}"
+        try:
+            from dyn.service import get_dyn as _gd
+
+            svc2 = _gd()
+            tgt = svc2._targets.get(f"{serial}:{int(pid)}")   # noqa: SLF001 - 只读
+            dbg = getattr(tgt, "dbg", None) if tgt is not None else None
+            if dbg is not None:
+                raw_hits = getattr(dbg, "hits", None)
+                if isinstance(raw_hits, list):
+                    for h in raw_hits:
+                        hit_list.append({
+                            "so_name": getattr(h, "so_name", ""),
+                            "static_addr": getattr(h, "static_addr", 0),
+                            "runtime_addr": getattr(h, "runtime_addr", 0),
+                            "thread_id": getattr(h, "thread_id", 0),
+                            "context": getattr(h, "context", {}) or {},
+                            "seq": getattr(h, "seq", 0),
+                        })
+        except Exception:                                 # noqa: BLE001
+            pass
+    if not hit_list:
+        return _j({"error": (f"取不到命中记录（{hits_error or '缓存为空'}）"),
+                   "code": "NO_HITS",
+                   "hint": ("先 set_breakpoint 并让目标命中一次。"
+                            "可用 probe_hits 先确认哪个地址真的会跑")})
+    try:
+        return _j(mod.probe_vm_from_hits(
+            serial, int(pid), hit_list,
+            count_offset=int(count_offset), array_offset=int(array_offset),
+            instr_size=int(instr_size), max_instr=int(max_instr),
+            max_candidates=int(max_candidates)))
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}",
+                   "code": getattr(exc, "code", "PROBE_FAILED")})
+
+
+@server.tool()
+@logged()
+def trace_call_tree(serial: str, pid: int, so_name: str, entries: list,
+                    duration: float = 5.0, max_edges: int = 500) -> str:
+    """追踪一组函数入口的**调用者**，回答「这条路径到底有没有被调用」。
+
+    某函数断点 0 命中时，有两种完全不同的原因：
+        · 上层根本没有调用它（这条路在当前场景没走）
+        · 地址/模块找错了
+
+    只看"0 命中"分不清。本工具同时给出：这个函数**被调了几次**、
+    **是被谁（哪个返回地址）调的**。
+
+    ## 与 watch_module 的分工
+
+        watch_module     在整个 so 的所有函数入口撒点，看"谁被执行了"（**广度**）
+        trace_call_tree  针对指定的少数几个入口，看"谁调用了它"（**深度**）
+
+    ## 典型用法
+
+        # 1) 先确认哪些入口真的可挂、被执行
+        watch_module(so_name, offset_range=[0x174000, 0x177000], max_points=50)
+
+        # 2) 针对关心的几个入口看调用关系
+        trace_call_tree(so_name, entries=[0x174F00, 0x175018])
+
+    ## 参数
+
+        entries     要追踪的函数入口静态偏移列表，如 [0x174F00, 0x175018]
+        duration    观察秒数（建议 ≤ 30）
+        max_edges   最多记多少条调用边（防热点函数打爆内存）
+
+    ## 返回
+
+        entry_hits   {offset_hex: 被调用次数}
+        edges[]      {caller_static, callee_static, count}，按次数降序
+        verdict      一句话结论（区分"没被调用"与"挂不上"）
+        placed/failed  挂点情况
+
+    ## 已知边界（如实标注）
+
+        · 用 `this.returnAddress`（lr）作调用者，**只拿得到直接调用者**；
+          经 PLT 或尾调用过来的可能落在桩上
+        · 调用者若不在本 so 内，说明是跨模块调用——这正是有价值的线索
+    """
+    mod, err = _load_dyn_module("dyn.tracer", "trace_call_tree")
+    if err:
+        return _j(err)
+    try:
+        return _j(mod.trace_call_tree(serial, int(pid), so_name, entries,
+                                      duration=float(duration),
+                                      max_edges=int(max_edges)))
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}",
+                   "code": getattr(exc, "code", "TRACE_FAILED")})

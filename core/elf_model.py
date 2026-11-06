@@ -709,6 +709,24 @@ class SoFile:
                 return sec
         return None
 
+    @property
+    def function_list(self) -> list:
+        """函数对象列表（按地址升序）。
+
+        (1) 第一次修改（2026-11-06）：
+            bug 原因：`so.functions` 是 dict[int, Function]，`len()` 返回个数
+                      看起来很自然，但 `for f in so.functions` 拿到的是**整数键**，
+                      再访问 `f.addr` 就抛 AttributeError: 'int' object has no
+                      attribute 'addr'——使用方被这个隐式约定绊住。
+            解决方案：新增 `function_list` 属性，明确返回**函数对象列表**；
+                      保留 `functions` 字典不动（大量内部代码按地址查它），
+                      但把"要遍历请用 function_list"写进两者的文档。
+        """
+        fns = getattr(self, "functions", None) or {}
+        if isinstance(fns, dict):
+            return sorted(fns.values(), key=lambda f: int(getattr(f, "addr", 0) or 0))
+        return sorted(list(fns), key=lambda f: int(getattr(f, "addr", 0) or 0))
+
     def function_at(self, addr: int) -> Function | None:
         """反查地址所属函数（二分，O(log N)）。
 

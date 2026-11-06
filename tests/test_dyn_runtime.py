@@ -235,9 +235,18 @@ def main() -> int:
     dbg2.hits = [StubHit(0xAA)]
     wh = S2.wait_hits(serial, pid, timeout=0)
     check("wait_hits 仍返回列表", isinstance(wh, list), type(wh).__name__)
-    check("wait_hits 元素含 7 字段", wh and set(wh[0]) == {
+    # (1) 第一次修改（2026-11-06）：字段数从 7 变成 8。
+    #     bug 原因：新增了 stack_hex（命中瞬间抓 sp..sp+0x100 的原始字节），
+    #               用于"参数是 指针+长度、内容在栈上"的场景；
+    #               旧的 7 字段断言因此失败——这是预期变化，不是回归。
+    #     解决方案：把 stack_hex 加进期望集合。
+    # (2) 第二次修改（2026-11-06）：字段数 8 -> 9。
+    #     bug 原因：新增了结构化 stack（[{addr, bytes_hex, size}]），
+    #               与 stack_hex 并存——前者带起始地址，后者是裸字节。
+    #     解决方案：把 stack 加进期望集合。
+    check("wait_hits 元素含 9 字段（新增 stack）", wh and set(wh[0]) == {
         "so_name", "static_addr", "runtime_addr", "thread_id",
-        "context", "backtrace", "ts",
+        "context", "backtrace", "stack_hex", "stack", "ts",
     }, str(set(wh[0]) if wh else "空"))
 
     print(f"\n结果: {PASS} 通过 / {FAIL} 失败")

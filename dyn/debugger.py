@@ -159,7 +159,22 @@ _JS_SOURCE = r"""
             runtime: hook.runtime,
             tid: ctx.threadId,
             ctx: snapshotContext(ctx.context),
-            bt: rawBacktrace(ctx.context)
+            bt: rawBacktrace(ctx.context),
+            // (18) 第十八次修改（2026-11-06）：顺带抓一段栈内存。
+            //     为什么：只有寄存器常常不够——很多参数是"指针 + 长度"，
+            //     真正的内容在栈上。每次命中抓 0x100 字节代价很小，
+            //     但能省掉"命中后再发一次 RPC 读栈"（那会多打断目标一次）。
+            stack: (function () {
+                try {
+                    var sp = ctx.context.sp;
+                    if (sp === null || sp === undefined) { return null; }
+                    var buf = ptr(sp).readByteArray(0x100);
+                    if (buf === null) { return null; }
+                    return Array.from(new Uint8Array(buf))
+                        .map(function (x) { return x.toString(16).padStart(2, '0'); })
+                        .join('');
+                } catch (e) { return null; }
+            })()
         };
         if (hook.policy === 'hold') {
             holdSeq += 1;
@@ -295,13 +310,48 @@ class BreakpointHit:
     static_addr: int  # 断点处的静态地址
     runtime_addr: int
     thread_id: int
-    context: dict = field(default_factory=dict)  # x0..x28, fp/lr/sp/pc/nzcv
+    context: dict = field(default_factory=dict)  # x0..x30, fp/lr/sp/pc/nzcv
     backtrace: list[str] = field(default_factory=list)
+    # (19) 第十九次修改（2026-11-06）：新增栈内存快照。
+    #     为什么：只有寄存器常常不够——参数常是"指针+长度"，内容在栈上。
+    #     命中瞬间顺带抓 sp..sp+0x100，省掉事后再发一次 RPC（那会多打断目标一次）。
+    stack_hex: str = ""                      # sp..sp+0x100 的原始字节（hex）
+    # (20) 第二十次修改（2026-11-06）：新增结构化 stack，与 stack_hex 并存。
+    #      bug 原因：stack_hex 只是一个裸 hex 串，调用方还得自己知道
+    #                "它从 sp 开始"才能解释；断点现场常常同时需要
+    #                "某段内存的地址 + 内容"，单字符串表达不了。
+    #      解决方案：额外给 stack = [{addr, bytes_hex, size}]，显式带起始地址；
+    #                stack_hex 保留（向后兼容，老调用方仍能取到字节）。
+    stack: list = field(default_factory=list)
     ts: float = field(default_factory=time.time)
     # 以下为本次新增字段：老调用方按名取字段，多出来的不影响
     seq: int = 0         # 事件流序号，从 1 开始单调递增
     held: bool = False   # 该命中是否真的把线程挂住了（hold 策略）
     token: str = ""      # 放行该挂起所用的消息类型，resume() 用它唤醒
+
+
+def _build_stack_entries(hex_str, sp_value) -> list:
+    """把命中时抓到的栈十六进制串转成 [{addr, bytes_hex, size}]。
+
+    (20) 第二十次修改（2026-11-06）：新增，配合 BreakpointHit.stack。
+        为什么：裸 hex 串丢掉了"这段字节从哪个地址开始"的信息，
+        调用方拿到后还要自己去猜 sp 的值。这里显式带上起始地址。
+
+    sp_value 是命中现场的 sp（"0x..." 字符串或 int）。取不到时 addr 为 None，
+    但**仍然返回字节**——宁可少一个字段，也不丢已采到的数据。
+    """
+    if not hex_str:
+        return []
+    text = str(hex_str)
+    if len(text) % 2:                                     # 半个字节说明数据有问题
+        return []
+    try:
+        addr = None
+        if sp_value not in (None, "", 0):
+            addr = int(sp_value, 16) if isinstance(sp_value, str) else int(sp_value)
+        return [{"addr": addr, "bytes_hex": text, "size": len(text) // 2}]
+    except (TypeError, ValueError):
+        return [{"addr": None, "bytes_hex": text, "size": len(text) // 2}]
 
 
 # ---------------- 寄存器整理（纯函数，可离线单测） ----------------
@@ -884,6 +934,9 @@ class Debugger:
             thread_id=_parse_addr(payload.get("tid")),
             context=_normalize_context(payload.get("ctx") or {}),
             backtrace=backtrace,
+            stack_hex=str(payload.get("stack") or ""),
+            stack=_build_stack_entries(payload.get("stack"),
+                                       (payload.get("ctx") or {}).get("sp")),
         )
         hit.held = bool(token)
         hit.token = token
@@ -916,8 +969,12 @@ class Debugger:
         (1) 第一次修改（本轮新增）
         bug 原因：hold 断点命中后目标线程在 recv().wait() 里阻塞。若此时 RPC
                   派发因 JS 侧没让出执行权而卡住，调用方（AI/UI）会无限期等下去。
-                  frida 的 recv().wait() 会释放执行权，正常情况下不会发生，但不能
-                  把「会不会卡死」交给运气。
+                  原注释写「frida 的 recv().wait() 会释放执行权」是**未经验证的判断**；
+                  2026-11-05 实测更正：挂起期间内存 RPC 确实可用，但原因不是让出
+                  执行权，而是 dyn/rebase.py 的 read_memory 每次新建独立脚本，
+                  不经过被挂住的调试脚本。至于本脚本自身导出的 RPC 在挂起期间
+                  是否响应，取决于是否还落在同一个 JS 上下文里——所以超时保护
+                  依然必要。
         解决方案：RPC 放到守护线程执行，主线程最多等 timeout（默认 _RPC_TIMEOUT）
                   秒；超时按失败返回并记录 last_error，宁可报错也不阻塞调用方。
                   close() 用更短的 timeout，保证关闭流程不会被卡住。
