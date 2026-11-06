@@ -1610,7 +1610,11 @@ def test_r51_java_batch_hook() -> None:
         check(f"R51 支持参数 {p}", p in sig.parameters)
 
     js = getattr(_jb, "_JS_JAVA_HOOK_MULTI", "")
-    check("R51 支持类名通配符", "wildToRe" in js and "PATTERN" in js)
+    # (2) 第二次修改（2026-11-06）：wildToRe 已改名 makeRe 并改了语义。
+    #     bug 原因：原断言查 "wildToRe" 这个实现名，改名就红——
+    #              这类"查实现名"的断言既脆弱又验不出真问题。
+    #     解决方案：查能力关键词，语义正确性交给 R53 的 node 实跑验证。
+    check("R51 支持类名匹配", "makeRe" in js and "PATTERN" in js)
     check("R51 支持包名过滤", "PACKAGE" in js)
     check("R51 分别统计每个类", "classes: []" in js and "call_count" in js)
     check("R51 兄弟方法探测", "SIBLING_PROBE" in js and "siblingHits" in js)
@@ -1649,40 +1653,122 @@ def test_r52_java_callers() -> None:
           or "class_name=class_name" in _insp.getsource(_jb.java_find_callers))
 
 
-def test_r53_js_raw_string() -> None:
-    """R53：含反斜杠的 JS 模板必须是 raw string，否则正则被 Python 吃掉一层。"""
+def test_r53_js_pattern_semantics() -> None:
+    """R53：pattern / method 的匹配语义必须正确（用 node 实跑，不看字符串特征）。
+
+    (3) 第三次修改（2026-11-06）：整个测试重写。
+        bug 原因：原测试只检查源码里"字符类有没有双反斜杠"这类**字符串特征**，
+                  所以下面这个真 bug 完全没被发现：
+                  java_find_classes 把 pattern 走"转义 + ^…$ 全匹配"，
+                  导致**任何非空 pattern 都返回 0**——
+                    pattern="java\.lang\.String" 匹配不到 java.lang.String
+                    pattern="mtopsdk|anetwork"     匹配不到
+                    pattern="Security"             匹不到 com.x.SecurityFoo
+                  而空 pattern 正常，极易误判成"进程里没有目标类"。
+                  之所以漏掉：测试和自己手测都用了 *X* 这种带星号的写法，
+                  转成 ^.*X.*$ 恰好能匹配，把问题盖住了。
+        解决方案：把 makeRe 抽出来用 node **真实执行**，直接断言匹配结果。
+                  只有验证语义才防得住这类回归。
+    """
+    import inspect as _insp
+    import json as _json
+    import os
     import re as _re
+    import shutil
+    import subprocess
+    import tempfile
 
     import dyn.java_bridge as _jb
 
-    src = __import__("inspect").getsource(_jb)
-    # java_find_classes 与 _JS_JAVA_HOOK_MULTI 都含 wildToRe 的正则字面量
-    # 两处都必须是 r""" 开头的 raw string
-    # (3) 第三次修改（2026-11-06）：断言换成"行为校验"而不是数次数。
-    #     bug 原因：原来用正则数 r""" 的出现次数，但这个数字会随代码里
-    #              注释/其他模板的增减而变，属于脆断言——改个注释就红。
-    #     解决方案：直接验证**关键行为**——两个含 wildToRe 的模板
-    #              生成的 JS 里，字符类必须是合法形态。
-    import json as _json
+    src = _insp.getsource(_jb)
+    names = ["java.lang.String", "com.taobao.mtopsdk.ANetworkConverter",
+             "anetwork.channel.NetworkConverterImpl", "com.x.SecurityGuard"]
+    method_names = ["sendMessage", "sendMessageDelayed", "convertRequest", "convert"]
 
-    # 两个含 wildToRe 的地方都必须能生成合法 JS（不抛异常即说明转义对）
-    for name in ("java_find_classes", "java_hook"):
-        fn = getattr(_jb, name)
-        ok = callable(fn)
-        check(f"R53 {name} 可调用", ok)
+    if not shutil.which("node"):
+        # 没有 node 时退化为关键实现检查（至少能发现 makeRe 被删）
+        check("R53 makeRe 存在", "makeRe" in src)
+        check("R53 不再用 ^$ 全匹配", "new RegExp(p, 'i')" in src)
+        return
 
-    # 关键校验：生成的 JS 里字符类必须是 [\]\\\\] 形态（能正确匹配反斜杠）
-    import json as _json
+    # 抽出 makeRe 函数体（两个文件里应该是同一份实现风格）
+    m = _re.search(r'(function makeRe\(.*?\n\s{4,8}\})', src, _re.S)
+    check("R53 能找到 makeRe 实现", m is not None)
+    if not m:
+        return
+    fn = m.group(1)
 
-    tpl = _re.search(r'user_js = _JS_HELPERS \+ r"""(.*?)"""', src, _re.S)
-    if tpl:
-        js = tpl.group(1)
-        idx = js.find("var esc = p.replace")
-        seg = js[idx:idx + 70]
-        check("R53 字符类含双反斜杠", "\\\\]" in seg or "[\\]\\\\]" in seg,
-              f"实际 {seg!r}")
+    script = fn + """
+const names = %s;
+const meths = %s;
+function run(p, anchor) {
+  const re = makeRe(p, 'test', anchor);
+  return re === null ? null : re.test.bind(re);
+}
+const out = {};
+for (const [label, pat, anchor] of [
+  ['empty',        '',                       false],
+  ['escaped_dot',  'java\\\\.lang\\\\.String', false],
+  ['alternation',  'mtopsdk|anetwork',       false],
+  ['plain_substr', 'Security',               false],
+  ['wildcard',     '*NetworkConverter*',     false],
+  ['method_exact', 'sendMessage',            true],
+  ['method_wild',  'convert*',               true],
+]) {
+  try {
+    const f = run(pat, anchor);
+    out[label] = label.indexOf('method') === 0
+      ? meths.filter(x => f && f(x))
+      : names.filter(x => f === null || f(x));
+  } catch (e) { out[label] = 'ERROR: ' + e.message; }
+}
+try { run('[[[', false); out.bad_regex = 'NONE(错)'; }
+catch (e) { out.bad_regex = 'THREW'; }
+console.log(JSON.stringify(out));
+""" % (_json.dumps(names), _json.dumps(method_names))
 
+    with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False,
+                                     encoding="utf-8") as fh:
+        fh.write(script)
+        path = fh.name
+    try:
+        proc = subprocess.run(["node", path], capture_output=True, text=True,
+                              timeout=30)
+        if proc.returncode != 0:
+            check("R53 node 执行成功", False, (proc.stderr or "")[:200])
+            return
+        res = _json.loads((proc.stdout or "{}").strip() or "{}")
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
 
+    # 空 pattern = 不过滤
+    check("R53 空 pattern 返回全部", res.get("empty") == names,
+          str(res.get("empty")))
+    # 正则里的 \. 必须按点匹配，不能当字面反斜杠
+    check("R53 转义点号能匹配",
+          res.get("escaped_dot") == ["java.lang.String"], str(res.get("escaped_dot")))
+    # | 必须是或，不能是字面量
+    check("R53 竖线是正则或",
+          len(res.get("alternation") or []) == 2, str(res.get("alternation")))
+    # 纯子串：Security 要能匹配 com.x.SecurityGuard（这是本次 bug 的核心）
+    check("R53 纯子串不要求全匹配",
+          res.get("plain_substr") == ["com.x.SecurityGuard"],
+          str(res.get("plain_substr")))
+    # 通配符仍要工作
+    check("R53 通配符仍可用",
+          len(res.get("wildcard") or []) == 2, str(res.get("wildcard")))
+    # 方法名锚定：sendMessage 不该带出 sendMessageDelayed
+    check("R53 方法名精确匹配",
+          res.get("method_exact") == ["sendMessage"], str(res.get("method_exact")))
+    check("R53 方法名通配符",
+          set(res.get("method_wild") or []) == {"convert", "convertRequest"},
+          str(res.get("method_wild")))
+    # 非法正则必须报错，绝不能静默返回全部
+    check("R53 非法正则必须报错", res.get("bad_regex") == "THREW",
+          str(res.get("bad_regex")))
 
 
 def test_r54_hits_register_filter() -> None:
@@ -1855,8 +1941,8 @@ def main() -> int:
     test_r51_java_batch_hook()
     print("== R52 Java 调用者追踪 ==")
     test_r52_java_callers()
-    print("== R53 JS raw string ==")
-    test_r53_js_raw_string()
+    print("== R53 pattern 匹配语义 ==")
+    test_r53_js_pattern_semantics()
     print("== R54 hits 寄存器过滤 ==")
     test_r54_hits_register_filter()
     print("== R55 hits 聚合统计 ==")

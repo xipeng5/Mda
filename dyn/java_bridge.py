@@ -454,16 +454,67 @@ def java_find_classes(serial: str, pid: int, pattern: str = "",
         var LIMIT = __LIMIT__;
         var SCAN_CAP = __SCAN_CAP__;
 
-        function wildToRe(p) {
+        // (11) 第十一次修改（2026-11-06）：修回正则语义 + 去掉全匹配锚定。
+        //     bug 原因：上一版把 pattern 走"通配符转正则"，做了两件与用户期望
+        //              冲突的事：
+        //                ① 转义了正则元字符 —— 用户传 java\.lang\.String /
+        //                   mtopsdk|anetwork 会被当**字面量**，永远匹配不到；
+        //                ② 加了 ^...$ 全匹配 —— 用户传 Security 变成
+        //                   必须整个类名等于 Security，而真实类名是
+        //                   com.xxx.SecurityFoo，同样匹配不到。
+        //              结果是**任何非空 pattern 都返回 0**，而空 pattern 正常，
+        //              极易误判成"这个进程没有目标类"。
+        //              之所以没被发现：我自己的测试全用 *NetworkConverter* 这种
+        //              带 * 的写法，转成 ^.*X.*$ 恰好能匹配，掩盖了问题。
+        //     解决方案：① **不再锚定**，改为子串搜索（还原最初实现的语义）；
+        //               ② 智能判断——先当**正则**编译，成功就用正则（所以
+        //                  Security / java\.lang\.String / a|b 都对）；
+        //                  失败才转通配符（所以 *NetworkConverter* 也对）。
+        //                  两种写法都能用，且不歧义。
+        //               ③ 两者都失败时**明确报错**，绝不静默返回全部——
+        //                  静默放行会让用户以为"匹配到了所有类"。
+        // 判定规则（**不能用"能不能编译"来判断**—— convert* 是合法正则，
+        // 会被理解成 ^convert*$ 也就是只匹配 conver/convert/convertt，
+        // 用户的真实意图却是 "convert 开头的所有方法"）。
+        //
+        //   含 * 或 ?，且**不含**正则专属符号（\\ | [ ] ( ) { } ^ $）
+        //       → 按通配符：* 变 .*  ? 变 .  其余转义
+        //   否则 → 按正则原样编译
+        //
+        // 于是这几种写法都对：
+        //   convert* / *NetworkConverter*  → 通配符
+        //   java\.lang\.String / a|b      → 正则
+        //   Security                       → 正则子串（匹配 com.x.SecurityFoo）
+        function makeRe(p, label, anchor) {
             if (!p) { return null; }
-            var esc = p.replace(/[.+^${}()|[\]\\]/g, '\\$&');
-            esc = esc.replace(/\*/g, '.*').replace(/\?/g, '.');
-            return new RegExp('^' + esc + '$', 'i');
+            var a = anchor ? '^' : '', z = anchor ? '$' : '';
+            var isWild = /[*?]/.test(p) && !/[\\|\[\](){}^$]/.test(p);
+            if (isWild) {
+                var esc = p.replace(/[.+${}()|[\]]/g, '\\$&');
+                esc = esc.replace(/\*/g, '.*').replace(/\?/g, '.');
+                try { return new RegExp(a + esc + z, 'i'); }
+                catch (e) { throw new Error(label + ' 通配符转换失败：' + p); }
+            }
+            try { return new RegExp(a + p + z, 'i'); }
+            catch (e) {
+                // 到这里说明用户写的是"想当正则用但不合法"的东西，必须报错。
+                // 静默放行（返回 null）会匹配所有类，比报错危险得多。
+                throw new Error(label + ' 不是合法正则：' + p
+                                + '（若想用通配符请写 convert* 这种形式）');
+            }
         }
-        var nameRe = wildToRe(PATTERN);
-        var fieldRe = wildToRe(FIELD);
-        var retRe = wildToRe(RETURN_TYPE);
-        var methRe = wildToRe(METHOD_PATTERN);
+        var nameRe, fieldRe, retRe, methRe;
+        try {
+            nameRe = makeRe(PATTERN, 'pattern', false);
+            fieldRe = makeRe(FIELD, 'field', false);
+            retRe = makeRe(RETURN_TYPE, 'return_type', false);
+            // 方法名锚定：搜 setHeaders 不该把 setHeadersAndMore 也算进来
+            methRe = makeRe(METHOD_PATTERN, 'method_pattern', true);
+        } catch (e) {
+            // 参数本身有语法错 → 明确报错，不要抛到脚本层变成看不出原因的崩溃
+            send({kind: 'hook_error', code: 'BAD_PATTERN', error: String(e)});
+            return;
+        }
 
         var all;
         try { all = Java.enumerateLoadedClassesSync(); }
@@ -679,12 +730,32 @@ Java.perform(function () {
         return false;
     }
 
-    // 通配符 -> 正则（* -> .*  ? -> .），大小写不敏感
-    function wildToRe(p) {
+    // (11) 第十一次修改（2026-11-06）：与 java_find_classes 同一处回归的修复。
+    //     bug 原因：同样的"转义 + 全匹配"写法，导致 pattern="Security" 这类
+    //              不带 * 的写法永远匹配不到（被锚成 ^Security$）。
+    //     解决方案：makeRe 智能判断（正则优先，通配符兜底），并用 anchor
+    //              参数区分两种语义：
+    //                · 类名 pattern  → **不锚定**，子串搜（Security 能匹配
+    //                  com.xxx.SecurityFoo）
+    //                · 方法名 method  → **锚定**，精确或通配（sendMessage 只
+    //                  匹配 sendMessage，不会把 sendMessageDelayed 也挂上）
+    // 判定规则同 java_find_classes：含 * 或 ? 且不含正则专属符号 → 通配符，
+    // 否则按正则。不能用"能不能编译"判断，因为 convert* 是合法正则。
+    function makeRe(p, label, anchor) {
         if (!p) { return null; }
-            var esc = p.replace(/[.+^${}()|[\]\\]/g, '\\$&');
+        var a = anchor ? '^' : '', z = anchor ? '$' : '';
+        var isWild = /[*?]/.test(p) && !/[\\|\[\](){}^$]/.test(p);
+        if (isWild) {
+            var esc = p.replace(/[.+${}()|[\]]/g, '\\$&');
             esc = esc.replace(/\*/g, '.*').replace(/\?/g, '.');
-        return new RegExp('^' + esc + '$', 'i');
+            try { return new RegExp(a + esc + z, 'i'); }
+            catch (e) { throw new Error(label + ' 通配符转换失败：' + p); }
+        }
+        try { return new RegExp(a + p + z, 'i'); }
+        catch (e) {
+            throw new Error(label + ' 不是合法正则：' + p
+                            + '（若想用通配符请写 convert* 这种形式）');
+        }
     }
 
     // Map / List / 数组 展开成可读结构（P1-1）
@@ -744,7 +815,15 @@ Java.perform(function () {
         var all;
         try { all = Java.enumerateLoadedClassesSync(); }
         catch (e) { send({kind: 'hook_error', error: '无法枚举类：' + e}); return; }
-        var re = wildToRe(PATTERN);
+        var re;
+        var methRe;
+        try {
+            re = makeRe(PATTERN, 'pattern', false);      // 类名：子串
+            methRe = makeRe(METHOD, 'method', true);     // 方法名：精确/通配
+        } catch (e) {
+            send({kind: 'hook_error', code: 'BAD_PATTERN', error: String(e)});
+            return;
+        }
         for (var i = 0; i < all.length && candidates.length < MAX_CLASSES; i++) {
             var nm = all[i];
             if (shouldSkip(nm)) { continue; }
@@ -761,7 +840,6 @@ Java.perform(function () {
         return;
     }
 
-    var methRe = wildToRe(METHOD);
     var result = {classes: [], total_hits: 0};
     var siblingHits = {};      // 用于 0 命中时的旁证
 
@@ -839,7 +917,14 @@ Java.perform(function () {
                             }
                             return ovObj.apply(this, arguments);
                         };
-                        entry.hooked_methods.push(mnm + sig);
+                        // (13) 第十三次修改（2026-11-06）：修正签名拼接。
+                        //     bug 原因：原来写成 mnm + sig，而 sig 本身已是
+                        //              "function execute(java.lang.Runnable): void"
+                        //              这种完整签名，拼出来变成
+                        //              "executefunction execute(...)"，方法名重复且粘连。
+                        //     解决方案：直接用 sig（它已包含方法名），仅在
+                        //              没有签名文本时退回 mnm。
+                        entry.hooked_methods.push(sig || mnm);
                     })(ovs[oi], String(ovs[oi]), jc, mname);
                 }
             } catch (e) {
@@ -1385,6 +1470,20 @@ def _run_java_hook(serial: str, pid: int, user_js: str,
         "duration": duration,
         "sibling_hits": data.get("sibling_hits") or {},
     }
+
+    # (12) 第十二次修改（2026-11-06）：单类时补回顶层 hooked / calls。
+    #      bug 原因：把 java_hook 改成批量之后，返回结构变成 classes[] 嵌套，
+    #                顶层的 hooked 与 calls **被去掉了**。只 hook 一个类的
+    #                场景下，调用方读 r["hooked"] 会拿到 None（不是报错，
+    #                所以更隐蔽），旧脚本与旧文档的用法都会失效。
+    #      解决方案：class_count == 1 时在顶层补一份 hooked / calls，
+    #                与批量结构的 classes[0] 内容一致；多类时不补
+    #                （那时顶层放哪一份都会误导）。
+    if len(classes) == 1:
+        only = classes[0]
+        out["hooked"] = only.get("hooked_methods") or []
+        out["calls"] = only.get("calls") or []
+        out["truncated"] = bool(only.get("truncated"))
 
     # ---- P0-3：0 命中时给诊断，而不是只说"没被调用" ----
     if total == 0:
