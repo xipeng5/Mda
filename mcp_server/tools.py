@@ -4085,3 +4085,159 @@ def find_dispatch_tables(so_name: str, max_tables: int = 200,
     except Exception as exc:                              # noqa: BLE001
         return _j({"error": f"{type(exc).__name__}: {exc}",
                    "code": getattr(exc, "code", "DISPATCH_SCAN_FAILED")})
+
+
+# ---------------- Java 层分析（frida 17 需注入 bridge） ----------------
+#
+# frida 17 起 Java bridge 从内核解耦，脚本里直接 `Java.use` 会报
+# ReferenceError。dyn/java_bridge.py 负责把 frida_tools 自带的 java.js
+# 拼到脚本前面，这一组工具才有 Java 能力。
+
+
+@server.tool()
+@logged()
+def java_bridge_status() -> str:
+    """检查 **Java bridge 是否可用**（纯本地，不连设备）。
+
+    frida 17 起 Java bridge 不再内置，需要 mda 注入 `frida_tools` 自带的
+    `java.js`。本工具报告能否找到该文件——找不到时所有 java_* 工具都会失败，
+    先查这里最快。
+
+    返回：{ok, path, size_bytes, loaded_from_cache, error, code}
+    """
+    mod, err = _load_dyn_module("dyn.java_bridge", "bridge_status")
+    if err:
+        return _j(err)
+    try:
+        return _j(mod.bridge_status("java"))
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}",
+                   "code": "BRIDGE_CHECK_FAILED"})
+
+
+@server.tool()
+@logged()
+def java_list_methods(serial: str, pid: int, class_name: str,
+                      include_fields: bool = True) -> str:
+    """列出一个 Java 类的所有方法与字段（**包含动态加载的类**）。
+
+    加固 app 的类常由 DexClassLoader 懒加载，静态反编译看不到。本工具通过
+    `Java.use(cls).class` 拿运行时的 Class 对象，所以**运行时才存在的类也能列**。
+
+    ## 参数
+
+        class_name       全限定类名，如 "android.app.Activity"（不能用简称）
+        include_fields   是否一并列字段
+
+    ## 返回
+
+        found / class_name / superclass / interfaces
+        methods[]   {name, signature, return_type, param_types, is_native, modifiers}
+        fields[]    {name, type, modifiers}
+        counts      {methods, fields}
+
+    ## 找不到类时
+
+    返回 found=false + hint，提示两种常见原因：类名写错（需要全限定名）、
+    类还没被加载（用 `java_find_classes` 先按正则找）。
+    """
+    mod, err = _load_dyn_module("dyn.java_bridge", "java_list_methods")
+    if err:
+        return _j(err)
+    try:
+        return _j(mod.java_list_methods(serial, int(pid), class_name,
+                                        include_fields=bool(include_fields)))
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}",
+                   "code": "JAVA_LIST_FAILED"})
+
+
+@server.tool()
+@logged()
+def java_find_classes(serial: str, pid: int, pattern: str = "",
+                      limit: int = 200) -> str:
+    """在**已加载的类**里按正则搜索全限定类名。
+
+    加固 app 会动态加载大量类，静态看不到。本工具枚举运行时的全部 Class
+    再正则筛选——是摸清一个 app 内部结构的起点。
+
+    ## 参数
+
+        pattern   正则（大小写不敏感），空则返回前 limit 个
+        limit     最多返回多少个（1..2000）
+
+    ## 返回
+
+        classes[]  全限定类名
+        total      枚举到的类总数（不受 limit 影响）
+        matched    匹配数
+        note       匹配数超过本页时明确说明
+
+    ## 典型用法
+
+        java_find_classes(pattern="Security|Sign|Guard")
+        → 找出所有与签名/安全相关的已加载类
+    """
+    mod, err = _load_dyn_module("dyn.java_bridge", "java_find_classes")
+    if err:
+        return _j(err)
+    try:
+        return _j(mod.java_find_classes(serial, int(pid), pattern,
+                                        limit=int(limit)))
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}",
+                   "code": "JAVA_FIND_FAILED"})
+
+
+@server.tool()
+@logged()
+def java_hook(serial: str, pid: int, class_name: str, method: str,
+              overload: str = "", duration: float = 5.0, max_calls: int = 200,
+              include_stack: bool = True, stack_depth: int = 8) -> str:
+    """hook 一个 Java 方法，记录每次调用的**参数、返回值、调用栈**。
+
+    这是 mda 从「只看 native」跨到「Java 层可见」的关键能力。
+
+    ## 参数
+
+        class_name    全限定类名
+        method        方法名
+        overload      重载签名（可选），如 "(Ljava/lang/String;)V"；
+                      不传则 hook **所有**同名重载
+        duration      采集秒数
+        max_calls     最多记录多少次（防高频方法打爆内存，上限 5000）
+        include_stack 是否抓 Java 调用栈
+        stack_depth   栈深度
+
+    ## 返回
+
+        hooked       实际 hook 上的重载签名列表
+        calls[]      {seq, ts, thread, args[], ret, stack[], threw?}
+        call_count   调用次数（可能 > len(calls)，被 max_calls 截断）
+        truncated    是否因 max_calls 截断
+        verdict      一句话结论：区分「hook 上但没被调」与「调了多少次」
+
+    ## 已知边界（如实标注）
+
+        · 参数按 `String(v)` 转字符串并截断 200 字符——**对象只给摘要**
+        · ART 的 JIT 内联可能让 hook 失效（已知限制）
+        · 加固 app 可能阻断 `Java.perform`，这时返回 NOT_READY 并说明
+
+    ## 典型用法
+
+        java_hook(class_name="com.taobao.security.Sign", method="doCommand",
+                  duration=8)
+        → 期间操作 app，回来就能看到每次调用的参数和返回值
+    """
+    mod, err = _load_dyn_module("dyn.java_bridge", "java_hook")
+    if err:
+        return _j(err)
+    try:
+        return _j(mod.java_hook(serial, int(pid), class_name, method,
+                                overload=overload, duration=float(duration),
+                                max_calls=int(max_calls),
+                                include_stack=bool(include_stack),
+                                stack_depth=int(stack_depth)))
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}",
+                   "code": "JAVA_HOOK_FAILED"})

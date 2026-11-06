@@ -1503,6 +1503,77 @@ def test_r48_symbol_not_clobbered() -> None:
             break
 
 
+
+
+def test_r49_java_bridge() -> None:
+    """R49：Java bridge 必须能自动注入（frida 17 起不再内置）。"""
+    import inspect as _insp
+
+    import dyn.java_bridge as _jb
+
+    check("R49 bridge_status 存在", hasattr(_jb, "bridge_status"))
+    check("R49 wrap_with_java_bridge 存在", hasattr(_jb, "wrap_with_java_bridge"))
+
+    # 真实环境：frida_tools 自带 bridge 应能找到
+    st = _jb.bridge_status("java")
+    check("R49 Java bridge 源码可用", st.get("ok") is True,
+          f"期望找到 bridge，实际 {st.get('error') or st.get('code')}")
+    check("R49 bridge 体积合理（>100KB）", (st.get("size_bytes") or 0) > 100_000,
+          f"实际 {st.get('size_bytes')}")
+
+    # 包装后的脚本必须把 bridge 挂到 globalThis
+    wrapped = _jb.wrap_with_java_bridge("send({x:1});")
+    check("R49 包装含 defineProperty", "defineProperty" in wrapped)
+    check("R49 包装挂的是 Java", "globalThis, 'Java'" in wrapped)
+    check("R49 用户脚本在 bridge 之后", wrapped.rstrip().endswith("send({x:1});"),
+          "顺序反了会导致 Java 还没定义就执行用户代码")
+    check("R49 不可枚举（避免被检测）", "enumerable: false" in wrapped,
+          "可枚举的 Java 更容易被反调试发现")
+
+    # 找不到时的错误码要可区分
+    bad = _jb.bridge_status("not_a_lang")
+    check("R49 未知语言有明确错误码", bad.get("ok") is False and bad.get("code"),
+          str(bad))
+
+    # _js_str 生成**完整 JS 字符串字面量**（含外层引号），不是裸内容。
+    # 用 json.dumps 实现，因此三种引号/反斜杠都被正确转义，可安全内插到 JS。
+    import json as _json
+
+    for raw in ('normal', 'a"b', "a'b", 'back\\slash', '中文'):
+        got = _jb._js_str(raw)
+        check(f"R49 转义 {raw!r}", got == _json.dumps(raw),
+              f"得到 {got!r}")
+        check(f"R49 转义后能还原 {raw!r}", _json.loads(got) == raw,
+              f"{got!r} 解码不回原值")
+
+
+def test_r50_java_tools() -> None:
+    """R50：三个 Java 工具必须在且不返回假数据。"""
+    import inspect as _insp
+
+    import dyn.java_bridge as _jb
+
+    for fn, args in (("java_list_methods", ("s", 1, "cls")),
+                     ("java_find_classes", ("s", 1)),
+                     ("java_hook", ("s", 1, "cls", "m"))):
+        check(f"R50 {fn} 存在", hasattr(_jb, fn))
+        sig = _insp.signature(getattr(_jb, fn))
+        check(f"R50 {fn} 参数完整", len(sig.parameters) >= len(args),
+              str(list(sig.parameters)))
+
+    # 无 frida 时必须给明确 code，不能返回空列表冒充"没有"
+    src = _insp.getsource(_jb)
+    check("R50 有 pending 结构", "NEEDS_FRIDA_JAVA" in src)
+    check("R50 不编造空结果", "绝不返回空列表" in src or "绝不返回编造" in src.lower()
+          or "NEEDS_FRIDA_JAVA" in src)
+
+    # java_hook 必须能区分"没被调用"与"hook 失败"
+    hsrc = _insp.getsource(_jb.java_hook)
+    check("R50 hook 有 max_calls 上限", "max_calls" in hsrc)
+    check("R50 hook 抓参数与返回值", "rec.args" in hsrc and "rec.ret" in hsrc)
+    check("R50 hook 抓调用栈", "mdaJavaStack" in src)
+
+
 def main() -> int:
     print("== R1 held/token 透出（防线程永久挂起）==")
     test_r1_held_is_exposed()
@@ -1600,6 +1671,10 @@ def main() -> int:
     test_r47_jni_and_dispatch()
     print("== R48 符号不被清空 ==")
     test_r48_symbol_not_clobbered()
+    print("== R49 Java bridge 注入 ==")
+    test_r49_java_bridge()
+    print("== R50 Java 工具 ==")
+    test_r50_java_tools()
 
     print(f"\n结果: {PASS} 通过 / {FAIL} 失败")
     return 0 if FAIL == 0 else 1
