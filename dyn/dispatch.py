@@ -431,7 +431,14 @@ def _match_byte_offset_table(insns, idx: int, so):
     if hit == 0:
         return None                     # 全都不指向代码 → 不是分发表
 
+    # 表长：优先用 ldrb 的**源索引**寄存器去找 cmp（形如 cmp w15,#0xa 用的是
+    # 查表前的那个索引，不是 ldrb 的目标寄存器）——两者不同，这里都要试。
+    src_index = _index_reg(byte_ins.op_str) or index_reg
     count, bound_detail = B._ti_table_count(insns, add_pos, index_reg)
+    if "未找到" in bound_detail and src_index and src_index != index_reg:
+        count2, bound2 = B._ti_table_count(insns, add_pos, src_index)
+        if "未找到" not in bound2:
+            count, bound_detail = count2, bound2
     return {
         "mode": "byte_offset_table",
         "table_addr": int(table_addr),
