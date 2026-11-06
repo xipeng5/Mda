@@ -38,3 +38,11 @@ docs/ui-review/
 
 # 前端导出的示例数据（由 tests/ui_review/dump_sphere_data.py 生成，不入库）
 web/public/data.js
+
+# ===== 会话/记忆存储（不入库）=====
+# 含设备序列号、本机绝对路径等环境相关信息；
+# 且是工具运行期产物，不属于项目源码。
+.dsh/
+
+# PyInstaller spec 的手工备份（同内容，无新信息）
+*.spec.bak
