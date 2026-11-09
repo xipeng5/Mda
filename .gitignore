@@ -46,3 +46,17 @@ web/public/data.js
 
 # PyInstaller spec 的手工备份（同内容，无新信息）
 *.spec.bak
+
+# 设备端 helper 编译产物（由 dyn/device/build.sh 生成，不入库）
+dyn/device/mda_perfwatch
+
+# perf_event 探针的编译产物（ARM64 ELF，由同目录 .c 编译得到，不入库）
+# 只提交 .c 源码，二进制随平台变、体积大，且不该混进仓库历史
+tests/probe_perf/hwslot
+tests/probe_perf/perf_probe
+tests/probe_perf/perf_probe2
+tests/probe_perf/perf_remote
+tests/probe_perf/perf_thread
+tests/probe_perf/perf_v3
+tests/probe_perf/perf_v4
+tests/probe_perf/perf_v5
