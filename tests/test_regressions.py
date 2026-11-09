@@ -2020,6 +2020,125 @@ def test_r58_perf_watch_daemon() -> None:
     check("R58 C 侧有状态文件", "mda_pw_%d.state" in csrc or "state_path" in csrc)
 
 
+
+
+def test_r59_vm_breakpoint() -> None:
+    """R59：VM 层断点必须在，且 idx 用 prog_base 解引用算。
+
+    (1) 第一次修改（2026-11-09）：新增。
+
+    关键事实（真机实测，用户提供线索后验证）：
+        prog_base = *(*(x27 + 0x240) + 0x1a0)
+        vm_pc     = *(x27 + 8)
+        idx       = (vm_pc - prog_base) / 16
+
+    **不能用 vm_pc - 模块基址**：VM 代码区是 malloc 出来的匿名内存，
+    与 so 模块不在一处（实测 vm_pc 落在 [anon:libc_malloc] 段，
+    相对模块基址的偏移超过模块大小）。
+    """
+    import inspect as _insp
+
+    import dyn.vmbreak as _vb
+
+    for fn in ("vm_breakpoint", "vm_regs_snapshot", "find_dispatch_points"):
+        check(f"R59 {fn} 存在", hasattr(_vb, fn))
+
+    # prog_base 的两跳路径必须是默认值
+    check("R59 prog_base P1 偏移", _vb.VM_DEFAULTS.get("prog_base_p1_offset") == 0x240,
+          str(_vb.VM_DEFAULTS.get("prog_base_p1_offset")))
+    check("R59 prog_base P2 偏移", _vb.VM_DEFAULTS.get("prog_base_p2_offset") == 0x1A0,
+          str(_vb.VM_DEFAULTS.get("prog_base_p2_offset")))
+
+    src = _insp.getsource(_vb)
+    check("R59 用两跳解引用算 prog_base", "P1_OFF" in src and "P2_OFF" in src)
+    check("R59 不用模块基址算 idx", "CODE_BASE" not in src,
+          "用模块基址算 idx 会全错（VM 代码区在 malloc 区）")
+
+    # 派发点特征：str x21,[x27,#8]
+    check("R59 默认特征正确", _vb.VM_DEFAULT_PATTERN == "750700f9",
+          _vb.VM_DEFAULT_PATTERN)
+    check("R59 说明 br x2 不可靠", "br x2" in src or "派发寄存器" in src,
+          "实测派发寄存器不固定，br x2 只能扫到 42/805")
+
+    # 索引断言：派发点必须 100% 是 str 后跟 br
+    import os as _os
+
+    base = _os.path.dirname(_os.path.dirname(_os.path.abspath(_vb.__file__)))
+    so = _os.path.join(base, "samples")
+    # 有样本就做真实扫描
+    for cand in ("liblog.so",):
+        p2 = _os.path.join(so, cand)
+        if _os.path.isfile(p2):
+            r = _vb.find_dispatch_points(p2)
+            check(f"R59 {cand} 扫描可用", r.get("ok") is True)
+            break
+
+
+def test_r60_vm_trace() -> None:
+    """R60：VM 执行轨迹采集。"""
+    import inspect as _insp
+
+    import dyn.vmtrace as _vt
+
+    check("R60 vm_trace 存在", hasattr(_vt, "vm_trace"))
+    sig = _insp.signature(_vt.vm_trace)
+    for p in ("dispatch_offset", "duration", "max_rows", "idx_from", "idx_to",
+              "record_regs"):
+        check(f"R60 参数 {p}", p in sig.parameters)
+
+    src = _insp.getsource(_vt)
+    check("R60 只在 JS 侧累积不回传", "rows.push" in src and "send({" in src,
+          "逐条 send 会把目标拖死")
+    check("R60 有容量上限", "VM_TRACE_MAX" in src)
+    check("R60 支持 idx 范围过滤", "IDX_FROM" in src and "IDX_TO" in src)
+    check("R60 用 prog_base 算 idx", "P1_OFF" in src and "P2_OFF" in src)
+    check("R60 返回分布统计", "idx_distribution" in src)
+
+
+def test_r61_mem_snapshot_diff() -> None:
+    """R61：内存快照 diff 必须走设备端 native，不能走 shell。
+
+    (2) 第二次修改（2026-11-09）：新增。
+
+    实测性能差：
+        adb shell + dd 读 4MB : 37,000 ms
+        设备端 native pread    :      6.4 ms   （快 5786 倍）
+    """
+    import inspect as _insp
+    import os as _os
+
+    import dyn.memdiff as _md
+
+    for fn in ("mem_snapshot", "mem_diff", "mem_snapshot_clear",
+               "ensure_memsnap_helper"):
+        check(f"R61 {fn} 存在", hasattr(_md, fn))
+
+    src = _insp.getsource(_md)
+    check("R61 用设备端 helper", "mda_memsnap" in src)
+    check("R61 不走 dd/base64 读内存", "base64" not in src,
+          "走 shell 读 4MB 要 37 秒")
+
+    # helper 源码与编译脚本必须在仓库里
+    base = _os.path.dirname(_os.path.dirname(_os.path.abspath(_md.__file__)))
+    csrc_p = _os.path.join(base, "dyn", "device", "mda_memsnap.c")
+    check("R61 helper C 源码在仓库", _os.path.isfile(csrc_p))
+
+    if _os.path.isfile(csrc_p):
+        csrc = open(csrc_p, encoding="utf-8").read()
+        # 小段优先：大段优先会让 1GB 段吃光预算，diff 永远 0
+        check("R61 小段优先", "segs[j].size < segs[i].size" in csrc,
+              "大段优先会导致 diff 恒为 0")
+        # 单趟线性扫描：双层循环会退化成 O(n^2) 卡死
+        check("R61 单趟线性扫描", "// 单趟" in csrc or "i >= n) break" in csrc,
+              "双层扫描在整块变化时会卡死")
+        # 预算判断用 continue 不是 break
+        check("R61 预算用 continue", "> max_bytes) continue" in csrc,
+              "用 break 会因为最大的段超预算而全部放弃")
+        # 独立的 chosen 数组
+        check("R61 独立 chosen 数组", "chosen" in csrc,
+              "原位留存会取到被跳过的巨型段")
+
+
 def main() -> int:
     print("== R1 held/token 透出（防线程永久挂起）==")
     test_r1_held_is_exposed()
@@ -2137,6 +2256,12 @@ def main() -> int:
     test_r57_perf_watch()
     print("== R58 常驻观察点 ==")
     test_r58_perf_watch_daemon()
+    print("== R59 VM 断点 ==")
+    test_r59_vm_breakpoint()
+    print("== R60 VM 轨迹 ==")
+    test_r60_vm_trace()
+    print("== R61 内存快照 diff ==")
+    test_r61_mem_snapshot_diff()
 
     print(f"\n结果: {PASS} 通过 / {FAIL} 失败")
     return 0 if FAIL == 0 else 1

@@ -11,8 +11,10 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
-SRC="$HERE/mda_perfwatch.c"
-OUT="$HERE/mda_perfwatch"
+PERFWATCH_SRC="$HERE/mda_perfwatch.c"
+PERFWATCH_OUT="$HERE/mda_perfwatch"
+MEMSNAP_SRC="$HERE/mda_memsnap.c"
+MEMSNAP_OUT="$HERE/mda_memsnap"
 
 find_ndk() {
     if [ -n "${ANDROID_NDK:-}" ] && [ -d "$ANDROID_NDK" ]; then
@@ -46,13 +48,14 @@ fi
 echo "NDK   : $NDK"
 echo "CC    : $CC"
 
-# -pie + --no-warnings：Android 需要 PIE；
-# -Os：体积优先（推送到设备，越小越快）；
-# -Wl,--gc-sections：去掉未用代码。
-"$CC" -Os -pie -fPIE \
-      -Wl,--gc-sections \
-      -o "$OUT" "$SRC"
+# -pie：Android 需要 PIE；-Os：体积优先；--gc-sections：去掉未用代码。
+build_one() {
+    local src="$1" out="$2"
+    "$CC" -Os -pie -fPIE -Wl,--gc-sections -o "$out" "$src"
+    local size
+    size="$(wc -c < "$out" | tr -d ' ')"
+    echo "输出  : $out (${size} bytes)"
+}
 
-SIZE="$(wc -c < "$OUT" | tr -d ' ')"
-echo "输出  : $OUT (${SIZE} bytes)"
-file "$OUT" 2>/dev/null | sed 's/^/类型  : /' || true
+build_one "$PERFWATCH_SRC" "$PERFWATCH_OUT"
+build_one "$MEMSNAP_SRC"   "$MEMSNAP_OUT"

@@ -4756,3 +4756,260 @@ def perf_watch_list(serial: str) -> str:
     except Exception as exc:                              # noqa: BLE001
         return _j({"error": f"{type(exc).__name__}: {exc}",
                    "code": "PERF_LIST_FAILED"})
+
+
+# ---------------- VM 层分析 ----------------
+#
+# 动态加载 VM 的分析难点：所有 handler 各自内联了同一段派发尾，
+# 而且 VM 代码区是 malloc 出来的，与 so 模块不在一处。
+# 这组工具用「派发点」作为统一落点，绕开每个 op handler 的寄存器约定差异。
+
+
+@server.tool()
+@logged()
+def find_vm_dispatch_points(so_name: str, pattern_hex: str = "750700f9",
+                            limit: int = 2000) -> str:
+    """扫描 so 里所有 **VM 派发点**的位置。
+
+    ## 什么是派发点
+
+    VM 解释器里，每条字节码执行完后都会走同一段「保存 VM pc → 跳到下一个 handler」：
+
+        ldr  x2,  [x23, x5, lsl #3]   ; 查 handler 表
+        str  x21, [x27, #8]           ; 保存 VM pc   ← 特征在这里
+        br   x2                       ; 派发
+
+    在这段上拦一次，就能在**每条 VM 指令执行前**拿到完整 VM 状态，
+    不需要理解任何单个 op 的寄存器约定（那是逐个校准的地狱）。
+
+    ## 特征选择（实测教训）
+
+    默认特征 `750700f9` = `str x21, [x27, #8]`。
+
+    **不要用 `br x2`（40001fd6）当特征**：实测派发寄存器完全不固定
+    （x7/x17/x3/x15/x6/x4/x13/x19/x20/x11 都在用），用 br x2 只能扫到
+    42/805 处。而 str x21,[x27,#8] 是 805/805 = 100% 命中。
+
+    ## 返回
+
+        count     找到多少个派发点
+        points[]  {offset, offset_hex}
+    """
+    mod, err = _load_dyn_module("dyn.vmbreak", "find_dispatch_points")
+    if err:
+        return _j(err)
+    try:
+        so = _pick_so_by_name(_session, so_name)
+        return _j(mod.find_dispatch_points(so_name, so=so,
+                                           pattern_hex=pattern_hex,
+                                           limit=int(limit)))
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}",
+                   "code": "VM_SCAN_FAILED"})
+
+
+@server.tool()
+@logged()
+def vm_regs_snapshot(serial: str, pid: int, so_name: str,
+                     dispatch_offset: str = "0x76024",
+                     capture_regs: int = 32, wait: float = 5.0) -> str:
+    """在 VM 派发点抓一次快照：当前 VM pc、VM 寄存器堆、VM 栈。
+
+    **用途**：还不知道要断哪条指令时，先用它看 VM 现在跑到哪些 idx。
+
+    ## 返回
+
+        vm_pc        当前 VM 指令指针（下一条要执行的）
+        ctx          VM 上下文指针
+        reg_base     VM 寄存器堆基址
+        regs         {r0..r31}  ← **这就是 VM 寄存器堆**
+        stack_hex    native 栈快照
+
+    ## 注意
+
+    单次快照只能看到「此刻」。VM 在多个 prog 之间来回跳，
+    要多采几次才能看到全貌。
+    """
+    mod, err = _load_dyn_module("dyn.vmbreak", "vm_regs_snapshot")
+    if err:
+        return _j(err)
+    try:
+        return _j(mod.vm_regs_snapshot(
+            serial, int(pid), so_name, dispatch_offset=dispatch_offset,
+            capture_regs=int(capture_regs), wait=float(wait)))
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}",
+                   "code": "VM_SNAPSHOT_FAILED"})
+
+
+@server.tool()
+@logged()
+def vm_breakpoint(serial: str, pid: int, so_name: str, target_idx: int = -1,
+                  dispatch_offset: str = "0x76024", slot_size: int = 16,
+                  max_hits: int = 1, wait: float = 10.0,
+                  capture_regs: int = 32, stack_bytes: int = 256) -> str:
+    """在**某条 VM 指令**上设断点，停下时给出 VM 寄存器堆与 VM 栈。
+
+    这是「按 VM 层思考」的核心工具：不用管单个 op 的寄存器约定，
+    直接说「我要停在第 N 条 VM 指令」。
+
+    ## idx 是怎么算出来的（关键）
+
+        prog_base = *(*(ctx + 0x240) + 0x1a0)    ← 运行时自动解引用
+        vm_pc     = *(ctx + 8)
+        idx       = (vm_pc - prog_base) / 16
+
+    **不需要你提供任何基址。** VM 代码区是 malloc 出来的匿名内存，
+    与 so 模块基址不在一处——用模块基址算 idx 会全错。
+
+    ## 参数
+
+        target_idx      目标 VM 指令序号；**-1 = 不过滤，采所有遇到的**
+        dispatch_offset 挂哪个派发点（默认 0x76024，op491 handler 尾部）
+        max_hits        最多命中几次
+        wait            等多久（秒）
+        capture_regs    抓多少个 VM 寄存器
+        stack_bytes     抓多少字节栈
+
+    ## 返回
+
+        hits[]  {vm_idx, vm_pc, prog_base, regs{r0..r31}, ctx, stack_hex}
+        verdict
+
+    ## 0 命中怎么办
+
+    派发点有几百个，**只挂一个点就只能看到经过它的指令**。
+    先用 `vm_regs_snapshot` 看当前活跃的 idx，再挑合适的点。
+
+    ## 实测（真机）
+
+        vm_breakpoint(target_idx=43556)
+        → 命中 2 次，prog_base=0x79e1786d30，regs 32 个全拿到
+    """
+    mod, err = _load_dyn_module("dyn.vmbreak", "vm_breakpoint")
+    if err:
+        return _j(err)
+    try:
+        return _j(mod.vm_breakpoint(
+            serial, int(pid), so_name, target_idx=int(target_idx),
+            dispatch_offset=dispatch_offset, slot_size=int(slot_size),
+            max_hits=int(max_hits), wait=float(wait),
+            capture_regs=int(capture_regs), stack_bytes=int(stack_bytes)))
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}",
+                   "code": "VM_BREAK_FAILED"})
+
+
+# ---------------- 内存快照 diff ----------------
+#
+# 为什么必须用设备端 helper（实测数据）：
+#   adb shell + dd 读 /proc/<pid>/mem：4MB 耗时 37,000 ms
+#   设备端 native pread 直接读：       4MB 耗时 6.4 ms
+#   **差 5786 倍**。快照动辄几十 MB，走 shell 完全不可行。
+
+
+@server.tool()
+@logged()
+def mem_snapshot(serial: str, pid: int, max_mb: int = 64,
+                 key: str = "default") -> str:
+    """在设备上拍一份**内存快照**（只取可写匿名段），供后续 diff。
+
+    ## 用途
+
+    「某个东西从无到有」这类问题，正向追很难（不知道起点），
+    但两次快照一 diff，新增的块就直接浮出来了。
+
+        mem_snapshot(key="r98")        # t1
+        # ... 触发目标功能 ...
+        mem_diff(key="r98", min_size=90, max_size=110)
+        → 直接列出新增的 90~110 字节块
+
+    ## 参数
+
+        max_mb  最多读多少 MB（默认 64）
+        key     快照名，diff 时用同一个
+
+    ## 返回
+
+        segments / bytes / file
+
+    ## 段选择策略（实测教训）
+
+    **小段优先**。大段优先时，1GB 的 dalvik region space 一次就吃光预算，
+    而真正会出现「新增 98 字节块」的是几 MB 的小段——
+    结果 diff 永远返回 0，看起来像「没有变化」，实际是「根本没读到」。
+    小段优先后同样预算能覆盖 3000+ 段而不是 2 段。
+
+    ## 注意
+
+    快照**留在设备上**（`/data/local/tmp/mda_snap_<key>.bin`），不传回本机。
+    diff 也在设备上算，只把变化的块传回来。
+
+    ## 风控提醒
+
+    读 `/proc/<pid>/mem` 是加固 App 典型的风控检测点（内存 dump 行为）。
+    对阿里系等加固目标，**建议单次不要超过 16MB，且不要连续多轮**。
+    """
+    mod, err = _load_dyn_module("dyn.memdiff", "mem_snapshot")
+    if err:
+        return _j(err)
+    try:
+        return _j(mod.mem_snapshot(serial, int(pid), max_mb=int(max_mb),
+                                   key=key))
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}",
+                   "code": "MEM_SNAPSHOT_FAILED"})
+
+
+@server.tool()
+@logged()
+def mem_diff(serial: str, pid: int, key: str = "default", min_size: int = 1,
+             max_size: int = 0, max_report: int = 100) -> str:
+    """再拍一份快照并对比，找出**新增/变化的块**。
+
+    ## 参数
+
+        min_size   只看至少这么大的块
+        max_size   只看至多这么大的（**0 = 不限**）——
+                   **找「新的 98 字节块」时设 90~110 最有效**
+        max_report 最多报多少块
+
+    ## 返回
+
+        changed[]  {addr, size, sample_hex}
+        count / total_bytes
+
+    ## 实测性能（systemui，870 段 / 16MB）
+
+        snap : 0.3 秒
+        diff : 0.04 秒
+
+    ## 拿到地址之后
+
+    用 `perf_watch_daemon` 观察「谁写了它」。
+    """
+    mod, err = _load_dyn_module("dyn.memdiff", "mem_diff")
+    if err:
+        return _j(err)
+    try:
+        return _j(mod.mem_diff(serial, int(pid), key=key,
+                               min_size=int(min_size),
+                               max_size=int(max_size),
+                               max_report=int(max_report)))
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}",
+                   "code": "MEM_DIFF_FAILED"})
+
+
+@server.tool()
+@logged()
+def mem_snapshot_clear(serial: str, key: str = "default") -> str:
+    """删掉设备上的快照文件，释放空间。"""
+    mod, err = _load_dyn_module("dyn.memdiff", "mem_snapshot_clear")
+    if err:
+        return _j(err)
+    try:
+        return _j(mod.mem_snapshot_clear(serial, key=key))
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}",
+                   "code": "MEM_CLEAR_FAILED"})

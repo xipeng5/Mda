@@ -60,3 +60,4 @@ tests/probe_perf/perf_thread
 tests/probe_perf/perf_v3
 tests/probe_perf/perf_v4
 tests/probe_perf/perf_v5
+dyn/device/mda_memsnap
