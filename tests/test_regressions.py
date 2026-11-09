@@ -1897,6 +1897,129 @@ def test_r56_mcp_schema_matches_dyn() -> None:
                   f"schema 里缺: {sorted(missing)}")
 
 
+
+
+def test_r57_perf_watch() -> None:
+    """R57：硬件观察点（perf_event）必须可用，且不依赖 frida。
+
+    (1) 第一次修改（2026-11-09）：新增。
+
+    为什么单独做这条路：frida 的 trace_write 只能抓走 memcpy/memset 的写，
+    编译器内联的 str/stp 完全抓不到。perf_event 是 CPU 硬件触发，
+    任何指令都能抓，且不停线程、目标无感知。
+
+    实测约束（写进断言，防止后续改坏）：
+      · 地址必须脱 ARM64 TBI tag，否则 EINVAL
+      · 长度只能 1/2/4/8
+      · watchpoint 只有 4 个槽位
+    """
+    import dyn.perfwatch as _pw
+
+    check("R57 perf_watch 存在", hasattr(_pw, "perf_watch"))
+    check("R57 probe 存在", hasattr(_pw, "perf_watch_probe"))
+    check("R57 槽位常量正确", _pw.PERF_WATCH_MAX_SLOTS == 4,
+          f"实测内核 dbg_info=0x804 → 4，得到 {_pw.PERF_WATCH_MAX_SLOTS}")
+    check("R57 长度上限正确", _pw.PERF_WATCH_MAX_LEN == 8)
+
+    # 设备端 helper 的源码必须已经脱 tag（这是 EINVAL 的真凶）。
+    # 注意：脱 tag 实际发生在 C 侧，Python 只负责把原始地址传下去。
+    import inspect as _insp
+    import os as _os
+
+    src = _insp.getsource(_pw)
+    base = _os.path.dirname(_os.path.dirname(_os.path.abspath(_pw.__file__)))
+    cpath = _os.path.join(base, "dyn", "device", "mda_perfwatch.c")
+    csrc = open(cpath, encoding="utf-8").read() if _os.path.isfile(cpath) else ""
+    check("R57 C 侧自动脱 tag", "0x00FFFFFFFFFFFFFF" in csrc,
+          "不脱 tag（0xb4...）会 EINVAL")
+    check("R57 C 侧说明脱 tag 原因", "TBI" in csrc or "tag" in csrc.lower())
+    check("R57 Python 侧说明 tag 行为", "tag" in src.lower())
+
+    # 参数校验必须在本地做（不要等设备端报错）
+    bad = [
+        ({"addr": "not_an_addr"}, "BAD_ADDR"),
+        ({"addr": "0x1000", "size": 3}, "BAD_SIZE"),
+        ({"addr": "0x1000", "watch_type": "zzz"}, "BAD_TYPE"),
+    ]
+    for kwargs, want in bad:
+        r = _pw.perf_watch("no-such-serial", 1, **kwargs)
+        check(f"R57 本地校验 {want}", r.get("code") == want,
+              f"得到 {r.get('code')}：{r.get('error')}")
+
+    # helper 是设备端二进制，源码与编译脚本都必须在仓库里
+    import os
+
+    base = os.path.dirname(os.path.dirname(os.path.abspath(_pw.__file__)))
+    check("R57 helper C 源码在仓库", os.path.isfile(
+        os.path.join(base, "dyn", "device", "mda_perfwatch.c")))
+    check("R57 编译脚本在仓库", os.path.isfile(
+        os.path.join(base, "dyn", "device", "build.sh")))
+
+    # 0 命中时必须给排查提示（不是只回一个 0）
+    check("R57 0 命中给 hint", "hint" in src and "tid" in src)
+
+
+
+
+def test_r58_perf_watch_daemon() -> None:
+    """R58：常驻观察点——提前设好，等目标自己来写。
+
+    (2) 第二次修改（2026-11-09）：新增。
+
+    为什么必须常驻：实测踩到的死结——「在 hook 里拿到地址，再回头设观察点」时，
+    数据**已经写完了**。一次 adb+su+helper 启动至少 109ms，而写发生在几十毫秒内。
+    once 模式是固定窗口，错过就没了。
+
+    daemon 模式实测验证：设点后 **8 秒**才写入，仍然捕获成功。
+    """
+    import inspect as _insp
+
+    import dyn.perfwatch as _pw
+
+    for fn in ("perf_watch_daemon", "perf_watch_poll",
+               "perf_watch_stop", "perf_watch_list"):
+        check(f"R58 {fn} 存在", hasattr(_pw, fn))
+        check(f"R58 {fn} 已导出", fn in _pw.__all__)
+
+    # 参数校验必须在本地做
+    bad = [
+        ({"addr": "0x1000", "slot": 9}, "BAD_SLOT"),
+        ({"addr": "0x1000", "size": 3}, "BAD_SIZE"),
+        ({"addr": "zzz"}, "BAD_ADDR"),
+    ]
+    for kwargs, want in bad:
+        r = _pw.perf_watch_daemon("no-serial", 1, **kwargs)
+        check(f"R58 本地校验 {want}", r.get("code") == want,
+              f"得到 {r.get('code')}")
+
+    # (3) 第三次修改（2026-11-09）：锁住「自动避开主线程」这个行为。
+    #     实测真因（用户 force-stop 对照实验证实）：
+    #       frida 附着 → 主线程 NO_SLOT；force-stop 后不附着 → 主线程正常
+    #     ⇒ 是 frida 的 Interceptor 占了主线程的 debug 寄存器。
+    #     所以 tid=0 时必须自动挑非主线程，否则必然失败。
+    src = _insp.getsource(_pw)
+    check("R58 自动避开主线程", "auto_pick" in src and "_list_tids" in src)
+    check("R58 记录 picked_tid", "picked_tid" in src)
+    check("R58 NO_SLOT 归因给 frida", "Interceptor" in src,
+          "真因是 frida 占 debug 寄存器，不是进程固有特性")
+    check("R58 给出 detach 路线", "detach_target" in src)
+
+    # daemon 必须用 nohup，否则 adb shell 退出时被回收（实测）
+    check("R58 daemon 用 nohup 保活", "nohup" in _insp.getsource(
+        _pw.perf_watch_daemon))
+
+    # C 侧：daemon 不能 fork（fork 后父进程退出会让 perf fd 失效）
+    import os as _os
+
+    base = _os.path.dirname(_os.path.dirname(_os.path.abspath(_pw.__file__)))
+    cpath = _os.path.join(base, "dyn", "device", "mda_perfwatch.c")
+    csrc = open(cpath, encoding="utf-8").read() if _os.path.isfile(cpath) else ""
+    check("R58 C 侧有 daemon 子命令", "cmd_daemon" in csrc)
+    check("R58 C 侧不用 fork", "fork()" not in csrc,
+          "fork 后父退出会关掉 perf fd，daemon 立刻失效（实测）")
+    check("R58 C 侧有状态文件", "mda_pw_%d.state" in csrc or "state_path" in csrc)
+
+
 def main() -> int:
     print("== R1 held/token 透出（防线程永久挂起）==")
     test_r1_held_is_exposed()
@@ -2010,6 +2133,10 @@ def main() -> int:
     test_r55_hits_group_by()
     print("== R56 MCP 参数与 dyn 层一致 ==")
     test_r56_mcp_schema_matches_dyn()
+    print("== R57 硬件观察点 ==")
+    test_r57_perf_watch()
+    print("== R58 常驻观察点 ==")
+    test_r58_perf_watch_daemon()
 
     print(f"\n结果: {PASS} 通过 / {FAIL} 失败")
     return 0 if FAIL == 0 else 1

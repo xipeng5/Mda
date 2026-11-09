@@ -64,6 +64,15 @@ except Exception:
 
 datas = [
     *_frida_tools_datas,
+    # (5) 第五次修改（2026-11-09）：把 dyn/device/ 打进包。
+    #     bug 原因：perf_watch 依赖设备端 helper（mda_perfwatch.c + build.sh），
+    #              它们放在 dyn/device/ 下。PyInstaller 只收 .py 模块，
+    #              **非 .py 的资源不会自动进包**，于是打包版里
+    #              os.path.dirname(dyn.__file__)/device 不存在，
+    #              perf_watch 直接报 HELPER_NOT_BUILT —— 而源码环境完全正常。
+    #              这与之前 frida_tools/bridges/*.js 漏收是同一类问题。
+    #     解决方案：显式把整个目录作为 datas 收进去（保留相对路径 dyn/device）。
+    (os.path.join(ROOT, "dyn", "device"), os.path.join("dyn", "device")),
     (os.path.join(ROOT, "assets"), "assets"),
     (os.path.join(ROOT, "plugins"), "plugins"),
     (os.path.join(ROOT, "web", "dist"), os.path.join("web", "dist")),   # 前端产物

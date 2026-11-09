@@ -4571,3 +4571,188 @@ def java_find_callers(serial: str, pid: int, class_name: str, method: str,
     except Exception as exc:                              # noqa: BLE001
         return _j({"error": f"{type(exc).__name__}: {exc}",
                    "code": "CALLERS_FAILED"})
+
+
+@server.tool()
+@logged()
+def perf_watch_probe(serial: str) -> str:
+    """检查**硬件观察点**这条路径在本设备是否可用（不设观察点）。
+
+    这条路**不经过 frida**，用内核的 perf_event 硬件断点。
+
+    ## 与 trace_write 的区别（关键）
+
+        trace_write    hook libc 内存函数（memcpy/memset…）
+                       → **编译器内联的 str/stp 抓不到**
+        perf_watch     CPU 硬件触发
+                       → **任何指令都能抓**，且不停线程、不可检测、开销极低
+
+    能力有限制：watchpoint 只有 **4 个槽位**，长度只能 1/2/4/8 字节。
+
+    返回：{ok, max_slots, max_len, helper, note}
+    """
+    mod, err = _load_dyn_module("dyn.perfwatch", "perf_watch_probe")
+    if err:
+        return _j(err)
+    try:
+        return _j(mod.perf_watch_probe(serial))
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}",
+                   "code": "PERF_PROBE_FAILED"})
+
+
+@server.tool()
+@logged()
+def perf_watch(serial: str, pid: int, addr: str, size: int = 8,
+               watch_type: str = "w", tid: int = 0, duration: float = 3.0,
+               max_hits: int = 32) -> str:
+    """在指定地址上设**硬件观察点**，抓「谁访问了这块内存」。
+
+    这是回答「这块数据是谁生成的」最直接的手段，**不依赖 frida**。
+
+    ## 为什么不用 trace_write
+
+    `trace_write` hook 的是 libc 的 memcpy/memset 等函数，
+    **编译器内联的直接 `str`/`stp` 完全抓不到**。而 perf_watch 是
+    CPU 硬件触发，任何指令都能抓，且不停线程、目标无感知。
+
+    ## 参数
+
+        addr        运行时绝对地址。带 ARM64 tag（0xb4...）也行，内部自动脱
+        size        观察字节数，只有 1/2/4/8（内核限制）
+        watch_type  "w" 写 / "r" 读 / "rw" 读写 / "x" 执行
+        tid         观察哪个线程。0 = 整个进程。
+                    **但观察点按线程生效**，写入往往只在某个特定线程，
+                    抓不到时先换写线程的 tid
+        duration    采集秒数
+        max_hits    最多返回多少条
+
+    ## 返回
+
+        count / hits[] / distinct_pcs
+        hits[]: {ip, pid, tid, ts_ms, regs:{x0,x1,x2,lr}}
+
+    ## 0 命中的排查顺序（工具会自动提示）
+
+        ① tid 不对（最常见）
+        ② 地址在窗口内没被写
+        ③ 该线程槽位已满（NO_SLOT）
+        ④ 写入不在观察窗口内
+
+    ## 典型用法（抓「首次写入」）
+
+        perf_watch(serial, pid, addr="0xb400007d8780a000", size=8,
+                   watch_type="w", duration=5, max_hits=1)
+
+    ## 已知边界
+
+        · 只有 4 个槽位，第 5 个地址要先清掉一个
+        · 部分进程主线程返回 NO_SLOT，换非主线程
+        · 只给**写指令的 pc**，不给调用栈；
+          要调用栈用返回的 ip 到 frida 侧下断点补
+    """
+    mod, err = _load_dyn_module("dyn.perfwatch", "perf_watch")
+    if err:
+        return _j(err)
+    try:
+        return _j(mod.perf_watch(serial, int(pid), addr, size=int(size),
+                                 watch_type=watch_type, tid=int(tid),
+                                 duration=float(duration),
+                                 max_hits=int(max_hits)))
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}",
+                   "code": "PERF_WATCH_FAILED"})
+
+
+@server.tool()
+@logged()
+def perf_watch_daemon(serial: str, pid: int, addr: str, slot: int = 0,
+                      size: int = 8, watch_type: str = "w", tid: int = 0,
+                      duration: float = 0) -> str:
+    """起一个**常驻**硬件观察点：提前设好，等目标自己来写。
+
+    ## 为什么需要它（这是本工具最重要的用途）
+
+    实测反复踩到的坑：**「在 hook 里拿到地址，再回头设观察点」时，数据已经写完了**。
+    一次 adb+su+helper 启动至少 109ms，而写操作发生在几十毫秒内，必然错过。
+
+    `perf_watch` 是「设点 → 等 N 秒 → 返回」，窗口固定，错过就没了。
+    `perf_watch_daemon` 是「设点 → 一直盯着 → 随时取」，**不丢事件**。
+
+    **正确用法**：在 buffer 刚分配、还是空的时候就设好，
+    然后不管多久之后被写都能抓到。实测验证：设点后 8 秒才写入，仍然捕获。
+
+    ## 参数
+
+        slot     0..3（硬件只有 4 个槽位）
+        addr/size/watch_type/tid   同 perf_watch
+        duration 0 = 无限期常驻；>0 表示这么多秒后自动退出
+
+    ## 配套工具
+
+        perf_watch_poll(serial, slot)    取命中（可反复调，看新增）
+        perf_watch_list(serial)          列出所有常驻观察点
+        perf_watch_stop(serial, slot)    停掉并清理
+
+    ## 关于 tid（实测关键）
+
+    观察点**按线程生效**，必须指向真正执行写的那个线程。
+    不指定（tid=0）时本工具会**自动避开主线程**——因为
+    frida 的 Interceptor 常占用主线程的 debug 寄存器，导致 NO_SLOT。
+    """
+    mod, err = _load_dyn_module("dyn.perfwatch", "perf_watch_daemon")
+    if err:
+        return _j(err)
+    try:
+        return _j(mod.perf_watch_daemon(
+            serial, int(pid), addr, slot=int(slot), size=int(size),
+            watch_type=watch_type, tid=int(tid), duration=float(duration)))
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}",
+                   "code": "PERF_DAEMON_FAILED"})
+
+
+@server.tool()
+@logged()
+def perf_watch_poll(serial: str, slot: int = 0, limit: int = 200) -> str:
+    """取一个常驻观察点的当前结果（可反复调用，看新增命中）。
+
+    返回：ok / active / total_hits / count / hits[] / distinct_pcs / verdict
+    hits[]: {ip, pid, tid, ts_ms, age_ms, regs:{x0,x1,x2,lr}}
+    """
+    mod, err = _load_dyn_module("dyn.perfwatch", "perf_watch_poll")
+    if err:
+        return _j(err)
+    try:
+        return _j(mod.perf_watch_poll(serial, slot=int(slot), limit=int(limit)))
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}",
+                   "code": "PERF_POLL_FAILED"})
+
+
+@server.tool()
+@logged()
+def perf_watch_stop(serial: str, slot: int = 0) -> str:
+    """停掉一个常驻观察点并清理设备上的状态文件。"""
+    mod, err = _load_dyn_module("dyn.perfwatch", "perf_watch_stop")
+    if err:
+        return _j(err)
+    try:
+        return _j(mod.perf_watch_stop(serial, slot=int(slot)))
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}",
+                   "code": "PERF_STOP_FAILED"})
+
+
+@server.tool()
+@logged()
+def perf_watch_list(serial: str) -> str:
+    """列出所有常驻硬件观察点及其状态（含各自已采集的命中数）。"""
+    mod, err = _load_dyn_module("dyn.perfwatch", "perf_watch_list")
+    if err:
+        return _j(err)
+    try:
+        return _j(mod.perf_watch_list(serial))
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}",
+                   "code": "PERF_LIST_FAILED"})
