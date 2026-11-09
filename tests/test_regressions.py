@@ -1836,6 +1836,67 @@ def test_r55_hits_group_by() -> None:
     check("R55 group_by 时清掉大字段", 'h.pop("backtrace"' in src)
 
 
+
+
+def test_r56_mcp_schema_matches_dyn() -> None:
+    """R56：MCP 工具参数不能与 dyn 层实现脱节。
+
+    (1) 第一次修改（2026-11-06）：
+        bug 原因：给 dyn/java_bridge.java_find_classes 加了 field / return_type /
+                  method_pattern / max_scan_classes 四个维度，但 mcp_server/tools.py
+                  里的包装函数没跟着改 —— dyn 层有、MCP 层没有。
+                  这种情况下调用方**根本传不进这四个参数**（schema 里不存在），
+                  而 dyn 层单测全绿，回归也全绿，问题完全不可见。
+                  同类风险：任何"dyn 改了参数、MCP 忘了同步"的改动。
+        解决方案：直接比对两层签名 —— MCP 函数的参数必须覆盖 dyn 函数的
+                  全部可选参数（serial/pid 等由 MCP 层持有，跳过）。
+    """
+    import inspect as _insp
+
+    import dyn.java_bridge as _jb
+    import mcp_server.tools as _T
+
+    # 由 MCP 层自己持有、不下传给 dyn 的参数
+    skip = {"serial", "pid"}
+
+    pairs = [
+        ("java_find_classes", _T.java_find_classes, _jb.java_find_classes),
+        ("java_hook", _T.java_hook, _jb.java_hook),
+        ("java_find_callers", _T.java_find_callers, _jb.java_find_callers),
+        ("java_list_methods", _T.java_list_methods, _jb.java_list_methods),
+    ]
+    for name, mcp_fn, dyn_fn in pairs:
+        dyn_params = set(_insp.signature(dyn_fn).parameters) - skip
+        mcp_params = set(_insp.signature(mcp_fn).parameters) - skip
+        missing = dyn_params - mcp_params
+        check(f"R56 {name} 参数已全部暴露", not missing,
+              f"dyn 层有但 MCP 层没暴露: {sorted(missing)}")
+
+    # schema 里也要真的能传（有些包装器虽有形参但 schema 未生成）
+    # —— 这里用注册后的 input_schema 核对，必须与函数签名一致
+    import asyncio
+
+    from mcp_server.tools import server as _srv
+
+    async def _schemas():
+        return {t.name: t for t in await _srv.list_tools()}
+
+    try:
+        tools = asyncio.run(_schemas())
+    except Exception:                                     # noqa: BLE001
+        tools = {}
+    if tools:
+        for name, _mcp_fn, dyn_fn in pairs:
+            tool = tools.get(name)
+            if tool is None:
+                continue
+            props = set((tool.input_schema or {}).get("properties", {}))
+            dyn_params = set(_insp.signature(dyn_fn).parameters) - skip
+            missing = dyn_params - props
+            check(f"R56 {name} schema 含全部参数", not missing,
+                  f"schema 里缺: {sorted(missing)}")
+
+
 def main() -> int:
     print("== R1 held/token 透出（防线程永久挂起）==")
     test_r1_held_is_exposed()
@@ -1947,6 +2008,8 @@ def main() -> int:
     test_r54_hits_register_filter()
     print("== R55 hits 聚合统计 ==")
     test_r55_hits_group_by()
+    print("== R56 MCP 参数与 dyn 层一致 ==")
+    test_r56_mcp_schema_matches_dyn()
 
     print(f"\n结果: {PASS} 通过 / {FAIL} 失败")
     return 0 if FAIL == 0 else 1

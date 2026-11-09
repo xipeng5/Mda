@@ -4384,35 +4384,68 @@ def java_list_methods(serial: str, pid: int, class_name: str,
 @server.tool()
 @logged()
 def java_find_classes(serial: str, pid: int, pattern: str = "",
-                      limit: int = 200) -> str:
-    """在**已加载的类**里按正则搜索全限定类名。
+                      limit: int = 200, field: str = "",
+                      return_type: str = "", method_pattern: str = "",
+                      max_scan_classes: int = 0) -> str:
+    """在**已加载的类**里搜索——支持类名、字段名、返回类型、方法名四种维度。
 
-    加固 app 会动态加载大量类，静态看不到。本工具枚举运行时的全部 Class
-    再正则筛选——是摸清一个 app 内部结构的起点。
+    加固 app 会动态加载大量类，静态看不到。本工具枚举运行时全部 Class 再筛选，
+    是摸清一个 app 内部结构的起点。
+
+    ## 四种搜索维度（可组合）
+
+        pattern        类名（支持正则，也支持 * ? 通配符）
+        field          类里有这个**字段名**
+        return_type    类里某方法**返回这个类型**（全限定名）
+        method_pattern 类里有匹配这个**方法名**的方法
+
+    **匹配语义**（踩过坑，写清楚）：类名与字段名是**子串搜索**——
+    `Security` 能匹配 `com.x.SecurityGuard`，不需要写全名；
+    方法名是**精确/通配匹配**——`setHeaders` 不会连带 `setHeadersAndMore`。
+    非法正则（如 `[[[`）会明确报错，**不会静默返回全部**。
 
     ## 参数
 
-        pattern   正则（大小写不敏感），空则返回前 limit 个
-        limit     最多返回多少个（1..2000）
+        pattern          类名（正则或通配符），空则不限
+        limit            最多返回多少个（1..2000）
+        field            字段名，如 "headers"
+        return_type      返回类型，如 "*Request"
+        method_pattern   方法名，如 "get*"
+        max_scan_classes 反射扫描上限（0=默认3000）
+
+    ## 性能提示（重要）
+
+    只给 pattern → 秒回（走 `enumerateLoadedClassesSync`，不反射）。
+    给了 field/return_type/method_pattern → **需要逐类反射，很慢**，
+    已加载类几万个时尤其明显。用 max_scan_classes 限制扫描量，
+    返回里的 `scanned` 会说明实际扫了多少类，用于判断结果是否可信。
+
+    **建议先用 pattern 缩小范围再叠加其他维度。**
 
     ## 返回
 
         classes[]  全限定类名
-        total      枚举到的类总数（不受 limit 影响）
+        reasons{}  命中的依据（哪个字段/方法匹配的）
+        total      枚举到的类总数
+        scanned    实际反射扫描的类数
         matched    匹配数
-        note       匹配数超过本页时明确说明
+        matched_by 本次用了哪些维度
 
     ## 典型用法
 
         java_find_classes(pattern="Security|Sign|Guard")
-        → 找出所有与签名/安全相关的已加载类
+        java_find_classes(pattern="*StatusBar*", field="m*")
+        java_find_classes(return_type="*Request", max_scan_classes=2000)
     """
     mod, err = _load_dyn_module("dyn.java_bridge", "java_find_classes")
     if err:
         return _j(err)
     try:
-        return _j(mod.java_find_classes(serial, int(pid), pattern,
-                                        limit=int(limit)))
+        return _j(mod.java_find_classes(
+            serial, int(pid), pattern, limit=int(limit),
+            field=field, return_type=return_type,
+            method_pattern=method_pattern,
+            max_scan_classes=int(max_scan_classes)))
     except Exception as exc:                              # noqa: BLE001
         return _j({"error": f"{type(exc).__name__}: {exc}",
                    "code": "JAVA_FIND_FAILED"})
