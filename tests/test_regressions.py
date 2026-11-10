@@ -2050,9 +2050,25 @@ def test_r59_vm_breakpoint() -> None:
           str(_vb.VM_DEFAULTS.get("prog_base_p2_offset")))
 
     src = _insp.getsource(_vb)
-    check("R59 用两跳解引用算 prog_base", "P1_OFF" in src and "P2_OFF" in src)
-    check("R59 不用模块基址算 idx", "CODE_BASE" not in src,
-          "用模块基址算 idx 会全错（VM 代码区在 malloc 区）")
+    check("R59 用两跳解引用算 data_base", "P1_OFF" in src and "P2_OFF" in src)
+    # (2) 第二次修改（2026-11-09）：
+    #     bug 原因：原断言是 "CODE_BASE" not in src，因为早期设计禁止用 code_base。
+    #               但实测证明 data_base 不是字节码区基址，算不出 vm_idx，
+    #               必须允许调用方显式传 code_base —— 旧断言会挡死这个修复。
+    #     (3) 第三次修改：断言不要扫注释（注释里会提到旧实现，导致误报）。
+    #               改成只检查实际代码行。
+    code_lines = [ln for ln in src.splitlines()
+                  if ln.strip() and not ln.strip().startswith("//")
+                  and not ln.strip().startswith("#")]
+    code_only = "\n".join(code_lines)
+    check("R59 data_base 不再参与 idx 计算",
+          "vmPc.sub(dataBase)" not in code_only
+          and "vmPc.sub(progBase)" not in code_only,
+          "data_base 指向数据区，减去 vm_pc 得不到指令序号")
+    check("R59 code_base 真的注入 JS", "__CODE_BASE__" in src,
+          "code_base 只躺在签名里不注入，调用方传了会被静默忽略")
+    check("R59 回读 vm_pc 字节", "__VM_PC_BYTES__" in src and "vm_pc_bytes" in src,
+          "不知道 code_base 时，只有原始字节能让调用方自己反推")
 
     # 派发点特征：str x21,[x27,#8]
     check("R59 默认特征正确", _vb.VM_DEFAULT_PATTERN == "750700f9",
@@ -2137,6 +2153,141 @@ def test_r61_mem_snapshot_diff() -> None:
         # 独立的 chosen 数组
         check("R61 独立 chosen 数组", "chosen" in csrc,
               "原位留存会取到被跳过的巨型段")
+
+
+def test_r62_vm_break_no_nameerror() -> None:
+    """R62：vm_breakpoint 在「一次都没命中」时不能崩 NameError。
+
+    (1) 第一次修改（2026-11-09）：
+        bug 原因：_run_vm_break 末尾的 verdict 文案引用了 target_idx，
+                  但它只是 vm_breakpoint 的形参，没往下传。于是**只要 0 命中**
+                  （走到 elif not box["hits"]）就抛
+                  NameError: name 'target_idx' is not defined，
+                  被外层 except 包成 VM_BREAK_FAILED。
+                  真机表现：target_idx 给 18367 和 -1 都报同一个 NameError，
+                  看起来像「参数没传进 JS」，实际是 Python 作用域问题。
+        解决方案：target_idx / slot_size 显式传进 _run_vm_break；
+                  本测试用打桩 frida 真跑一次 0 命中路径，确认不再崩。
+    """
+    import inspect as _insp
+    import types as _types
+
+    import dyn.vmbreak as _vb
+
+    # 静态：形参必须存在
+    params = _insp.signature(_vb._run_vm_break).parameters
+    check("R62 _run_vm_break 有 target_idx 形参", "target_idx" in params,
+          "缺这个形参 → 0 命中时必崩 NameError")
+    check("R62 _run_vm_break 有 slot_size 形参", "slot_size" in params)
+
+    # 静态：vm_breakpoint 必须真的往下传
+    src = _insp.getsource(_vb.vm_breakpoint)
+    check("R62 vm_breakpoint 传 target_idx", "target_idx=int(target_idx)" in src,
+          "不传下去等于没修")
+    check("R62 vm_breakpoint 传 slot_size", "slot_size=int(slot_size)" in src)
+
+    # 动态：打桩 frida，真跑 0 命中分支
+    class _S:
+        def __init__(self, src): self.handlers = []
+        def on(self, ev, fn): self.handlers.append(fn)
+        def load(self): pass
+        def post(self, d): pass
+
+    class _Sess:
+        def create_script(self, src): return _S(src)
+        def detach(self): pass
+
+    class _Dev:
+        def attach(self, pid): return _Sess()
+
+    orig_frida = _vb.__dict__.get("_FRIDA_FOR_TEST")
+    import sys as _sys
+    saved = _sys.modules.get("frida")
+    _sys.modules["frida"] = _types.SimpleNamespace(
+        get_device=lambda serial, timeout=15: _Dev())
+    orig_detach = _vb._detach_async
+    _vb._detach_async = lambda sess, timeout=2.0: None
+    try:
+        r = _vb._run_vm_break("FAKE", 1, "libx.so", "(function(){})()",
+                              hold=False, max_hits=1, wait=0.2,
+                              target_idx=18367, slot_size=16)
+        check("R62 0 命中不抛 NameError", isinstance(r, dict),
+              "抛异常说明仍未修好")
+        check("R62 0 命中给出 target_idx", r.get("target_idx_used") == 18367,
+              str(r.get("target_idx_used")))
+        check("R62 0 命中给出 slot_size", r.get("slot_size_used") == 16,
+              str(r.get("slot_size_used")))
+        check("R62 0 命中 hit_count 为 0", r.get("hit_count") == 0,
+              str(r.get("hit_count")))
+        # 诊断提示里要提到「会话失效」这条真机常见原因
+        check("R62 提示含会话失效", "会话已失效" in (r.get("verdict") or ""),
+              (r.get("verdict") or "")[:60])
+    finally:
+        _vb._detach_async = orig_detach
+        if saved is None:
+            _sys.modules.pop("frida", None)
+        else:
+            _sys.modules["frida"] = saved
+
+
+def test_r63_vm_idx_not_faked() -> None:
+    """R63：没有 code_base 时 vm_idx 必须是 null，不能给假数字。
+
+    (1) 第一次修改（2026-11-09）：
+        bug 原因：原来用 data_base（当时叫 prog_base）算 vm_idx。但 data_base
+                  推导链末端是 `add host_var, base, imm` —— 指向**数据区**。
+                  拿它减 vm_pc 算出的数只是碰巧落在某个范围，不代表指令序号
+                  （真机实测 idx=40162 查镜像得 op=4 A=28，不是合法边界）。
+        解决方案：vm_idx 只在显式给 code_base 时才计算；否则 null +
+                  vm_idx_source="unavailable"。同时回读 vm_pc 处原始字节，
+                  让调用方自己比对镜像反推。
+    """
+    import inspect as _insp
+    import re as _re
+
+    import dyn.vmbreak as _vb
+
+    src = open(_vb.__file__, encoding="utf-8").read()
+
+    # JS 里必须有 null 兜底路径
+    check("R63 vm_idx 默认 null", "var idx = null;" in src,
+          "默认给了数字，就是在伪造")
+    check("R63 标注 idx 来源", "idxSource = 'unavailable'" in src,
+          "没有来源标注，调用方无法判断可信度")
+    check("R63 只在有 code_base 时计算", "CODE_BASE !== null" in src)
+
+    # 占位符必须真的被替换（CODE_BASE 曾经只躺在签名里）
+    m = _re.search(r'_JS_VM_BREAK = r"""(.*?)"""', src, _re.S)
+    js = m.group(1)
+    ph = set(_re.findall(r"__[A-Z0-9_]+__", js))
+    keys = set(_re.findall(r'\("(__[A-Z0-9_]+__)"', src))
+    missing = ph - keys
+    check("R63 模板占位符全部有替换", not missing, str(sorted(missing)))
+
+    # 真实注入：给 code_base 时，生成的 JS 里必须是数字而不是 null
+    js_given = _vb._JS_VM_BREAK.replace("__CODE_BASE__", _vb._js_code_base("0x7900000000"))
+    check("R63 给 code_base 时注入数字",
+          "var CODE_BASE = 519691042816;" in js_given,
+          "注入失败则 idx 永远算不出来")
+    js_none = _vb._JS_VM_BREAK.replace("__CODE_BASE__", _vb._js_code_base(None))
+    check("R63 不给时注入 null", "var CODE_BASE = null;" in js_none,
+          "应注入 null 而不是 0 或空")
+
+    # 旧公式必须已移除（data_base 不再减 vm_pc）
+    check("R63 旧公式已移除",
+          "vmPc.sub(dataBase)" not in src and "vmPc.sub(progBase)" not in src,
+          "data_base 减 vm_pc 是无意义的")
+
+    # 64 位安全：不能用 toInt32 截断
+    # (2) 第二次修改（2026-11-09）：
+    #     bug 原因：断言直接扫整段 JS，但注释里会解释「旧实现用了 toInt32」，
+    #               于是 `"toInt32()" not in js` 必然误报失败。
+    #     解决方案：只检查实际代码行，跳过以 // 开头的注释。
+    js_code_lines = [ln for ln in js.splitlines()
+                     if ln.strip() and not ln.strip().startswith("//")]
+    check("R63 不用 toInt32 算差值",
+          "toInt32" not in "\n".join(js_code_lines),
+          "toInt32 会在跨度超 ±2GB 时溢出")
 
 
 def main() -> int:
@@ -2262,6 +2413,10 @@ def main() -> int:
     test_r60_vm_trace()
     print("== R61 内存快照 diff ==")
     test_r61_mem_snapshot_diff()
+    print("== R62 vm_breakpoint 不崩 NameError ==")
+    test_r62_vm_break_no_nameerror()
+    print("== R63 vm_idx 不伪造 ==")
+    test_r63_vm_idx_not_faked()
 
     print(f"\n结果: {PASS} 通过 / {FAIL} 失败")
     return 0 if FAIL == 0 else 1

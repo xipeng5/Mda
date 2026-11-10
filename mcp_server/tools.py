@@ -4845,7 +4845,8 @@ def vm_regs_snapshot(serial: str, pid: int, so_name: str,
 @server.tool()
 @logged()
 def vm_breakpoint(serial: str, pid: int, so_name: str, target_idx: int = -1,
-                  dispatch_offset: str = "0x76024", slot_size: int = 16,
+                  code_base: str = "", dispatch_offset: str = "0x76024",
+                  slot_size: int = 16, vm_pc_bytes: int = 64,
                   max_hits: int = 1, wait: float = 10.0,
                   capture_regs: int = 32, stack_bytes: int = 256) -> str:
     """在**某条 VM 指令**上设断点，停下时给出 VM 寄存器堆与 VM 栈。
@@ -4853,19 +4854,37 @@ def vm_breakpoint(serial: str, pid: int, so_name: str, target_idx: int = -1,
     这是「按 VM 层思考」的核心工具：不用管单个 op 的寄存器约定，
     直接说「我要停在第 N 条 VM 指令」。
 
-    ## idx 是怎么算出来的（关键）
+    ## idx 是怎么算出来的（关键，已修正）
 
-        prog_base = *(*(ctx + 0x240) + 0x1a0)    ← 运行时自动解引用
-        vm_pc     = *(ctx + 8)
-        idx       = (vm_pc - prog_base) / 16
+        data_base = *(*(ctx + 0x240) + 0x1a0)   ← 这是**数据区**基址
+        vm_pc     = *(ctx + 8)                  ← 下一条要执行的指令
+        vm_idx    = (vm_pc - code_base) / 16    ← 必须你显式给 code_base
 
-    **不需要你提供任何基址。** VM 代码区是 malloc 出来的匿名内存，
-    与 so 模块基址不在一处——用模块基址算 idx 会全错。
+    **data_base 不是 code_base。** 它的推导链末端是 `add host_var, base, imm`
+    ——加完得到 host 变量地址，说明它指向数据区。拿它减 vm_pc 算出来的数
+    只是碰巧落在某个范围，**不代表指令序号**（真机实测：按它算出的 idx
+    去查镜像，得到 op=4 A=28，不是合法指令边界）。
+
+    所以要按 idx 过滤，必须传 `code_base`（VM 字节码数组起点）。
+
+    ## 不知道 code_base 怎么办
+
+    不传即可：此时 `vm_idx` 返回 **null**（工具不会编一个看起来合理的数），
+    同时返回 `vm_pc_bytes` —— vm_pc 处原始字节码。你拿它去比对镜像：
+
+        ① 在镜像里搜这段字节，命中位置就是该指令的偏移
+        ② code_base = vm_pc - 命中偏移
+        ③ 下次调用把 code_base 传进来，就能按 idx 精确过滤
 
     ## 参数
 
         target_idx      目标 VM 指令序号；**-1 = 不过滤，采所有遇到的**
+                        （给了 target_idx 却没给 code_base 时无法过滤，
+                         工具会明确返回 0 命中而不是假装过滤）
+        code_base       字节码区基址，"0x..." 或十进制。**给了才算 vm_idx**
         dispatch_offset 挂哪个派发点（默认 0x76024，op491 handler 尾部）
+        slot_size       每条 VM 指令字节数
+        vm_pc_bytes     在 vm_pc 处回读多少字节原始字节码（默认 64）
         max_hits        最多命中几次
         wait            等多久（秒）
         capture_regs    抓多少个 VM 寄存器
@@ -4873,18 +4892,24 @@ def vm_breakpoint(serial: str, pid: int, so_name: str, target_idx: int = -1,
 
     ## 返回
 
-        hits[]  {vm_idx, vm_pc, prog_base, regs{r0..r31}, ctx, stack_hex}
+        hits[]  {vm_idx, vm_idx_source, vm_pc, vm_pc_bytes, data_base,
+                 regs{r0..r31}, ctx, stack_hex}
         verdict
+
+        vm_idx_source: "code_base"（可信）/ "unavailable"（没给 code_base）
 
     ## 0 命中怎么办
 
     派发点有几百个，**只挂一个点就只能看到经过它的指令**。
-    先用 `vm_regs_snapshot` 看当前活跃的 idx，再挑合适的点。
+    先用 `vm_regs_snapshot` 看当前 VM 跑到哪，再挑合适的点。
+
+    若报「会话已失效」，说明进程还在但 frida 会话是旧的（旧进程残留）：
+    确认目标进程是新起的，再重试。
 
     ## 实测（真机）
 
-        vm_breakpoint(target_idx=43556)
-        → 命中 2 次，prog_base=0x79e1786d30，regs 32 个全拿到
+        vm_breakpoint(target_idx=-1)
+        → 命中 7 次，每次给 vm_pc + 32 个 VM 寄存器 + 128 字节栈
     """
     mod, err = _load_dyn_module("dyn.vmbreak", "vm_breakpoint")
     if err:
@@ -4892,6 +4917,8 @@ def vm_breakpoint(serial: str, pid: int, so_name: str, target_idx: int = -1,
     try:
         return _j(mod.vm_breakpoint(
             serial, int(pid), so_name, target_idx=int(target_idx),
+            code_base=(code_base or None),
+            vm_pc_bytes=int(vm_pc_bytes),
             dispatch_offset=dispatch_offset, slot_size=int(slot_size),
             max_hits=int(max_hits), wait=float(wait),
             capture_regs=int(capture_regs), stack_bytes=int(stack_bytes)))

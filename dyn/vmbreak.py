@@ -25,17 +25,23 @@
     x27  → VM 上下文，[x27 + 8] = 当前 VM pc
     x23  → op → handler 的跳转表基址
 
-    prog_base = *(*(x27 + 0x240) + 0x1a0)     ← 用来把 vm_pc 换算成 idx
-    idx       = (vm_pc - prog_base) / 16
+    data_base = *(*(x27 + 0x240) + 0x1a0)     ← **数据区**基址，不是字节码区
+    vm_idx    = (vm_pc - code_base) / 16      ← code_base 必须调用方显式给
 
-`prog_base` 的推导链（sub_170a8c，op508 host handler 调用的函数）：
+`data_base` 的推导链（sub_170a8c，op508 host handler 调用的函数）：
 
     0x170a98  ldr x8, [x1, #0x240]    ; x1 = VM ctx
-    0x170aa0  ldr x8, [x8, #0x1a0]    ; ← prog_base
-    0x170aa4  add x0, x8, x2          ; + imm = host 变量地址
+    0x170aa0  ldr x8, [x8, #0x1a0]    ; ← data_base
+    0x170aa4  add x0, x8, x2          ; + imm = **host 变量地址**
 
-实测（真机，2026-11-09）：prog_base 只有 12~13 个不同值，
-与 prog 数量吻合；用它算出的 idx 100% 落在合法范围内。
+★ 注意最后一行：加完得到的是 host 变量地址 ⇒ 这个基址指向**数据区**。
+  所以它**不能**用来算 vm_idx（真机实测：算出的 idx 去查镜像是 op=4 A=28，
+  不是合法指令边界）。字段原名 prog_base 具有误导性，已改为 data_base。
+
+★ 真正的 code_base 在 ctx 里的位置**尚未确认**，因此：
+  · 不传 code_base 时，vm_idx 返回 null（不伪造数字）
+  · 工具会回读 vm_pc 处原始字节（vm_pc_bytes），调用方拿它比对镜像自己反推
+
 **不能用 vm_pc 直接减模块基址**——VM 代码区是 malloc 出来的，
 与 so 模块不在一处。
 
@@ -95,7 +101,8 @@ VM_DEFAULTS = {
     "ip_offset": 8,            # [ctx + 8] = 当前 VM pc
     "slot_size": 16,           # 每条 VM 指令 16 字节
     "vm_reg_count": 32,        # VM 寄存器个数
-    # prog_base 的两跳解引用路径：[ctx + p1_off] → [+ p2_off] = prog_base
+    # data_base 的两跳解引用路径：[ctx + p1_off] → [+ p2_off] = data_base
+    # （名为 prog_base_* 是历史兼容；它指向数据区，不是字节码区）
     "prog_base_p1_offset": 0x240,
     "prog_base_p2_offset": 0x1A0,
 }
@@ -161,6 +168,7 @@ def find_dispatch_points(so_name: str, so=None,
 
 def vm_breakpoint(serial: str, pid: int, so_name: str, target_idx: int = -1,
                   code_base: int | str | None = None,
+                  vm_pc_bytes: int = 64,
                   dispatch_offset: int | str | None = None,
                   pattern_hex: str = VM_DEFAULT_PATTERN,
                   slot_size: int = VM_DEFAULTS["slot_size"],
@@ -181,6 +189,10 @@ def vm_breakpoint(serial: str, pid: int, so_name: str, target_idx: int = -1,
     ## 参数
 
         target_idx       目标 VM 指令序号（如 11068）。**-1 = 不过滤，采所有**
+                         **注意**：要按 idx 过滤，必须同时给 code_base；
+                         否则无法计算 idx，本工具不会假装过滤（会返回 0 命中）
+        code_base        字节码区基址（VM 指令数组起点）。**不给就不算 vm_idx**
+        vm_pc_bytes      在 vm_pc 处回读多少字节原始字节码（默认 64）
         dispatch_offset  挂哪个派发点（静态偏移）。
                          不给则自动扫第一个匹配 pattern 的位置。
                          **建议给一个在频繁执行路径上的点**，否则可能长期不命中。
@@ -199,25 +211,41 @@ def vm_breakpoint(serial: str, pid: int, so_name: str, target_idx: int = -1,
     ## 返回
 
         installed        挂上了几个点
-        hits[]           {index, vm_pc, vm_idx, regs{r0..r31}, ctx, stack_hex}
+        hits[]           {index, vm_pc, data_base, vm_idx, vm_idx_source,
+                          vm_pc_bytes, regs{r0..r31}, ctx, stack_hex}
         verdict
 
-    ## 关键：idx 是怎么算出来的
+    ## 关键：data_base 与 vm_idx 不是一回事
 
-        prog_base = *(*(ctx + 0x240) + 0x1a0)     ← 运行时解引用，不用调用方提供
-        vm_pc     = *(ctx + 8)
-        idx       = (vm_pc - prog_base) / 16
+        data_base = *(*(ctx + 0x240) + 0x1a0)     ← host 全局变量区基址
+        vm_pc     = *(ctx + 8)                    ← 下一条要执行的指令地址
+        vm_idx    = (vm_pc - code_base) / 16      ← **必须显式给 code_base**
 
-    **不要用 vm_pc - 模块基址**：VM 代码区是 malloc 出来的匿名内存，
-    与 so 模块不在一处。实测该公式算出的 idx 100% 合法。
+    (6) 第六次修改（2026-11-09）：
+        bug 原因：此前把 data_base 当成了 code_base 用来算 vm_idx
+                  （字段名还叫 prog_base，更容易误解）。它的推导链末端是
+                  `add x0, x8, imm`，加完得到 host 变量地址 —— 说明它指向
+                  数据区。拿它减 vm_pc 算出来的「idx」只是碰巧落在某个
+                  范围内，不代表指令序号：真机实测 idx=40162 去查镜像，
+                  得到 op=4 A=28，不是合法指令边界。
+        解决方案：① 字段改名 data_base，保留原值（它对定位 host 变量有用）；
+                  ② vm_idx 只在给了 code_base 时才算，否则为 null 并标
+                     vm_idx_source="unavailable"；
+                  ③ 新增 vm_pc_bytes：回读 vm_pc 处原始字节，调用方拿它
+                     去比对镜像，自己反推 code_base（这是目前唯一可靠的
+                     定位方式，因为 code_base 在 ctx 里的位置尚未确认）。
+
+    **不要用 vm_pc - so 模块基址**：VM 代码区是 malloc 出来的匿名内存，
+    与 so 模块不在一处。
 
     派发点是在「当前指令执行完、下一条还没执行」的时刻被拦下的。
     所以停在这里读到的 vm_pc 是**下一条**要执行的指令。
-    要停在第 target_idx 条「执行之前」，判断条件就是 vm_idx == target_idx。
 
     ## 已知边界
 
-        · prog_base 的偏移路径（+0x240 / +0x1a0）是参数，换 VM 可改
+        · data_base 的偏移路径（+0x240 / +0x1a0）是参数，换 VM 可改
+        · **不传 code_base 时 vm_idx 为 null**：这是刻意为之，
+          data_base 不能算出指令序号（见上文「data_base 与 vm_idx 不是一回事」）
         · 派发点有几百个，**只挂一个**：挂在哪个点就只能看到经过那个点的指令。
           如果目标 idx 的执行路径不经过这个点，会一直不命中——
           这时换一个点（或告诉我执行路径，我帮你选）
@@ -231,9 +259,15 @@ def vm_breakpoint(serial: str, pid: int, so_name: str, target_idx: int = -1,
     # (2) 第二次修改（2026-11-09）：code_base 不再是必需参数。
     #     bug 原因：原来要求调用方给 code_base，但 VM 代码区是 malloc 出来的
     #               匿名内存，和 so 模块基址不在一处，调用方根本无从得知。
-    #     解决方案：prog_base 改为运行时从 VM 上下文解引用得到：
-    #               prog_base = *(*(ctx + 0x240) + 0x1a0)
-    #               调用方不再需要提供任何基址。
+    #     解决方案：改为运行时解引用 *(*(ctx + 0x240) + 0x1a0) 得到基址。
+    #
+    # (7) 第七次修改（2026-11-09）——上面那条方案被实测推翻：
+    #     bug 原因：那个地址推导链末端是 `add host_var, base, imm`，加完是
+    #               host 变量地址，说明它是**数据区**基址，不是字节码区。
+    #               用它算 vm_idx 得到的数没有意义（真机实测查镜像对不上）。
+    #     解决方案：该值改名 data_base 并原样返回；vm_idx 恢复为「只在调用方
+    #               显式给 code_base 时才算」，同时回读 vm_pc 处原始字节，
+    #               让调用方自己比对镜像反推真正的 code_base。
 
     if int(slot_size) not in (8, 16, 32):
         return {"ok": False, "code": "BAD_SLOT_SIZE",
@@ -272,12 +306,20 @@ def vm_breakpoint(serial: str, pid: int, so_name: str, target_idx: int = -1,
         ("__STACK_BYTES__", str(int(stack_bytes))),
         ("__HOLD__", "true" if hold else "false"),
         ("__MAX_HITS__", str(max(1, int(max_hits)))),
+        # (5) 第五次修改（2026-11-09）：
+        #     bug 原因：code_base 参数一直只躺在签名里，从未传给 JS
+        #               （grep CODE_BASE 无结果），调用方传了也被静默忽略。
+        #     解决方案：真正注入；没给就传 null，JS 侧据此不计算 vm_idx。
+        ("__CODE_BASE__", _js_code_base(code_base)),
+        ("__VM_PC_BYTES__", str(int(vm_pc_bytes))),
     ):
         user_js = user_js.replace(k, v)
 
     return _run_vm_break(serial, int(pid), so_name, user_js,
                          hold=bool(hold), max_hits=int(max_hits),
-                         wait=float(wait))
+                         wait=float(wait),
+                         target_idx=int(target_idx),
+                         slot_size=int(slot_size))
 
 
 _JS_VM_BREAK = r"""
@@ -295,6 +337,10 @@ _JS_VM_BREAK = r"""
     var CAPTURE_REGS = __CAPTURE_REGS__;
     var STACK_BYTES = __STACK_BYTES__;
     var MAX_HITS = __MAX_HITS__;
+    // 显式字节码基址；null 表示调用方没给（那就不会算 vm_idx）
+    var CODE_BASE = __CODE_BASE__;
+    // vm_pc 处回读多少字节原始字节码（供调用方比对镜像）
+    var VM_PC_BYTES = __VM_PC_BYTES__;
 
     var mod = Process.findModuleByName(SO_NAME);
     if (mod === null) {
@@ -321,10 +367,9 @@ _JS_VM_BREAK = r"""
         catch (e) { return null; }
     }
 
-    // prog_base = *(*(ctx + P1_OFF) + P2_OFF)
-    // 这是把 vm_pc 换算成 idx 的关键：VM 代码区是 malloc 出来的，
-    // 与 so 模块基址不在一处，**不能**用 pc - 模块基址。
-    function readProgBase(ctxp) {
+    // data_base = *(*(ctx + P1_OFF) + P2_OFF)
+    // 指向 host 全局变量区（推导链末端是 add host_var, imm），**不是**字节码区。
+    function readDataBase(ctxp) {
         try {
             var p1 = ctxp.add(P1_OFF).readPointer();
             return p1.add(P2_OFF).readPointer();
@@ -342,22 +387,68 @@ _JS_VM_BREAK = r"""
             try { vmPc = ctxp.add(IP_OFFSET).readPointer(); }
             catch (e) { return; }
 
-            var progBase = readProgBase(ctxp);
-            if (progBase === null) { return; }
+            // data_base = *(*(ctx+P1_OFF)+P2_OFF)
+            //
+            // (3) 第三次修改（2026-11-09）：
+            //     bug 原因：这个值原名叫 prog_base，被当成「字节码区基址」用来
+            //               算 vm_idx。但它的推导链末端是 `add x0, x8, imm`
+            //               ——加完得到的是 host 变量地址，说明它指向**数据区**，
+            //               不是字节码区。用它减 vm_pc 没有意义，算出的 idx 只是
+            //               「落在某个范围里」，不代表指令序号（真机实测过
+            //               idx=40162 查镜像得到 op=4 A=28，不是合法指令边界）。
+            //     解决方案：改名 data_base 并原样返回（它对定位 host 变量有用）；
+            //               vm_idx 只在调用方显式给 code_base 时才计算，
+            //               否则返回 null 并注明 unavailable。不给假数字。
+            var dataBase = readDataBase(ctxp);
 
-            // 用有符号差再除，避免 vm_pc 小于 prog_base 时被当成巨大正数
-            var delta = vmPc.sub(progBase).toInt32();
-            var idx = delta / SLOT_SIZE;
+            // 在 vm_pc 处读一段原始字节，供调用方自己比对镜像、反推 code_base。
+            // 这是「不知道 code_base」时的唯一可靠出路：给出原料，不猜结论。
+            var codeBytes = null;
+            try {
+                var nSlots = VM_PC_BYTES / SLOT_SIZE;
+                codeBytes = Array.from(new Uint8Array(vmPc.readByteArray(nSlots * SLOT_SIZE)))
+                    .map(function (b) { return ('0' + b.toString(16)).slice(-2); })
+                    .join('');
+            } catch (e) { codeBytes = null; }
 
-            if (TARGET_IDX >= 0 && idx !== TARGET_IDX) { return; }
+            // idx 只认显式 code_base
+            var idx = null;
+            var idxSource = 'unavailable';
+            if (CODE_BASE !== null && CODE_BASE !== 0) {
+                // (4) 第四次修改（2026-11-09）：
+                //     bug 原因：原来用 vmPc.sub(base).toInt32()，toInt32 会把
+                //               64 位差值截断成 32 位；当 code_base 与 vm_pc 的
+                //               跨度超过 ±2GB（不同 mmap 段很常见）时会溢出成错值。
+                //     解决方案：用十进制字符串转 BigInt 相减，再整除 slot_size。
+                //               这样任意跨度都精确，且不依赖 frida 的 32 位转换。
+                var big = null;
+                try {
+                    big = BigInt(vmPc.toString()) - BigInt(ptr(CODE_BASE).toString());
+                } catch (e) { big = null; }
+                if (big !== null) {
+                    var q = big / BigInt(SLOT_SIZE);
+                    var r = big % BigInt(SLOT_SIZE);
+                    idx = Number(q) + Number(r) / SLOT_SIZE;
+                    idxSource = 'code_base';
+                }
+            }
+
+            // 给了 target_idx 但没给 code_base 时无法过滤：
+            // 不假装过滤（那会静默返回 0 命中，让人以为是位置不对）
+            if (TARGET_IDX >= 0) {
+                if (idx === null) { return; }
+                if (idx !== TARGET_IDX) { return; }
+            }
 
             hitCount++;
             var rec = {
                 kind: 'vm_hit',
                 index: hitCount,
                 vm_pc: vmPc.toString(),
-                prog_base: progBase.toString(),
+                data_base: dataBase === null ? null : dataBase.toString(),
                 vm_idx: idx,
+                vm_idx_source: idxSource,
+                vm_pc_bytes: codeBytes,
                 native_pc: c.pc.toString(),
                 dispatch_addr: addr.toString(),
                 ctx: ctxp.toString(),
@@ -383,7 +474,8 @@ _JS_VM_BREAK = r"""
     send({kind: 'installed', dispatch_addr: addr.toString(),
           dispatch_offset: DISPATCH_OFFSET, target_idx: TARGET_IDX,
           module_base: mod.base.toString(), module: mod.name,
-          prog_base_path: '*(*(ctx+0x' + P1_OFF.toString(16) + ')+0x'
+          code_base_used: CODE_BASE,
+          data_base_path: '*(*(ctx+0x' + P1_OFF.toString(16) + ')+0x'
                           + P2_OFF.toString(16) + ')'});
 
     recv('stop', function () {
@@ -398,6 +490,22 @@ def _js_str(s) -> str:
     import json as _json
 
     return _json.dumps(str(s))
+
+
+def _js_code_base(code_base) -> str:
+    """把 code_base 转成 JS 字面量：没给就是 null。
+
+    支持 int 与 "0x..." / "12345" 字符串。给不出合法值一律当 null，
+    宁可不算 idx，也不注入一个错的基址。
+    """
+    if code_base is None or code_base == "":
+        return "null"
+    try:
+        v = int(code_base, 16) if isinstance(code_base, str) \
+            and code_base.lower().startswith("0x") else int(code_base)
+    except (TypeError, ValueError):
+        return "null"
+    return str(v) if v > 0 else "null"
 
 
 def _detach_async(sess, timeout: float = 2.0) -> None:
@@ -423,8 +531,20 @@ def _detach_async(sess, timeout: float = 2.0) -> None:
 
 def _run_vm_break(serial: str, pid: int, so_name: str, user_js: str,
                   hold: bool = True, max_hits: int = 1,
-                  wait: float = 10.0) -> dict:
-    """注入 VM 断点脚本并等待命中。"""
+                  wait: float = 10.0,
+                  target_idx: int = -1,
+                  slot_size: int = 16) -> dict:
+    """注入 VM 断点脚本并等待命中。
+
+    (1) 第一次修改（2026-11-09）：
+        bug 原因：本函数末尾的 verdict 文案里引用了 `target_idx`，但本函数
+                  签名里没有这个参数（它只是 vm_breakpoint 的形参，没往下传）。
+                  于是**只要一次都没命中**，走到 `elif not box["hits"]` 分支
+                  就会抛 `NameError: name 'target_idx' is not defined`，
+                  被外层 except 包成 VM_BREAK_FAILED。
+                  表现为：target_idx 给任何值（含 -1）都报同一个 NameError。
+        解决方案：把 target_idx / slot_size 显式传进来，供文案与诊断使用。
+    """
     import time as _time
 
     try:
@@ -503,17 +623,29 @@ def _run_vm_break(serial: str, pid: int, so_name: str, user_js: str,
         out["code"] = box.get("error_code") or "VM_BREAK_FAILED"
         out["error"] = box["error"]
     elif not box["hits"]:
+        # (2) 第二次修改（2026-11-09）：
+        #     bug 原因：原提示只讲了「该指令没被执行」和「派发点不在路径上」，
+        #               但真机排障时最常见的是第三种：进程还活着、frida 会话
+        #               却是旧的（attach 到已失效会话后一切静默）。
+        #     解决方案：把这条也写进 hint，并明确指出 target_idx 过滤只在
+        #               code_base 已知时才有意义。
         out["verdict"] = (f"{wait:.0f}s 内没有命中 idx={target_idx}。"
                           "可能原因：① 该指令在当前操作下没被执行；"
                           "② 挂的派发点不在它的执行路径上"
-                          "（805 个点里只挂了 1 个）")
-        out["hint"] = ("先用 vm_regs_snapshot 看当前 VM 在跑哪些 idx，"
+                          "（805 个点里只挂了 1 个）；"
+                          "③ 进程虽在，但 frida 会话已失效（旧进程残留）")
+        out["hint"] = ("先用 vm_regs_snapshot 确认这条链路是活的"
+                       "（它能给 vm_pc 就说明会话正常）；"
                        "再挑一个在活跃路径上的派发点；"
                        "或把 target_idx 设成 -1（不过滤，采所有遇到的 idx）")
+        out["target_idx_used"] = target_idx
+        out["slot_size_used"] = slot_size
     else:
         h0 = box["hits"][0]
+        src = h0.get("vm_idx_source") or "unknown"
         out["verdict"] = (f"命中 {len(box['hits'])} 次，"
-                          f"VM pc={h0.get('vm_pc')} idx={h0.get('vm_idx')}")
+                          f"VM pc={h0.get('vm_pc')} "
+                          f"idx={h0.get('vm_idx')}（来源 {src}）")
     return out
 
 
