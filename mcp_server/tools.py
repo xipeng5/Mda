@@ -166,7 +166,8 @@ def logged(tool_name: str | None = None):
 
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
-            t0 = time.time()
+            # 用单调时钟：墙钟会被 NTP/手动校时改变，差值会出负数
+            t0 = time.monotonic()
             # bug 原因：MCP 框架以**关键字**方式调用工具函数，位置参数元组
             # args 恒为空，此前 dict(zip(sig_keys, args)) if args else {} 得到
             # 空字典 → UI 回放拿不到 so_name/addr，AI 操作无法可视化。
@@ -191,27 +192,27 @@ def logged(tool_name: str | None = None):
             if link.should_forward():
                 fw = link.forward(name, call_args)
                 if fw is not None:
-                    ms = (time.time() - t0) * 1000
+                    ms = (time.monotonic() - t0) * 1000
                     parts = [
                         f"{k}={str(v)[:60]}"
                         for k, v in call_args.items()
                         if v not in (None, "")
                     ]
-                    _activity(name, call_args, ", ".join(parts) or "-", ms)
+                    _activity(name, call_args, ", ".join(parts) or "", ms)
                     return fw
 
             try:
                 result = fn(*args, **kwargs)
-                ms = (time.time() - t0) * 1000
+                ms = (time.monotonic() - t0) * 1000
                 parts = [
                     f"{k}={str(v)[:60]}"
                     for k, v in call_args.items()
                     if v not in (None, "")
                 ]
-                _activity(name, call_args, ", ".join(parts) or "-", ms)
+                _activity(name, call_args, ", ".join(parts) or "", ms)
                 return result
             except Exception as e:
-                ms = (time.time() - t0) * 1000
+                ms = (time.monotonic() - t0) * 1000
                 import traceback
 
                 tb = traceback.format_exc()

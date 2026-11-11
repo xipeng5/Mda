@@ -5,6 +5,7 @@ import type { ApiInsn } from "./lib/api";
 import { SphereCanvas } from "./components/SphereCanvas";
 import { LeftPanel } from "./components/LeftPanel";
 import { RightPanel } from "./components/RightPanel";
+import { RealtimeMonitor, type AiEvent } from "./components/RealtimeMonitor";
 import { Hud, type HudData } from "./components/Hud";
 import { CodeOverlay } from "./components/CodeOverlay";
 import type { Relations, Theme } from "./lib/sphere";
@@ -20,6 +21,10 @@ export default function App() {
   const [sel, setSel] = useState<number[]>([]);
   const [logs, setLogs] = useState<LogItem[]>([]);
   const [watch, setWatch] = useState<WatchItem[]>([]);
+  // 实时监控台：每次 MCP 工具调用都进这条流（服务端 @logged 广播）
+  const [aiEvents, setAiEvents] = useState<AiEvent[]>([]);
+  const [aiPaused, setAiPaused] = useState(false);
+  const [mainView, setMainView] = useState<"monitor" | "module">("monitor");
   // (1) 第一次修改：主题默认跟随系统外观（macOS 深色/浅色），不再硬编码 dark。
   //     手动点过切换按钮后锁定用户选择，系统再变也不覆盖。
   const [theme, setTheme] = useState<Theme>(() =>
@@ -222,7 +227,7 @@ export default function App() {
       return i < 0 ? null : { mi, i };
     };
     ws.onmessage = (ev) => {
-      let msg: { type?: string; tool?: string; args?: Record<string, unknown>; summary?: string; event?: Record<string, unknown> };
+      let msg: { type?: string; tool?: string; args?: Record<string, unknown>; summary?: string; ms?: number; ts?: string; event?: Record<string, unknown> };
       try { msg = JSON.parse(ev.data); } catch { return; }
       // (3) 第三次修改（2026-11-11）：
       //     bug 原因：服务端在卸载/清空后会广播 modules_changed，
@@ -257,6 +262,16 @@ export default function App() {
         })();
       }
       if (msg.type === "ai") {
+        // 每次工具调用都进实时流。暂停时不再追加（但也不丢已有数据）。
+        setAiEvents((prev) => {
+          if (aiPaused) return prev;
+          const next = [
+            { tool: msg.tool ?? "", args: msg.args as Record<string, unknown> | undefined,
+              summary: msg.summary, ms: msg.ms, ts: msg.ts },
+            ...prev,
+          ];
+          return next.slice(0, 500);   // 上限，避免长时间运行吃内存
+        });
         const a = (msg.args ?? {}) as { so_name?: string; name?: string; addr?: number };
         const so = a.so_name ?? a.name ?? "";
         const addr = typeof a.addr === "number" ? a.addr : undefined;
@@ -462,7 +477,35 @@ export default function App() {
       <main className="workspace">
         <LeftPanel logs={logs} watch={watch} onPickWatch={(w) => log(`观察：${w.name} @ ${hex(w.addr)}`)} />
         <section className={"stage" + (code.open ? " compact" : "")}>
-          {!empty && (
+          {/* 主视图切换：实时监控台（AI 在做什么） / 模块视图（so 结构） */}
+          <div className="viewtabs">
+            <button
+              className={"vtab" + (mainView === "monitor" ? " on" : "")}
+              onClick={() => setMainView("monitor")}
+            >
+              实时 <b>{aiEvents.length}</b>
+            </button>
+            <button
+              className={"vtab" + (mainView === "module" ? " on" : "")}
+              onClick={() => setMainView("module")}
+              disabled={empty}
+            >
+              模块{!empty && active >= 0 && modules[active] ? ` · ${modules[active].so}` : ""}
+            </button>
+            <span className="grow" />
+          </div>
+
+          {mainView === "monitor" && (
+            <RealtimeMonitor
+              events={aiEvents}
+              paused={aiPaused}
+              onTogglePause={() => setAiPaused((v) => !v)}
+              onClear={() => setAiEvents([])}
+            />
+          )}
+
+          {mainView === "module" && !empty && (
+            <div className="stage-canvas">
             <SphereCanvas
               modules={modules}
               active={active}
@@ -476,9 +519,28 @@ export default function App() {
               flash={flash}
               pulseKey={pulseKey}
             />
+            {!empty && (
+              <>
+                <div className="legend">
+                  <div><i className="hi" />热点（被引用 ≥5）</div>
+                  <div><i className="mid" />有引用</div>
+                  <div><i />无引用</div>
+                </div>
+                <div className="lat">
+                  纬度 = 地址<br />{hex(mod.funcs[0].a)} → {hex(mod.funcs[mod.funcs.length - 1].a)}
+                </div>
+                <div className="active-label">
+                  {mod.so}<span>{mod.funcs.length} 函数 · 导出 {mod.funcs.filter((x) => x.e).length}</span>
+                </div>
+                <div className="hint">
+                  {code.open ? "Esc 返回球体" : "拖动旋转 · 点右侧函数定位 · 双击 / 回车展开代码"}
+                </div>
+              </>
+            )}
+            </div>
           )}
 
-          {empty && !loading && (
+          {mainView === "module" && empty && !loading && (
             <div className="empty-stage">
               <div className="empty-mark"><span className="mark" /></div>
               <div className="empty-title">打开一个 so 开始分析</div>
@@ -499,24 +561,6 @@ export default function App() {
             </div>
           )}
 
-          {!empty && (
-            <>
-              <div className="legend">
-                <div><i className="hi" />热点（被引用 ≥5）</div>
-                <div><i className="mid" />有引用</div>
-                <div><i />无引用</div>
-              </div>
-              <div className="lat">
-                纬度 = 地址<br />{hex(mod.funcs[0].a)} → {hex(mod.funcs[mod.funcs.length - 1].a)}
-              </div>
-              <div className="active-label">
-                {mod.so}<span>{mod.funcs.length} 函数 · 导出 {mod.funcs.filter((x) => x.e).length}</span>
-              </div>
-              <div className="hint">
-                {code.open ? "Esc 返回球体" : "拖动旋转 · 点右侧函数定位 · 双击 / 回车展开代码"}
-              </div>
-            </>
-          )}
 
           <Hud hud={hud} onClose={() => setHud(null)} />
           <CodeOverlay

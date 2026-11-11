@@ -66,8 +66,11 @@ body{background:var(--bg);color:var(--fg);font-family:var(--mono);font-size:12px
 .log-line.ai .k{color:var(--live)}
 
 /* 舞台 */
-.stage{flex:1;position:relative;min-width:0;background:var(--panel);
-  border:1px solid var(--line);overflow:hidden}
+.stage{flex:1;min-width:0;background:var(--panel);
+  border:1px solid var(--line);overflow:hidden;
+  display:flex;flex-direction:column;min-height:0}
+/* 画布容器：浮层（图例/纬度/当前函数）相对它定位，不会压到 tab 上 */
+.stage-canvas{flex:1;position:relative;min-height:0;min-width:0}
 .stage canvas{display:block;width:100%;height:100%}
 .legend{position:absolute;left:12px;top:10px;display:flex;flex-direction:column;gap:4px;
   font-size:10px;color:var(--fg3);letter-spacing:.08em;pointer-events:none}
@@ -236,3 +239,91 @@ html[data-theme="light"] .drop-box{background:rgba(255,255,255,.75)}
 .drop-icon::after{content:"";position:absolute;left:50%;top:6px;width:1px;height:14px;
   background:var(--live);transform:translateX(-.5px)}
 .drop-sub{font-size:10.5px;color:var(--fg3)}
+
+/* ══ 实时监控台 ══
+   AI 的每次 MCP 工具调用都在这里上流。
+   界面只承载证据（调了什么/参数/返回/耗时），结论留在对话里。 */
+.viewtabs{flex:0 0 28px;display:flex;align-items:center;gap:2px;
+  padding:0 8px;border-bottom:1px solid var(--line);background:var(--panel)}
+.vtab{height:20px;padding:0 9px;border:1px solid transparent;border-radius:3px;
+  color:var(--fg3);font-size:11.5px;background:none;cursor:pointer}
+.vtab:hover:not(:disabled){color:var(--fg);background:var(--line2)}
+.vtab.on{color:var(--live);background:var(--livebg);border-color:var(--live)}
+.vtab:disabled{opacity:.4;cursor:default}
+.vtab b{font-family:var(--mono);font-size:10px;font-weight:400;
+  margin-left:3px;opacity:.8;font-variant-numeric:tabular-nums}
+
+.monitor{flex:1;display:flex;flex-direction:column;min-height:0;overflow:hidden}
+.mon-bar{flex:0 0 32px;display:flex;align-items:center;gap:10px;padding:0 10px;
+  border-bottom:1px solid var(--line);background:var(--panel);font-size:11px}
+.mon-title{color:var(--fg);font-weight:600}
+.mon-count{font-family:var(--mono);font-size:11px;color:var(--fg3)}
+.mon-count b{color:var(--live);font-weight:600}
+.mon-btn{height:20px;padding:0 8px;border:1px solid var(--line);border-radius:3px;
+  color:var(--fg3);font-size:10.5px;background:none;cursor:pointer}
+.mon-btn:hover:not(:disabled){color:var(--fg);border-color:var(--fg3)}
+.mon-btn.on{color:var(--live);border-color:var(--live);background:var(--livebg)}
+.mon-btn:disabled{opacity:.4;cursor:default}
+
+.mon-body{flex:1;display:grid;grid-template-columns:minmax(0,1fr) 300px;min-height:0}
+.mon-stream{overflow-y:auto;overflow-x:hidden;min-height:0;
+  font-family:var(--mono);font-size:11px;border-right:1px solid var(--line)}
+.mon-detail{overflow-y:auto;min-height:0;padding:0 0 8px}
+.mon-empty{color:var(--fg3);font-size:11px;padding:14px 12px;line-height:1.7;
+  font-family:var(--sans)}
+
+/* 事件流的一行 */
+.sr{display:flex;align-items:center;gap:9px;height:25px;padding:0 9px;
+  cursor:pointer;border-left:1px solid transparent;
+  animation:sr-in .30s cubic-bezier(.16,1,.3,1)}
+@keyframes sr-in{from{opacity:0;transform:translateY(-6px);filter:blur(1.2px)}
+  to{opacity:1;transform:none;filter:blur(0)}}
+.sr:hover{background:color-mix(in srgb, var(--fg) 4%, transparent)}
+.sr.sel{background:var(--livebg);border-left-color:var(--live)}
+.sr-t{width:74px;flex:0 0 74px;color:var(--fg3);
+  font-variant-numeric:tabular-nums}
+.sr-tp{width:64px;flex:0 0 64px;font-size:10px;text-align:center;
+  padding:1px 4px;border-radius:2px;letter-spacing:.02em;
+  overflow:hidden;white-space:nowrap;font-family:var(--sans)}
+.sr-tx{flex:1;min-width:0;color:var(--fg);overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap}
+.sr-m{margin-left:auto;color:var(--fg3);font-size:10px;flex:0 0 auto;
+  font-variant-numeric:tabular-nums}
+/* 类别配色：色相承载"这是什么类型的操作" */
+.sr-tp.static{color:#52525b;background:#f0f0f2}
+.sr-tp.vm{color:#1d4ed8;background:#eff6ff}
+.sr-tp.bp{color:#b91c1c;background:#fef2f2}
+.sr-tp.proc{color:#b45309;background:#fffbeb}
+.sr-tp.behavior{color:#15803d;background:#f0fdf4}
+.sr-tp.mem{color:#c2410c;background:#fff7ed}
+.sr-tp.watch{color:#0e7490;background:#ecfeff}
+.sr-tp.trace{color:#0f766e;background:#f0fdfa}
+.sr-tp.java{color:#6d28d9;background:#f5f3ff}
+.sr-tp.runtime{color:#4338ca;background:#eef2ff}
+[data-theme=dark] .sr-tp.static{color:#c9c9d1;background:#242430}
+[data-theme=dark] .sr-tp.vm{color:#dbeafe;background:#1e3a8a}
+[data-theme=dark] .sr-tp.bp{color:#fecaca;background:#7f1d1d}
+[data-theme=dark] .sr-tp.proc{color:#fde68a;background:#78350f}
+[data-theme=dark] .sr-tp.behavior{color:#bbf7d0;background:#14532d}
+[data-theme=dark] .sr-tp.mem{color:#fed7aa;background:#7c2d12}
+[data-theme=dark] .sr-tp.watch{color:#a5f3fc;background:#164e63}
+[data-theme=dark] .sr-tp.trace{color:#99f6e4;background:#134e4a}
+[data-theme=dark] .sr-tp.java{color:#ddd6fe;background:#4c1d95}
+[data-theme=dark] .sr-tp.runtime{color:#e0e7ff;background:#312e81}
+
+/* 详情面板 */
+.det-hd{font-family:var(--mono);font-size:12.5px;font-weight:600;
+  padding:9px 10px 4px;color:var(--fg);word-break:break-all}
+.det-sub{font-size:11px;color:var(--fg3);padding:0 10px 6px;
+  font-family:var(--mono)}
+.det-sec{font-size:10px;letter-spacing:.08em;text-transform:uppercase;
+  color:var(--fg3);padding:8px 10px 3px}
+.det-json{margin:0 10px;background:var(--line2);border-radius:3px;
+  padding:6px 8px;font-family:var(--mono);font-size:11px;color:var(--fg2);
+  white-space:pre-wrap;word-break:break-word;overflow:auto;max-height:220px}
+.det-note{font-size:11px;color:var(--fg3);padding:0 10px;line-height:1.6}
+
+/* 尊重系统的减少动效偏好 */
+@media (prefers-reduced-motion: reduce){
+  .sr{animation:none}
+}
