@@ -106,6 +106,69 @@ async def modules(request):
     return JSONResponse({"modules": [_mod_brief(m) for m in _session.modules.values()]})
 
 
+async def unload(request):
+    """卸载一个模块（释放 mda 内的静态分析结果，不影响设备进程）。
+
+    (1) 第一次修改（2026-11-11）：
+        bug 原因：① 直接在事件循环里调 _session.unload()，而它内部的
+                     gc.collect() 在大堆时会卡住整个事件循环（WebSocket/HTTP 全停）；
+                  ② 用**输入名**清理 _loaded_paths，但 unload 内部可能把名字
+                     解析成别名/改名后的键，导致旧映射残留——同一文件再加载
+                     会被"幂等"逻辑误拦；
+                  ③ request.json() 没兜底，坏 JSON 直接 500。
+        解决方案：① 放到线程池执行；
+                  ② 用返回里的真实键 res["so"] 清理；
+                  ③ JSON 解析加 try。
+    """
+    try:
+        body = await request.json()
+    except Exception:                                     # noqa: BLE001
+        return _err("请求体不是合法 JSON", 400)
+    name = str(body.get("so", "")).strip()
+    if not name:
+        return _err("缺少 so")
+
+    # ① 线程池：gc.collect 会阻塞事件循环
+    loop = asyncio.get_event_loop()
+    res = await loop.run_in_executor(None, _session.unload, name)
+    if not res.get("ok"):
+        return _err(res.get("error") or "卸载失败", 404)
+
+    # ② 用真实键清理，而不是输入名
+    real_key = res.get("so") or name
+    for real, so_name in list(_loaded_paths.items()):
+        if so_name in (name, real_key):
+            _loaded_paths.pop(real, None)
+    _broadcast_sync({"type": "modules_changed", "action": "unload",
+                     "so": real_key, "modules": list(_session.modules)})
+    return JSONResponse(res)
+
+
+async def clear_modules(request):
+    """批量卸载，body 可带 {"keep": ["xxx.so"]}。"""
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:                                     # noqa: BLE001
+        body = {}
+    keep = body.get("keep")
+    # keep 的类型校验在 Session.clear 里做（传 str 视为单个模块名，
+    # 传其它类型直接报 BAD_KEEP），这里只负责透传
+    loop = asyncio.get_event_loop()
+    res = await loop.run_in_executor(None, _session.clear, keep)
+    for real, so_name in list(_loaded_paths.items()):
+        if so_name not in _session.modules:
+            _loaded_paths.pop(real, None)
+    _broadcast_sync({"type": "modules_changed", "action": "clear",
+                     "modules": list(_session.modules)})
+    return JSONResponse(res)
+
+
+async def module_memory(request):
+    """各模块内存占用估算。"""
+    return JSONResponse(_session.memory_usage())
+
+
 async def load(request):
     body = await request.json()
     path = str(body.get("path", "")).strip()
@@ -369,6 +432,9 @@ routes = [
     Route("/api/mcp-config", mcp_config),
     Route("/api/modules", modules),
     Route("/api/load", load, methods=["POST"]),
+    Route("/api/unload", unload, methods=["POST"]),
+    Route("/api/clear_modules", clear_modules, methods=["POST"]),
+    Route("/api/module_memory", module_memory),
     Route("/api/load_upload", load_upload, methods=["POST"]),
     Route("/api/functions", functions),
     Route("/api/disasm", disasm),

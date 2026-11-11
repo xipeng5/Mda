@@ -12,15 +12,17 @@ type Props = {
   onActivate: (mi: number) => void;
   onSelect: (mi: number, i: number) => void;
   onOpen: (mi: number, i: number) => void;
+  onUnload: (so: string) => void;
 };
 
 /** 单个 so 的函数面板：1900+ 行必须做虚拟滚动，否则滚动必掉帧。 */
 function ModulePanel({
-  mod, mi, isActive, sel, onActivate, onSelect, onOpen,
+  mod, mi, isActive, sel, onActivate, onSelect, onOpen, onUnload,
 }: {
   mod: ModuleData; mi: number; isActive: boolean; sel: number;
   onActivate: (mi: number) => void; onSelect: (mi: number, i: number) => void;
   onOpen: (mi: number, i: number) => void;
+  onUnload: (so: string) => void;
 }) {
   const [kw, setKw] = useState("");
   const [scrollTop, setScrollTop] = useState(0);
@@ -52,6 +54,19 @@ function ModulePanel({
       <div className="mod-head" onClick={() => onActivate(mi)}>
         <span className="mod-name">{mod.so}</span>
         <span className="mod-n">{mod.funcs.length}</span>
+        {/* 释放：只清 mda 内的解析结果，不影响设备上运行的进程 */}
+        <button
+          className="mod-free"
+          title="释放该模块占用的内存（不影响设备端进程）"
+          onClick={(e) => {
+            e.stopPropagation();
+            if (confirm(`释放 ${mod.so} 的内存？\n\n只清理 mda 里的解析结果，不影响设备上运行的进程。`)) {
+              onUnload(mod.so);
+            }
+          }}
+        >
+          ✕
+        </button>
       </div>
       <input className="search" placeholder="过滤…（名称或地址）" value={kw} onChange={(e) => setKw(e.target.value)} />
       <div
@@ -86,7 +101,7 @@ function ModulePanel({
   );
 }
 
-export function RightPanel({ modules, active, selected, onActivate, onSelect, onOpen }: Props) {
+export function RightPanel({ modules, active, selected, onActivate, onSelect, onOpen, onUnload }: Props) {
   return (
     <aside className="right">
       {modules.map((m, mi) => (
@@ -99,6 +114,7 @@ export function RightPanel({ modules, active, selected, onActivate, onSelect, on
           onActivate={onActivate}
           onSelect={onSelect}
           onOpen={onOpen}
+          onUnload={onUnload}
         />
       ))}
     </aside>

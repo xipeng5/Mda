@@ -1,0 +1,2310 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>MDA 界面改版原型 · 方向 A</title>
+<style>
+:root{
+  --bg:#fbfbfc; --panel:#fff; --line:#e6e6e9; --line2:#f0f0f2;
+  --fg:#18181b; --fg2:#52525b; --fg3:#71717a; --fg4:#c9c9d1;
+  --live:#2563eb; --livebg:#eff6ff; --live-ink:#1d4ed8;
+  --hot1:#dbeafe; --hot2:#93c5fd; --hot3:#3b82f6; --hot4:#1d4ed8;
+  --ok:#15803d; --warn:#b45309; --err:#b91c1c;
+  --mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+  --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;
+}
+[data-theme=dark]{
+  --fg:#f4f4f5; --fg2:#a1a1aa; --fg3:#94949e; --fg4:#3f3f46;
+  --live:#60a5fa; --livebg:#172554; --live-ink:#bfdbfe;
+  --hot1:#1e3a5f; --hot2:#1e40af; --hot3:#3b82f6; --hot4:#93c5fd;
+  --ok:#4ade80; --warn:#fbbf24; --err:#f87171;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+
+
+/* ══ 图标系统：统一 1.4 描边、12px 网格、currentColor 着色 ══
+   不用 Unicode 字形当图标——字形随字体变化，粗细和基线不可控。
+   ─────────────────────────────────────────────── */
+.ic{width:12px;height:12px;flex:0 0 12px;display:inline-block;
+  stroke:currentColor;fill:none;stroke-width:1.4;
+  stroke-linecap:round;stroke-linejoin:round;vertical-align:-1px}
+.ic-lg{width:14px;height:14px;flex:0 0 14px}
+
+/* ══ 动效：一个有主次的时刻 ══
+   原则：不做「每个元素都来一遍相同的入场」。
+   这里的主动效只有一个 —— 新记录进入事件流时，
+   从它「来源」的位置滑入并落定。其余动效（工具行脉冲、
+   目标待命纹、断点冻结）都是**状态反馈**，不参与入场。
+   缓动统一用指数缓出，从「已可见」的默认态出发。
+   ─────────────────────────────────── */
+:root{
+  --ease-out:cubic-bezier(.16,1,.3,1);      /* 指数缓出 */
+  --ease-inout:cubic-bezier(.65,0,.35,1);
+}
+
+/* 主时刻：新事件滑入 */
+@keyframes enter{
+  from{opacity:0;transform:translateY(-7px) scale(.985);filter:blur(1.5px)}
+  60%{opacity:1;filter:blur(0)}
+  to{opacity:1;transform:none;filter:blur(0)}
+}
+.sr{animation:enter .34s var(--ease-out)}
+.sr.sel{animation:enter .34s var(--ease-out)}
+
+/* 选中切换：只改底色，不做位移（避免抖动） */
+.sr{transition:background .13s linear}
+
+/* 工具行脉冲用指数缓出 */
+.tvrow.busy{animation:tvbusy .95s var(--ease-out)}
+
+/* 待命扫描纹：线性、恒定速度（表示"持续在盯"，不适合缓动） */
+.armed::after{animation:armedsweep 2.4s linear infinite}
+
+/* 断点冻结：短促，指数缓出 */
+.freeze-pulse{animation:frz .34s var(--ease-out)}
+
+/* 尊重系统偏好：关掉所有装饰性动效，只保留状态切换 */
+@media (prefers-reduced-motion: reduce){
+  *,*::before,*::after{
+    animation-duration:.01ms !important;
+    animation-iteration-count:1 !important;
+    transition-duration:.01ms !important;
+  }
+  .armed::after{display:none}
+}
+
+/* ══ 浏览器自带表面：不画也属于设计 ══
+   滚动条、选区、焦点环、插入符、数字排版，默认值不属于任何设计系统。
+   这是「页面被认真做过」最廉价、也最容易被跳过的信号。
+   ─────────────────────────────────── */
+::selection{background:color-mix(in srgb, var(--live) 22%, transparent);
+  color:var(--fg)}
+html{caret-color:var(--live)}
+*{scrollbar-width:thin;scrollbar-color:var(--fg3) transparent}
+::-webkit-scrollbar{width:9px;height:9px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:var(--fg4);border-radius:4px;
+  border:2px solid transparent;background-clip:content-box}
+::-webkit-scrollbar-thumb:hover{background:var(--fg3);background-clip:content-box}
+::-webkit-scrollbar-corner{background:transparent}
+:focus-visible{outline:2px solid var(--live);outline-offset:1px;border-radius:2px}
+button:focus:not(:focus-visible){outline:none}
+/* 表格状数字用等宽数字，避免跳动 */
+.tvrow .tl,.sr .t,.sr .m,.mon-epm b,.mt .vv,.armtag,.det-sub,
+.modtab b,.navitem b,.wtab b,.evtab b,.mon-tgt b{font-variant-numeric:tabular-nums}
+
+/* 兜底：类选择器上的 display 会盖过 [hidden] 的 UA 样式，必须显式压住 */
+[hidden]{display:none !important}
+html,body{height:100%}
+body{
+  background:var(--bg);color:var(--fg);font-family:var(--sans);
+  font-size:12px;line-height:1.45;display:flex;flex-direction:column;
+  -webkit-font-smoothing:antialiased;overflow:hidden;
+}
+button{font:inherit;color:inherit;background:none;border:none;cursor:pointer}
+.grow{flex:1}
+
+
+/* ══ 层次修正 ══
+   问题：事件流是主体，但它和左栏、右栏的字号/对比度几乎一样，
+        眼睛没有落点。
+   做法：拉开三级对比
+     · 事件流   → 主信息，最高对比
+     · 左栏目标 → 上下文，压低一档
+     · 右栏详情 → 按需查看，最安静
+   ─────────────────────────────────── */
+/* 中栏事件流：主信息 */
+.evstream{font-size:11px}
+.sr{height:23px}
+.sr .tx{color:var(--fg)}
+.sr .tx em{color:var(--fg);font-weight:600;font-style:normal}
+.sr .t{color:var(--fg3)}
+.sr .m{color:var(--fg3)}
+
+/* 左栏：上下文，整栏压低 */
+.mon-left{background:color-mix(in srgb, var(--panel) 96%, var(--bg))}
+.mon-left .proc .pn{color:var(--fg2);font-size:11.5px}
+.mon-left .proc.sel .pn{color:var(--fg);font-weight:600}
+.mon-left .proc .metrics{color:var(--fg3);font-size:11px}
+.mon-hd{color:var(--fg3);font-size:11px}
+.modlist .mr .mn{color:var(--fg2);font-size:11px}
+.modlist .mr .mt2{color:var(--fg2)}
+
+/* 右栏：最安静，只在选中时抬头 */
+.mon-right{background:color-mix(in srgb, var(--panel) 96%, var(--bg))}
+.det-hd{font-size:12px}
+
+/* 分栏之间用底色差分开，而不是靠更多边框 */
+.mon-mid{background:var(--panel)}
+
+/* 事件流行的悬停用极轻的底，避免和选中态打架 */
+.sr:hover{background:color-mix(in srgb, var(--fg) 4%, transparent)}
+.sr.sel{background:var(--livebg)}
+
+/* 筛选条：当前项更明确 */
+.evtab{color:var(--fg3);transition:color .12s,background .12s}
+.evtab:hover{color:var(--fg2)}
+.evtab.on{background:var(--livebg);color:var(--live);font-weight:500}
+
+/* 顶栏状态条：压低，不抢主体 */
+.mon-bar{background:color-mix(in srgb, var(--panel) 98%, var(--bg));
+  border-bottom:1px solid var(--line)}
+
+/* ══ 实时监控台（监控视图）══════════════════════════════
+   设计原则：动效必须编码信息，不做纯装饰。
+   · 模块条变长 = 加载耗时
+   · 命中时热力条闪点 = 这里被打过
+   · 新事件滑入 + 高亮消退 = 时间在往前走
+*/
+body.live-mode .insp{display:none}
+/* (4) 实时监控台监控的是「进程」，顶部的 so 地址热力条与它无关，隐藏避免误导 */
+body.live-mode .heatwrap{display:none}
+/* 实时监控台自己就是事件流，底部那条重复了，隐藏 */
+body.live-mode .events{display:none}
+
+.live{display:grid;grid-template-columns:minmax(0,1.05fr) minmax(0,1fr);
+  height:100%;min-width:0}
+.live-l{border-right:1px solid var(--line);overflow-y:auto;padding:0 0 8px}
+.live-r{overflow-y:auto;padding:0 0 8px;min-width:0}
+.lcard{border-bottom:1px solid var(--line2);padding:8px 11px}
+.lcard-hd{display:flex;align-items:center;gap:6px;font-size:11px;letter-spacing:.1em;
+  text-transform:uppercase;color:var(--fg3);margin-bottom:7px}
+.lcard-hd b{margin-left:auto;font-family:var(--mono);font-size:11px;font-weight:400;
+  letter-spacing:0;color:var(--fg3);text-transform:none}
+
+/* 状态灯 */
+.dotg{width:6px;height:6px;border-radius:50%;flex:0 0 6px;display:inline-block}
+.dotg.on{background:var(--ok);box-shadow:0 0 0 3px rgba(21,128,61,.16)}
+.dotg.idle{background:var(--fg4)}
+.dotg.warn{background:var(--warn);box-shadow:0 0 0 3px rgba(180,83,9,.16)}
+.dotg.live{background:var(--live);animation:bpulse 1.6s infinite}
+@keyframes bpulse{0%,100%{box-shadow:0 0 0 0 rgba(37,99,235,.5)}
+  50%{box-shadow:0 0 0 5px rgba(37,99,235,0)}}
+
+/* 设备行 */
+.devrow{display:flex;align-items:center;gap:12px;font-size:11.5px;color:var(--fg2);
+  font-family:var(--mono);flex-wrap:wrap}
+.devrow .k{color:var(--fg3);font-family:var(--sans);font-size:11px}
+.devrow .sep{color:var(--fg3)}
+
+/* 进程卡 */
+.proc{display:flex;align-items:center;gap:8px;height:30px;padding:0 6px;
+  border-radius:3px;cursor:pointer;position:relative}
+.proc:hover{background:var(--line2)}
+.proc.sel{background:var(--livebg);box-shadow:inset 1px 0 0 var(--live)}
+.proc .pn{font-family:var(--mono);font-size:11px;min-width:0;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap;flex:1}
+.proc .pn .sfx{color:var(--fg3)}
+.proc .m{font-family:var(--mono);font-size:11px;color:var(--fg3);width:52px;
+  text-align:right;flex:0 0 52px}
+.proc .m b{color:var(--fg2);font-weight:400}
+.proc .m.hot b{color:var(--live)}
+.proc .m.cold{color:var(--fg3)}
+.proc .act{opacity:0;font-size:11px;color:var(--live);border:1px solid var(--live);
+  border-radius:2px;padding:0 4px;transition:opacity .12s}
+.proc:hover .act{opacity:1}
+
+/* 模块加载条 */
+.modrow{display:flex;align-items:center;gap:7px;height:19px;font-size:11px}
+.modrow .mn{font-family:var(--mono);color:var(--fg2);width:118px;flex:0 0 118px;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.modrow .track{flex:1;height:5px;background:var(--line2);border-radius:2px;
+  overflow:hidden;display:block}
+/* (4) 第四次修改：<i> 默认 inline，宽高不生效，条子永远是空的 → 强制 block */
+.modrow .fillb{display:block;height:100%;background:var(--hot3);border-radius:2px;
+  transition:width .8s cubic-bezier(.2,.8,.2,1)}
+.modrow .t{font-family:var(--mono);font-size:11px;color:var(--fg3);width:44px;
+  text-align:right;flex:0 0 44px}
+
+/* hook 徽章 */
+.hooks{display:flex;flex-wrap:wrap;gap:4px;position:relative}
+.hk{font-family:var(--mono);font-size:11px;padding:1px 4px;border-radius:2px;
+  border:1px solid var(--line);color:var(--fg2);display:inline-flex;
+  align-items:center;gap:3px;white-space:nowrap}
+.hk i{width:4px;height:4px;border-radius:50%;background:var(--ok);display:block}
+.hk.hit{border-color:var(--ok);color:var(--ok);background:rgba(21,128,61,.06)}
+.hk.sens{border-color:var(--warn);color:var(--warn)}
+
+/* AI 任务 */
+.task{border:1px solid var(--line);border-radius:3px;padding:7px 9px;margin-bottom:6px}
+.task.act{border-color:var(--live);background:var(--livebg)}
+.task .tt{display:flex;align-items:center;gap:6px;font-family:var(--mono);font-size:11.5px}
+.task .tt .nm{color:var(--fg)}
+.task .tt .pct{margin-left:auto;font-size:11px;color:var(--live)}
+.task .pb{height:3px;background:var(--line2);border-radius:2px;margin-top:6px;overflow:hidden}
+.task .pb i{display:block;height:100%;background:var(--live);border-radius:2px;
+  transition:width .35s ease}
+.task .sub{font-size:11px;color:var(--fg3);margin-top:4px;font-family:var(--mono)}
+
+/* 发现 */
+.find{border-left:1px solid var(--line);padding:5px 0 6px 9px;margin-bottom:7px;
+  transition:border-color .2s}
+.find:hover{border-left-color:var(--live)}
+.find .ft{font-size:11px;color:var(--fg);line-height:1.5}
+.find .ft b{font-family:var(--mono);background:var(--line2);padding:0 3px;border-radius:2px}
+.find .fm{display:flex;align-items:center;gap:6px;margin-top:4px;flex-wrap:wrap}
+.find .ev{font-family:var(--mono);font-size:11px;color:var(--fg3);border:1px solid var(--line);
+  padding:0 4px;border-radius:2px}
+.find .go{font-size:11px;color:var(--live);border:1px solid var(--live);
+  padding:0 5px;border-radius:2px;cursor:pointer}
+.find .go:hover{background:var(--livebg)}
+.find .go.ghost{color:var(--fg3);border-color:var(--line)}
+.find .go.ghost:hover{color:var(--fg);border-color:var(--fg3);background:none}
+
+/* 建议 */
+.adv{display:flex;align-items:flex-start;gap:6px;font-size:11.5px;color:var(--fg2);
+  padding:3px 0;line-height:1.5}
+.adv .n{color:var(--fg3);font-family:var(--mono);font-size:11px;flex:0 0 12px}
+
+/* 实时指标瓦片 */
+.metrics{display:grid;grid-template-columns:1fr 1fr;gap:6px}
+.mt{border:1px solid var(--line);border-radius:3px;padding:6px 8px;background:var(--panel)}
+.mt .lb{font-size:11px;color:var(--fg3);letter-spacing:.06em}
+.mt .vv{font-family:var(--mono);font-size:17px;color:var(--fg);line-height:1.15;
+  margin-top:2px;display:flex;align-items:baseline;gap:4px}
+.mt .vv small{font-size:11px;color:var(--fg3);font-weight:400}
+.mt .vv .up{font-size:11px;color:var(--ok)}
+.mt .bars{display:flex;align-items:flex-end;gap:1px;height:16px;margin-top:3px}
+.mt .bars i{flex:1;background:var(--hot3);border-radius:1px;min-height:1px;
+  transition:height .35s ease;opacity:.75}
+.mt.acc .vv{color:var(--live)}
+
+/* AI 操作流水 */
+.feed{font-family:var(--mono);font-size:11px}
+.feed .fr{display:flex;align-items:center;gap:6px;height:19px;color:var(--fg2)}
+.feed .fr:hover{background:var(--line2)}
+.feed .fr .tm{color:var(--fg3);width:56px;flex:0 0 56px;font-size:11px}
+.feed .fr .tl{color:var(--fg)}
+.feed .fr .ok{margin-left:auto;color:var(--ok);font-size:11px}
+.feed .fr .ms{margin-left:auto;color:var(--fg3);font-size:11px}
+
+/* ══ AI 操作特效层 ══
+   设计原则：每道特效都要回答「AI 对谁做了什么」。
+   · 因果连线：目标 → 这次调用产生的记录（谁被操作了）
+   · 目标 ping：被作用的条目闪一下（作用到了）
+   · 通电序列：一次挂 N 个 hook 逐个亮（挂载是过程，不是瞬间）
+   · 冻结脉冲：断点命中时目标短暂失活（进程真的被暂停了）
+   ─────────────────────────────────────── */
+.live2{position:relative}
+.fx{position:absolute;inset:0;pointer-events:none;z-index:9;overflow:visible}
+.fx path{stroke:var(--live);stroke-width:2;fill:none;opacity:0}
+.fx path.go{animation:fxline .9s cubic-bezier(.3,.7,.3,1) forwards}
+@keyframes fxline{
+  0%{opacity:0;stroke-dasharray:6 400;stroke-dashoffset:400}
+  18%{opacity:.95}
+  70%{opacity:.55}
+  100%{opacity:0;stroke-dasharray:6 400;stroke-dashoffset:0}
+}
+.fx circle{fill:var(--live);opacity:0}
+.fx circle.go{animation:fxdur 1s ease-out forwards}
+@keyframes fxdur{0%{opacity:0}12%{opacity:1}100%{opacity:0}}
+
+.ping{animation:pingit .85s ease-out}
+@keyframes pingit{
+  0%{box-shadow:inset 0 0 0 1px var(--live),0 0 0 0 rgba(37,99,235,.45)}
+  40%{box-shadow:inset 0 0 0 1px var(--live),0 0 0 7px rgba(37,99,235,0)}
+  100%{box-shadow:none}
+}
+.hk.ping{animation:hkping .9s ease-out}
+@keyframes hkping{
+  0%{border-color:var(--live);color:var(--live);transform:scale(1)}
+  30%{transform:scale(1.14);box-shadow:0 0 0 5px rgba(37,99,235,.28)}
+  100%{transform:scale(1);box-shadow:none}
+}
+.hk.poweron{animation:power .55s ease-out}
+@keyframes power{
+  0%{background:transparent;border-color:var(--line)}
+  35%{background:rgba(21,128,61,.22);border-color:var(--ok);color:var(--ok)}
+  100%{background:rgba(21,128,61,.06);border-color:var(--ok);color:var(--ok)}
+}
+/* 目标上的浮动标签：直接写出「刚才 AI 对它做了什么」
+   ——比一条 5px 的连线有用得多 */
+/* 目标行的活动指示：一个 5px 圆点 + 原生 title，绝不遮挡正文 */
+.fxdot{position:absolute;right:-3px;top:-3px;width:6px;height:6px;
+  border-radius:50%;background:var(--live);pointer-events:none;
+  box-shadow:0 0 0 2px var(--panel),0 0 0 3px color-mix(in srgb, var(--live) 40%, transparent);
+  animation:fxdotpulse .9s var(--ease-out) forwards}
+@keyframes fxdotpulse{
+  0%{opacity:0;transform:scale(.4)}
+  25%{opacity:1;transform:scale(1.35)}
+  100%{opacity:0;transform:scale(.9)}
+}
+/* 旧浮动标签样式保留但不再使用 */
+.fxtag{display:none}
+.fxtag{position:absolute;z-index:12;pointer-events:none;
+  font-family:var(--mono);font-size:10px;color:#fff;background:var(--live);
+  padding:1px 6px;border-radius:3px;white-space:nowrap;max-width:150px;
+  overflow:hidden;text-overflow:ellipsis;
+  box-shadow:0 2px 8px rgba(37,99,235,.35);
+  animation:tagdrift 1.2s var(--ease-out) forwards}
+@keyframes tagdrift{
+  0%{opacity:0;transform:translateX(-100%) translateY(3px)}
+  18%{opacity:1;transform:translateX(-100%) translateY(0)}
+  72%{opacity:.95;transform:translateX(-100%) translateY(-3px)}
+  100%{opacity:0;transform:translateX(-100%) translateY(-10px)}
+}
+/* 待命标记：不是一闪而过，而是「持续盯着」的状态
+   （perf_watch / 断点 / hook 装好之后，目标会一直带着这个标记） */
+.armed{position:relative;overflow:hidden}
+.armed::after{
+  content:"";position:absolute;left:0;right:0;top:0;height:100%;
+  background:repeating-linear-gradient(90deg,
+    transparent 0 6px, rgba(37,99,235,.13) 6px 7px);
+  pointer-events:none;animation:armedsweep 2.2s linear infinite;
+}
+@keyframes armedsweep{from{background-position:0 0}to{background-position:14px 0}}
+/* (11) 第十一次修改：原来绝对定位在行内右上，直接压住了进程名。
+   改成挂在行**下方**的新行上——不覆盖任何内容，多目标也能叠加。 */
+.armtag{display:block;font-family:var(--mono);font-size:11px;line-height:13px;
+  color:var(--live);padding:0 0 0 13px;pointer-events:none;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%}
+.armed{overflow:visible}
+
+.freeze-pulse{animation:frz .34s ease-out}
+@keyframes frz{
+  0%{filter:none}
+  30%{filter:grayscale(.55) brightness(.94)}
+  100%{filter:none}
+}
+.strobe{animation:stb 1.1s linear infinite}
+@keyframes stb{0%,100%{opacity:.35}50%{opacity:1}}
+
+/* ══ 工具被调用时的特效 ══
+   一条调用发生时，工具清单里对应的那一行要有反应：
+   · 呼吸高亮：这个工具「活着」
+   · 扫描光带：从左到右掠过（调用的进行感）
+   · 计数跳动：数字弹一下
+   · 从工具行 → 事件流 的连线（调用流向）
+   ─────────────────────────────────────── */
+.tvrow.busy{
+  background:var(--livebg);
+  animation:tvbusy 1.15s cubic-bezier(.3,.7,.3,1);
+  position:relative;overflow:hidden;
+}
+@keyframes tvbusy{
+  0%{box-shadow:inset 0 0 0 0 rgba(37,99,235,.9)}
+  25%{box-shadow:inset 0 0 0 1px var(--live),inset 0 0 22px rgba(37,99,235,.30)}
+  100%{box-shadow:inset 0 0 0 0 rgba(37,99,235,0)}
+}
+.tvrow.busy::after{
+  content:"";position:absolute;top:0;bottom:0;left:-40%;width:40%;
+  background:linear-gradient(90deg,transparent,rgba(37,99,235,.30),transparent);
+  animation:tvsweep 1s ease-out;
+  pointer-events:none;
+}
+@keyframes tvsweep{from{left:-40%}to{left:100%}}
+
+/* 计数跳动 */
+.tvrow .tl.pop{animation:popnum .6s cubic-bezier(.2,.8,.2,1);color:var(--live)}
+@keyframes popnum{
+  0%{transform:scale(1)}
+  35%{transform:scale(1.55);color:var(--live)}
+  100%{transform:scale(1)}
+}
+
+/* 工具名闪色 */
+.tvrow.busy .tn{color:var(--live);font-weight:600}
+.tvrow.busy .tc{box-shadow:0 0 0 1px currentColor}
+
+/* 事件流那一行也标出来源工具 */
+.sr.fromTool{border-left-color:var(--live)}
+
+/* ══ 工具页（102 个 MCP 工具清单）══ */
+.toolsview{display:flex;flex-direction:column;flex:1 1 auto;min-height:0;height:100%}
+.tv-bar{flex:0 0 32px;display:flex;align-items:center;gap:9px;padding:0 10px;
+  border-bottom:1px solid var(--line)}
+.tv-search{flex:0 0 300px;height:22px;background:transparent;
+  border:1px solid var(--line);border-radius:3px;color:var(--fg);
+  padding:0 8px;font-size:11px;font-family:var(--mono);outline:none}
+.tv-search:focus{border-color:var(--live)}
+.tv-count{font-family:var(--mono);font-size:11px;color:var(--live)}
+.tv-hint{font-size:11px;color:var(--fg3)}
+.tv-body{flex:1 1 auto;display:grid;grid-template-columns:minmax(0,1fr) 320px;
+  min-height:0;overflow:hidden}
+.tv-list{overflow-y:auto;overflow-x:hidden;border-right:1px solid var(--line);
+  min-height:0;min-width:0}
+.tvrow{display:flex;align-items:center;gap:8px;height:24px;flex:0 0 24px;
+  padding:0 9px;cursor:pointer;border-left:1px solid transparent;
+  width:100%;box-sizing:border-box}
+.tvrow:hover{background:var(--line2)}
+.tvrow.sel{background:var(--livebg);border-left-color:var(--live);
+  box-shadow:inset 0 1px 0 color-mix(in srgb, var(--live) 18%, transparent),
+             inset 0 -1px 0 color-mix(in srgb, var(--live) 18%, transparent)}
+.tvrow .tn{font-family:var(--mono);font-size:11px;color:var(--fg);
+  width:200px;flex:0 0 200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tvrow .tc{font-size:11px;padding:0 4px;border-radius:2px;flex:0 0 auto;letter-spacing:.03em}
+.tvrow .td{font-size:11px;color:var(--fg3);overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap;min-width:0;flex:1}
+.tvrow .tl{margin-left:auto;font-family:var(--mono);font-size:11px;
+  color:var(--fg3);flex:0 0 auto}
+.tvrow .tl.has{color:var(--live)}
+.tv-detail{overflow-y:auto;padding:0 0 8px;min-height:0;min-width:0}
+.tvd-hd{font-family:var(--mono);font-size:12.5px;font-weight:600;
+  padding:9px 10px 6px;color:var(--fg);word-break:break-all}
+.tvd-sec{font-size:11px;letter-spacing:.1em;text-transform:uppercase;
+  color:var(--fg3);padding:7px 10px 3px}
+.tvd-desc{font-size:11.5px;color:var(--fg2);padding:0 10px;line-height:1.6}
+.tvd-params{padding:0 10px 6px;display:flex;flex-wrap:wrap;gap:4px}
+.par{font-family:var(--mono);font-size:11px;padding:1px 5px;border-radius:2px;
+  border:1px solid var(--line);color:var(--fg2)}
+.tvd-last{padding:0 10px}
+.lcbox{background:var(--line2);border-radius:2px;padding:5px 7px;font-family:var(--mono);
+  font-size:11px;color:var(--fg2);line-height:1.5;word-break:break-word}
+
+/* ══ 监控台 v2 ══ */
+.modlist{padding:0 6px}
+.mr{display:flex;align-items:center;gap:6px;height:17px;font-family:var(--mono);font-size:11px}
+.mr .mn{color:var(--fg2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
+.mr .mt2{color:var(--fg3);font-size:11px;flex:0 0 auto}
+.live2{display:flex;flex-direction:column;flex:1 1 auto;min-height:0;height:100%}
+.mon-bar{flex:0 0 30px;display:flex;align-items:center;gap:9px;padding:0 10px;
+  border-bottom:1px solid var(--line);font-size:11.5px;background:var(--panel)}
+.mon-t{color:var(--fg);font-weight:600;letter-spacing:.02em}
+.mon-tgt{font-family:var(--mono);color:var(--fg2);font-size:11.5px}
+.mon-tgt b{color:var(--fg3);font-weight:400}
+.mon-sep{color:var(--fg3)}
+.mon-epm{color:var(--fg3);font-size:11px}
+.mon-epm b{font-family:var(--mono);color:var(--live);font-weight:600}
+.mon-warn{font-size:11px;color:var(--warn);border:1px solid var(--warn);
+  padding:1px 5px;border-radius:2px}
+
+.mon-body{flex:1;display:grid;grid-template-columns:214px minmax(0,1fr) 288px;
+  min-height:0}
+/* (8) 第八次修改：栅格子项默认 min-height:auto，内容会撑破行高，
+   事件流最后一行压到下面的泳道上。全部显式约束。 */
+.mon-left{border-right:1px solid var(--line);overflow-y:auto;padding:6px 4px;
+  min-height:0;overflow-x:hidden}
+.mon-hd{font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--fg3);
+  padding:2px 6px 5px}
+/* (5) 第五次修改：196px 宽放不下「名字 + 两个数字」，进程名被截成 ":..."。
+   改成两行：上行名字（可省略），下行指标。 */
+.mon-left .proc{min-height:34px;height:auto;align-items:flex-start;
+  flex-direction:column;justify-content:center;gap:1px;padding:3px 6px}
+.mon-left .proc .pn{font-size:11.5px;width:100%;flex:none;padding-left:13px}
+.mon-left .proc .metrics{display:flex;gap:8px;font-family:var(--mono);font-size:11px;
+  color:var(--fg3);padding-left:13px}
+.mon-left .proc .metrics b{font-weight:400;color:var(--fg2)}
+.mon-left .proc .metrics b.hot{color:var(--live)}
+.mon-left .proc .dotg{position:absolute;left:6px;top:10px}
+.mon-left .proc{position:relative}
+.mon-left .proc .act{position:absolute;right:5px;top:8px}
+
+.mon-mid{display:flex;flex-direction:column;min-width:0;min-height:0;
+  overflow:hidden;border-right:1px solid var(--line)}
+.mon-filter{flex:0 0 28px;display:flex;align-items:center;gap:2px;padding:0 7px;
+  border-bottom:1px solid var(--line2)}
+.evstream{flex:1;min-height:0;overflow-y:auto;overflow-x:hidden;
+  font-family:var(--mono);font-size:11.5px}
+
+/* 统一流的一行 */
+.sr{display:flex;align-items:center;gap:8px;height:22px;padding:0 8px;
+  white-space:nowrap;cursor:pointer;border-left:1px solid transparent;
+  animation:srin .25s cubic-bezier(.2,.8,.2,1)}
+@keyframes srin{from{opacity:0;transform:translateY(-6px)}to{opacity:1;transform:none}}
+.sr:hover{background:var(--line2)}
+.sr.sel{background:var(--livebg);border-left-color:var(--live)}
+/* 选中态里的次要文字要在淡蓝底上仍 ≥4.5:1 */
+.sr.sel .t,.sr.sel .m{color:#5f5f68}
+.sr.sel .tp{color:var(--live);background:#dbeafe}
+.sr .t{width:74px;flex:0 0 74px;color:var(--fg3);font-size:11px}
+.sr .tp{width:64px;flex:0 0 64px;font-size:10px;text-align:center;
+  padding:1px 4px;border-radius:2px;letter-spacing:.02em;
+  overflow:hidden;white-space:nowrap}
+.sr .tx{color:var(--fg2);overflow:hidden;text-overflow:ellipsis;min-width:0;flex:1}
+.sr .tx em{color:var(--fg);font-style:normal}
+.sr .tx b{color:var(--live);font-weight:400}
+.sr .tn{color:var(--fg);font-weight:600}
+.sr .m{margin-left:auto;color:var(--fg3);font-size:11px;flex:0 0 auto}
+.sr.tool{background:rgba(37,99,235,.03)}
+.sr.tool .tx{color:var(--fg)}
+.tp.tool{color:var(--live);background:var(--livebg)}
+.tp.crypto{color:#7c3aed;background:rgba(124,58,237,.1)}
+.tp.vm{color:var(--live);background:var(--livebg)}
+.tp.bp{color:var(--err);background:rgba(185,28,28,.09)}
+.tp.file{color:var(--ok);background:rgba(21,128,61,.09)}
+.tp.proc{color:var(--warn);background:rgba(180,83,9,.1)}
+
+/* 详情 */
+.mon-right{overflow-y:auto;padding:0 0 8px;min-height:0}
+#detail{padding:6px 10px}
+.det-none{color:var(--fg3);font-size:11.5px;padding:10px 0}
+.det-hd{font-family:var(--mono);font-size:11.5px;font-weight:600;color:var(--fg);
+  word-break:break-all;line-height:1.4}
+.det-sub{font-size:11px;color:var(--fg3);margin-top:3px;font-family:var(--mono)}
+.ask{font-size:11px;color:#fff;background:#2563eb;border:1px solid #2563eb;
+  padding:1px 7px;border-radius:2px;cursor:pointer}
+.ask:hover{opacity:.85}
+.det-sec{font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--fg3);
+  margin:9px 0 3px}
+.det-json{font-family:var(--mono);font-size:11px;color:var(--fg2);
+  background:var(--line2);border-radius:2px;padding:5px 7px;white-space:pre-wrap;
+  word-break:break-word;overflow-wrap:anywhere;line-height:1.5;
+  max-height:210px;overflow:auto}
+
+/* 泳道瀑布 */
+/* 活动密度：这是测量数据，不是装饰（每条泳道右端给出真实计数） */
+.lanes{flex:0 0 108px;border-top:1px solid var(--line);padding:6px 12px 7px;
+  background:var(--panel)}
+.lanes-hd{display:flex;align-items:center;gap:8px;font-size:11px;
+  letter-spacing:.09em;text-transform:uppercase;color:var(--fg3);margin-bottom:4px}
+.lanes-hd .span{margin-left:auto;font-family:var(--mono);font-size:11px;
+  letter-spacing:0;text-transform:none;color:var(--fg3)}
+.lane{display:flex;align-items:center;gap:7px;height:15px}
+.lane .nm{width:62px;flex:0 0 62px;font-family:var(--mono);font-size:11px;
+  color:var(--fg3);text-align:right}
+.lane .cnt{width:26px;flex:0 0 26px;font-family:var(--mono);font-size:11px;
+  color:var(--fg3);text-align:right;font-variant-numeric:tabular-nums}
+.lane .cnt.has{color:var(--fg2)}
+.lane .tr{flex:1;display:flex;align-items:flex-end;gap:1px;height:12px}
+.lane .tr i{flex:1;min-height:1px;border-radius:1px;transition:height .3s ease}
+.lane.static   .tr i{background:var(--fg3)}
+.lane.vm       .tr i{background:var(--live)}
+.lane.bp       .tr i{background:var(--err)}
+.lane.proc     .tr i{background:var(--warn)}
+.lane.behavior .tr i{background:var(--ok)}
+.lane.mem      .tr i{background:#c2410c}
+
+/* 事件流增强：sparkline + 滑入 */
+.evhd-spark{margin-left:10px;display:flex;align-items:flex-end;gap:1px;height:14px}
+.evhd-spark i{width:2px;background:var(--fg4);border-radius:1px;transition:height .3s}
+.evrow{animation:rowin .28s cubic-bezier(.2,.8,.2,1)}
+@keyframes rowin{from{opacity:0;transform:translateY(-5px)}to{opacity:1;transform:none}}
+.evrow.fresh{background:var(--livebg);animation:rowin .28s cubic-bezier(.2,.8,.2,1),fadebg 1.6s ease forwards}
+@keyframes fadebg{from{background:var(--livebg)}to{background:transparent}}
+
+
+/* ── 顶栏 ── */
+.topbar{height:38px;flex:0 0 38px;display:flex;align-items:center;gap:10px;
+  padding:0 10px;border-bottom:1px solid var(--line);background:var(--panel)}
+.brand{display:flex;align-items:center;gap:6px;font-weight:600;letter-spacing:.02em}
+.brand .mark{width:11px;height:11px;border:1.6px solid var(--fg);display:block;position:relative}
+.brand .mark::after{content:"";position:absolute;inset:2.5px;background:var(--live)}
+.brand small{font-weight:400;color:var(--fg3);font-size:11px;letter-spacing:.04em}
+
+.modtabs{display:flex;align-items:center;gap:3px;margin-left:6px}
+.modtab{display:flex;align-items:center;gap:7px;height:24px;padding:0 8px;
+  border:1px solid transparent;border-radius:3px;color:var(--fg2);font-size:11.5px;
+  max-width:200px}
+.modtab:hover{background:var(--line2)}
+.modtab.on{background:var(--livebg);border-color:var(--live);color:var(--fg)}
+.modtab .nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.modtab b{font-family:var(--mono);font-size:11px;color:var(--fg3);font-weight:400}
+.modtab .x{color:var(--fg3);font-size:12px;padding:0 2px;border-radius:2px}
+.modtab .x:hover{color:var(--err);background:rgba(0,0,0,.06)}
+
+.jump{height:24px;width:230px;background:transparent;border:1px solid var(--line);
+  color:var(--fg);padding:0 8px;font-size:11px;font-family:var(--mono);outline:none;border-radius:3px}
+.jump:focus{border-color:var(--live)}
+.tbtn{height:24px;padding:0 9px;border:1px solid var(--line);border-radius:3px;
+  color:var(--fg2);font-size:11px;white-space:nowrap}
+.tbtn:hover{border-color:var(--fg3);color:var(--fg)}
+
+/* ── 主体 ── */
+.body{flex:1;display:flex;min-height:0;padding:6px;gap:6px}
+
+/* 左导航 */
+.nav{width:186px;flex:0 0 186px;background:var(--panel);border:1px solid var(--line);
+  border-radius:4px;overflow-y:auto;padding:4px 0}
+.navgrp{margin-bottom:2px}
+.navhdr{display:flex;align-items:center;gap:5px;height:24px;padding:0 9px;
+  color:var(--fg3);font-size:11px;letter-spacing:.1em;text-transform:uppercase;
+  cursor:pointer;user-select:none}
+.navhdr:hover{color:var(--fg2)}
+.navhdr .car{font-size:11px;transition:transform .15s;display:inline-block}
+.navgrp.fold .navhdr .car{transform:rotate(-90deg)}
+.navgrp.fold .navlist{display:none}
+.navitem{display:flex;align-items:center;gap:7px;width:100%;height:25px;padding:0 9px 0 19px;
+  color:var(--fg2);text-align:left;font-size:11.5px;border-left:1px solid transparent}
+.navitem:hover{background:var(--line2);color:var(--fg)}
+.navitem.on{background:var(--livebg);border-left-color:var(--live);color:var(--fg);font-weight:500}
+.navitem .ic{width:11px;text-align:center;color:var(--fg3);font-size:11px;flex:0 0 11px}
+.navitem b{margin-left:auto;font-family:var(--mono);font-size:11px;
+  color:var(--fg2);font-weight:500}
+.navitem.on b{color:#1e3a8a;font-weight:600}
+.navitem .dot{width:5px;height:5px;border-radius:50%;background:var(--ok);flex:0 0 5px}
+
+/* 主工作区 */
+.work{flex:1;min-width:0;background:var(--panel);border:1px solid var(--line);
+  border-radius:4px;display:flex;flex-direction:column;overflow:hidden}
+.tabbar{height:32px;flex:0 0 32px;display:flex;align-items:stretch;gap:0;
+  border-bottom:1px solid var(--line);padding:0 6px}
+.wtab{display:flex;align-items:center;gap:6px;padding:0 11px;color:var(--fg2);
+  font-size:11.5px;border-bottom:2px solid transparent;margin-bottom:-1px}
+.wtab:hover{color:var(--fg)}
+.wtab.on{color:var(--fg);border-bottom-color:var(--live);font-weight:500}
+.wtab b{font-family:var(--mono);font-size:11px;color:var(--fg3);font-weight:400}
+.wtab.on b{color:var(--live)}
+.workopts{margin-left:auto;display:flex;align-items:center;gap:6px;padding-right:6px}
+.mini{height:20px;padding:0 7px;border:1px solid var(--line);border-radius:3px;
+  color:var(--fg3);font-size:11px}
+.mini:hover{color:var(--fg);border-color:var(--fg3)}
+.mini.on{color:var(--live);border-color:var(--live);background:var(--livebg)}
+
+/* 热力条 */
+.heatwrap{flex:0 0 auto;border-bottom:1px solid var(--line);padding:5px 8px 4px;background:var(--panel)}
+.heat{position:relative;height:34px;display:flex;gap:1px;cursor:crosshair;
+  border:1px solid var(--line2);border-radius:2px;overflow:hidden}
+.hseg{position:relative;height:100%;background:var(--hot1)}
+.hseg .fill{position:absolute;inset:0;opacity:.85}
+.hseg span{position:absolute;left:3px;bottom:1px;font-family:var(--mono);font-size:11px;
+  color:var(--fg2);letter-spacing:.02em;pointer-events:none;
+  text-shadow:0 0 3px var(--panel),0 0 3px var(--panel)}
+.heat .cursorln{position:absolute;top:0;bottom:0;width:1px;background:var(--live);
+  pointer-events:none;display:none}
+.heat:hover .cursorln{display:block}
+.heat-legend{display:flex;align-items:center;gap:10px;margin-top:4px;
+  font-size:11px;color:var(--fg3)}
+.heat-legend i{display:inline-block;width:9px;height:7px;margin-right:3px;vertical-align:0}
+.heat-legend .r{margin-left:auto;font-family:var(--mono)}
+
+/* 代码区 */
+.content{flex:1;overflow:auto;min-height:0;display:flex;flex-direction:column}
+.listing{font-family:var(--mono);font-size:11.5px}
+.fnhdr{display:flex;align-items:center;gap:8px;height:26px;padding:0 8px;
+  background:var(--line2);border-top:1px solid var(--line);border-bottom:1px solid var(--line);
+  color:var(--fg);cursor:pointer;position:sticky;top:0;z-index:2}
+.fnhdr.exp{border-left:1px solid var(--live)}
+.fnhdr:hover{background:var(--livebg)}
+.fnhdr .t{font-size:13px;color:var(--ok);width:9px;text-align:center}
+.fnhdr .n{font-weight:600}
+.fnhdr .tag{font-family:var(--sans);font-size:11px;color:var(--fg3);border:1px solid var(--line);
+  padding:0 4px;border-radius:2px;letter-spacing:.04em}
+.fnhdr .tag.exp{color:var(--ok);border-color:var(--ok)}
+.fnhdr .a{margin-left:auto;color:var(--fg3);font-size:11.5px}
+.ins{display:flex;align-items:center;height:19px;padding:0 8px;color:var(--fg2);white-space:pre}
+.ins:hover{background:var(--line2)}
+.ins.sel{background:var(--livebg);box-shadow:inset 1px 0 0 var(--live)}
+.ins .addr{width:64px;flex:0 0 64px;color:var(--fg3)}
+.ins .by{width:74px;flex:0 0 74px;color:var(--fg3);font-size:11px}
+.ins .mn{width:62px;flex:0 0 62px;color:var(--fg);font-weight:500}
+.ins .op{color:var(--fg2)}
+.ins .cm{margin-left:auto;color:var(--fg3);font-size:11px}
+.ins.br .mn{color:var(--err)}
+.ins.bl .mn{color:var(--live)}
+
+.refs-hd{padding:8px 10px 5px;font-size:11.5px;color:var(--fg3);
+  border-bottom:1px solid var(--line2)}
+.refs-hd b{color:var(--fg);font-family:var(--mono);font-weight:600}
+.refs-note{padding:9px 10px;color:var(--fg3);font-size:11.5px}
+/* 图谱 */
+.graph-hud{position:absolute;left:10px;bottom:8px;font-size:11px;color:var(--fg3)}
+.gnode circle{fill:var(--panel);stroke:var(--fg4);stroke-width:1.2}
+.gnode.root circle{fill:var(--livebg);stroke:var(--live);stroke-width:2}
+.gnode text{font-family:var(--mono);font-size:11px;fill:var(--fg3);pointer-events:none}
+.gnode:hover circle{stroke:var(--live);stroke-width:2}
+/* 时间线 */
+.tlview{display:flex;flex-direction:column;flex:1 1 auto;min-height:0;overflow:hidden}
+.tl-hd{height:26px;flex:0 0 26px;display:flex;align-items:center;padding:0 10px;
+  font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--fg3);
+  border-bottom:1px solid var(--line2)}
+.tl-body{flex:1;overflow:auto;padding:6px 0;font-family:var(--mono);font-size:11px}
+.tlrow{display:flex;align-items:center;gap:8px;height:20px;padding:0 10px}
+.tlrow:hover{background:var(--line2)}
+.tlrow .t{width:74px;flex:0 0 74px;color:var(--fg3);font-size:11px}
+.tlrow .bar{height:8px;border-radius:1px;flex:0 0 auto}
+.tlrow .tx{color:var(--fg2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tlrow .tx em{color:var(--fg);font-style:normal}
+/* 引用页 */
+.refs{padding:2px 0}
+.refrow{display:flex;align-items:center;gap:9px;height:26px;padding:0 10px;font-size:11.5px}
+.refrow:hover{background:var(--line2)}
+.refrow .dir{width:52px;flex:0 0 52px;font-size:11px;letter-spacing:.04em;
+  text-align:center;padding:1px 0;border-radius:2px}
+.refrow .dir.in{color:var(--live);background:var(--livebg)}
+.refrow .dir.out{color:var(--warn);background:rgba(180,83,9,.08)}
+.refrow .fn{font-family:var(--mono);color:var(--fg)}
+.refrow .a{margin-left:auto;font-family:var(--mono);color:var(--fg3);font-size:11.5px}
+.refrow .via{font-size:11px;color:var(--fg3);border:1px solid var(--line);padding:0 4px;border-radius:2px}
+
+/* 图谱页 */
+.graph{display:flex;flex:1 1 auto;min-height:0;align-items:center;justify-content:center;position:relative;
+  background:radial-gradient(circle at 50% 45%,var(--line2) 0%,transparent 62%)}
+.graph svg{width:100%;height:100%}
+.gnode{cursor:pointer}
+.gnode:hover circle{stroke:var(--live);stroke-width:2}
+.gnode:hover text{fill:var(--fg)}
+.gnode text{font-family:var(--mono);font-size:11px;fill:var(--fg3);pointer-events:none}
+.gedge{stroke:var(--fg4);fill:none}
+.gedge.hi{stroke:var(--live);stroke-width:1.6}
+
+/* 右侧检查器 */
+.insp{width:286px;flex:0 0 286px;background:var(--panel);border:1px solid var(--line);
+  border-radius:4px;overflow-y:auto;display:flex;flex-direction:column}
+.insp-hd{padding:9px 10px 8px;border-bottom:1px solid var(--line)}
+.insp-hd .nm{font-family:var(--mono);font-size:12.5px;font-weight:600;
+  word-break:break-all;line-height:1.3}
+.insp-hd .meta{display:flex;align-items:center;gap:7px;margin-top:5px;
+  font-family:var(--mono);font-size:11px;color:var(--fg3)}
+.insp-hd .meta .sep{color:var(--fg3)}
+.badge{font-family:var(--sans);font-size:11px;padding:1px 5px;border-radius:2px;
+  letter-spacing:.04em;border:1px solid}
+.badge.exp{color:var(--ok);border-color:var(--ok)}
+.badge.hot{color:var(--err);border-color:var(--err)}
+.sec{border-bottom:1px solid var(--line2)}
+.sec-hd{display:flex;align-items:center;gap:6px;height:26px;padding:0 10px;
+  font-size:11px;letter-spacing:.09em;text-transform:uppercase;color:var(--fg3);cursor:pointer}
+.sec-hd:hover{color:var(--fg2)}
+.sec-hd b{margin-left:auto;font-family:var(--mono);font-size:11px;
+  color:var(--fg3);font-weight:400;letter-spacing:0}
+.sec-bd{padding:1px 0 6px}
+.kv{display:flex;align-items:baseline;gap:8px;padding:2px 10px;font-size:11px}
+.kv .k{width:56px;flex:0 0 56px;color:var(--fg3);font-size:11.5px}
+.kv .v{font-family:var(--mono);color:var(--fg);word-break:break-all;min-width:0}
+.kv .v.dim{color:var(--fg3)}
+.xref{display:flex;align-items:center;gap:7px;height:23px;padding:0 10px;font-size:11px}
+.xref:hover{background:var(--line2);cursor:pointer}
+.xref .fn{font-family:var(--mono);color:var(--fg2);overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap;min-width:0;flex:1}
+.xref .a{font-family:var(--mono);color:var(--fg3);font-size:11px;flex:0 0 auto}
+.str{display:flex;align-items:center;gap:7px;height:23px;padding:0 10px;font-size:11px}
+.str:hover{background:var(--line2)}
+.str q{font-family:var(--mono);color:var(--warn);quotes:none;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.empty{padding:10px;color:var(--fg3);font-size:11.5px;font-style:normal}
+
+/* 底部事件流 */
+.events{flex:0 0 auto;background:var(--panel);border:1px solid var(--line);
+  border-radius:4px;margin:0 6px 6px;display:flex;flex-direction:column;overflow:hidden;
+  transition:height .12s}
+.ev-hd{height:26px;flex:0 0 26px;display:flex;align-items:center;gap:9px;padding:0 9px;
+  border-bottom:1px solid var(--line);cursor:pointer}
+.ev-hd .ttl{font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--fg3)}
+.ev-hd .live{width:5px;height:5px;border-radius:50%;background:var(--ok);
+  box-shadow:0 0 0 2px rgba(21,128,61,.15);animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+.evhd-tabs{display:flex;gap:2px;margin-left:4px}
+.evtab{padding:1px 7px;border-radius:2px;font-size:11.5px;color:var(--fg3)}
+.evtab.on{background:var(--livebg);color:var(--live)}
+.evtab b{font-family:var(--mono);font-size:11px;margin-left:3px;opacity:.75}
+.evbd{flex:1;overflow:auto;min-height:0;font-family:var(--mono);font-size:11px}
+.evrow{display:flex;align-items:center;gap:9px;height:21px;padding:0 9px;white-space:pre}
+.evrow:hover{background:var(--line2)}
+.evrow .tm{width:70px;flex:0 0 70px;color:var(--fg3);font-size:11px}
+.evrow .cat{width:58px;flex:0 0 58px;font-size:11px;text-align:center;
+  padding:1px 0;border-radius:2px;letter-spacing:.03em}
+.cat.crypto{color:#7c3aed;background:rgba(124,58,237,.09)}
+.cat.file{color:var(--ok);background:rgba(21,128,61,.09)}
+.cat.vm{color:var(--live);background:var(--livebg)}
+.cat.proc{color:var(--warn);background:rgba(180,83,9,.09)}
+.cat.bp{color:var(--err);background:rgba(185,28,28,.08)}
+.evrow .msg{color:var(--fg2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.evrow .msg em{color:var(--fg);font-style:normal}
+.evrow .msg .hl{color:var(--live)}
+.evrow .stk{margin-left:auto;color:var(--fg3);font-size:11px;flex:0 0 auto}
+
+/* 状态栏 */
+.status{height:22px;flex:0 0 22px;display:flex;align-items:center;gap:12px;padding:0 10px;
+  border-top:1px solid var(--line);background:var(--panel);font-size:11px;color:var(--fg3);
+  font-family:var(--mono)}
+.status .k{color:var(--fg3)}
+.status .v{color:var(--fg2)}
+.status .r{margin-left:auto;display:flex;gap:12px;font-family:var(--sans)}
+
+/* 提示条 */
+.note{margin:0 6px 6px;padding:6px 10px;border:1px solid var(--line);
+  border-left:1px solid var(--live);background:var(--livebg);border-radius:3px;
+  font-size:11.5px;color:var(--fg2);line-height:1.5}
+.note b{color:var(--fg)}
+
+
+/* ══ 深色主题覆盖（放最后，确保压过前面的同名规则）══ */
+[data-theme=dark]{
+  --bg:#0b0b0d; --panel:#121215; --line:#26262b; --line2:#1c1c21;
+  --fg:#f4f4f5; --fg2:#c9c9d1; --fg3:#c9c9d1; --fg4:#52525b;
+  --live:#60a5fa; --livebg:#172554; --live-ink:#bfdbfe;
+  --hot1:#1e3a5f; --hot2:#1e40af; --hot3:#3b82f6; --hot4:#93c5fd;
+  --ok:#4ade80; --warn:#fbbf24; --err:#f87171;
+}
+/* 徽章在深色下用不透明底，避免半透明叠色导致对比度不可控 */
+[data-theme=dark] .sr .tp,
+[data-theme=dark] .tvrow .tc{
+  background:#242430 !important;
+  color:#ececf1 !important;
+  border:1px solid #34343f;
+}
+[data-theme=dark] .ask{background:#1d4ed8;border-color:#3b82f6;color:#fff}
+[data-theme=dark] .sr.sel .tp{
+  background:#1e3a8a !important;
+  color:#dbeafe !important;
+}
+
+/* 次要文字在深色底上统一提亮到 ≥4.5:1 */
+[data-theme=dark] .evtab{color:#c9c9d1}
+[data-theme=dark] .evtab.on{color:#dbeafe}
+[data-theme=dark] .tvrow .td{color:#c9c9d1}
+[data-theme=dark] .tvrow .tn{color:#f4f4f5}
+[data-theme=dark] .tvrow .tl{color:#c9c9d1}
+[data-theme=dark] .navitem{color:#c9c9d1}
+[data-theme=dark] .navitem b{color:#c9c9d1}
+[data-theme=dark] .navitem.on b{color:#dbeafe}
+[data-theme=dark] .navhdr{color:#c9c9d1}
+[data-theme=dark] .mon-hd{color:#c9c9d1}
+[data-theme=dark] .modlist .mr .mn{color:#f4f4f5}
+[data-theme=dark] .modlist .mr .mt2{color:#c9c9d1}
+[data-theme=dark] .mon-left .proc .pn{color:#f4f4f5}
+[data-theme=dark] .mon-left .proc .metrics{color:#c9c9d1}
+[data-theme=dark] .mon-left .proc .metrics b{color:#e4e4e7}
+[data-theme=dark] .sr .t{color:#c9c9d1}
+[data-theme=dark] .sr .m{color:#c9c9d1}
+[data-theme=dark] .sr .tx{color:#f4f4f5}
+[data-theme=dark] .sr .tx em{color:#ffffff}
+[data-theme=dark] .sr.sel .t,[data-theme=dark] .sr.sel .m{color:#dbeafe}
+[data-theme=dark] .sr.sel .tx,[data-theme=dark] .sr.sel .tx em{color:#ffffff}
+[data-theme=dark] .det-sub{color:#c9c9d1}
+[data-theme=dark] .det-sec{color:#c9c9d1}
+[data-theme=dark] .tvd-sec{color:#c9c9d1}
+[data-theme=dark] .tvd-desc{color:#e4e4e7}
+[data-theme=dark] .lanes-hd{color:#c9c9d1}
+[data-theme=dark] .lane .nm{color:#c9c9d1}
+[data-theme=dark] .lane .cnt{color:#c9c9d1}
+[data-theme=dark] .mon-tgt{color:#e4e4e7}
+[data-theme=dark] .mon-epm{color:#c9c9d1}
+[data-theme=dark] .status{color:#c9c9d1}
+[data-theme=dark] .evrow .tm{color:#c9c9d1}
+[data-theme=dark] .ins .addr,[data-theme=dark] .ins .by{color:#c9c9d1}
+[data-theme=dark] .ins .cm{color:#c9c9d1}
+[data-theme=dark] .kv .k{color:#c9c9d1}
+[data-theme=dark] .refrow .a{color:#c9c9d1}
+[data-theme=dark] .navitem.on{color:#f4f4f5}
+
+</style>
+</head>
+<body data-theme="light">
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <g id="i-fn"><path d="M4 2h4l2 3v5H6L4 7z"/><path d="M6 7h3"/></g>
+  <g id="i-ref"><path d="M3 9V4a1 1 0 011-1h3"/><path d="M7 1l2 2-2 2"/><path d="M9 7v2H3"/></g>
+  <g id="i-str"><path d="M2 3h8v6H2z"/><path d="M4 5h4M4 7h2"/></g>
+  <g id="i-seg"><path d="M2 2h8v3H2zM2 7h8v3H2z"/></g>
+  <g id="i-graph"><circle cx="3" cy="6" r="1.4"/><circle cx="9" cy="3" r="1.4"/><circle cx="9" cy="9" r="1.4"/><path d="M4.2 5.3L7.8 3.7M4.2 6.7l3.6 1.6"/></g>
+  <g id="i-proc"><rect x="2" y="2.5" width="8" height="7" rx="1"/><path d="M4 5h4M4 7h2"/></g>
+  <g id="i-bp"><circle cx="6" cy="6" r="3.2"/><circle cx="6" cy="6" r="1" fill="currentColor" stroke="none"/></g>
+  <g id="i-hit"><path d="M2 6h2l1.5-3 2 6L9 6h1"/></g>
+  <g id="i-mem"><rect x="2" y="3" width="8" height="6" rx="1"/><path d="M4 3V1.6M8 3V1.6M4 10.4V9M8 10.4V9"/></g>
+  <g id="i-dispatch"><path d="M6 1.5L10 4v4L6 10.5 2 8V4z"/><path d="M6 5v3"/></g>
+  <g id="i-reg"><path d="M2 4h8M2 6h8M2 8h8"/><circle cx="4" cy="4" r="1" fill="currentColor" stroke="none"/><circle cx="7" cy="8" r="1" fill="currentColor" stroke="none"/></g>
+  <g id="i-trace"><path d="M2 8l2-3 2 3 2-5 2 3"/></g>
+  <g id="i-algo"><circle cx="3.5" cy="3.5" r="1.5"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M5 5l2 2M8.5 3v2M3.5 7v2"/></g>
+  <g id="i-file"><path d="M3 1.8h4l2 2v6.4H3z"/><path d="M7 1.8v2h2"/></g>
+  <g id="i-act"><rect x="2" y="2.5" width="8" height="7" rx="1"/><path d="M2 4.5h8"/></g>
+  <g id="i-asset"><path d="M2 4l4-2 4 2v4l-4 2-4-2z"/><path d="M2 4l4 2 4-2M6 6v4"/></g>
+  <g id="i-tool"><path d="M4 2.5l4 4-3 3-4-4zM7.5 6.5L10 9"/></g>
+  <g id="i-code"><path d="M4 3L1.5 6 4 9M8 3l2.5 3L8 9"/></g>
+  <g id="i-monitor"><rect x="1.6" y="2.4" width="8.8" height="6" rx="1"/><path d="M4 10.4h4M6 8.4v2"/></g>
+  <g id="i-timeline"><path d="M2 3h8M2 6h5M2 9h7"/><circle cx="9" cy="6" r="1" fill="currentColor" stroke="none"/></g>
+  <g id="i-play"><path d="M4 2.5l5 3.5-5 3.5z"/></g>
+  <g id="i-pause"><path d="M4 2.5v7M8 2.5v7"/></g>
+  <g id="i-export"><path d="M6 1.6v6M3.5 5.2L6 7.8l2.5-2.6M2 9.4h8"/></g>
+  <g id="i-sun"><circle cx="6" cy="6" r="2.2"/><path d="M6 1v1.4M6 9.6V11M1 6h1.4M9.6 6H11M2.5 2.5l1 1M8.5 8.5l1 1M9.5 2.5l-1 1M3.5 8.5l-1 1"/></g>
+  <g id="i-car"><path d="M6 2.4v5M3.6 5L6 7.6 8.4 5"/></g>
+  <g id="i-x"><path d="M3 3l6 6M9 3l-6 6"/></g>
+  <g id="i-plus"><path d="M6 2.4v7.2M2.4 6h7.2"/></g>
+  <g id="i-search"><circle cx="5.2" cy="5.2" r="3.2"/><path d="M7.6 7.6L10 10"/></g>
+  <g id="i-grid"><rect x="2" y="2" width="3.2" height="3.2"/><rect x="6.8" y="2" width="3.2" height="3.2"/><rect x="2" y="6.8" width="3.2" height="3.2"/><rect x="6.8" y="6.8" width="3.2" height="3.2"/></g>
+  <g id="i-eye"><path d="M1.5 6s1.8-3 4.5-3 4.5 3 4.5 3-1.8 3-4.5 3S1.5 6 1.5 6z"/><circle cx="6" cy="6" r="1.3"/></g>
+</defs></svg>
+
+
+<header class="topbar">
+  <div class="brand"><span class="mark"></span>MDA<small>0.4 · web</small></div>
+  <div class="modtabs">
+    <button class="modtab on"><span class="nm">liblog.so</span><b>111</b><svg class="ic" aria-hidden="true"><use href="#i-x"/></svg></button>
+    <button class="modtab"><span class="nm">libsgmainso</span><b>3007</b><svg class="ic" aria-hidden="true"><use href="#i-x"/></svg></button>
+    <button class="modtab" title="打开 so"><svg class="icic-lg" aria-hidden="true"><use href="#i-plus"/></svg></button>
+  </div>
+  <div class="grow"></div>
+  <input class="jump" placeholder="跳转到地址 / 函数名 / 字符串…">
+  <button class="tbtn" id="themeBtn"><svg class="ic" aria-hidden="true"><use href="#i-sun"/></svg> 深色</button>
+</header>
+
+<div class="body">
+  <!-- 左导航：按能力分组，替代原来只有「日志/观察」两页 -->
+  <nav class="nav">
+    <div class="navgrp">
+      <div class="navhdr"><span class="car">▾</span>静态</div>
+      <div class="navlist">
+        <button class="navitem on"><svg class="ic" aria-hidden="true"><use href="#i-fn"/></svg>代码<b>111</b></button>
+        <button class="navitem"><svg class="ic" aria-hidden="true"><use href="#i-ref"/></svg>引用<b>248</b></button>
+        <button class="navitem"><svg class="ic" aria-hidden="true"><use href="#i-str"/></svg>字符串<b>63</b></button>
+        <button class="navitem"><svg class="ic" aria-hidden="true"><use href="#i-seg"/></svg>段 / 节<b>25</b></button>
+        <button class="navitem"><svg class="ic" aria-hidden="true"><use href="#i-graph"/></svg>图谱</button>
+      </div>
+    </div>
+    <div class="navgrp">
+      <div class="navhdr"><span class="car">▾</span>动态</div>
+      <div class="navlist">
+        <button class="navitem"><svg class="ic" aria-hidden="true"><use href="#i-proc"/></svg>目标进程<b>4</b></button>
+        <button class="navitem"><svg class="ic" aria-hidden="true"><use href="#i-bp"/></svg>断点<b>2</b></button>
+        <button class="navitem"><svg class="ic" aria-hidden="true"><use href="#i-hit"/></svg>命中<b>48</b></button>
+        <button class="navitem"><svg class="ic" aria-hidden="true"><use href="#i-mem"/></svg>内存<b>—</b></button>
+      </div>
+    </div>
+    <div class="navgrp">
+      <div class="navhdr"><span class="car">▾</span>VM</div>
+      <div class="navlist">
+        <button class="navitem"><svg class="ic" aria-hidden="true"><use href="#i-dispatch"/></svg>派发点<b>805</b></button>
+        <button class="navitem"><svg class="ic" aria-hidden="true"><use href="#i-reg"/></svg>寄存器<b>32</b></button>
+        <button class="navitem"><svg class="ic" aria-hidden="true"><use href="#i-trace"/></svg>轨迹<b>199</b></button>
+      </div>
+    </div>
+    <div class="navgrp">
+      <div class="navhdr"><span class="car">▾</span>行为</div>
+      <div class="navlist">
+        <button class="navitem"><span class="dot"></span>算法<b>4</b></button>
+        <button class="navitem"><svg class="ic" aria-hidden="true"><use href="#i-algo"/></svg>文件<b>2</b></button>
+        <button class="navitem"><svg class="ic" aria-hidden="true"><use href="#i-act"/></svg>Activity<b>1</b></button>
+        <button class="navitem"><svg class="ic" aria-hidden="true"><use href="#i-asset"/></svg>assets<b>0</b></button>
+      </div>
+    </div>
+    <div class="navgrp fold">
+      <div class="navhdr"><span class="car">▾</span>工具</div>
+      <div class="navlist">
+        <button class="navitem" id="navTools"><svg class="ic" aria-hidden="true"><use href="#i-tool"/></svg>全部工具<b>102</b></button>
+        <button class="navitem"><svg class="ic" aria-hidden="true"><use href="#i-monitor"/></svg>热力条</button>
+        <button class="navitem"><svg class="ic" aria-hidden="true"><use href="#i-mem"/></svg>内存 diff</button>
+        <button class="navitem"><svg class="ic" aria-hidden="true"><use href="#i-grid"/></svg>模块管理</button>
+      </div>
+    </div>
+  </nav>
+
+  <!-- 主工作区 -->
+  <main class="work">
+    <div class="tabbar">
+      <button class="wtab on">实时<b>●</b></button>
+      <button class="wtab">代码</button>
+      <button class="wtab">引用<b>248</b></button>
+      <button class="wtab">图谱</button>
+      <button class="wtab">时间线<b>199</b></button>
+      <button class="wtab">工具<b>102</b></button>
+      <div class="workopts">
+        <button class="mini on">ARM64</button>
+        <button class="mini">十六进制</button>
+        <button class="mini"><svg class="ic" aria-hidden="true"><use href="#i-grid"/></svg> 全屏</button>
+      </div>
+    </div>
+
+    <!-- 热力条：替代原来的球。位置=地址（真语义），浓淡=引用密度 -->
+    <div class="heatwrap">
+      <div class="heat" id="heat">
+        <div class="cursorln" id="curln"></div>
+      </div>
+      <div class="heat-legend">
+        <span><i style="background:var(--hot1)"></i>冷</span>
+        <span><i style="background:var(--hot2)"></i>温</span>
+        <span><i style="background:var(--hot3)"></i>热</span>
+        <span><i style="background:var(--hot4)"></i>最热</span>
+        <span style="margin-left:8px">
+          <i style="background:var(--hot3);width:2px;height:12px"></i>竖线=当前函数
+        </span>
+        <span class="r" id="heatInfo">0x5000 — 0xdfc0 · 111 函数 · 点击跳转</span>
+      </div>
+    </div>
+
+    <div class="content" id="content">
+
+      <!-- ══ 实时监控台 v2：事件流为主体，不是卡片报表 ══ -->
+      <div class="live2" id="viewLive">
+        <svg class="fx" id="fx"></svg>
+
+        <!-- 顶部状态条 -->
+        <div class="mon-bar">
+          <span class="dotg live"></span>
+          <span class="mon-t">监控中</span>
+          <span class="mon-tgt">com.taobao.idlefish <b>pid 31182</b></span>
+          <span class="mon-sep">·</span>
+          <span class="mon-epm"><b id="epm">0</b> 条/分</span>
+          <span class="mon-sep">·</span>
+          <span class="mon-epm"><b id="toolm">0</b> 次工具调用</span>
+          <span class="grow"></span>
+          <span class="mon-warn">⚠ 前台是 com.petmerge.game，目标在后台</span>
+          <button class="mini" id="pauseBtn"><svg class="ic" aria-hidden="true"><use href="#i-pause"/></svg> 暂停</button>
+          <button class="mini on"><svg class="ic" aria-hidden="true"><use href="#i-eye"/></svg> 自动滚动</button>
+          <button class="mini"><svg class="ic" aria-hidden="true"><use href="#i-export"/></svg> 导出</button>
+        </div>
+
+        <div class="mon-body">
+          <!-- 左：目标（窄条） -->
+          <div class="mon-left">
+            <div class="mon-hd">目标</div>
+            <div class="proc sel">
+              <span class="dotg live"></span>
+              <span class="pn">com.taobao.idlefish</span>
+              <div class="metrics"><span><b class="hot">5</b> inet</span>
+                <span><b>31</b> sock</span></div>
+            </div>
+            <div class="proc">
+              <span class="dotg on"></span>
+              <span class="pn">…:channel</span>
+              <div class="metrics"><span><b class="hot">2</b> inet</span>
+                <span><b>6</b> sock</span></div>
+            </div>
+            <div class="proc">
+              <span class="dotg on"></span>
+              <span class="pn">…:windowChannel</span>
+              <div class="metrics"><span><b class="hot">1</b> inet</span>
+                <span><b>3</b> sock</span></div>
+            </div>
+            <div class="proc">
+              <span class="dotg idle"></span>
+              <span class="pn">…:normal_render_proc0</span>
+              <div class="metrics"><span><b class="cold">0</b> inet</span>
+                <span><b>13</b> sock</span></div>
+            </div>
+            <div class="mon-hd" style="margin-top:10px">模块 <b style="color:var(--fg3);font-weight:400">1495 个</b></div>
+            <div class="modlist">
+              <div class="mr"><span class="mn">libsgmainso</span><span class="mt2">128ms</span></div>
+              <div class="mr"><span class="mn">libtnet</span><span class="mt2">86ms</span></div>
+              <div class="mr"><span class="mn">libc++_shared</span><span class="mt2">54ms</span></div>
+              <div class="mr"><span class="mn">libmtopsdk</span><span class="mt2">31ms</span></div>
+              <div class="mr"><span class="mn">libweex</span><span class="mt2">17ms</span></div>
+              <div class="mr"><span class="mn">libhermes</span><span class="mt2">9ms</span></div>
+            </div>
+
+            <div class="mon-hd" style="margin-top:10px">Hook 7 已挂</div>
+            <div class="hooks" style="padding:0 2px">
+              <span class="hk hit" title="java.security.MessageDigest"><i></i>MessageDigest</span>
+              <span class="hk hit" title="javax.crypto.Cipher"><i></i>Cipher</span>
+              <span class="hk hit" title="javax.crypto.Mac"><i></i>Mac</span>
+              <span class="hk" title="java.io.FileInputStream"><i></i>FileIn</span>
+              <span class="hk" title="java.io.FileOutputStream"><i></i>FileOut</span>
+              <span class="hk" title="android.app.Activity"><i></i>Activity</span>
+              <span class="hk" title="AssetManager.open"><i></i>Assets</span>
+              <span class="hk sens" title="Runtime.exec / ProcessBuilder — 反调试最敏感，默认关">
+                <i style="background:var(--warn)"></i>exec 关</span>
+            </div>
+          </div>
+
+          <!-- 中：事件流（主体） -->
+          <div class="mon-mid">
+            <div class="mon-filter">
+              <button class="evtab on">全部<b id="evAll">0</b></button>
+              <button class="evtab">静态</button>
+              <button class="evtab">运行时</button>
+              <button class="evtab">VM</button>
+              <button class="evtab">行为</button>
+              <button class="evtab">进程</button>
+              <span class="grow"></span>
+              <span style="font-size:11px;color:var(--warn);border:1px solid var(--warn);
+                padding:0 4px;border-radius:2px">演示流</span>
+            </div>
+            <div class="evstream" id="evStream"></div>
+          </div>
+
+          <!-- 右：选中详情 -->
+          <div class="mon-right">
+            <div class="mon-hd">事件详情</div>
+            <div id="detail">
+              <div class="det-none">点左边任意一条，看完整数据</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 底部泳道瀑布：看各类活动的节奏 -->
+        <div class="lanes" id="lanes">
+          <div class="lanes-hd">活动密度
+            <span class="span">最近 40 个采样 · 每格 ≈ 1 次调用</span></div>
+          <div id="laneRows"></div>
+        </div>
+      </div>
+
+      <div class="listing" id="listing" hidden></div>
+
+      <!-- 引用页：调用者 / 被调用 -->
+      <div class="refs" id="viewRefs" hidden>
+        <div class="refs-hd">引用方向 · <b>create_android_logger</b>（真实 xref）</div>
+        <div class="refrow"><span class="dir in">调用者</span><span class="fn">android_log_write_list_begin</span><span class="via">bl</span><span class="a">0x5248</span></div>
+        <div class="refrow"><span class="dir in">调用者</span><span class="fn">android_log_write_list</span><span class="via">bl</span><span class="a">0x570c</span></div>
+        <div class="refrow"><span class="dir in">调用者</span><span class="fn">__android_log_error_write</span><span class="via">bl</span><span class="a">0x5c2c</span></div>
+        <div class="refrow"><span class="dir in">调用者</span><span class="fn">android_logger_open</span><span class="via">bl</span><span class="a">0x5ef0</span></div>
+        <div class="refrow"><span class="dir out">被调用</span><span class="fn">sub_e040</span><span class="via">bl</span><span class="a">0xe040</span></div>
+        <div class="refrow"><span class="dir out">被调用</span><span class="fn">calloc</span><span class="via">plt</span><span class="a">0xdff0</span></div>
+        <div class="refrow"><span class="dir out">被调用</span><span class="fn">__errno</span><span class="via">plt</span><span class="a">0xe040</span></div>
+        <div class="refs-note">共 406 条引用（82 个函数有被引用）。点任意一行跳到那个函数。</div>
+      </div>
+
+      <!-- 图谱页：调用关系（边才是语义） -->
+      <div class="graph" id="viewGraph" hidden>
+        <svg viewBox="0 0 900 460" preserveAspectRatio="xMidYMid meet">
+          <defs>
+            <marker id="ar" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+              <path d="M0,0 L0,6 L7,3 z" fill="var(--fg4)"/>
+            </marker>
+            <marker id="arhi" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+              <path d="M0,0 L0,6 L7,3 z" fill="var(--live)"/>
+            </marker>
+          </defs>
+          <g id="edges"></g>
+          <g id="nodes"></g>
+        </svg>
+        <div class="graph-hud">拖动平移 · 滚轮缩放 · 双击节点展开</div>
+      </div>
+
+      <!-- 工具页：102 个 MCP 工具的可查清单 -->
+      <div class="toolsview" id="viewTools" hidden>
+        <div class="tv-bar">
+          <input class="tv-search" id="tvSearch" placeholder="搜工具名 / 参数 / 描述…">
+          <span class="tv-count" id="tvCount">102 个</span>
+          <span class="tv-hint">点一行看参数与最近调用</span>
+        </div>
+        <div class="tv-body">
+          <div class="tv-list" id="tvList"></div>
+          <div class="tv-detail" id="tvDetail">
+            <div class="det-none">点左边任意一个工具</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 时间线页：VM 轨迹 / 断点命中按时间排开 -->
+      <div class="tlview" id="viewTL" hidden>
+        <div class="tl-hd">时间线 · 一次会话（VM 轨迹 199 条 / 断点 36 次）</div>
+        <div class="tl-body" id="tlBody"></div>
+      </div>
+    </div>
+  </main>
+
+  <!-- 右侧检查器 -->
+  <aside class="insp">
+    <div class="insp-hd">
+      <div class="nm" id="iName">create_android_logger</div>
+      <div class="meta">
+        <span class="badge exp">导出</span>
+        <span id="iAddr">0x5020</span>
+        <span class="sep">·</span>
+        <span id="iSize">80 B</span>
+      </div>
+    </div>
+
+    <div class="sec">
+      <div class="sec-hd">概况</div>
+      <div class="sec-bd">
+        <div class="kv"><span class="k">引用数</span><span class="v" id="iRefs">12</span></div>
+        <div class="kv"><span class="k">调用者</span><span class="v">12 个</span></div>
+        <div class="kv"><span class="k">被调用</span><span class="v">3 个</span></div>
+        <div class="kv"><span class="k">所在段</span><span class="v">.text</span></div>
+        <div class="kv"><span class="k">连接</span><span class="v dim">未附加</span></div>
+      </div>
+    </div>
+
+    <div class="sec">
+      <div class="sec-hd">调用者<b>12</b></div>
+      <div class="sec-bd">
+        <div class="xref"><span class="fn">android_log_write_list_begin</span><span class="a">0x5248</span></div>
+        <div class="xref"><span class="fn">android_log_write_list</span><span class="a">0x570c</span></div>
+        <div class="xref"><span class="fn">__android_log_error_write</span><span class="a">0x5c2c</span></div>
+        <div class="xref"><span class="fn">android_logger_open</span><span class="a">0x5ef0</span></div>
+        <div class="xref" style="color:var(--fg3)"><span class="fn">还有 8 个…</span></div>
+      </div>
+    </div>
+
+    <div class="sec">
+      <div class="sec-hd">被调用<b>3</b></div>
+      <div class="sec-bd">
+        <div class="xref"><span class="fn">sub_e040</span><span class="a">0xe040</span></div>
+        <div class="xref"><span class="fn">calloc</span><span class="a">plt</span></div>
+        <div class="xref"><span class="fn">__errno</span><span class="a">plt</span></div>
+      </div>
+    </div>
+
+    <div class="sec">
+      <div class="sec-hd">引用字符串<b>2</b></div>
+      <div class="sec-bd">
+        <div class="str"><q>"log_id out of range"</q></div>
+        <div class="str"><q>"logger"</q></div>
+      </div>
+    </div>
+
+    <div class="sec">
+      <div class="sec-hd">动态</div>
+      <div class="sec-bd">
+        <div class="kv"><span class="k">断点</span><span class="v dim">未设置</span></div>
+        <div class="kv"><span class="k">命中</span><span class="v dim">0 次</span></div>
+      </div>
+    </div>
+  </aside>
+</div>
+
+<!-- 底部事件流：所有动态产物汇到这里 -->
+<section class="events" id="events" style="height:150px">
+  <div class="ev-hd" id="evHd">
+    <span class="live"></span>
+    <span class="ttl">事件流</span>
+    <div class="evhd-tabs">
+      <button class="evtab on">全部<b>48</b></button>
+      <button class="evtab">算法<b>4</b></button>
+      <button class="evtab">文件<b>2</b></button>
+      <button class="evtab">VM<b>6</b></button>
+      <button class="evtab">断点<b>36</b></button>
+    </div>
+    <div class="evhd-spark" id="spark"></div>
+    <div class="grow"></div>
+    <span style="font-size:11px;color:var(--warn);border:1px solid var(--warn);
+      padding:0 4px;border-radius:2px;margin-right:6px">演示动画</span>
+    <span style="font-size:11px;color:var(--fg3)">暂停 · 清空 · 导出</span>
+    <span style="font-size:11px;color:var(--fg3);margin-left:8px" id="evChev">▾</span>
+  </div>
+  <div class="evbd" id="evBd"></div>
+</section>
+
+<div class="note">
+  <b>这是 HTML 原型，不是生产代码。</b>
+  <b>人在界面上只做「看」和「取证」</b>——分析动作全部在对话侧由 AI 发起。
+  数据真实（liblog.so 函数名/反汇编、闲鱼 4 进程的 socket 与 inet 数、805 派发点）；
+  事件流的<strong>滚动是演示脚本</strong>（没有活跃 hook 会话），但每条的形状与实际广播格式一致。
+</div>
+
+<footer class="status">
+  <span><span class="k">so</span> <span class="v">liblog.so</span></span>
+  <span><span class="k">addr</span> <span class="v" id="sAddr">0x5020</span></span>
+  <span><span class="k">指令</span> <span class="v">80 B</span></span>
+  <span><span class="k">模块</span> <span class="v">2</span></span>
+  <div class="r">
+    <span>静态数据</span><span>ARM64</span><span>111 函数</span>
+  </div>
+</footer>
+
+<script>
+/* ═══════════════════════════════════════════════════════════
+   MDA 界面原型 · 前端逻辑
+
+   数据来源（全部真实）：
+     · FUNCS   ← ELF 解析 liblog.so：111 个函数 + 真实引用数
+     · DISASM  ← /api/disasm 真实返回
+     · TOOLS   ← server.list_tools()：102 个工具（名/描述/参数）
+     · 进程 / 模块 / Hook ← 真机实测
+   事件流的滚动是脚本回放（当前无活跃 hook 会话），但**渲染是通用的**：
+   接真实数据只需把 CALLS 换成 WebSocket 的 {type:"ai", tool, args, ms}。
+   ═══════════════════════════════════════════════════════════ */
+const FUNCS = [
+  {a:0x5000,n:"sub_5000",r:0,e:0},
+  {a:0x5010,n:"sub_5010",r:0,e:0},
+  {a:0x5018,n:"sub_5018",r:0,e:0},
+  {a:0x5020,n:"create_android_logger",r:1,e:1},
+  {a:0x5070,n:"create_android_log_parser",r:2,e:1},
+  {a:0x50e0,n:"android_log_destroy",r:2,e:1},
+  {a:0x5134,n:"android_log_reset",r:1,e:1},
+  {a:0x51c4,n:"android_log_parser_reset",r:2,e:1},
+  {a:0x5248,n:"android_log_write_list_begin",r:0,e:1},
+  {a:0x5304,n:"android_log_write_int32",r:0,e:1},
+  {a:0x5380,n:"android_log_write_int64",r:0,e:1},
+  {a:0x5400,n:"android_log_write_string8_len",r:2,e:1},
+  {a:0x54f8,n:"android_log_write_string8",r:2,e:1},
+  {a:0x55f0,n:"android_log_write_float32",r:0,e:1},
+  {a:0x5670,n:"android_log_write_list_end",r:0,e:1},
+  {a:0x570c,n:"android_log_write_list",r:0,e:1},
+  {a:0x57c0,n:"android_log_write_list_buffer",r:0,e:1},
+  {a:0x582c,n:"android_log_read_next",r:0,e:1},
+  {a:0x5838,n:"sub_5838",r:0,e:0},
+  {a:0x5c2c,n:"__android_log_error_write",r:6,e:1},
+  {a:0x5d10,n:"android_log_id_to_name",r:0,e:1},
+  {a:0x5d30,n:"android_name_to_log_id",r:2,e:1},
+  {a:0x5e48,n:"android_logger_get_id",r:0,e:1},
+  {a:0x5e54,n:"android_logger_list_alloc",r:1,e:1},
+  {a:0x5ea0,n:"android_logger_list_alloc_time",r:1,e:1},
+  {a:0x5ef0,n:"android_logger_open",r:0,e:1},
+  {a:0x5f3c,n:"android_logger_list_open",r:4,e:1},
+  {a:0x5fd4,n:"android_logger_list_free",r:2,e:1},
+  {a:0x6024,n:"android_logger_list_read",r:2,e:1},
+  {a:0x60d0,n:"__android_log_close",r:1,e:1},
+  {a:0x60ec,n:"sub_60ec",r:5,e:0},
+  {a:0x616c,n:"sub_616c",r:4,e:0},
+  {a:0x620c,n:"__android_log_set_default_tag",r:10,e:1},
+  {a:0x63d4,n:"__android_log_set_minimum_priority",r:1,e:1},
+  {a:0x63f8,n:"__android_log_get_minimum_priority",r:0,e:1},
+  {a:0x640c,n:"__android_log_set_logger",r:0,e:1},
+  {a:0x641c,n:"__android_log_default_aborter",r:2,e:1},
+  {a:0x6430,n:"__android_log_set_aborter",r:0,e:1},
+  {a:0x6440,n:"__android_log_call_aborter",r:0,e:1},
+  {a:0x6450,n:"__android_log_stderr_logger",r:7,e:1},
+  {a:0x65a4,n:"__android_log_logd_logger",r:3,e:1},
+  {a:0x664c,n:"sub_664c",r:22,e:0},
+  {a:0x6bf8,n:"__android_log_write",r:4,e:1},
+  {a:0x6ca8,n:"__android_log_buf_write",r:4,e:1},
+  {a:0x6d64,n:"__android_log_write_log_message",r:9,e:1},
+  {a:0x6edc,n:"__android_log_vprint",r:5,e:1},
+  {a:0x6fb8,n:"__android_log_print",r:5,e:1},
+  {a:0x70d8,n:"__android_log_buf_print",r:5,e:1},
+  {a:0x71fc,n:"__android_log_assert",r:8,e:1},
+  {a:0x734c,n:"sub_734c",r:2,e:0},
+  {a:0x73fc,n:"__android_log_bwrite",r:5,e:1},
+  {a:0x74c0,n:"sub_74c0",r:5,e:0},
+  {a:0x7584,n:"sub_7584",r:3,e:0},
+  {a:0x7618,n:"__android_log_btwrite",r:5,e:1},
+  {a:0x76ec,n:"__android_log_bswrite",r:6,e:1},
+  {a:0x77d0,n:"__android_log_security_bswrite",r:4,e:1},
+  {a:0x7884,n:"sub_7884",r:12,e:0},
+  {a:0x7aa8,n:"sub_7aa8",r:4,e:0},
+  {a:0x7b5c,n:"android_log_processLogBuffer",r:1,e:1},
+  {a:0x7cd4,n:"android_log_processBinaryLogBuffer",r:7,e:1},
+  {a:0x7fcc,n:"sub_7fcc",r:5,e:0},
+  {a:0x8d50,n:"__android_log_is_loggable_len",r:2,e:1},
+  {a:0x8dd4,n:"sub_8dd4",r:14,e:0},
+  {a:0x9274,n:"__android_log_is_loggable",r:3,e:1},
+  {a:0x930c,n:"__android_log_is_debuggable",r:3,e:1},
+  {a:0x9374,n:"sub_9374",r:2,e:0},
+  {a:0x93fc,n:"__android_log_security",r:5,e:1},
+  {a:0x94f8,n:"sub_94f8",r:0,e:0},
+  {a:0x9528,n:"sub_9528",r:5,e:0},
+  {a:0x9624,n:"sub_9624",r:9,e:0},
+  {a:0x9828,n:"android_openEventTagMap",r:16,e:1},
+  {a:0x9efc,n:"sub_9efc",r:3,e:0},
+  {a:0xa03c,n:"sub_a03c",r:2,e:0},
+  {a:0xa154,n:"sub_a154",r:2,e:0},
+  {a:0xa26c,n:"sub_a26c",r:2,e:0},
+  {a:0xa48c,n:"sub_a48c",r:1,e:0},
+  {a:0xa574,n:"sub_a574",r:3,e:0},
+  {a:0xa6f4,n:"sub_a6f4",r:3,e:0},
+  {a:0xa844,n:"sub_a844",r:0,e:0},
+  {a:0xabcc,n:"sub_abcc",r:0,e:0},
+  {a:0xacd4,n:"sub_acd4",r:0,e:0},
+  {a:0xae0c,n:"sub_ae0c",r:5,e:0},
+  {a:0xb09c,n:"sub_b09c",r:1,e:0},
+  {a:0xb184,n:"sub_b184",r:4,e:0},
+  {a:0xb384,n:"sub_b384",r:9,e:0},
+  {a:0xb730,n:"sub_b730",r:1,e:0},
+  {a:0xb768,n:"__android_log_pmsg_file_read",r:17,e:1},
+  {a:0xbea0,n:"sub_bea0",r:1,e:0},
+  {a:0xbee0,n:"sub_bee0",r:15,e:0},
+  {a:0xc39c,n:"__android_log_pmsg_file_write",r:7,e:1},
+  {a:0xc5a8,n:"sub_c5a8",r:9,e:0},
+  {a:0xc7ac,n:"sub_c7ac",r:8,e:0},
+  {a:0xc934,n:"android_logger_clear",r:5,e:1},
+  {a:0xca40,n:"android_logger_get_log_size",r:6,e:1},
+  {a:0xcbac,n:"android_logger_get_log_readable_size",r:6,e:1},
+  {a:0xcd18,n:"android_logger_set_log_size",r:5,e:1},
+  {a:0xce34,n:"android_logger_get_log_version",r:0,e:1},
+  {a:0xce40,n:"android_logger_get_statistics",r:1,e:1},
+  {a:0xd0d8,n:"android_logger_get_prune_list",r:1,e:1},
+  {a:0xd138,n:"android_logger_set_prune_list",r:9,e:1},
+  {a:0xd2d8,n:"sub_d2d8",r:11,e:0},
+  {a:0xd848,n:"sub_d848",r:1,e:0},
+  {a:0xd880,n:"sub_d880",r:3,e:0},
+  {a:0xd964,n:"sub_d964",r:13,e:0},
+  {a:0xdd30,n:"sub_dd30",r:6,e:0},
+  {a:0xde60,n:"sub_de60",r:0,e:0},
+  {a:0xde94,n:"sub_de94",r:3,e:0},
+  {a:0xdf30,n:"sub_df30",r:0,e:0},
+  {a:0xdf60,n:"sub_df60",r:0,e:0},
+  {a:0xdf90,n:"sub_df90",r:0,e:0},
+  {a:0xdfc0,n:"sub_dfc0",r:0,e:0},
+];
+
+const DISASM = {
+  0x5020:[
+    ["0x5020","3f2303d5","paciasp",""],
+    ["0x5024","fd7bbea9","stp","x29, x30, [sp, #-0x20]!"],
+    ["0x5028","f44f01a9","stp","x20, x19, [sp, #0x10]"],
+    ["0x502c","fd030091","mov","x29, sp"],
+    ["0x5030","f303002a","mov","w19, w0"],
+    ["0x5034","20008052","mov","w0, #1"],
+    ["0x5038","81088252","mov","w1, #0x1044"],
+    ["0x503c","34008052","mov","w20, #1"],
+    ["0x5040","00240094","bl","#0xe040","→ sub_e040"],
+    ["0x5044","e00000b4","cbz","x0, #0x5060"],
+    ["0x5048","48008052","mov","w8, #2"],
+    ["0x504c","69008052","mov","w9, #3"],
+    ["0x5050","142c00b9","str","w20, [x0, #0x2c]"],
+    ["0x5054","085c00b9","str","w8, [x0, #0x5c]"],
+    ["0x5058","090800b9","str","w9, [x0, #8]"],
+    ["0x505c","130280b9","str","w19, [x0, #0x80]"],
+    ["0x5060","fd7bc2a8","ldp","x29, x30, [sp], #0x20"],
+    ["0x5064","f44f41a9","ldp","x20, x19, [sp, #0x10]"],
+    ["0x5068","c0035fd6","ret",""],
+  ],
+  0x5070:[
+    ["0x5070","3f2303d5","paciasp",""],
+    ["0x5074","fd7bbea9","stp","x29, x30, [sp, #-0x20]!"],
+    ["0x5078","fd030091","mov","x29, sp"],
+    ["0x507c","f40300aa","mov","x20, x0"],
+    ["0x5080","13008052","mov","w19, #0"],
+    ["0x5084","00240094","bl","#0xe040","→ sub_e040"],
+    ["0x5088","800000b4","cbz","x0, #0x5098"],
+    ["0x508c","13008052","mov","w19, #0"],
+    ["0x5090","14008052","mov","w20, #0"],
+    ["0x5094","fd7bc2a8","ldp","x29, x30, [sp], #0x20"],
+    ["0x5098","c0035fd6","ret",""],
+  ],
+};
+
+const EVENTS=[
+  ["12:33:10.114","crypto","MessageDigest.getInstance(\"SHA-256\")","com.miui.systemui.util.Md5.getMd5Digest"],
+  ["12:33:10.115","crypto","digest  in=<em>414243</em> → out=<em>b5d4045c3f46…</em>",""],
+  ["12:33:10.221","vm","派发点 0xA2BB0  命中 idx=<em>43556</em>","prog_base 0x79e1786d30"],
+  ["12:33:10.303","bp","断点命中 <em>android_logger_open</em> @0x5ef0","x0=0x7fa21c40"],
+  ["12:33:10.401","file","open_read  <em>/data/local/tmp/cfg.xml</em>",""],
+  ["12:33:10.518","proc","进程扫描：<em>4</em> 个，<em>3</em> 个在跑网络","主 / :channel / :windowChannel"],
+  ["12:33:10.640","bp","断点命中 <em>android_log_write_list</em> @0x570c","x1=0x3"],
+  ["12:33:10.702","vm","VM 轨迹采集 <em>199</em> 条 / <em>74</em> 个不同 idx","3.0s"],
+  ["12:33:10.815","crypto","Cipher.getInstance(\"AES/CBC/PKCS5Padding\")","com.taobao.x.SignHelper"],
+];
+
+const TOOLS = [
+  {n:"list_plugins", d:"列出已加载插件及用法。写新插件到 plugins/*.py 即自动生效。", p:[]},
+  {n:"plugin_run", d:"执行插件。args 为 JSON 字符串，格式见 list_plugins 的 usage 字段。", p:["name", "args"]},
+  {n:"load_so", d:"加载一个 so 文件到分析会话。path 为绝对路径。", p:["path"]},
+  {n:"list_modules", d:"列出当前会话已加载的全部 so 及概况。", p:[]},
+  {n:"list_functions", d:"列出某 so 的函数。keyword 过滤函数名（大小写不敏感）。", p:["so_name", "keyword", "limit"]},
+  {n:"disassemble", d:"反汇编指定地址。addr 为静态虚拟地址（十进制）。", p:["so_name", "addr", "size"]},
+  {n:"decompile", d:"输出函数的结构化伪代码（非真反编译，控制流归类）。addr 为函数入口。", p:["so_name", "addr"]},
+  {n:"xrefs_to", d:"查询谁引用了 addr（调用点 + 数据引用点）。", p:["so_name", "addr"]},
+  {n:"xrefs_from", d:"查询某函数发出了哪些引用（IDA 的 xrefs from）。", p:["so_name", "addr"]},
+  {n:"imports", d:"导入符号表。keyword 过滤符号名。", p:["so_name", "keyword", "limit"]},
+  {n:"exports", d:"导出符号表。keyword 过滤符号名。", p:["so_name", "keyword", "limit"]},
+  {n:"segments", d:"程序头（PT_LOAD/DYNAMIC 等）与节表分开返回。", p:["so_name"]},
+  {n:"metadata", d:"文件元信息：架构/格式/入口/模块统计。", p:["so_name"]},
+  {n:"function_by_name", d:"按名字模式（大小写不敏感子串）查函数，返回精确地址。", p:["so_name", "pattern", "limit"]},
+  {n:"rename_function", d:"重命名函数（写操作，影响 GUI 与后续所有查询）。", p:["so_name", "addr", "new_name"]},
+  {n:"set_comment", d:"在地址处写注释（写操作）。注释出现在反汇编与伪代码视图。", p:["so_name", "addr", "comment"]},
+  {n:"get_comments", d:"列出该 so 的全部注释。", p:["so_name"]},
+  {n:"search_bytes", d:"按十六进制字节模式搜索（支持 ?? 通配单字节），如 '1f 20 03 d5' 或 '?? 20 03 d5'。", p:["so_name", "hex_pattern", "limit"]},
+  {n:"list_strings", d:"列出字符串。keyword 子串过滤。引用者需先调用 build_xrefs。", p:["so_name", "keyword", "limit"]},
+  {n:"string_refs", d:"查询某字符串被哪些函数引用。addr 为字符串起始静态地址。", p:["so_name", "addr"]},
+  {n:"build_xrefs", d:"显式构建某 so 的全量引用图（首次调用较慢，之后有缓存）。", p:["so_name", "aggressive"]},
+  {n:"call_chain", d:"跨 so 调用链（核心能力）。从 addr 出发展开调用树，跨 so 时自动深入。", p:["so_name", "addr", "depth"]},
+  {n:"callers_of", d:"跨 so 反查：哪些 so 的哪些函数调用了该导出符号。", p:["symbol"]},
+  {n:"list_devices", d:"列出 adb 设备。", p:[]},
+  {n:"list_processes", d:"列出设备进程。keyword 过滤进程名。", p:["serial", "keyword"]},
+  {n:"start_frida", d:"以 root 启动设备端 frida-server，并校验版本与本机客户端一致。", p:["serial"]},
+  {n:"frida_server_align", d:"把设备端 frida-server 覆盖成**与本机客户端完全一致**的版本并启动。", p:["serial", "version", "dry_run", "device_path"]},
+  {n:"freeze_process", d:"**冻结整个进程**（SIGSTOP），得到\"某一瞬间\"的完整快照。", p:["serial", "pid"]},
+  {n:"unfreeze_process", d:"**恢复**被 freeze_process 冻结的进程（SIGCONT）。", p:["serial", "pid"]},
+  {n:"remove_breakpoint", d:"**删除一个断点**（与 set_breakpoint 配套）。", p:["bp_id"]},
+  {n:"hits", d:"取**断点命中历史**（完整现场），与 poll_events 是两份不同的数据。", p:["serial", "pid", "bp_id", "limit", "since_seq", "include_context", "include_backtrace", "include_stack"]},
+  {n:"detach_target", d:"**断开目标进程**，移除所有断点并释放 frida 会话。", p:["serial", "pid"]},
+  {n:"stop_frida", d:"停止设备上**占用 27042** 的 frida-server（只停这一个）。", p:["serial"]},
+  {n:"preflight", d:"**一次性体检**：现在的环境到底能不能做动态分析，缺什么。", p:["serial"]},
+  {n:"runtime_modules", d:"列出目标进程加载的模块及运行时基址。keyword 过滤模块名。", p:["serial", "pid", "keyword"]},
+  {n:"set_breakpoint", d:"在目标进程的某 so 静态地址上下断点。", p:["serial", "pid", "so_name", "static_addr", "hold"]},
+  {n:"read_process_memory", d:"按 so 静态地址读取目标进程内存（自动完成 ASLR 换算）。", p:["serial", "pid", "so_name", "static_addr", "size"]},
+  {n:"wait_hits", d:"等待断点命中（阻塞到超时或出现新命中）。", p:["serial", "pid", "timeout"]},
+  {n:"resume", d:"放行 hold 策略下挂起的线程（重复调用无副作用）。", p:["serial", "pid"]},
+  {n:"poll_events", d:"非阻塞地取动态事件，并附上目标当前状态。", p:["serial", "pid", "timeout", "limit", "after_seq"]},
+  {n:"list_threads", d:"列出目标进程的线程（id / name / state / pc）。", p:["serial", "pid"]},
+  {n:"get_callstack", d:"取指定线程的调用栈，并用 **mda 自己的静态模型**把每一帧符号化。", p:["serial", "pid", "thread_id", "limit"]},
+  {n:"list_breakpoints", d:"列出当前所有断点（AI 与界面共用同一份）。", p:[]},
+  {n:"read_runtime_memory", d:"按**运行时绝对地址**读内存——专门用来读断点现场拿到的地址。", p:["serial", "pid", "runtime_addr", "size"]},
+  {n:"read_runtime_string", d:"按**运行时绝对地址**读 C 字符串——读断点现场 x0 指向的路径/内容。", p:["serial", "pid", "runtime_addr", "max_length"]},
+  {n:"read_typed", d:"按类型解释**静态 so 文件**里的值（不是读运行中进程的内存）。", p:["so_name", "addr", "type_name", "count", "source", "serial", "pid"]},
+  {n:"read_string", d:"从**静态 so 文件**读一个 C 字符串（遇 \\0 截止，按 UTF-8 解码）。", p:["so_name", "addr", "max_length", "source", "serial", "pid"]},
+  {n:"read_pointer", d:"从**静态 so 文件**读指针，可按 depth 逐层跟链。", p:["so_name", "addr", "depth", "offset", "source", "serial", "pid"]},
+  {n:"plan_step", d:"规划一次单步：**只算临时断点该下在哪，不执行**。", p:["so_name", "static_addr", "mode", "count", "so_context", "lr", "mnemonic", "max_insns"]},
+  {n:"execute_step", d:"**真正执行一次单步**：放行目标、停在临时断点处、返回停下时的现场。", p:["serial", "pid", "so_name", "static_addr", "mode", "count", "lr", "mnemonic"]},
+  {n:"trace_aggregate", d:"把 trace / 断点命中事件按**静态函数**聚合——先看\"谁被执行了上万次\"。", p:["events", "runtime_bases"]},
+  {n:"locate_runtime_addr", d:"运行时地址 → 完整静态定位（把\"设备上那个地址\"折回 mda 的静态模型）。", p:["serial", "pid", "runtime_addr"]},
+  {n:"hit_analysis", d:"最近一次断点命中 → 完整静态上下文（命中点前后指令 / 伪代码 / 调用者）。", p:["serial", "pid", "build_xrefs"]},
+  {n:"suggest_breakpoints", d:"静态选一个函数 → 建议在哪几个位置下断点（省掉满函数乱找）。", p:["so_name", "function", "addr"]},
+  {n:"trace_timeline", d:"把事件流整理成**函数级时间轴**——看\"先调了 A，再调了 B\"。", p:["events"]},
+  {n:"module_load_timeline", d:"模块加载事件 → 加载顺序时间轴 + 区间异常检测。", p:["load_events"]},
+  {n:"trace_module_load", d:"**采集模块加载时间轴**——回答\"这个 app 从启动到现在加载了什么、什么时候\"。", p:["serial", "package", "pid", "duration", "include_system", "keep_alive", "max_events"]},
+  {n:"trace_app_startup", d:"**从 app 启动第一刻起**，同时采集「so 加载」和「函数调用」，合成一条时间轴。", p:["serial", "package", "symbols", "breakpoints", "duration", "include_system", "keep_alive", "max_events"]},
+  {n:"trace_code", d:"指令级**调用** trace：用 Stalker 采集\"谁调用了谁\"。", p:["serial", "pid", "duration", "threads", "max_events"]},
+  {n:"trace_read", d:"监控「谁**读**了这块内存」，返回每次读取的函数、地址与调用栈。", p:["serial", "pid", "addr", "size", "so_name", "duration", "max_events"]},
+  {n:"trace_write", d:"监控「谁**写**了这块内存」，返回每次写入的函数、地址与调用栈。", p:["serial", "pid", "addr", "size", "so_name", "duration", "max_events"]},
+  {n:"run_script", d:"执行 Python 脚本操作分析会话（进阶能力）。", p:["code"]},
+  {n:"run_idc", d:"执行 IDC 脚本（IDA 脚本语法直译）。", p:["so_name", "source"]},
+  {n:"run_idc_file", d:"执行 IDC 脚本文件（绝对路径）。等价 IDA 里 File→Script file。", p:["so_name", "path"]},
+  {n:"watch_module", d:"观察某个 so 里**哪些函数真的被执行过**——回答「代码到底跑没跑到这里」。", p:["serial", "pid", "so_name", "duration", "max_points", "batch", "batch_interval_ms", "offset_range"]},
+  {n:"verify_breakpoint", d:"检查一个断点**到底有没有真的生效**（set_breakpoint 返回 true 不代表 armed）。", p:["serial", "pid", "so_name", "static_addr", "bp_id"]},
+  {n:"resolve_br", d:"解开 `adrp/ldr/br xN` 这类**间接跳转**，尽可能还原跳转目标表。", p:["so_name", "addr", "lookback", "max_targets"]},
+  {n:"dump_vm_state", d:"按约定的 VM 上下文结构，把**字节码指令数组**一次解出来。", p:["serial", "pid", "ctx_ptr", "count_offset", "array_offset", "instr_size", "max_instr"]},
+  {n:"read_memory_batch", d:"**一次调用读多段内存**，而不是一段一次 RPC。", p:["serial", "pid", "regions"]},
+  {n:"probe_hits", d:"**纯计数探针**：只统计某地址被进入多少次，不挂起、不依赖 hold。", p:["serial", "pid", "so_name", "static_addr", "duration"]},
+  {n:"read_jump_table", d:"读一张**跳转表**，把表项解析成目标地址（解决表驱动的 br）。", p:["so_name", "table_static_addr", "entry_size", "count", "code_base", "signed", "serial", "pid"]},
+  {n:"probe_vm_from_hits", d:"从**已有断点命中**的寄存器里挖出 VM 上下文指针，直接解出指令数组。", p:["serial", "pid", "count_offset", "array_offset", "instr_size", "max_instr", "max_candidates"]},
+  {n:"trace_call_tree", d:"追踪一组函数入口的**调用者**，回答「这条路径到底有没有被调用」。", p:["serial", "pid", "so_name", "entries", "duration", "max_edges"]},
+  {n:"decode_runtime_insn", d:"从**目标进程内存**读出 ARM64 指令并解码，可选配上寄存器现场。", p:["serial", "pid", "so_name", "static_addr", "count", "context"]},
+  {n:"probe_process", d:"探测目标 app **是否还在跑、是否闪退、还能不能注入**。", p:["serial", "pid", "package"]},
+  {n:"find_jni_registrations", d:"找 JNI **动态注册表**（`JNINativeMethod` 数组），把 Java 方法名映射到 so 内地址。", p:["so_name", "max_tables"]},
+  {n:"find_dispatch_tables", d:"全库扫描 so 里**所有 switch 跳转表**（一次性，不用一个地址问一次）。", p:["so_name", "max_tables", "min_entries"]},
+  {n:"java_bridge_status", d:"检查 **Java bridge 是否可用**（纯本地，不连设备）。", p:[]},
+  {n:"java_list_methods", d:"列出一个 Java 类的所有方法与字段（**包含动态加载的类**）。", p:["serial", "pid", "class_name", "include_fields"]},
+  {n:"java_find_classes", d:"在**已加载的类**里搜索——支持类名、字段名、返回类型、方法名四种维度。", p:["serial", "pid", "pattern", "limit", "field", "return_type", "method_pattern", "max_scan_classes"]},
+  {n:"java_hook", d:"hook Java 方法——支持**通配符批量**、参数深挖、0 命中诊断。", p:["serial", "pid", "class_name", "method", "overload", "duration", "max_calls", "include_stack"]},
+  {n:"java_find_callers", d:"找出**谁调用了**某个 Java 方法，返回调用栈样本。", p:["serial", "pid", "class_name", "method", "overload", "duration", "max_samples", "stack_depth"]},
+  {n:"perf_watch_probe", d:"检查**硬件观察点**这条路径在本设备是否可用（不设观察点）。", p:["serial"]},
+  {n:"perf_watch", d:"在指定地址上设**硬件观察点**，抓「谁访问了这块内存」。", p:["serial", "pid", "addr", "size", "watch_type", "tid", "duration", "max_hits"]},
+  {n:"perf_watch_daemon", d:"起一个**常驻**硬件观察点：提前设好，等目标自己来写。", p:["serial", "pid", "addr", "slot", "size", "watch_type", "tid", "duration"]},
+  {n:"perf_watch_poll", d:"取一个常驻观察点的当前结果（可反复调用，看新增命中）。", p:["serial", "slot", "limit"]},
+  {n:"perf_watch_stop", d:"停掉一个常驻观察点并清理设备上的状态文件。", p:["serial", "slot"]},
+  {n:"perf_watch_list", d:"列出所有常驻硬件观察点及其状态（含各自已采集的命中数）。", p:["serial"]},
+  {n:"find_vm_dispatch_points", d:"扫描 so 里所有 **VM 派发点**的位置。", p:["so_name", "pattern_hex", "limit"]},
+  {n:"vm_regs_snapshot", d:"在 VM 派发点抓一次快照：当前 VM pc、VM 寄存器堆、VM 栈。", p:["serial", "pid", "so_name", "dispatch_offset", "capture_regs", "wait"]},
+  {n:"vm_breakpoint", d:"在**某条 VM 指令**上设断点，停下时给出 VM 寄存器堆与 VM 栈。", p:["serial", "pid", "so_name", "target_idx", "code_base", "dispatch_offset", "slot_size", "vm_pc_bytes"]},
+  {n:"mem_snapshot", d:"在设备上拍一份**内存快照**（只取可写匿名段），供后续 diff。", p:["serial", "pid", "max_mb", "key"]},
+  {n:"mem_diff", d:"再拍一份快照并对比，找出**新增/变化的块**。", p:["serial", "pid", "key", "min_size", "max_size", "max_report"]},
+  {n:"mem_snapshot_clear", d:"删掉设备上的快照文件，释放空间。", p:["serial", "key"]},
+  {n:"unload_so", d:"卸载一个模块，**释放 mda 进程内的静态分析结果**。", p:["so_name"]},
+  {n:"clear_modules", d:"批量卸载模块，可指定保留哪些。", p:["keep"]},
+  {n:"module_memory", d:"查看各模块占用的内存（估算），用来决定该清哪个。", p:[]},
+  {n:"behavior_monitor_start", d:"启动 **App 行为监控**：算法 / 文件 / Activity / assets / Shell。", p:["serial", "pid", "crypto", "file", "activity", "assets", "shell", "duration"]},
+  {n:"behavior_monitor_poll", d:"取常驻行为监控的当前结果（可反复调用，看新增事件）。", p:["serial", "pid"]},
+  {n:"behavior_monitor_stop", d:"停掉常驻行为监控，返回最终汇总结果。", p:["serial", "pid"]},
+  {n:"list_app_processes", d:"列出一个 App 包名下的**所有进程**，并判断哪个在跑网络。", p:["serial", "package", "detect_network"]},
+  {n:"probe_network_processes", d:"专门回答「**哪个进程在跑网络**」，给抓包/注入选目标用。", p:["serial", "package"]},
+];
+
+const CALLS = [
+  {tool:"preflight",            args:{serial:"3e2ff172"}, ms:210, summary:"adb/root/frida 均正常"},
+  {tool:"load_so",              args:{path:"…/libsgmainso-6.7.260202.so"}, ms:96, summary:"3007 函数 · 0 导出"},
+  {tool:"metadata",             args:{so_name:"libsgmainso"}, ms:14, summary:"arm64 · ELF64 · 无节表"},
+  {tool:"find_vm_dispatch_points", args:{so_name:"libsgmainso"}, ms:830, summary:"805 处"},
+  {tool:"find_dispatch_tables",  args:{so_name:"libsgmainso"}, ms:1240, summary:"84 张跳转表"},
+  {tool:"list_app_processes",    args:{serial:"3e2ff172", package:"com.taobao.idlefish"}, ms:1210, summary:"4 进程 · 3 个跑网络"},
+  {tool:"probe_process",         args:{serial:"3e2ff172", pid:31182}, ms:180, summary:"存活且可注入"},
+  {tool:"vm_regs_snapshot",      args:{serial:"3e2ff172", pid:31182, so_name:"libsgmainso"}, ms:340, summary:"32 个 VM 寄存器"},
+  {tool:"vm_trace",              args:{dispatch_offset:"0xA2BB0", duration:3.0}, ms:3000, summary:"199 条 / 74 idx"},
+  {tool:"set_breakpoint",        args:{pid:31182, so_name:"libsgmainso", addr:665008}, ms:88, summary:"已武装"},
+  {tool:"hits",                  args:{serial:"3e2ff172", pid:31182}, ms:42, summary:"命中 36 次"},
+  {tool:"behavior_monitor_start",args:{pid:31182, crypto:true, file:true, shell:false}, ms:8000, summary:"7 hook 已挂"},
+  {tool:"java_hook",             args:{pid:31182, pattern:"*Sign*", method:"doSign"}, ms:2400, summary:"命中 12 次"},
+  {tool:"mem_snapshot",          args:{pid:31182, key:"r98", max_mb:16}, ms:310, summary:"870 段 / 16MB"},
+  {tool:"mem_diff",              args:{pid:31182, key:"r98", min_size:90, max_size:110}, ms:110, summary:"10 处变化"},
+  {tool:"perf_watch_daemon",     args:{pid:31182, addr:"0x7a82a80be0", slot:0}, ms:600, summary:"槽位 0 已布防"},
+  {tool:"read_runtime_string",   args:{pid:31182, runtime_addr:"0xb400007c"}, ms:35, summary:'"/data/local/tmp/cfg.xml"'},
+  {tool:"disassemble",           args:{so_name:"libsgmainso", addr:665008}, ms:22, summary:"40 条指令"},
+  {tool:"xrefs_to",              args:{so_name:"libsgmainso", addr:665008}, ms:410, summary:"37 个引用者"},
+  {tool:"trace_module_load",     args:{package:"com.taobao.idlefish", duration:3}, ms:3200, summary:"14 个新模块"},
+];
+
+/* ══ 工具分类：按工具名前缀通用归类（102 个工具全部覆盖）═ */
+function classify(tool){
+  const t = tool || "";
+  if(/^vm_|^dump_vm|^probe_vm/.test(t))            return "vm";
+  if(/^perf_watch/.test(t))                        return "watch";
+  if(/^java_/.test(t))                             return "java";
+  if(/^trace_|^watch_module|^module_load/.test(t)) return "trace";
+  if(/^mem_/.test(t))                              return "mem";
+  if(/^behavior_/.test(t))                         return "behavior";
+  if(/process|^list_threads|^probe_network/.test(t)) return "proc";
+  if(/breakpoint|^hits$|^wait_hits|^poll_events|^probe_hits|^resume$|^freeze|^unfreeze|^attach|^detach/.test(t)) return "bp";
+  if(/^read_|^locate_|^get_callstack|^runtime_modules|^list_modules/.test(t)) return "runtime";
+  return "static";
+}
+
+const TYPE_COLOR = {
+  vm:"var(--live)", watch:"#0891b2", java:"#7c3aed", trace:"#0d9488",
+  mem:"#c2410c", behavior:"#15803d", proc:"var(--warn)", bp:"var(--err)",
+  runtime:"#6366f1", static:"var(--fg3)"
+};
+const TV_TYPE_LABEL = {
+  static:"静态", vm:"VM", bp:"断点", proc:"进程", behavior:"行为",
+  mem:"内存", watch:"观察点", trace:"轨迹", java:"Java", runtime:"运行时"
+};
+const TV_TYPE_COLOR = TYPE_COLOR;
+
+/* 主题感知的徽章取色：浅色往黑压、深色往白提，两边都过 4.5:1 */
+/* 徽章文字色：
+   浅色 → 类别色压深（保证 4.5:1）
+   深色 → color-mix 不保证对比度，直接给高亮前景色；
+          色相语义由徽章左侧的圆点承担（见 addRow / renderTools）。 */
+function inkOf(hex){
+  const dark = document.body.dataset.theme === "dark";
+  if(dark) return "#f0f0f4";
+  return "color-mix(in srgb, " + hex + " 72%, #18181b)";
+}
+
+/* 每个工具被调用过几次（事件流与工具页共用） */
+var toolCalls = {};
+
+/* ══ 热力条 ══
+   位置 = 真实地址，颜色 = 真实引用数。这是测量，不是装饰。 */
+const heatEl  = document.getElementById("heat");
+const curlnEl = document.getElementById("curln");
+const LO = 0x5000, HI = 0xe9e8;            // .text 起点 → .plt 终点（真实节表）
+const MAXR = Math.max(...FUNCS.map(f=>f.r), 1);
+
+function heatColor(v){
+  const t = Math.log2(1+v) / Math.log2(1+MAXR);
+  if(t > .78) return "var(--hot4)";
+  if(t > .52) return "var(--hot3)";
+  if(t > .26) return "var(--hot2)";
+  return "var(--hot1)";
+}
+
+/* 逐函数色格：宽度按地址跨度分配 */
+FUNCS.forEach((f,i)=>{
+  const next = FUNCS[i+1] ? FUNCS[i+1].a : HI;
+  const c = document.createElement("div");
+  c.style.flex = (next - f.a) + " 0 0";
+  c.style.background = heatColor(f.r);
+  c.style.minWidth = "0";
+  c.style.cursor = "pointer";
+  c.title = f.n + "  0x" + f.a.toString(16) + "  引用 " + f.r;
+  c.onclick = (ev)=>{ ev.stopPropagation(); selectFn(f); };
+  heatEl.insertBefore(c, curlnEl);
+});
+
+/* 段分隔线 + 段名（真实边界） */
+[{n:".text", from:0x5000, to:0xdff0},
+ {n:".plt",  from:0xdff0, to:0xe9e8}].forEach(sec=>{
+  const left = ((sec.from - LO) / (HI - LO)) * 100;
+  if(left >= 99.5) return;
+  const ln = document.createElement("div");
+  ln.style.cssText = "position:absolute;left:"+left+"%;top:0;bottom:0;width:1px;"
+                   + "background:var(--panel);opacity:.9;pointer-events:none";
+  heatEl.appendChild(ln);
+  const lb = document.createElement("div");
+  lb.textContent = sec.n;
+  lb.style.cssText = "position:absolute;left:calc("+left+"% + 3px);top:1px;"
+                   + "font-family:var(--mono);font-size:10px;color:var(--fg2);"
+                   + "pointer-events:none;"
+                   + "text-shadow:0 0 3px var(--panel),0 0 2px var(--panel)";
+  heatEl.appendChild(lb);
+});
+
+/* 当前选中函数的指示线 */
+const selMark = document.createElement("div");
+selMark.style.cssText = "position:absolute;top:0;bottom:0;width:2px;"
+  + "background:var(--fg);box-shadow:0 0 0 1px var(--panel);pointer-events:none";
+heatEl.appendChild(selMark);
+
+heatEl.addEventListener("mousemove", e=>{
+  const r = heatEl.getBoundingClientRect();
+  curlnEl.style.left = (e.clientX - r.left) + "px";
+});
+heatEl.addEventListener("mouseleave", ()=>{ curlnEl.style.left = "-9999px"; });
+heatEl.addEventListener("click", e=>{
+  const r = heatEl.getBoundingClientRect();
+  const pct = (e.clientX - r.left) / r.width;
+  const idx = Math.min(FUNCS.length-1, Math.max(0, Math.floor(pct * FUNCS.length * 0.6)));
+  selectFn(FUNCS[idx]);
+});
+
+/* ══ 代码列表 ══ */
+const listing = document.getElementById("listing");
+let selAddr = 0x5020;
+
+function renderListing(){
+  listing.innerHTML = "";
+  FUNCS.slice(0,14).forEach(f=>{
+    const h = document.createElement("div");
+    h.className = "fnhdr" + (f.a === selAddr ? " exp" : "");
+    h.innerHTML = '<span class="t">' + (DISASM[f.a] ? "▾" : "▸") + '</span>'
+      + '<span class="n">' + f.n + '</span>'
+      + (f.e ? '<span class="tag exp">导出</span>' : "")
+      + '<span class="a">0x' + f.a.toString(16) + '</span>';
+    h.onclick = ()=> selectFn(f);
+    listing.appendChild(h);
+
+    if(DISASM[f.a]){
+      DISASM[f.a].forEach(ins=>{
+        const d = document.createElement("div");
+        const isBr = /^(bl|cbz|b|br)\b/.test(ins[2]);
+        const isBl = /^bl$/.test(ins[2]);
+        d.className = "ins" + (isBr ? (isBl ? " bl" : " br") : "");
+        d.innerHTML = '<span class="addr">' + ins[0] + '</span>'
+          + '<span class="by">' + ins[1] + '</span>'
+          + '<span class="mn">' + ins[2] + '</span>'
+          + '<span class="op">' + ins[3] + '</span>'
+          + '<span class="cm">' + (ins[4]||"") + '</span>';
+        d.onclick = ()=>{ selAddr = parseInt(ins[0]); renderListing(); };
+        listing.appendChild(d);
+      });
+    }
+  });
+  const rest = document.createElement("div");
+  rest.className = "empty";
+  rest.textContent = "… 其余 " + Math.max(0, FUNCS.length - 14) + " 个函数（虚拟滚动）";
+  listing.appendChild(rest);
+}
+
+function selectFn(f){
+  selAddr = f.a;
+  document.getElementById("iName").textContent = f.n;
+  document.getElementById("iAddr").textContent = "0x" + f.a.toString(16);
+  document.getElementById("iRefs").textContent = f.r;
+  document.getElementById("sAddr").textContent = "0x" + f.a.toString(16);
+  selMark.style.left = (((f.a - LO) / (HI - LO)) * 100) + "%";
+  renderListing();
+}
+
+/* ══ 底部事件流（旧样式样例，保持活着）══ */
+const evBd = document.getElementById("evBd");
+EVENTS.forEach(([t,c,m,s])=>{
+  const r = document.createElement("div");
+  r.className = "evrow";
+  r.innerHTML = '<span class="tm">' + t + '</span>'
+    + '<span class="cat ' + c + '">' + c.toUpperCase() + '</span>'
+    + '<span class="msg">' + m + '</span>'
+    + '<span class="stk">' + s + '</span>';
+  evBd.appendChild(r);
+});
+
+/* ══ 实时监控台 ══ */
+const streamEl = document.getElementById("evStream");
+const detailEl = document.getElementById("detail");
+const fxLayer  = document.getElementById("fx");
+const liveRoot = document.getElementById("viewLive");
+
+const seen = {total:0, tool:0};
+let sinceMin = [];
+
+function nowStr(offsetMs){
+  const t = new Date(Date.now() - (offsetMs||0));
+  return [t.getHours(),t.getMinutes(),t.getSeconds()]
+    .map(n=>String(n).padStart(2,"0")).join(":")
+    + "." + String(t.getMilliseconds()).padStart(3,"0");
+}
+
+/* 泳道 */
+const LANE_TYPES = ["static","vm","bp","proc","behavior","mem"];
+const LANE_CAP = 40;
+const laneData = {};
+LANE_TYPES.forEach(t=>{ laneData[t] = Array.from({length:LANE_CAP},()=>0); });
+
+(function buildLanes(){
+  const box = document.getElementById("laneRows");
+  if(!box) return;
+  LANE_TYPES.forEach(t=>{
+    const r = document.createElement("div");
+    r.className = "lane " + t;
+    r.innerHTML = '<span class="nm">' + t.toUpperCase() + '</span>'
+      + '<span class="tr" id="ln-' + t + '"></span>'
+      + '<span class="cnt" id="cn-' + t + '">0</span>';
+    box.appendChild(r);
+    const tr = r.querySelector(".tr");
+    for(let i=0;i<LANE_CAP;i++){
+      const i2 = document.createElement("i");
+      i2.style.height = "1px";
+      tr.appendChild(i2);
+    }
+  });
+})();
+
+function lanePush(type, v){
+  const arr = laneData[type] || laneData.proc;
+  arr.push(v);
+  if(arr.length > LANE_CAP) arr.shift();
+  const tr = document.getElementById("ln-" + type);
+  if(!tr) return;
+  const mx = Math.max(...arr, 3);
+  [...tr.children].forEach((el,i)=>{
+    el.style.height = Math.max(1, Math.round((arr[i]/mx)*11)) + "px";
+    el.style.opacity = 0.28 + (arr[i]/mx)*0.72;
+  });
+  const cn = document.getElementById("cn-" + type);
+  if(cn){
+    const total = Math.round(arr.reduce((a,b)=>a+b,0));
+    cn.textContent = total;
+    cn.classList.toggle("has", total > 0);
+  }
+}
+
+/* ══ 一次工具调用 → 一行 ══ */
+const SHOW_ARG = ["so_name","pid","addr","name","package","pattern","key",
+                  "dispatch_offset","duration","class_name","method","symbol",
+                  "target_idx","size","slot"];
+
+function toRow(c){
+  const type = classify(c.tool);
+  const a = c.args || {};
+  const shown = SHOW_ARG.filter(k => a[k] !== undefined && a[k] !== null)
+    .slice(0,3)
+    .map(k => k + '=<em>' + String(a[k]).slice(0,26) + '</em>').join(" ");
+  const summary = c.summary ? ' → <b>' + c.summary + '</b>' : "";
+  return {
+    type: type, tool: c.tool, args: a, ms: c.ms, summary: c.summary,
+    html: '<span class="tn">' + c.tool + '</span>'
+        + (shown ? "(" + shown + ")" : "") + summary,
+    meta: c.ms != null ? c.ms + "ms" : "",
+    result: c.result || ("{summary:'" + (c.summary||"") + "'}")
+  };
+}
+
+/* 几何辅助 */
+function relRect(el){
+  const a = el.getBoundingClientRect();
+  const b = liveRoot.getBoundingClientRect();
+  return {x:a.left-b.left, y:a.top-b.top, w:a.width, h:a.height};
+}
+
+/* 这次调用作用在谁身上（通用规则，按参数名推断） */
+function targetOf(ev){
+  const procs = document.querySelectorAll(".mon-left .proc");
+  if(!procs.length) return null;
+  const a = ev.args || {};
+  if(a.so_name) return document.querySelector(".modlist .mr") || procs[0];
+  return procs[0];
+}
+
+/* 因果连线：目标 → 新记录 */
+function drawLink(targetEl, rowEl){
+  if(!fxLayer || !targetEl || !rowEl) return;
+  const t = relRect(targetEl), r = relRect(rowEl);
+  const x1 = t.x + t.w, y1 = t.y + t.h/2;
+  const x2 = r.x, y2 = r.y + r.h/2;
+  if(x2 < x1) return;
+  const mid = (x1 + x2) / 2;
+  const d = "M"+x1+","+y1+" C"+mid+","+y1+" "+mid+","+y2+" "+x2+","+y2;
+  const path = document.createElementNS("http://www.w3.org/2000/svg","path");
+  path.setAttribute("d", d);
+  path.setAttribute("class","go");
+  fxLayer.appendChild(path);
+  setTimeout(()=>path.remove(), 1100);
+}
+
+/* 目标上的活动圆点（不遮挡内容，全名走原生 title） */
+function markTarget(targetEl, tool){
+  if(!targetEl || !tool) return;
+  targetEl.title = "刚执行：" + tool;
+  const dot = document.createElement("span");
+  dot.className = "fxdot";
+  targetEl.appendChild(dot);
+  setTimeout(()=>dot.remove(), 900);
+}
+
+/* 待命标记：装好后一直挂着，只显示数量 */
+function armTarget(targetEl, tool){
+  if(!targetEl || !tool) return;
+  targetEl.classList.add("armed");
+  const list = targetEl._armed || (targetEl._armed = []);
+  if(!list.includes(tool)) list.push(tool);
+  let tag = targetEl.querySelector(".armtag");
+  if(!tag){
+    tag = document.createElement("span");
+    tag.className = "armtag";
+    targetEl.appendChild(tag);
+  }
+  tag.textContent = "◉ " + list.length;
+  tag.title = "AI 正在盯着：" + list.join(" · ");
+}
+
+/* 目标 ping */
+function pingTarget(el, cls){
+  if(!el) return;
+  el.classList.remove(cls);
+  void el.offsetWidth;
+  el.classList.add(cls);
+  setTimeout(()=>el.classList.remove(cls), 950);
+}
+
+/* 一次挂多个 hook → 逐个通电 */
+function powerOnHooks(){
+  [...document.querySelectorAll(".hooks .hk")].forEach((hk,i)=>{
+    setTimeout(()=>{
+      hk.classList.add("poweron");
+      setTimeout(()=>hk.classList.remove("poweron"), 600);
+    }, i*90);
+  });
+}
+
+/* 断点命中 → 目标短暂失活 */
+function freezePulse(){
+  const body = document.querySelector(".mon-body");
+  if(!body) return;
+  body.classList.remove("freeze-pulse");
+  void body.offsetWidth;
+  body.classList.add("freeze-pulse");
+  setTimeout(()=>body.classList.remove("freeze-pulse"), 360);
+}
+
+/* VM 采集期间模块行高频闪 */
+let strobeTimer = null;
+function strobe(ms){
+  const mod = document.querySelector(".modlist .mr");
+  if(!mod) return;
+  mod.classList.add("strobe");
+  clearTimeout(strobeTimer);
+  strobeTimer = setTimeout(()=>mod.classList.remove("strobe"), ms||1600);
+}
+
+/* 工具行被调用时的反应 */
+function pulseToolRow(tool){
+  if(!tool) return;
+  const hit = [...document.querySelectorAll(".tvrow")]
+    .find(r => r.querySelector(".tn") && r.querySelector(".tn").textContent === tool);
+  if(hit){
+    hit.classList.remove("busy");
+    void hit.offsetWidth;
+    hit.classList.add("busy");
+    setTimeout(()=>hit.classList.remove("busy"), 1200);
+    const tl = hit.querySelector(".tl");
+    if(tl){
+      tl.classList.remove("pop");
+      void tl.offsetWidth;
+      tl.classList.add("pop");
+      tl.classList.add("has");
+      setTimeout(()=>tl.classList.remove("pop"), 700);
+    }
+    const list = document.getElementById("tvList");
+    if(list){
+      const lr = list.getBoundingClientRect(), rr = hit.getBoundingClientRect();
+      if(rr.top < lr.top || rr.bottom > lr.bottom){
+        hit.scrollIntoView({block:"center", behavior:"smooth"});
+      }
+    }
+  }
+  const nav = document.getElementById("navTools");
+  const toolsView = document.getElementById("viewTools");
+  if(nav && toolsView && toolsView.hidden){
+    nav.classList.remove("ping");
+    void nav.offsetWidth;
+    nav.classList.add("ping");
+    setTimeout(()=>nav.classList.remove("ping"), 900);
+  }
+}
+
+/* ══ 事件流的一行 ══ */
+function addRow(ev, offsetMs){
+  const r = document.createElement("div");
+  r.className = "sr " + ev.type;
+  const col = TYPE_COLOR[ev.type] || "var(--fg3)";
+  const ink = inkOf(col);
+  r.innerHTML = '<span class="t">' + nowStr(offsetMs) + '</span>'
+    + '<span class="tp" style="color:' + ink + ';background:color-mix(in srgb, '
+    + col + ' 13%, transparent)">' + ev.type.toUpperCase() + '</span>'
+    + '<span class="tx">' + (ev.html || ev.text || "") + '</span>'
+    + '<span class="m">' + (ev.meta || "") + '</span>';
+  r.onclick = ()=>{
+    document.querySelectorAll(".sr").forEach(x=>x.classList.remove("sel"));
+    r.classList.add("sel");
+    showDetail(ev);
+  };
+  streamEl.insertBefore(r, streamEl.firstChild);
+  while(streamEl.children.length > 120) streamEl.removeChild(streamEl.lastChild);
+
+  if(ev.tool){
+    toolCalls[ev.tool] = (toolCalls[ev.tool] || 0) + 1;
+    seen.tool++;
+  }
+  seen[ev.type] = (seen[ev.type] || 0) + 1;
+  seen.total++;
+  sinceMin.push(Date.now());
+  lanePush(ev.type, 1);
+  updateCounters();
+
+  requestAnimationFrame(()=>{
+    const tgt = targetOf(ev);
+    drawLink(tgt, r);
+    if(ev.tool) markTarget(tgt, ev.tool);
+    if(tgt) pingTarget(tgt, "ping");
+    if(/^(perf_watch|perf_watch_daemon|set_breakpoint|behavior_monitor_start|java_hook|vm_breakpoint)$/.test(ev.tool||"")){
+      armTarget(tgt, ev.tool);
+    }
+    if(ev.tool === "behavior_monitor_start") powerOnHooks();
+    if(ev.type === "bp") freezePulse();
+    if(ev.type === "vm" || ev.tool === "vm_trace") strobe(1800);
+    if(ev.tool) pulseToolRow(ev.tool);
+  });
+}
+
+function updateCounters(){
+  const cut = Date.now() - 60000;
+  sinceMin = sinceMin.filter(t=>t>cut);
+  const a = document.getElementById("epm");
+  if(a) a.textContent = sinceMin.length;
+  const b = document.getElementById("toolm");
+  if(b) b.textContent = seen.tool;
+  const ea = document.getElementById("evAll");
+  if(ea) ea.textContent = seen.total;
+}
+
+/* ══ 详情 ══ */
+function esc(v){
+  return String(v == null ? "" : v)
+    .replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")
+    .replace(/"/g,"&quot;");
+}
+
+function showDetail(ev){
+  if(!detailEl) return;
+  const a = ev.args || {};
+  const argsJson = Object.keys(a).length ? JSON.stringify(a, null, 1) : "（无参数）";
+  detailEl.innerHTML = ''
+    + '<div class="det-hd">' + esc(ev.tool || ev.type) + '</div>'
+    + '<div class="det-sub">类别 ' + esc(ev.type||"-") + ' · 耗时 '
+    + (ev.ms != null ? esc(ev.ms+"ms") : "—") + '</div>'
+    + '<div class="det-sec">参数 args</div>'
+    + '<div class="det-json">' + esc(argsJson) + '</div>'
+    + (ev.summary ? '<div class="det-sec">返回摘要</div>'
+        + '<div class="det-json">' + esc(ev.summary) + '</div>' : "")
+    + '<div class="det-sec">在界面上能做的</div>'
+    + '<div style="display:flex;gap:5px;flex-wrap:wrap">'
+    + '<span class="ask" data-ask="' + esc(ev.tool||"") + '">复制为提问</span>'
+    + '<span class="go" style="font-size:11px;color:var(--fg3);border:1px solid var(--line);'
+    + 'padding:1px 6px;border-radius:2px;cursor:pointer">复制原始返回</span>'
+    + '</div>'
+    + '<div style="font-size:11px;color:var(--fg3);margin-top:7px;line-height:1.55">'
+    + '界面不发起分析。分析在对话侧进行，这里只让你看见并取证。</div>';
+}
+
+/* ══ 播放 ══ */
+let si = 0, paused = false;
+function tick(){
+  if(paused) return;
+  addRow(toRow(CALLS[si % CALLS.length]));
+  si++;
+}
+const INIT = Math.min(14, CALLS.length);
+for(let i=INIT-1; i>=0; i--){
+  addRow(toRow(CALLS[i % INIT]), (i+1)*1600);
+}
+const firstRow = streamEl.firstElementChild;
+if(firstRow){
+  firstRow.classList.add("sel");
+  showDetail(toRow(CALLS[0]));
+}
+["static","vm","bp","proc","behavior","mem"].forEach(t=>{
+  for(let i=0;i<24;i++) lanePush(t, Math.random()<0.35 ? Math.random()*2.2 : 0.2);
+});
+setInterval(tick, 1700);
+
+document.getElementById("pauseBtn")?.addEventListener("click", (e)=>{
+  paused = !paused;
+  e.currentTarget.innerHTML = '<svg class="ic" aria-hidden="true"><use href="#i-'
+    + (paused?"play":"pause") + '"/></svg> ' + (paused?"继续":"暂停");
+});
+
+document.querySelectorAll(".proc").forEach(r=>{
+  r.onclick = ()=>{
+    document.querySelectorAll(".proc").forEach(x=>x.classList.remove("sel"));
+    r.classList.add("sel");
+  };
+});
+
+/* 「复制为提问」：把看到的证据变成对话的输入 */
+document.addEventListener("click", async (e)=>{
+  const el = e.target.closest ? e.target.closest(".ask") : null;
+  if(!el) return;
+  const row = document.querySelector(".sr.sel");
+  const txt = row ? row.innerText.replace(/\s+/g," ").trim() : "";
+  const prompt = "这次调用" + (el.dataset.ask ? "（"+el.dataset.ask+"）" : "")
+               + "的结果是：\n" + txt + "\n帮我解释一下这个结果意味着什么。";
+  try{
+    await navigator.clipboard.writeText(prompt);
+    el.textContent = "已复制 ✓";
+  }catch(err){
+    el.textContent = "复制失败";
+  }
+  setTimeout(()=>{ el.textContent = "复制为提问"; }, 1400);
+});
+
+/* ══ 工具页 ══ */
+function renderTools(filter){
+  const list = document.getElementById("tvList");
+  if(!list) return;
+  const q = (filter||"").trim().toLowerCase();
+  const rows = TOOLS.filter(t =>
+    !q || t.n.toLowerCase().indexOf(q) >= 0 || t.d.toLowerCase().indexOf(q) >= 0 ||
+          (t.p||[]).some(p => p.toLowerCase().indexOf(q) >= 0));
+  list.innerHTML = "";
+  rows.forEach(t=>{
+    const type = classify(t.n);
+    const calls = toolCalls[t.n] || 0;
+    const r = document.createElement("div");
+    r.className = "tvrow";
+    r.innerHTML = '<span class="tn">' + t.n + '</span>'
+      + '<span class="tc" style="color:' + inkOf(TV_TYPE_COLOR[type])
+      + ';background:color-mix(in srgb, ' + TV_TYPE_COLOR[type] + ' 13%, transparent)">'
+      + (TV_TYPE_LABEL[type]||type) + '</span>'
+      + '<span class="td">' + t.d + '</span>'
+      + '<span class="tl' + (calls?" has":"") + '">'
+      + (calls ? calls+" 次" : "—") + '</span>';
+    r.onclick = ()=>{
+      document.querySelectorAll(".tvrow").forEach(x=>x.classList.remove("sel"));
+      r.classList.add("sel");
+      showToolDetail(t);
+    };
+    list.appendChild(r);
+  });
+  const c = document.getElementById("tvCount");
+  if(c) c.textContent = rows.length + " 个" + (q ? " / " + TOOLS.length : "");
+}
+
+function showToolDetail(t){
+  const box = document.getElementById("tvDetail");
+  if(!box) return;
+  const type = classify(t.n);
+  const calls = toolCalls[t.n] || 0;
+  box.innerHTML = ''
+    + '<div class="tvd-hd">' + t.n + '</div>'
+    + '<div class="tvd-sec">类别</div>'
+    + '<div class="tvd-desc"><span style="color:' + TV_TYPE_COLOR[type]
+    + ';font-family:var(--mono)">' + (TV_TYPE_LABEL[type]||type)
+    + '</span>　调用 ' + calls + ' 次</div>'
+    + '<div class="tvd-sec">说明</div>'
+    + '<div class="tvd-desc">' + t.d + '</div>'
+    + '<div class="tvd-sec">参数（' + (t.p||[]).length + '）</div>'
+    + '<div class="tvd-params">'
+    + ((t.p||[]).length
+        ? t.p.map(p=>'<span class="par">'+p+'</span>').join("")
+        : '<span style="font-size:11px;color:var(--fg3)">无参数</span>')
+    + '</div>'
+    + '<div class="tvd-sec">最近调用</div>'
+    + '<div class="tvd-last"><div class="lcbox">'
+    + (calls ? "本会话调用过 " + calls + " 次，最近一次在事件流里点开可看完整参数与返回。"
+             : "本会话还没调用过。")
+    + '</div></div>'
+    + '<div class="tvd-sec">为什么这里是只读的</div>'
+    + '<div class="tvd-desc" style="font-size:11px;color:var(--fg3);padding-bottom:8px">'
+    + '工具由 AI 在对话侧调用。界面只负责让你看清「有哪些工具、各自干什么、调用过几次」。'
+    + '想用某个工具，在对话里说就行。</div>';
+}
+
+document.getElementById("tvSearch")?.addEventListener("input", e=>renderTools(e.target.value));
+document.getElementById("navTools")?.addEventListener("click", ()=>{
+  document.querySelectorAll(".wtab").forEach(x=>x.classList.remove("on"));
+  const tab = [...document.querySelectorAll(".wtab")]
+    .find(b=>b.textContent.indexOf("工具")===0);
+  if(tab) tab.classList.add("on");
+  showView("工具");
+});
+
+/* ══ 视图切换 ══ */
+const VIEWS = {
+  "实时":  ["viewLive"],
+  "代码":  ["listing"],
+  "引用":  ["viewRefs"],
+  "图谱":  ["viewGraph"],
+  "时间线": ["viewTL"],
+  "工具":  ["viewTools"]
+};
+
+function showView(name){
+  Object.keys(VIEWS).forEach(k=>{
+    VIEWS[k].forEach(id=>{
+      const el = document.getElementById(id);
+      if(el) el.hidden = true;
+    });
+  });
+  const target = VIEWS[name] || ["listing"];
+  target.forEach(id=>{
+    const el = document.getElementById(id);
+    if(el) el.hidden = false;
+  });
+  document.body.classList.toggle("live-mode", name === "实时");
+}
+
+document.querySelectorAll(".wtab").forEach(b=>{
+  b.onclick = ()=>{
+    document.querySelectorAll(".wtab").forEach(x=>x.classList.remove("on"));
+    b.classList.add("on");
+    showView(b.childNodes[0].textContent.trim());
+  };
+});
+
+/* ══ 图谱 ══ */
+const GRAPH = {
+  root: "create_android_logger",
+  in:  [["android_log_write_list_begin",0x5248],["android_log_write_list",0x570c],
+        ["__android_log_error_write",0x5c2c],["android_logger_open",0x5ef0]],
+  out: [["sub_e040",0xe040],["calloc",0xdff0],["__errno",0xe040]]
+};
+
+(function drawGraph(){
+  const edges = document.getElementById("edges");
+  const nodes = document.getElementById("nodes");
+  if(!edges || !nodes) return;
+  const W = 900, H = 460, CX = W/2, CY = H/2;
+  const NS = "http://www.w3.org/2000/svg";
+
+  function node(x,y,label,root){
+    const g = document.createElementNS(NS,"g");
+    g.setAttribute("class","gnode"+(root?" root":""));
+    const c = document.createElementNS(NS,"circle");
+    c.setAttribute("cx",x); c.setAttribute("cy",y);
+    c.setAttribute("r", root?17:10);
+    if(root) c.style.fill = "var(--livebg)";
+    g.appendChild(c);
+    const t = document.createElementNS(NS,"text");
+    t.setAttribute("x",x);
+    t.setAttribute("y", y + (root?34:26));
+    t.setAttribute("text-anchor","middle");
+    if(root){ t.style.fontSize="11px"; t.style.fill="var(--fg)"; }
+    t.textContent = label;
+    g.appendChild(t);
+    nodes.appendChild(g);
+    return {x:x,y:y};
+  }
+  function edge(a,b,hi){
+    const pr = document.createElementNS(NS,"path");
+    const dx = b.x-a.x, dy = b.y-a.y;
+    const mx = (a.x+b.x)/2, my = (a.y+b.y)/2;
+    pr.setAttribute("d", "M"+a.x+","+a.y+" Q"+(mx-dy*.12)+","+(my+dx*.12)
+      +" "+b.x+","+b.y);
+    pr.setAttribute("class","gedge"+(hi?" hi":""));
+    pr.setAttribute("marker-end", hi?"url(#arhi)":"url(#ar)");
+    edges.appendChild(pr);
+  }
+
+  const root = node(CX, CY, GRAPH.root, true);
+  GRAPH.in.forEach((pair,i)=>{
+    const k = GRAPH.in.length;
+    const ang = (-165 + i*(150/(k-1||1))) * Math.PI/180;
+    edge(node(CX+Math.cos(ang)*255, CY+Math.sin(ang)*185, pair[0], false), root, false);
+  });
+  GRAPH.out.forEach((pair,i)=>{
+    const k = GRAPH.out.length;
+    const ang = (15 + i*(150/(k-1||1))) * Math.PI/180;
+    edge(root, node(CX+Math.cos(ang)*255, CY+Math.sin(ang)*185, pair[0], false), i===0);
+  });
+})();
+
+/* ══ 时间线 ══ */
+(function drawTL(){
+  const box = document.getElementById("tlBody");
+  if(!box) return;
+  const ROWS = [
+    ["+0.000s","proc","attach com.taobao.idlefish (pid 31182)",6],
+    ["+0.042s","bp","断点 android_logger_open @0x5ef0 → 命中",3],
+    ["+0.061s","vm","派发点 0xA2BB0 首次命中 idx=43556",4],
+    ["+0.020s","vm","VM 轨迹采集 199 条 / 74 个 idx",120],
+    ["+0.184s","crypto","MessageDigest SHA-256 digest",5],
+    ["+0.201s","file","open_read /data/local/tmp/cfg.xml",9],
+    ["+0.233s","bp","断点 android_log_write_list @0x570c ×12",18],
+    ["+0.310s","proc","进程扫描 4 个 / 3 个在跑网络",22],
+    ["+0.401s","crypto","Cipher AES/CBC/PKCS5Padding",7],
+    ["+0.455s","vm","派发点二次命中 idx=2153",3]
+  ];
+  const COLOR = {proc:"var(--warn)",bp:"var(--err)",vm:"var(--live)",
+                 crypto:"#7c3aed",file:"var(--ok)"};
+  ROWS.forEach(row=>{
+    const r = document.createElement("div");
+    r.className = "tlrow";
+    r.innerHTML = '<span class="t">' + row[0] + '</span>'
+      + '<span class="bar" style="width:' + Math.max(6,row[3]*5)
+      + 'px;background:' + (COLOR[row[1]]||"var(--fg3)") + '"></span>'
+      + '<span class="tx">' + row[2] + '</span>';
+    box.appendChild(r);
+  });
+})();
+
+/* ══ 初始化 ══ */
+renderListing();
+renderTools("");
+showView("实时");
+selectFn(FUNCS.filter(f=>f.a===0x5020)[0] || FUNCS[0]);
+
+/* 主题切换 */
+const themeBtn = document.getElementById("themeBtn");
+if(themeBtn) themeBtn.onclick = (e)=>{
+  const isDark = document.body.dataset.theme === "dark";
+  document.body.dataset.theme = isDark ? "light" : "dark";
+  e.currentTarget.innerHTML = '<svg class="ic" aria-hidden="true"><use href="#i-sun"/></svg> '
+    + (isDark ? "深色" : "浅色");
+  renderTools(document.getElementById("tvSearch") ? document.getElementById("tvSearch").value : "");
+};
+
+/* 左导航折叠 / 选中 */
+document.querySelectorAll(".navhdr").forEach(h=>{
+  h.onclick = ()=> h.parentElement.classList.toggle("fold");
+});
+document.querySelectorAll(".navitem").forEach(b=>{
+  b.onclick = ()=>{
+    document.querySelectorAll(".navitem").forEach(x=>x.classList.remove("on"));
+    b.classList.add("on");
+  };
+});
+
+/* 事件流折叠 */
+let evOpen = true;
+const evHd = document.getElementById("evHd");
+if(evHd) evHd.addEventListener("click", ()=>{
+  const el = document.getElementById("events");
+  evOpen = !evOpen;
+  el.style.height = evOpen ? "150px" : "32px";
+  document.getElementById("evChev").textContent = evOpen ? "▾" : "▸";
+});
+
+</script>
+</body>
+</html>

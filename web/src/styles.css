@@ -92,7 +92,12 @@ body{background:var(--bg);color:var(--fg);font-family:var(--mono);font-size:12px
 .mod.act .mod-head{box-shadow:inset 2px 0 0 var(--live)}
 .mod-name{font-size:10.5px;color:var(--fg2);overflow:hidden;text-overflow:ellipsis}
 .mod.act .mod-name{color:var(--live);font-weight:600}
-.mod-n{margin-left:auto;color:var(--fg3);font-size:10px}
+.mod-n{color:var(--fg3);font-size:10px}
+/* 释放按钮：默认低对比，hover 才显眼，避免误点 */
+.mod-free{margin-left:auto;width:18px;height:18px;line-height:1;padding:0;
+  background:transparent;border:1px solid transparent;color:var(--fg3);
+  font-size:11px;cursor:pointer;border-radius:3px;flex:0 0 18px}
+.mod-free:hover{border-color:var(--fg3);color:var(--fg);background:rgba(255,255,255,.06)}
 .search{height:22px;flex:0 0 22px;margin:5px 6px 0;background:transparent;
   border:1px solid var(--line);color:var(--fg);font-family:var(--mono);font-size:11px;
   padding:0 8px;outline:none}

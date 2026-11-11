@@ -60,9 +60,26 @@ class CallChain:
 
 
 class Session:
-    """多 so 分析会话。一个 Session 对应一个工作区。"""
+    """多 so 分析会话。一个 Session 对应一个工作区。
+
+    (1) 第一次修改（2026-11-11）：加锁。
+
+    bug 原因：server/api.py 的 functions/disasm 等工作在**线程池**里跑，
+              而 /api/unload、/api/clear_modules 直接在事件循环里调用
+              unload()，它会清空 so.functions 等容器。正在迭代的线程会抛
+              "dictionary changed size during iteration"，实测可复现；
+              最坏情况是 build_xrefs（20-30 秒）跑到一半被清空，
+              返回残缺结果或直接失败。
+    解决方案：用 RLock（可重入，因为 add/unload 内部会互相调用），
+              并显式提供 locked_dict 快照方法给长读路径用。
+              清理动作本身也放到线程池里跑，避免 gc.collect() 卡住事件循环。
+    """
 
     def __init__(self):
+        import threading as _threading
+
+        # 可重入锁：add/unload 内部会调 ensure_* 之类的方法，不能自锁死
+        self._lock = _threading.RLock()
         self.modules: dict[str, SoFile] = {}  # so 短名 -> 模块
         self._xrefs: dict[str, Xref] = {}
         self._strings: dict[str, StringAnalyzer] = {}
@@ -77,6 +94,10 @@ class Session:
     # ---------- 加载 ----------
 
     def add(self, path: str) -> SoFile:
+        with self._lock:
+            return self._add_locked(path)
+
+    def _add_locked(self, path: str) -> SoFile:
         so = SoFile(path)
         key = so.name
         # 重名 so：后加载的加后缀区分，避免覆盖
@@ -348,6 +369,17 @@ class Session:
                     )
         return out
 
+    def snapshot_modules(self) -> dict:
+        """线程安全的模块字典快照（浅拷贝）。
+
+        (1) 第一次修改（2026-11-11）：新增。
+
+        长读路径（遍历函数表、构建引用图）应该先取快照再迭代，
+        这样即使同时有人卸载，也不会撞上 "dictionary changed size"。
+        """
+        with self._lock:
+            return dict(self.modules)
+
     def summary(self) -> dict:
         """会话概况，供 MCP/GUI 首屏。"""
         return {
@@ -363,3 +395,288 @@ class Session:
             ],
             "export_symbols": len(self._export_index),
         }
+
+    # ---------------------------------------------------------------- 卸载
+    #
+    # 为什么需要卸载：实测 2.9MB 的 so 加载后占 **14.7MB** 内存（约 5 倍），
+    # 每个函数约 5KB。加载 6 个模块、18.6 万个函数时占用接近 1GB。
+    #
+    # 为什么不能只 del：实测 `del so; gc.collect()` 只回收 0.5MB（应回收 14.7MB）。
+    # 根因是 SoFile 内部存在循环引用（SoFile ↔ Function ↔ Disassembler 等
+    # 互相持有），CPython 的引用计数释放不掉，而它又不足以触发分代回收。
+    # 所以卸载必须**主动断开内部引用**，否则等于没卸。
+
+    def unload(self, name: str) -> dict:
+        """卸载一个模块并释放内存。
+
+        (1) 第一次修改（2026-11-11）：新增。
+
+        释放的是 **mda 进程内的静态分析结果**，不影响目标设备上的 so，
+        也不会让正在跑的 App 崩溃。
+
+        返回 {ok, so, freed_estimate_mb} —— freed 是估算值，
+        真实回收量受 Python 内存分配器影响，可能小于它。
+        """
+        with self._lock:
+            return self._unload_locked(name)
+
+    def _unload_locked(self, name: str, do_gc: bool = True) -> dict:
+        import gc
+
+        key = self._resolve_key(name)
+        if key is None:
+            return {"ok": False, "code": "SO_NOT_LOADED",
+                    "error": f"未加载的 so: {name}",
+                    "loaded": list(self.modules)}
+
+        so = self.modules.get(key)
+        est_mb = round(len(getattr(so, "functions", {}) or {}) * 5 / 1024, 1)
+
+        # ① 从索引里摘掉这个模块的导出符号
+        #    注意不能整体清空 _export_index，别的模块还在用
+        dead_syms = []
+        for sym, owners in self._export_index.items():
+            kept = [o for o in owners if o[0] != key]
+            if kept:
+                self._export_index[sym] = kept
+            else:
+                dead_syms.append(sym)
+        for sym in dead_syms:
+            self._export_index.pop(sym, None)
+
+        # ② 摘掉各类缓存。
+        #    (2) 第二次修改（2026-11-11）：
+        #        bug 原因：原来只 pop 掉 self._xrefs[key] 就算完事，但 Xref 对象
+        #                  内部**持有 so 的引用**（Xref.so），而 Xref 又反过来
+        #                  被 so 引用不到——它是个独立的环。pop 掉字典项只是
+        #                  少了一个外部引用，Xref ↔ so ↔ Disassembler 这个环
+        #                  还在，gc 回收不掉，所以实测卸载后只回收 0.6/23 MB。
+        #        解决方案：pop 之前**先把 Xref / StringAnalyzer 内部的大容器清空**，
+        #                  再断开它们对 so 的引用，最后才从字典移除。
+        xref_obj = self._xrefs.pop(key, None)
+        strs_obj = self._strings.pop(key, None)
+        self._purge_helper(xref_obj)
+        self._purge_helper(strs_obj)
+
+        self.modules.pop(key, None)
+        self._import_edges.pop(key, None)
+        self._discovered.discard(key)
+
+        # ③ 主动断开 SoFile 内部引用。
+        #    这一步是**必须的**：不做的话 gc 回收不掉（实测只回收 0.5/14.7 MB）。
+        freed_objs = self._break_references(so)
+
+        # (3) 打上已卸载标记：避免出现"僵尸对象"——
+        #     清空容器后 function_at 返回 None，但 read() 还可能从残留缓存读到数据，
+        #     行为不一致。有了标记，公开方法可以明确报错。
+        try:
+            so._unloaded = True
+        except Exception:                                 # noqa: BLE001
+            pass
+        del so
+        if do_gc:
+            gc.collect()
+        return {
+            "ok": True,
+            "so": key,
+            "freed_estimate_mb": est_mb,
+            "broken_objects": freed_objs,
+            "remaining": list(self.modules),
+            "note": ("已释放 mda 内的静态分析结果；"
+                     "不影响设备上运行的进程。"),
+        }
+
+    def clear(self, keep=None) -> dict:
+        """批量卸载，可指定保留哪些。
+
+        (1) 第一次修改（2026-11-11）：新增。
+
+        用法：
+            clear()                            # 全清
+            clear(keep=["libil2cpp.so"])       # 只留这个
+        """
+        # (2) 第二次修改（2026-11-11）：
+        #     bug 原因：`{str(x) for x in (keep or [])}` 在 keep 传**字符串**时
+        #               会按字符拆开——clear(keep="liblog.so") 得到的集合是
+        #               {'l','i','b','o','g','.','s'}，于是**一个都不匹配**，
+        #               把全部模块都清空了。实测复现：加载 2 个模块，
+        #               传 keep="liblog.so" 后剩余 []。这是数据丢失级 bug。
+        #     解决方案：① 传 str 视为"单个模块名"（这是调用方最自然的意图）；
+        #               ② 传 list 时逐个校验必须是 str，否则直接报错，
+        #                  不猜、不静默降级。
+        if keep is None:
+            keep_list: list[str] = []
+        elif isinstance(keep, str):
+            keep_list = [keep]
+        elif isinstance(keep, (list, tuple, set)):
+            keep_list = []
+            for x in keep:
+                if not isinstance(x, str):
+                    return {"ok": False, "code": "BAD_KEEP",
+                            "error": f"keep 里必须是字符串，收到 {type(x).__name__}",
+                            "hint": "正确写法：keep=['a.so', 'b.so'] 或 keep='a.so'"}
+                keep_list.append(x)
+        else:
+            return {"ok": False, "code": "BAD_KEEP",
+                    "error": f"keep 必须是字符串或字符串列表，收到 {type(keep).__name__}"}
+
+        keep_set = set(keep_list)
+        with self._lock:
+            targets = [k for k in list(self.modules) if k not in keep_set]
+        if not targets:
+            return {"ok": True, "freed": [], "remaining": list(self.modules),
+                    "note": "没有需要清理的模块"}
+
+        # (3) 第三次修改（2026-11-11）：
+        #     bug 原因：原来每个模块调一次 unload()，而 unload 内部有一次
+        #               gc.collect() —— 批量清理 20 个模块就是 20 次全量 GC。
+        #     解决方案：批量时走内部无 GC 的路径，最后统一 gc 一次。
+        freed = []
+        with self._lock:
+            for k in targets:
+                r = self._unload_locked(k, do_gc=False)
+                if r.get("ok"):
+                    freed.append({"so": k,
+                                  "est_mb": r.get("freed_estimate_mb")})
+        import gc as _gc
+
+        _gc.collect()
+        return {
+            "ok": True,
+            "freed": freed,
+            "freed_count": len(freed),
+            "est_total_mb": round(sum(f["est_mb"] or 0 for f in freed), 1),
+            "remaining": list(self.modules),
+        }
+
+    def memory_usage(self) -> dict:
+        """估算各模块占用的内存，供用户在清理前判断。
+
+        (1) 第一次修改（2026-11-11）：新增。
+
+        为什么给估算而不是精确值：精确测量要遍历整个对象图（慢且会触发
+        完整 gc，反而影响正在进行的分析）。按实测比例
+        「每函数约 5KB」估算，误差在可接受范围内，足够用来决策。
+        """
+        rows = []
+        with self._lock:
+            items = list(self.modules.items())
+        for name, so in items:
+            n = len(getattr(so, "functions", {}) or {})
+            rows.append({
+                "so": name,
+                "functions": n,
+                "exports": len(getattr(so, "exports", {}) or {}),
+                "est_mb": round(n * 5 / 1024, 1),
+            })
+        rows.sort(key=lambda r: -(r["est_mb"] or 0))
+        return {
+            "count": len(rows),
+            "modules": rows,
+            "est_total_mb": round(sum(r["est_mb"] for r in rows), 1),
+            "note": ("est_mb 按实测「每函数约 5KB」估算。"
+                     "实测 2.9MB 的 so 加载后占约 14.7MB。"),
+        }
+
+    def _resolve_key(self, name: str) -> str | None:
+        """把用户给的名字（可能是原文件名/短名/重命名后的名字）解析成内部键。"""
+        if not name:
+            return None
+        if name in self.modules:
+            return name
+        for key, so in self.modules.items():
+            if getattr(so, "renamed_from", None) == name:
+                return key
+        # 退一步：按 basename 或去扩展名匹配
+        import os as _os
+
+        base = _os.path.basename(str(name))
+        for key in self.modules:
+            if key == base or _os.path.splitext(key)[0] == _os.path.splitext(base)[0]:
+                return key
+        return None
+
+    @staticmethod
+    def _purge_helper(obj) -> int:
+        """清空 Xref / StringAnalyzer / Disassembler 这类辅助对象内部的大容器。
+
+        (2) 第二次修改（2026-11-11）：新增。
+
+        为什么需要单独处理：这些对象与 SoFile 互相持有引用，形成环。
+        只把它们从 session 的字典里 pop 掉，引用计数不会归零，
+        gc 也不会主动回收——实测卸载 3 份模块只回收 0.6MB（应回收 23MB）。
+
+        做法：把属性值里「容器类」的清空、指向 so 的引用断开。
+        """
+        if obj is None:
+            return 0
+        n = 0
+        d = getattr(obj, "__dict__", None)
+        if isinstance(d, dict):
+            for attr, val in list(d.items()):
+                try:
+                    # 断开对 SoFile 的引用（这是环的关键一环）
+                    if type(val).__name__ == "SoFile":
+                        d[attr] = None
+                        n += 1
+                    elif isinstance(val, (dict, list, set)):
+                        val.clear()
+                        n += 1
+                    elif isinstance(val, (bytes, bytearray)):
+                        d[attr] = b""
+                        n += 1
+                except Exception:                         # noqa: BLE001
+                    continue
+        return n
+
+    @staticmethod
+    def _break_references(so) -> int:
+        """主动断开 SoFile 的内部引用，让 gc 真正回收。
+
+        (1) 第一次修改（2026-11-11）：新增。
+
+        bug 原因：实测 `del so; gc.collect()` 只回收 0.5MB 而非 14.7MB。
+                  SoFile 内部 functions / symbols / sections / 反汇编缓存
+                  之间互相引用，形成环；引用计数归零不了，
+                  而分代回收不会因为一个从字典里摘掉的对象就立刻动手。
+        解决方案：把持有大对象引用的容器逐个清空。
+                  只清容器内容（clear()），不递归遍历整图——
+                  那样慢且可能踩到半初始化对象。
+        """
+        # (3) 第三次修改（2026-11-11）：
+        #     bug 原因：review 指出漏清 _cache（节数据字节）、_elf、_starts、
+        #               _loads、plt_map、plt_stubs、_stub_sorted、_func_ranges。
+        #               实测 libbase 带外部引用卸载后仍残留 _cache 24 项，
+        #               实际只回收 0.62/1.16 MB——对带节表的大 so 这部分不小。
+        #     解决方案：把 SoFile 内部所有持有大对象的容器都列进来。
+        n = 0
+        for attr in ("functions", "symbols", "sections", "imports",
+                     "exports", "strings", "relocations", "plt",
+                     "loads", "_raw", "data",
+                     # (3) 补漏的字段
+                     "_cache", "_elf", "_starts", "_loads",
+                     "plt_map", "plt_stubs", "_stub_sorted",
+                     "_func_ranges", "_segments", "_phdrs"):
+            obj = getattr(so, attr, None)
+            if obj is None:
+                continue
+            try:
+                if isinstance(obj, (dict, list, set)):
+                    obj.clear()
+                    n += 1
+                elif isinstance(obj, (bytes, bytearray)):
+                    setattr(so, attr, b"")
+                    n += 1
+                elif hasattr(obj, "clear") and callable(obj.clear):
+                    obj.clear()
+                    n += 1
+            except Exception:                             # noqa: BLE001
+                continue
+        try:
+            sol = getattr(so, "_stream", None)
+            if sol is not None:
+                sol.close()
+                n += 1
+        except Exception:                                 # noqa: BLE001
+            pass
+        return n

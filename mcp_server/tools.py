@@ -5040,3 +5040,261 @@ def mem_snapshot_clear(serial: str, key: str = "default") -> str:
     except Exception as exc:                              # noqa: BLE001
         return _j({"error": f"{type(exc).__name__}: {exc}",
                    "code": "MEM_CLEAR_FAILED"})
+
+
+# ---------------- 模块卸载 / 内存释放 ----------------
+#
+# 为什么需要：实测 2.9MB 的 so 加载后占 14.7MB（约 5 倍），每函数约 5KB。
+# 加载 6 个模块、18.6 万函数时占用接近 1GB。
+
+
+@server.tool()
+@logged()
+def unload_so(so_name: str) -> str:
+    """卸载一个模块，**释放 mda 进程内的静态分析结果**。
+
+    ## 释放的是什么
+
+    只清 mda 里的解析结果（函数表、反汇编缓存、引用图），
+    **不影响设备上正在运行的进程**，也不会让 App 崩溃。
+
+    ## 为什么卸载了 RSS 不一定立刻降
+
+    Python 的内存分配器倾向于把释放的块留在自己的池子里复用，
+    不马上归还操作系统。所以看到 RSS 没降**不代表没释放**。
+
+    验证方式：卸载后再加载同样的模块，占用会明显小于第一次
+    （实测：首次 24MB，第二次只涨 13MB）。
+
+    返回：{ok, so, freed_estimate_mb, remaining}
+    """
+    from mcp_server.tools import get_session
+
+    try:
+        return _j(get_session().unload(so_name))
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}",
+                   "code": "UNLOAD_FAILED"})
+
+
+@server.tool()
+@logged()
+def clear_modules(keep: list | None = None) -> str:
+    """批量卸载模块，可指定保留哪些。
+
+    ## 用法
+
+        clear_modules()                          # 全清
+        clear_modules(keep=["libil2cpp.so"])     # 只留这个
+
+    返回：{ok, freed[], freed_count, est_total_mb, remaining}
+    """
+    from mcp_server.tools import get_session
+
+    try:
+        return _j(get_session().clear(keep=keep))
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}",
+                   "code": "CLEAR_FAILED"})
+
+
+@server.tool()
+@logged()
+def module_memory() -> str:
+    """查看各模块占用的内存（估算），用来决定该清哪个。
+
+    返回：{count, modules[{so, functions, exports, est_mb}], est_total_mb}
+
+    ## 估算依据
+
+    实测：2.9MB 的 so（3012 个函数）加载后占 14.7MB，即**每函数约 5KB**。
+    按这个比例估算，足够用来做清理决策。
+    """
+    from mcp_server.tools import get_session
+
+    try:
+        return _j(get_session().memory_usage())
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}",
+                   "code": "MEMORY_QUERY_FAILED"})
+
+
+# ---------------- App 行为监控 ----------------
+#
+# 实现方式：frida 注入（运行时 attach），**不需要 Xposed**。
+# 原理：hook Java 标准 API 入口，算法名是 App 自己通过
+#       getInstance("MD5") 告诉我们的，不是特征识别。
+
+
+@server.tool()
+@logged()
+def behavior_monitor_start(serial: str, pid: int, crypto: bool = True,
+                           file: bool = True, activity: bool = True,
+                           assets: bool = True, shell: bool = False,
+                           duration: float = 0, max_events: int = 3000) -> str:
+    """启动 **App 行为监控**：算法 / 文件 / Activity / assets / Shell。
+
+    ## 它怎么实现的（不是识别算法）
+
+    hook Java 标准 API 的入口。App 调 `MessageDigest.getInstance("MD5")` 时
+    **自己把算法名告诉了我们**，不需要任何特征匹配。
+    再 hook `digest()` / `doFinal()` 拿输入输出，就得到完整的
+    「算法 + 明文 + 密文 + 调用栈」。
+
+    ## 参数（每类独立开关，按需最小化）
+
+        crypto   哈希/加解密/密钥哈希（MessageDigest / Cipher / Mac）
+        file     文件读写（FileInputStream / FileOutputStream）
+        activity Activity 生命周期
+        assets   assets 资源加载
+        shell    **执行 shell 命令**，默认关（反调试最敏感的点之一）
+        duration 采集秒数（**0 = 常驻**，之后用 poll / stop）
+
+    ## 返回
+
+        installed[]        实际挂上的 hook
+        events[]           事件列表（cat / kind / 各类字段 / stack）
+        counts{}           各类事件计数
+        algorithms_seen[]  用到的算法名（去重）
+        verdict            一句话结论
+
+    ## 实测样例
+
+        behavior_monitor_start(pid=..., duration=8)
+        → installed: [MessageDigest, Cipher, Mac, FileInputStream, ...]
+          algorithms_seen: ["MD5"]
+          [crypto] digest_algo: MD5
+            调用栈: com.miui.systemui.util.Md5.getMd5Digest(Md5.java:11)
+
+    ## 覆盖边界（重要）
+
+        ✅ 用标准 API 的 App（绝大多数）
+        ❌ 自研 VM / 自己实现的算法 —— 不调 MessageDigest，hook 抓不到
+
+    ## 风控提醒
+
+    每多开一类监控，被检测概率就上升。实测教训（2026-11-09）：
+    批量 hook 是最强信号，一次挂 317 个方法后阿里系 App 直接拒绝访问。
+    **建议按需最小化开启。**
+    """
+    mod, err = _load_dyn_module("dyn.behavior", "behavior_monitor_start")
+    if err:
+        return _j(err)
+    try:
+        return _j(mod.behavior_monitor_start(
+            serial, int(pid), crypto=bool(crypto), file=bool(file),
+            activity=bool(activity), assets=bool(assets), shell=bool(shell),
+            duration=float(duration), max_events=int(max_events)))
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}",
+                   "code": "BEHAVIOR_START_FAILED"})
+
+
+@server.tool()
+@logged()
+def behavior_monitor_poll(serial: str = "", pid: int = 0) -> str:
+    """取常驻行为监控的当前结果（可反复调用，看新增事件）。"""
+    mod, err = _load_dyn_module("dyn.behavior", "behavior_monitor_poll")
+    if err:
+        return _j(err)
+    try:
+        return _j(mod.behavior_monitor_poll(serial, int(pid or 0)))
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}",
+                   "code": "BEHAVIOR_POLL_FAILED"})
+
+
+@server.tool()
+@logged()
+def behavior_monitor_stop(serial: str = "", pid: int = 0) -> str:
+    """停掉常驻行为监控，返回最终汇总结果。"""
+    mod, err = _load_dyn_module("dyn.behavior", "behavior_monitor_stop")
+    if err:
+        return _j(err)
+    try:
+        return _j(mod.behavior_monitor_stop(serial, int(pid or 0)))
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}",
+                   "code": "BEHAVIOR_STOP_FAILED"})
+
+
+# ---------------- App 进程全貌 ----------------
+#
+# 为什么不注入也能查：全部走 adb + /proc，目标完全无感知。
+# 这解决了「抓包抓不到」最常见的误判——网络根本不在主进程里。
+
+
+@server.tool()
+@logged()
+def list_app_processes(serial: str, package: str,
+                       detect_network: bool = True) -> str:
+    """列出一个 App 包名下的**所有进程**，并判断哪个在跑网络。
+
+    ## 为什么需要它
+
+    抓包抓不到，很多时候不是工具不行，而是**网络根本不在你以为的那个进程里**。
+
+    实测 com.taobao.idlefish：
+
+        pid=31182  主进程                31 个 socket
+        pid=970    :normal_render_proc0  13 个 socket
+        pid=31204  :channel               6 个 socket
+        pid=31975  :windowChannel         3 个 socket
+
+    四个进程都在跑网络。只 hook 主进程必然漏掉其余三个的流量。
+
+    ## 参数
+
+        package         包名，如 "com.taobao.idlefish"
+        detect_network  是否探测各进程网络活动
+
+    ## 返回
+
+        count / processes[] / main_pid / network_pids[] / verdict
+        processes[]: {pid, ppid, name, suffix, role, sockets, loaded_so_count, is_main}
+
+    ## 判定依据（通用，不依赖任何特定库名）
+
+        sockets  = /proc/<pid>/fd 里 socket 型 fd 的数量
+        role     = 按 Android 通用命名规律（:channel / :push / :remote…）推断
+
+    **注意**：`/proc/<pid>/net/tcp` 是网络命名空间级的，
+    对所有进程返回值相同，**不能**用来区分进程——所以不用它判定。
+
+    ## 完全无感知
+
+    纯读 /proc，不 attach、不注入，不会被风控感知。
+    """
+    mod, err = _load_dyn_module("dyn.appproc", "list_app_processes")
+    if err:
+        return _j(err)
+    try:
+        return _j(mod.list_app_processes(serial, package,
+                                         detect_network=bool(detect_network)))
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}",
+                   "code": "LIST_APP_PROCESSES_FAILED"})
+
+
+@server.tool()
+@logged()
+def probe_network_processes(serial: str, package: str) -> str:
+    """专门回答「**哪个进程在跑网络**」，给抓包/注入选目标用。
+
+    比 `list_app_processes` 更聚焦：只列有网络活动的进程，并给出注入建议顺序。
+
+    返回：{ok, candidates[], recommend[], total_processes, verdict}
+
+    ## 典型用法
+
+        抓包抓不到 → probe_network_processes("com.xxx")
+        → 发现 :channel 也在跑网络 → 对那几个 pid 分别处理
+    """
+    mod, err = _load_dyn_module("dyn.appproc", "probe_network_processes")
+    if err:
+        return _j(err)
+    try:
+        return _j(mod.probe_network_processes(serial, package))
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}",
+                   "code": "PROBE_NET_FAILED"})

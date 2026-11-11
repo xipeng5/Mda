@@ -97,6 +97,43 @@ export default function App() {
     log(`已打开 ${so} · ${funcs.length} 函数（后端实时解析）`, "ai");
   }, [log]);
 
+  /** 释放一个模块：只清 mda 内的解析结果，不影响设备端进程。 */
+  const unloadModule = useCallback(async (so: string) => {
+    try {
+      const r = await fetch(`${location.origin}/api/unload`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ so }),
+      });
+      const j = await r.json();
+      if (!r.ok || j.ok === false) {
+        log(`释放失败：${j.error || r.statusText}`, "ai");
+        return;
+      }
+      // 从本地状态里移除，保持前后端一致
+      backendMods.current.delete(so);
+      // (3) 第三次修改（2026-11-11）：
+      //     bug 原因：原来无条件 setActive(0)，卸载非当前模块时界面会莫名跳回第一个。
+      //     解决方案：按剩余模块重新定位——如果卸载的不是当前模块，保持当前；
+      //               否则退到第一个（没有模块时归零）。同时用"按 so 名过滤"而不是
+      //               "用旧下标过滤"，避免稀疏数组错位。
+      setModules((prev) => {
+        const kept = prev.filter((m) => m.so !== so);
+        const curSo = prev[active]?.so;
+        const newIdx = curSo === so ? 0 : kept.findIndex((m) => m.so === curSo);
+        setActive(newIdx < 0 ? 0 : newIdx);
+        return kept;
+      });
+      setSel((prev) => {
+        const kept = prev.filter((_, i) => modules[i]?.so !== so);
+        return kept;
+      });
+      log(`已释放 ${so}（约 ${j.freed_estimate_mb ?? "?"} MB），设备端进程不受影响`, "ai");
+    } catch (e) {
+      log(`释放出错：${String(e)}`, "ai");
+    }
+  }, [log, modules]);
+
   /** 按路径加载（原生对话框选择的结果） */
   const buildModule = useCallback(async (path: string): Promise<void> => {
     const name = path.split("/").pop() || path;
@@ -187,6 +224,25 @@ export default function App() {
     ws.onmessage = (ev) => {
       let msg: { type?: string; tool?: string; args?: Record<string, unknown>; summary?: string; event?: Record<string, unknown> };
       try { msg = JSON.parse(ev.data); } catch { return; }
+      // (3) 第三次修改（2026-11-11）：
+      //     bug 原因：服务端在卸载/清空后会广播 modules_changed，
+      //               但前端只处理 ai / ui 两类消息——于是 AI 通过 MCP 调
+      //               unload_so / clear_modules 之后，界面仍显示旧模块，
+      //               点一下就是 404，与「AI 与界面同会话」的目标相悖。
+      //     解决方案：收到 modules_changed 就按服务端给的模块列表对齐本地状态。
+      if (msg.type === "modules_changed") {
+        const alive = new Set(
+          ((msg as { modules?: string[] }).modules ?? []));
+        setModules((prev) => {
+          const kept = prev.filter((m) => alive.has(m.so));
+          if (kept.length !== prev.length) {
+            backendMods.current = new Set(kept.map((m) => m.so));
+            log(`模块已释放，界面同步（剩余 ${kept.length} 个）`, "ai");
+          }
+          return kept.length === prev.length ? prev : kept;
+        });
+        return;
+      }
       if (msg.type === "ai" && msg.tool === "load_so") {
         // (2) 第一次修改：AI 通过 MCP 加载 so 后，界面自动出现该模块。
         //     原因：之前只有 AI 自己看得见，人要在窗口里手动再开一次。
@@ -361,7 +417,7 @@ export default function App() {
       }}
     >
       <header className="topbar">
-        <div className="brand"><span className="mark" />MDA<small>0.3.7 · web</small></div>
+        <div className="brand"><span className="mark" />MDA<small>0.3.9 · web</small></div>
         <div className="divider" />
         <div className="so-tabs">
           {modules.map((m, i) => (
@@ -474,7 +530,7 @@ export default function App() {
             onClose={() => setCode((c) => ({ ...c, open: false }))}
           />
         </section>
-        <RightPanel modules={modules} active={active} selected={sel} onActivate={setActive} onSelect={selectFn} onOpen={(mi, i) => { selectFn(mi, i); void openCode(); }} />
+        <RightPanel modules={modules} active={active} selected={sel} onActivate={setActive} onSelect={selectFn} onOpen={(mi, i) => { selectFn(mi, i); void openCode(); }} onUnload={unloadModule} />
       </main>
 
       {dragging && (

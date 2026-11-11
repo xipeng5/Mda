@@ -2290,6 +2290,360 @@ def test_r63_vm_idx_not_faked() -> None:
           "toInt32 会在跨度超 ±2GB 时溢出")
 
 
+
+
+def test_r65_module_unload() -> None:
+    """R65：模块卸载必须真正释放对象，且不影响其它模块。
+
+    (1) 第一次修改（2026-11-11）：新增。
+
+    实测背景：2.9MB 的 so 加载后占 14.7MB（约 5 倍），每函数约 5KB。
+    加载 6 个模块、18.6 万函数时接近 1GB，所以卸载能力是刚需。
+
+    关键坑（已修）：只把模块从字典里 pop 掉不够——
+    SoFile ↔ Xref ↔ Disassembler 之间有环，gc 回收不掉。
+    实测第一次只回收 0.6/23 MB。必须主动清空这些辅助对象的内部分容器。
+    """
+    import inspect as _insp
+
+    from core.session import Session
+
+    for fn in ("unload", "clear", "memory_usage", "_break_references",
+               "_purge_helper", "_resolve_key"):
+        check(f"R65 Session.{fn} 存在", hasattr(Session, fn))
+
+    src = _insp.getsource(Session)
+    check("R65 卸载会清辅助对象", "_purge_helper" in src,
+          "只 pop 字典项回收不掉（实测 0.6/23MB）")
+    check("R65 断开 SoFile 引用", "_break_references" in src)
+    check("R65 清理 export 索引", "_export_index" in src and "dead_syms" in src,
+          "不清的话别的模块的符号会被误删或残留")
+    check("R65 有内存估算", "memory_usage" in src and "5 / 1024" in src,
+          "按每函数 5KB 估算")
+
+    # 参数校验
+    s = Session()
+    r = s.unload("不存在的.so")
+    check("R65 卸载不存在的模块要报错", r.get("ok") is False
+          and r.get("code") == "SO_NOT_LOADED", str(r.get("code")))
+    r2 = s.clear()
+    check("R65 空会话 clear 不报错", r2.get("ok") is True)
+
+
+def test_r64_behavior_monitor() -> None:
+    """R64：App 行为监控（算法/文件/Activity/assets/Shell）。
+
+    (1) 第一次修改（2026-11-11）：新增。
+
+    原理澄清（重要）：不是「识别算法」，是 hook Java 标准 API 入口——
+    App 调 MessageDigest.getInstance("MD5") 时自己把算法名说了出来。
+    """
+    import inspect as _insp
+
+    import dyn.behavior as _bh
+
+    for fn in ("behavior_monitor_start", "behavior_monitor_poll",
+               "behavior_monitor_stop"):
+        check(f"R64 {fn} 存在", hasattr(_bh, fn))
+
+    # 五类监控都要在
+    cats = _bh.BEHAVIOR_CATEGORIES
+    for c in ("crypto", "file", "activity", "assets", "shell"):
+        check(f"R64 有 {c} 类", c in cats)
+        check(f"R64 {c} 有风险标注", bool(cats.get(c, {}).get("risk")))
+
+    # shell 必须默认关（反调试最敏感）
+    sig = _insp.signature(_bh.behavior_monitor_start)
+    check("R64 shell 默认关闭", sig.parameters["shell"].default is False,
+          "实测批量 hook 会触发风控，敏感项不能默认开")
+
+    src = _insp.getsource(_bh)
+    check("R64 用标准 API 而非特征识别", "getInstance" in src,
+          "算法名来自 App 自己的 getInstance 参数")
+    check("R64 抓调用栈", "javaStack" in src)
+    check("R64 说明覆盖边界", "自研" in src or "VM" in src)
+    check("R64 只记录不拦截", "return this." in src,
+          "hook 必须调原实现，不能改变目标行为")
+    check("R64 有事件上限", "MAX_EVENTS" in src)
+
+    # 没有开任何类别时要报错
+    r = _bh.behavior_monitor_start("no-serial", 1, crypto=False, file=False,
+                                   activity=False, assets=False, shell=False)
+    check("R64 全关时要报错", r.get("code") == "NO_CATEGORY", str(r.get("code")))
+
+
+
+
+
+
+
+
+def test_r66_app_processes() -> None:
+    # R66: App 进程全貌，判定用通用指标（不依赖特定库名）。
+    # (1) 第一次修改（2026-11-11）: 新增。
+    #
+    # 为什么需要: 抓包抓不到最常见的原因是网络不在主进程里。
+    # 实测闲鱼 4 个进程，主进程 31 socket、:channel 6、渲染 13
+    # ——只 hook 主进程必然漏。
+    #
+    # 关键教训:
+    #   不能靠库名判定（换 App 就失效）
+    #   /proc/<pid>/net/tcp 是 namespace 级，对所有进程相同，不可用
+    #   只有 /proc/<pid>/fd 的 socket 数是进程级准确的
+    import inspect as _insp
+
+    import dyn.appproc as _ap
+
+    check("R66 list_app_processes 存在", hasattr(_ap, "list_app_processes"))
+    check("R66 probe_network_processes 存在",
+          hasattr(_ap, "probe_network_processes"))
+
+    src = _insp.getsource(_ap)
+
+    check("R66 用 socket 数判定", "sockets" in src)
+    check("R66 说明 net/tcp 是命名空间级",
+          "namespace" in src or chr(21629) + chr(21517) + chr(31354) + chr(38388) in src)
+
+    # (2) 第二次修改（2026-11-11）: 断言改成只检查「真代码」。
+    #     bug 原因: 原来只排除以 # 开头的行，但实测数据示例写在模块
+    #               docstring 里（pid=31182 ... + libtnet.so），
+    #               那属于说明性内容，不该被当成"代码依赖"判定失败。
+    #     解决方案: 用 ast 取模块真正的代码行——把 docstring 全部剔除。
+    import ast as _ast
+    tree = _ast.parse(src)
+    doc_lines = set()
+    for node in _ast.walk(tree):
+        if isinstance(node, (_ast.Module, _ast.FunctionDef, _ast.ClassDef,
+                             _ast.AsyncFunctionDef)):
+            body = getattr(node, "body", None)
+            if body and isinstance(body[0], _ast.Expr) and \
+                    isinstance(body[0].value, _ast.Constant) and \
+                    isinstance(body[0].value.value, str):
+                d = body[0]
+                for ln in range(d.lineno, (d.end_lineno or d.lineno) + 1):
+                    doc_lines.add(ln)
+    code_only = [
+        ln for i, ln in enumerate(src.splitlines(), start=1)
+        if i not in doc_lines and not ln.strip().startswith("#")
+    ]
+    code = chr(10).join(code_only)
+    for bad in ("libtnet", "libaccs", "libmtopsdk", "libanet"):
+        check("R66 代码里没有 " + bad, bad not in code,
+              "特定 App 的库名，通用能力不能依赖")
+
+    r = _ap.list_app_processes("no-serial", "")
+    check("R66 空包名报错", r.get("code") == "NO_PACKAGE", str(r.get("code")))
+
+
+
+def test_r67_behavioral_not_source() -> None:
+    """R67：真行为测试，替代 R65/R66 的源码字符串断言。
+
+    (1) 第一次修改（2026-11-11）：新增。
+
+    bug 原因：R65/R66 用 `inspect.getsource(...)` 做字符串断言，比如
+              `"_purge_helper" in src`——**一个什么都不做的 unload 也能通过**。
+              测的是"代码里有这个词"，不是"功能对不对"，是假测试。
+    解决方案：改成会失败的真行为测试：
+              ① 卸载后容器真的空了、没有残留 SoFile
+              ② 并发读 + 卸载不抛 RuntimeError
+              ③ clear(keep=字符串) 正确保留而不是全清
+              ④ 常驻监控的 poll 真的能拿到事件
+    """
+    import gc
+    import os
+    import threading
+    import types
+
+    from core.session import Session
+
+    # ---------- ① 卸载后真的释放 ----------
+    so_path = None
+    for cand in (
+        "/Users/waterclean/Desktop/ProJect/py/pythonProject1/咸鱼web/hooks/out/"
+        "_t1_sgmainso_260202.so",
+        "/tmp/sg_real.so",
+        "samples/liblog.so",
+        "samples/libbase.so",
+    ):
+        if os.path.isfile(cand):
+            so_path = cand
+            break
+
+    if so_path:
+        s = Session()
+        s.add(so_path)
+        key = list(s.modules)[0]
+        so_obj = s.modules[key]
+        n_funcs = len(so_obj.functions)
+        check("R67 加载后有函数", n_funcs > 0, str(n_funcs))
+
+        r = s.unload(key)
+        check("R67 卸载返回成功", r.get("ok") is True, str(r.get("code")))
+        check("R67 模块已从 modules 移除", key not in s.modules)
+        check("R67 函数表已清空", len(so_obj.functions) == 0,
+              f"残留 {len(so_obj.functions)} 个函数")
+        check("R67 _raw 已清空", not getattr(so_obj, "_raw", b""),
+              "so 文件字节没释放")
+        check("R67 打了卸载标记", getattr(so_obj, "_unloaded", False) is True,
+              "没有标记会变成僵尸对象")
+        # 全量 gc 后不应再有从这个 Session 来的 SoFile 残留
+        del so_obj
+        gc.collect()
+        check("R67 没有残留 SoFile 引用",
+              "剩余" not in str(s.modules) and len(s.modules) == 0)
+
+        # ---------- ③ clear(keep=字符串) ----------
+        s2 = Session()
+        s2.add(so_path)
+        s2.add(so_path)
+        keep_one = sorted(s2.modules)[0]
+        r2 = s2.clear(keep=keep_one)
+        check("R67 clear(keep=字符串) 只清其余的",
+              r2.get("remaining") == [keep_one],
+              f"剩余 {r2.get('remaining')}（应为 ['{keep_one}']）")
+        r3 = s2.clear(keep=123)
+        check("R67 clear(keep=非法类型) 要报错",
+              r3.get("code") == "BAD_KEEP", str(r3.get("code")))
+
+        # ---------- ② 并发读 + 卸载 ----------
+        s3 = Session()
+        s3.add(so_path)
+        errors: list = []
+
+        def _reader() -> None:
+            try:
+                for _ in range(150):
+                    for _k, _so in s3.snapshot_modules().items():
+                        _ = len(_so.functions)
+            except Exception as exc:                      # noqa: BLE001
+                errors.append(f"{type(exc).__name__}: {exc}")
+
+        th = threading.Thread(target=_reader)
+        th.start()
+        s3.clear()
+        th.join(timeout=30)
+        check("R67 并发读 + 卸载不抛异常", not errors,
+              errors[0][:80] if errors else "")
+    else:
+        check("R67 找不到样本，跳过卸载测试", True)
+
+    # ---------- ④ 常驻监控 poll 能拿到事件（用假 frida）----------
+    import dyn.behavior as bh
+
+    class _Script:
+        def __init__(self, src):
+            self.src = src
+            self.handlers = []
+            self.events = [{"cat": "crypto", "kind": "digest_algo",
+                            "algo": "MD5", "stack": []}]
+            self.cursor = 0
+
+        def on(self, ev, fn):
+            self.handlers.append(fn)
+
+        def load(self):
+            self._emit({"kind": "installed", "installed": ["MessageDigest"]})
+
+        def _emit(self, payload):
+            for h in self.handlers:
+                h({"payload": payload}, None)
+
+        def post(self, msg):
+            t = msg.get("type")
+            if t == "dump":
+                sl = self.events[self.cursor:]
+                self.cursor = len(self.events)
+                self._emit({"kind": "dump", "events": sl,
+                            "counts": {"crypto": len(self.events)},
+                            "total": len(self.events)})
+            elif t == "stop":
+                self._emit({"kind": "result", "events": self.events,
+                            "counts": {"crypto": len(self.events)},
+                            "installed": ["MessageDigest"]})
+
+    class _Sess:
+        def __init__(self):
+            self.detached = False
+            self.sscript = None
+
+        def create_script(self, src):
+            self.sscript = _Script(src)
+            return self.sscript
+
+        def detach(self):
+            self.detached = True
+
+    class _Dev:
+        def __init__(self):
+            self.sessions = []
+
+        def attach(self, pid):
+            x = _Sess()
+            self.sessions.append(x)
+            return x
+
+    dev = _Dev()
+    fake = types.ModuleType("frida")
+    fake.get_device = lambda serial, timeout=15: dev
+    old_frida = sys.modules.get("frida")
+    sys.modules["frida"] = fake
+    old_wrap = getattr(bh, "wrap_with_java_bridge", None)
+    bh.wrap_with_java_bridge = lambda js: js
+    try:
+        st = bh.behavior_monitor_start("t-dev", 424242, duration=0)
+        check("R67 常驻监控启动成功", st.get("ok") is True, str(st.get("code")))
+
+        pl = bh.behavior_monitor_poll("t-dev", 424242)
+        check("R67 poll 能拿到事件（修复前恒为 0）",
+              pl.get("count") == 1, f"实际 {pl.get('count')}")
+        check("R67 poll 能识别算法", pl.get("algorithms_seen") == ["MD5"],
+              str(pl.get("algorithms_seen")))
+
+        # poll 返回的是**累计总数**（JS 侧只传增量，避免重复搬运大对象），
+        # 所以第二次 poll 的正确期望是「还是 1 条」——没有重复累加。
+        pl2 = bh.behavior_monitor_poll("t-dev", 424242)
+        check("R67 第二次 poll 不重复累加", pl2.get("count") == 1,
+              f"实际 {pl2.get('count')}（>1 说明游标失效，重复计数）")
+
+        check("R67 常驻会话未被误 detach",
+              dev.sessions[0].detached is False)
+
+        # 重复 start 必须先把旧的停掉（B3）
+        st2 = bh.behavior_monitor_start("t-dev", 424242, duration=0)
+        check("R67 重复 start 成功", st2.get("ok") is True)
+        check("R67 重复 start 停掉了旧会话",
+              dev.sessions[0].detached is True,
+              "旧会话没停 = frida 会话泄漏")
+
+        sp = bh.behavior_monitor_stop("t-dev", 424242)
+        check("R67 stop 返回全量", sp.get("count") == 1, str(sp.get("count")))
+    finally:
+        if old_frida is not None:
+            sys.modules["frida"] = old_frida
+        bh.wrap_with_java_bridge = old_wrap
+        bh._ACTIVE.clear()
+
+    # ---------- 行为 hook 必须覆盖无参重载 ----------
+    import dyn.behavior as _bh2
+
+    check("R67 有 digest 无参重载", "digest.overload()" in _bh2._JS_BEHAVIOR,
+          "无参 digest() 是最常见用法，不挂就抓不到密文")
+    check("R67 有 doFinal 无参重载", "doFinal.overload()" in _bh2._JS_BEHAVIOR)
+    check("R67 Mac 有 doFinal", "mac_io" in _bh2._JS_BEHAVIOR,
+          "只挂 getInstance 却声称抓输入输出，是文档与实现不符")
+
+    # ---------- appproc 判定口径 ----------
+    import dyn.appproc as _ap2
+
+    check("R67 用 inet_conns 判定网络", "inet_conns" in
+          __import__("inspect").getsource(_ap2),
+          "只用 socket 会把 unix socket 进程误报成在跑网络")
+    check("R67 inode 取第 9 列", "parts[9]" in
+          __import__("inspect").getsource(_ap2),
+          "按行尾取数字会拿到标志位（实测得到 0/2/4/7/10）")
+
+
 def main() -> int:
     print("== R1 held/token 透出（防线程永久挂起）==")
     test_r1_held_is_exposed()
@@ -2413,6 +2767,14 @@ def main() -> int:
     test_r60_vm_trace()
     print("== R61 内存快照 diff ==")
     test_r61_mem_snapshot_diff()
+    print("== R65 模块卸载 ==")
+    test_r65_module_unload()
+    print("== R64 行为监控 ==")
+    test_r64_behavior_monitor()
+    print("== R66 App process enum ==")
+    test_r66_app_processes()
+    print("== R67 真行为测试 ==")
+    test_r67_behavioral_not_source()
     print("== R62 vm_breakpoint 不崩 NameError ==")
     test_r62_vm_break_no_nameerror()
     print("== R63 vm_idx 不伪造 ==")

@@ -61,3 +61,5 @@ tests/probe_perf/perf_v3
 tests/probe_perf/perf_v4
 tests/probe_perf/perf_v5
 dyn/device/mda_memsnap
+tests/probe_*.py
+tests/_r67_block.py
