@@ -32,28 +32,34 @@ uprobe 不做栈展开，拿不到完整调用栈；`%lr` 是这条路上能拿�
 `r:GROUP/NAME PATH:OFFSET ret=$retval`（返回探针）语法可用，
 但本模块**不挂**：对 malloc 这种热点会额外翻倍内核开销。
 
-### 二、绝不能创建 tracefs instance（会留下删不掉的垃圾）
+### 二、全局 `tracing_on` 写不进去 → 必须用 tracefs instance
 
-本来想用 `instances/<name>/` 隔离（它有独立 `tracing_on`），但实测：
+实测（这台设备 perfetto 常驻）：
 
-    mkdir  /sys/kernel/tracing/instances/xxx        → 成功
-    rmdir  /sys/kernel/tracing/instances/xxx        → EBUSY（Device or resource busy）
-    rm -rf 同上                                     → 同样失败
+    echo 1 > /sys/kernel/tracing/tracing_on   → rc=0，但读回来仍是 0
 
-**即使一个全新的、什么都没做的实例也删不掉**（内核里 instance 的
-`events/` 等子目录不可移除）。也就是说每调一次工具就在系统的 tracefs 里
-永久留一个目录。因此**本模块只用全局 tracefs，不建实例**。
+**rc=0 但不生效**，属静默失败。曾误以为"被 perfetto 锁死"，因为在清掉
+自己遗留的探针后它又短暂可用过；但重复验证后确认：**同一时刻**
+全局写不进、而 `instances/<名>/tracing_on` 写 1 读回就是 1，并且能正常
+收到事件（同条件下实测 888 条）。所以本模块的开关与收集一律走实例。
 
-### 三、全局 `tracing_on` 是可写的（但会被残留状态拖死）
+### 三、实例目录删不掉 → 只能复用，不能每次新建
 
-一度观察到全局 `tracing_on` 写 1 后读回仍是 0（写返回 rc=0，静默失败），
-误判为"被 perfetto 锁死"。清理掉自己遗留的事件/实例后复测：
-**全局 `tracing_on` 正常可写**（实测 `echo 1 > tracing_on` 后读回 1，
-且能收到 351 条真实事件）。真正的原因是残留事件把 tracefs 卡在忙碌态。
+`instances/<名>/` 的 `rmdir` 恒失败：
 
-**教训**：`uprobe_events` 在有事件 enable 时会返回 EBUSY，
-必须先 `echo 0 > enable` 才能增删探针。所以本模块的启动/清理严格按
-「先关 enable → 再改 uprobe_events」的顺序。
+    mkdir  instances/xxx     → 成功
+    rmdir  instances/xxx     → EBUSY (Device or resource busy)
+    rm -rf instances/xxx     → 同样失败
+
+**连一个全新的、什么都没做的实例也删不掉**（内核里 instance 的 `events/`
+等子目录不可移除）。所以：
+
+  · 绝不"每次调用建一个新实例"——那会在系统 tracefs 里不断堆积删不掉的目录
+  · 改为**固定名字 `mda_probe` 复用**，每次只 `echo > trace` 清缓冲区
+  · 缓冲区可以正常清空（实测清完 488 字节，即只剩 header）
+
+这是本模块唯一一个"会留在设备上"的痕迹，且它是一个空目录 + 空缓冲区，
+不采集任何东西时不产生开销。
 
 ### 四、libc 是全系统共享页 → 对每次 malloc 生效，必须过滤
 
@@ -139,12 +145,29 @@ _TRACEFS_CANDIDATES = ("/sys/kernel/tracing", "/sys/kernel/debug/tracing")
 
 _EVENT_GROUP = "mda_alloc"
 
+# tracefs instance 名。**固定不变**：实测实例的 rmdir 恒失败（EBUSY），
+# 每次建一个新的会在系统里不断堆积删不掉的目录，所以复用一个。
+_INSTANCE = "mda_probe"
+
 # 窗口硬上限（秒）。不能让 trace 无限收集：libc 是全系统共享页，
 # 无过滤时每秒数万条，设备实测会被拖到重启。
 _MAX_DURATION = 60.0
 
 # trace 文件大小上限。超过就说明事件量失控（过滤没生效），主动收窗。
 _MAX_TRACE_BYTES = 48 * 1024 * 1024
+
+# filter 表达式的实际长度上限。实测（Android 12 / 4.19.113）：
+#   1015 字节（45 个条件）→ 写成功
+#   1037 字节（46 个条件）→ `printf: write: Invalid argument`，**静默失败**
+# 写失败后事件照常 enable、tracing_on 照常置 1，但过滤条件根本没生效
+# ——表现为"抓到一堆别的进程的分配"（实测泄漏 23 万条），极难定位。
+# 所以这里硬性截断，宁可少覆盖几个线程，也不要写出一个无效 filter。
+_MAX_FILTER_BYTES = 960
+
+# 采集窗口内探测体量所需的最小剩余时间。低于这个值就不再探测，
+# 直接睡到收窗——否则一次 adb 往返（约 150ms，设备异常时可达数秒）
+# 会把窗口本身挤掉。
+_PROBE_MIN_REMAIN_S = 1.0
 
 class UprobeError(RuntimeError):
     """uprobe 路径的可预期失败：带机器可读 code。"""
@@ -276,6 +299,30 @@ def _symbol_offsets(local_libc: str, funcs: list[str]) -> tuple[dict, list[str]]
     return got, missing
 
 
+def _build_filter(tids: list[int]) -> tuple[str, list[int]]:
+    """拼 `common_pid` 的 OR 链，返回 (表达式, 实际纳入的 tid 列表)。
+
+    为什么要截断：内核的 filter 表达式有长度上限，超了会**静默失败**
+    （写返回 EINVAL，事件仍然 enable，但条件不生效 → 抓到全系统的分配）。
+    实测上限在 1015~1037 字节之间（45 个条件可以，46 个不行），
+    这里留余量取 `_MAX_FILTER_BYTES`。
+
+    超限时按顺序取到装得下的为止，并把"没纳入"的真相带回给调用方
+    （结果里的 `threads_covered` / `threads_skipped`），
+    而不是让人以为已经覆盖了全部线程。
+    """
+    joined: list[str] = []
+    used: list[int] = []
+    for t in tids:
+        cand = f"common_pid == {int(t)}"
+        trial = " || ".join(joined + [cand])
+        if len(trial) > _MAX_FILTER_BYTES and joined:
+            break
+        joined.append(cand)
+        used.append(int(t))
+    return " || ".join(joined), used
+
+
 def _list_tids(serial: str, pid: int) -> list[int]:
     """列出目标进程的所有线程 id。
 
@@ -328,47 +375,149 @@ def _tracefs_root(serial: str) -> str:
         "设备上没有 tracefs，已探测：" + "、".join(_TRACEFS_CANDIDATES))
 
 
-def _cleanup(serial: str, root: str) -> dict:
-    """清掉本工具注册的探针，并确认真的清干净了。
+def _looks_like_adb_failure(out: str) -> bool:
+    """判断输出是不是 adb 自身的报错（而不是设备上的真实结果）。
+
+    实测到的形态：`adb: device 'xxx' not found` / `error: closed` /
+    `error: device offline`。这些会把清理/采集的结论带偏，
+    必须单独识别出来当"未知"处理，而不是当作"没有残留"。
+    """
+    low = (out or "").lower()
+    markers = ("not found", "error: closed", "device offline",
+               "no devices", "unauthorized", "protocol fault")
+    return any(m in low for m in markers)
+
+
+def _parse_left_count(out: str) -> int:
+    """从 cleanup 脚本输出里取 `LEFT_BEGIN ... LEFT_END` 之间的计数。
+
+    用显式标记而不是 `grep -c` 直接回显，是因为 Android 的 sh 不支持
+    `${var:-default}`（实测 bad substitution），而 `|| echo 0` 又会在
+    grep 有输出时再补一个 0（变成 "0 0"）。包在标记之间最稳。
+    解析不出时返回 -1（**当作"没清干净"处理**，宁可多重试一轮，
+    也不要误报成功）。
+    """
+    inside = False
+    for line in out.splitlines():
+        t = line.strip()
+        if t == "LEFT_BEGIN":
+            inside = True
+            continue
+        if t == "LEFT_END":
+            # 标记之间没有可解析的数字 → 解析失败，交给调用方按"可能没清干净"重试
+            return -1
+        if inside:
+            try:
+                return int(t)
+            except ValueError:
+                continue
+    return -1
+
+
+def _cleanup(serial: str, root: str, attempts: int = 3) -> dict:
+    """清掉**本工具组**的探针，并确认真的清干净了。
+
+    (3) 第三次修改（2026-11-16）：
+        bug 原因：初版只按 `events/<组>/` 目录枚举要删的事件，而事件目录与
+                  `uprobe_events` 里的注册名不一定同步（实测残留一个 dbg1 事件时
+                  组目录里找不到它 → 删不掉 → `uprobe_events` 一直 EBUSY →
+                  **后续所有注册都失败**，却表现为"tracing_on 置不上 1"这种
+                  完全不相关的报错）。
+        解决方案：改为直接解析 `uprobe_events` 文本，找出属于本组的事件名，
+                  先关 enable 再逐条删除。**只删本组的**。
+
+    (4) 第四次修改（2026-11-16）：
+        bug 原因①：单次删除不可靠。内核移除 uprobe 是异步的，删完立刻回读
+                  可能还没生效，只看一次会把"还没生效"报成"清不掉"。
+        bug 原因②（更隐蔽）：事件名提取原先用 `sed 's|...|\1|p'` 传反斜杠，
+                  而这段脚本是 Python f-string 拼出来的——`\1` 在源码里
+                  写成单反斜杠，被 Python 当成**八进制转义**解释成 \x01，
+                  于是发到设备的 sed 表达式里根本没有反向引用，`MINE` 恒为空，
+                  删除循环一条都没执行。这类"字符串转义吃掉反斜杠"的坑在
+                  多层拼装（Python → adb → sh → su）里极难靠读代码发现。
+        解决方案：① 加收敛重试（最多 3 轮，轮间等待）；
+                  ② **彻底不用反向引用**，改用 grep -o + cut 提事件名，
+                     整段脚本里不出现任何反斜杠转义，从根上消掉这个坑。
 
     顺序不能变（实测）：
-      ① 先 `tracing_on = 0` —— 停止收集
-      ② 再逐个 `enable = 0`  —— **有事件 enable 时 uprobe_events 是 EBUSY**，
-         不先关就删不掉探针
+      ① 先关实例 `tracing_on` —— 停止收集
+      ② 再逐个 `enable = 0` —— **有事件 enable 时 uprobe_events 是 EBUSY**
       ③ 用 `-:GROUP/NAME` 逐条删事件（不能靠清 filter，见模块文档⑤）
-      ④ 删全局 tracing_on 复位
-
-    注意：**不碰 instances**（本模块从不创建实例，见模块文档②）。
-    也**不清空整个 uprobe_events**（那会连带删掉别人的探针，
-    比如 perfetto 或别的工具注册的），只删自己 `_EVENT_GROUP` 前缀的。
     """
     if not root:
         return {"ok": False, "reason": "no tracefs"}
-    script = "\n".join([
-        f"echo 0 > {root}/tracing_on 2>/dev/null",
-        f"for e in {root}/events/{_EVENT_GROUP}/*/enable; do echo 0 > \"$e\" 2>/dev/null; done",
-        # 先把自己的事件名全找出来（删之前），再逐条删
-        f"NAMES=$(grep -o '{_EVENT_GROUP}/[A-Za-z0-9_]*' {root}/uprobe_events 2>/dev/null | sort -u)",
-        f"for n in $NAMES; do echo \"-:$n\" >> {root}/uprobe_events 2>/dev/null; done",
-        f"echo LEFT=[$(cat {root}/uprobe_events 2>/dev/null | tr '\\n' '|')]",
-        f"echo EVENTDIR=[$(ls {root}/events/{_EVENT_GROUP} 2>/dev/null | tr '\\n' ' ')]",
+    inst = f"{root}/instances/{_INSTANCE}"
+    # 事件名 = "p:mda_alloc/NAME" 里 NAME 那段。
+    # 用 grep -o + cut 取，不用 sed 反向引用（见上面 bug 原因②）。
+    pattern = f"^[pr]:{_EVENT_GROUP}/[A-Za-z0-9_]*"
+    script = " ; ".join([
+        f"echo 0 > {inst}/tracing_on 2>/dev/null",
+        f"MINE=$(grep -o '{pattern}' {root}/uprobe_events 2>/dev/null "
+        f"| cut -d/ -f2 | sort -u)",
+        f"for n in $MINE; do echo 0 > {inst}/events/{_EVENT_GROUP}/$n/enable 2>/dev/null"
+        f" ; echo 0 > {root}/events/{_EVENT_GROUP}/$n/enable 2>/dev/null ; done",
+        # 必须用双引号：$n 要由 shell 展开；单引号会让它变成字面量 $n
+        f'for n in $MINE; do echo "-:{_EVENT_GROUP}/$n" >> {root}/uprobe_events '
+        f'2>/dev/null ; done',
+        f"echo > {inst}/trace 2>/dev/null",
+        # 数剩余条数。**Android 的 sh 不支持 ${var:-default}**（实测 bad
+        # substitution），所以直接把 grep -c 的输出接出来：它无匹配时会打印
+        # 0（rc=1 但输出有效），不要 `|| echo 0`（会变成 "0 0" 带偏解析）。
+        "echo LEFT_BEGIN",
+        f"grep -c '^{_EVENT_GROUP}/' {root}/uprobe_events 2>/dev/null",
+        "echo LEFT_END",
+        f"echo MINE=[$MINE]",
     ])
-    out = _run(serial, script, timeout=60)
-    left = ""
-    evdir = ""
-    for line in out.splitlines():
-        if line.startswith("LEFT="):
-            left = line[5:].strip()
-        elif line.startswith("EVENTDIR="):
-            evdir = line[9:].strip()
-    # 只关心自己的组是否还有残留
-    leftover = [x for x in left.split("|") if _EVENT_GROUP in x]
-    return {
-        "ok": not leftover,
-        "uprobes_left": leftover,
-        "event_dir": evdir,
-        "all_probes": [x for x in left.split("|") if x.strip()],
-    }
+
+    leftover: list[str] = []
+    mine = ""
+    for i in range(max(1, int(attempts))):
+        out = _run(serial, script, timeout=60)
+        left = _parse_left_count(out)
+        for line in out.splitlines():
+            if line.startswith("MINE="):
+                mine = line[5:].strip()
+        if left == 0:
+            return {"ok": True, "uprobes_left": [], "instance": inst,
+                    "attempts": i + 1, "removed": mine}
+        time.sleep(0.3)
+    left_out = _run(serial, f"grep '^{_EVENT_GROUP}/' {root}/uprobe_events 2>/dev/null",
+                    timeout=30)
+    # 设备失联（adb 把错误打到 stdout）时要与"确实没清掉"区分开：
+    # 前者是无法确认，后者是确定性残留。混为一谈会让人去排查根本不存在的问题。
+    if _looks_like_adb_failure(left_out):
+        return {"ok": False, "unknown": True, "instance": inst,
+                "attempts": attempts,
+                "error": ("清理时设备失联，无法确认探针是否已移除；"
+                          "重连后可用 uprobe_probe 检查 existing_probes"),
+                "raw": left_out.strip()[:200]}
+    leftover = [x.strip() for x in left_out.splitlines() if x.strip()]
+    return {"ok": False, "uprobes_left": leftover, "instance": inst,
+            "attempts": attempts}
+
+
+def _ensure_instance(serial: str, root: str) -> str:
+    """确保固定名字的 tracefs instance 存在，返回它的路径。
+
+    (2) 第二次修改（2026-11-16）：改为复用实例，不再用全局 tracing_on。
+        bug 原因：这台设备（perfetto 常驻）的**全局 `tracing_on` 写不进去**：
+                  `echo 1 > /sys/kernel/tracing/tracing_on` 返回 rc=0，
+                  读回来仍是 0 —— 静默失败。实测在全局路径下工具会直接报
+                  TRACING_NOT_STARTED，一个事件都收不到；而同样的操作放到
+                  instance 里（`instances/<名>/tracing_on`）写 1 读回就是 1，
+                  能正常收到事件（同条件实测 888 条）。
+        解决方案：用实例。但实例的 rmdir 恒失败（EBUSY，全新实例也删不掉），
+                  所以不能"每次调用建一个"，否则会在系统 tracefs 里不断堆积
+                  删不掉的目录；改为**固定名字复用**，每次只清它的缓冲区。
+    """
+    inst = f"{root}/instances/{_INSTANCE}"
+    # 已经存在就直接用；不存在才建（mkdir -p 幂等）
+    out = _run(serial, f"mkdir -p {inst} 2>&1; ls -d {inst} 2>/dev/null", timeout=30)
+    if inst not in out or "No such file" in out:
+        raise UprobeError(
+            "NO_INSTANCE",
+            f"无法创建 tracefs 实例 {inst}：{out.strip()[:200]}")
+    return inst
 
 
 # ---------------------------------------------------------------- 解析
@@ -566,7 +715,7 @@ def trace_alloc(serial: str, pid: int, tid: int = 0, size_min: int = 0,
     root = ""
     tmpdir = ""
     registered = False
-    t_start = 0.0
+    t_start0 = time.time()
     try:
         # ---- ① 目标进程实际用的 libc ----
         libc_path = _find_libc_path(serial, pid)
@@ -590,9 +739,13 @@ def trace_alloc(serial: str, pid: int, tid: int = 0, size_min: int = 0,
         tids = [tid] if tid else _list_tids(serial, pid)
         result["threads"] = len(tids)
 
-        # ---- ④ tracefs 定位 + 清掉自己上次的残留 ----
+        # ---- ④ tracefs 定位 + 实例准备 + 清掉自己上次的残留 ----
         root = _tracefs_root(serial)
         result["tracefs"] = root
+        # 探针注册在**全局** uprobe_events（事件定义是全局的），
+        # 但收集/开关走**实例**——全局 tracing_on 在本机写不进去（见模块文档③）
+        inst = _ensure_instance(serial, root)
+        result["instance"] = inst
         _cleanup(serial, root)
 
         # ---- ⑤ 注册探针 ----
@@ -618,20 +771,40 @@ def trace_alloc(serial: str, pid: int, tid: int = 0, size_min: int = 0,
         registered = True
 
         # ---- ⑥ 设 filter + 启用（顺序：filter → enable → tracing_on）----
-        filt = " || ".join(f"common_pid == {t}" for t in tids)
+        filt, covered = _build_filter(tids)
+        result["threads_covered"] = len(covered)
+        if len(covered) < len(tids):
+            # 内核 filter 有长度上限（见 _build_filter），超了会静默失效。
+            # 如实报告少覆盖了哪些，不假装全覆盖。
+            result["threads_skipped"] = [t for t in tids if t not in covered]
+            result["filter_note"] = (
+                f"内核 filter 长度上限约 {_MAX_FILTER_BYTES} 字节，"
+                f"只覆盖了 {len(covered)}/{len(tids)} 个线程；"
+                "要完整覆盖请用 tid 参数分别追踪")
         en = []
         for func in offsets:
+            # 写 filter 并**立刻**在同一行取 $?（跨行会被下一个命令覆盖）
             en.append(f"printf '%s' {_shquote(filt)} > "
-                      f"{root}/events/{_EVENT_GROUP}/{func}/filter")
-            en.append(f"echo 1 > {root}/events/{_EVENT_GROUP}/{func}/enable")
+                      f"{inst}/events/{_EVENT_GROUP}/{func}/filter; "
+                      f"echo FRC_{func}=$?")
+            en.append(f"echo 1 > {inst}/events/{_EVENT_GROUP}/{func}/enable")
         first_func = next(iter(offsets))
         en += [
-            f"echo > {root}/trace",
-            f"echo 1 > {root}/tracing_on",
-            f"echo ON=[$(cat {root}/tracing_on)]",
-            f"echo FILT=[$(cat {root}/events/{_EVENT_GROUP}/{first_func}/filter)]",
+            f"echo > {inst}/trace",
+            f"echo 1 > {inst}/tracing_on",
+            f"echo ON=[$(cat {inst}/tracing_on)]",
+            f"echo FILT=[$(cat {inst}/events/{_EVENT_GROUP}/{first_func}/filter)]",
         ]
         on_out = _run(serial, "\n".join(en), timeout=90)
+        bad_filter = [ln for ln in on_out.splitlines()
+                      if ln.startswith("FRC_") and "=0" not in ln]
+        if bad_filter:
+            result.update({
+                "code": "FILTER_REJECTED",
+                "error": ("filter 写入被内核拒绝（表达式可能超长），"
+                          "若继续跑会抓到全系统的分配：" + "、".join(bad_filter)),
+            })
+            return result
         if "ON=[1]" not in on_out:
             result.update({
                 "code": "TRACING_NOT_STARTED",
@@ -640,16 +813,31 @@ def trace_alloc(serial: str, pid: int, tid: int = 0, size_min: int = 0,
             return result
 
         # ---- ⑦ 采集窗口：到点或超量即收 ----
-        # 窗口内每 1.5s 探一次体量：一次 adb 往返约 150ms，探太勤会明显
-        # 侵占采集窗口；但完全不探又可能在过滤失效时把设备拖垮（实测有过）。
-        t_start = time.time()
-        deadline = t_start + duration
-        while time.time() < deadline:
-            chunk = min(1.5, max(0.05, deadline - time.time()))
-            time.sleep(chunk)
+        # 时间口径要说清楚（否则会出现"我给了 5 秒，报告写 13 秒"的困惑）：
+        #   `window_ms`  = 从 tracing_on=1 到 tracing_off 的实际墙钟时长
+        #   `elapsed_ms` = 整个 trace_alloc 的耗时（含准备与取回）
+        # 体量探测只在**剩余时间还够一次往返**时做。完全不探不行：
+        # 过滤失效时 trace 会以每秒数万行增长（实测能把缓冲区打满）。
+        # 但探测本身要判设备失联——否则 adb 一次 20 秒超时就把窗口吃光了，
+        # 表现为"给 8 秒只采了 1.5 秒"这种莫名其妙的结果。
+        t_on = time.time()
+        deadline = t_on + duration
+        while True:
+            remain = deadline - time.time()
+            if remain <= 0:
+                break
+            # 剩余不足一次探测往返，就别探了，直接睡到点
+            if remain <= _PROBE_MIN_REMAIN_S:
+                time.sleep(remain)
+                break
+            time.sleep(min(1.5, remain))
             if time.time() >= deadline:
                 break
-            probe = _run(serial, f"wc -c < {root}/trace 2>/dev/null", timeout=20)
+            probe = _run(serial, f"wc -c < {inst}/trace 2>/dev/null", timeout=15)
+            if _looks_like_adb_failure(probe):
+                result["device_lost"] = True
+                result["device_lost_error"] = probe.strip()[:200]
+                break
             try:
                 seen_bytes = int(probe.strip().split()[0])
             except (ValueError, IndexError):
@@ -660,14 +848,15 @@ def trace_alloc(serial: str, pid: int, tid: int = 0, size_min: int = 0,
                     f"{_MAX_TRACE_BYTES // (1024 * 1024)}MB 上限），提前收窗；"
                     "说明 tid 过滤没完全生效，或目标分配极其频繁")
                 break
+        result["window_ms"] = int((time.time() - t_on) * 1000)
 
         # ---- ⑧ 收窗：先关 tracing_on，再关 enable ----
-        off = [f"echo 0 > {root}/tracing_on"]
+        off = [f"echo 0 > {inst}/tracing_on"]
         for func in offsets:
-            off.append(f"echo 0 > {root}/events/{_EVENT_GROUP}/{func}/enable")
+            off.append(f"echo 0 > {inst}/events/{_EVENT_GROUP}/{func}/enable")
         _run(serial, "\n".join(off), timeout=60)
 
-        raw = _read_trace(serial, root)
+        raw = _read_trace(serial, inst)
         result["trace_bytes"] = len(raw)
 
         # ---- ⑨ 解析 ----
@@ -692,13 +881,14 @@ def trace_alloc(serial: str, pid: int, tid: int = 0, size_min: int = 0,
                     continue
             kept.append(r)
 
+        result["elapsed_ms"] = int((time.time() - t_start0) * 1000)
         result["dropped"] = max(0, len(kept) - max_records)
         result["records"] = kept[:max_records]
         result["ok"] = True
         result["verdict"] = (
             f"uprobe 捕获 {len(kept)} 条分配事件"
             f"（{len(offsets)} 个函数 × {len(tids)} 个线程，"
-            f"窗口 {time.time() - t_start:.1f}s）")
+            f"窗口 {result.get('window_ms', 0) / 1000:.1f}s）")
         if not kept:
             if result.get("events_seen"):
                 result["hint"] = (f"有 {result['events_seen']} 条事件但都被 size 过滤掉了，"
@@ -730,14 +920,14 @@ def trace_alloc(serial: str, pid: int, tid: int = 0, size_min: int = 0,
             shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-def _read_trace(serial: str, root: str) -> str:
+def _read_trace(serial: str, inst: str) -> str:
     """把 trace 文件取回本地（有大小上限）。
 
     为什么不用 trace_pipe：它是**消费型**管道，读走即删且阻塞。
     本工具是"跑满窗口再一次性分析"，`trace` 文件（环形缓冲）语义正好，
     还能先 `wc -c` 判断体量，避免把几十 MB 拉回来。
     """
-    size_out = _run(serial, f"wc -c < {root}/trace 2>/dev/null", timeout=30)
+    size_out = _run(serial, f"wc -c < {inst}/trace 2>/dev/null", timeout=30)
     try:
         size = int(size_out.strip().split()[0])
     except (ValueError, IndexError):
@@ -748,11 +938,11 @@ def _read_trace(serial: str, root: str) -> str:
         # 用 [0-9]+ 锚定时间戳，避免把 header 或无关行带回来。
         out = _run(serial,
                    f"grep -a -E '^ *\\S+-[0-9]+ +\\([^)]*\\) +\\[[0-9]+\\] "
-                   f"+\\S+ +[0-9]+\\.[0-9]+: ' {root}/trace 2>/dev/null "
+                   f"+\\S+ +[0-9]+\\.[0-9]+: ' {inst}/trace 2>/dev/null "
                    f"| head -c {_MAX_TRACE_BYTES}",
                    timeout=180)
         return out
-    return _run(serial, f"cat {root}/trace 2>/dev/null", timeout=180)
+    return _run(serial, f"cat {inst}/trace 2>/dev/null", timeout=180)
 
 
 # ---------------------------------------------------------------- 写事件快照

@@ -97,6 +97,12 @@ class DynamicService:
         # AI 可以直接说"给我 seq > 100 的事件"。
         self._events: deque[dict] = deque(maxlen=_EVENT_LOG_MAX)
         self._seq: int = 0
+        # (21) 第二十一次修改（2026-11-16）：自动放行定时器表。
+        #      key = (target.key, token) → {"timer", "deadline", "bp_id", "ms"}
+        #      为什么要 token 粒度而不是 target 粒度：hold 断点命中可能同时挂住
+        #      多个线程（不同 token），每个命中的 deadline 不同，必须各管各的，
+        #      否则一个 token 到点就把别的还没到点的线程一起放行了。
+        self._auto_resume: dict[tuple[str, str], dict] = {}
 
     # ---------- 生命周期 ----------
 
@@ -135,6 +141,15 @@ class DynamicService:
             # 先置 detached 再关资源：并发调用方看到的状态与实际一致
             tgt.state = STATE_DETACHED
             self._emit(tgt, "detached")
+        # (21) 第二十一次修改（2026-11-16）：detach 必须清掉自动放行定时器。
+        #      bug 原因：定时器在守护线程里调 resume()，而 resume 要 post 到
+        #                frida 脚本；会话已经关闭时 post 会抛异常，异常落在
+        #                守护线程里被静默吞掉——排查时只看到"有时多一条日志"。
+        #      解决方案：detach 一开始（状态已置 detached 后）取消该目标全部定时器。
+        cancelled = self._cancel_auto_resume(tgt)
+        if cancelled:
+            self._emit(tgt, "auto_resume_cancelled", count=cancelled,
+                       reason="detached")
         try:
             tgt.dbg.close()
         except Exception:                                  # noqa: BLE001
@@ -183,6 +198,10 @@ class DynamicService:
                     "last_seq": tgt.polled_seq,
                     "breakpoints": list(tgt.breakpoints.values()),
                     "hits": len(_dbg_hits(tgt.dbg)),
+                    # (21) 第二十一次修改（2026-11-16）：透出还有几个自动放行
+                    #      定时器在等。调用方据此判断"我现在不管它安全吗"。
+                    "auto_resume_pending": sum(
+                        1 for (k, _t) in self._auto_resume if k == tgt.key),
                 })
             return {"targets": targets, "seq": self._seq}
 
@@ -226,7 +245,8 @@ class DynamicService:
     # ---------- 断点 ----------
 
     def set_breakpoint(self, serial: str, pid: int, so_name: str,
-                       static_addr: int, hold: bool = False) -> dict:
+                       static_addr: int, hold: bool = False,
+                       auto_resume_after_ms: int = 0) -> dict:
         """下断点并持有它的脚本，返回断点 id（同一地址重复下返回既有 id）。
 
         (11) 第十一次修改（2026-11-06）：增加 **4 字节对齐校验**。
@@ -237,7 +257,41 @@ class DynamicService:
                       用户会以为是"断点失效"或"代码没执行"，属于最难排查的一类假成功。
             解决方案：下断点前校验 `static_addr % 4 == 0`，不满足直接抛 BAD_ALIGNMENT，
                       把问题挡在最前面。硬断点（BRK 指令）和 Interceptor 都受此约束。
+
+        (21) 第二十一次修改（2026-11-16）：新增 auto_resume_after_ms。
+            bug 原因：hold=True 之后如果调用方忘了 resume，被挂住的线程会一直阻塞
+                      在 JS 的 recv().wait() 里，目标进程最终被系统 ANR 杀掉。
+                      这不是"用错了"就能避免的——AI 可能一次下十几个 hold 断点，
+                      中间被别的调用打断，忘掉一两个是常态；
+                      而且 commit 里已有先例（debugger.py 里那条"永久挂起且没有
+                      任何 API 能救，只能杀进程"的注释）。
+            解决方案：hold 且给了 auto_resume_after_ms>0 时，在**每个命中**上起一个
+                      守护定时器；到点自动调 resume() 放行，并在事件流里写一条
+                      `auto_resumed`（绝不静默自动放行，否则用户会看不懂
+                      "我没调 resume 为什么它自己跑了"）。
+                      边界处理：
+                        ① 手动 resume 成功的同一次放行会取消对应定时器，
+                           不会重复 post（重复 post 会让 JS 侧收到不存在的 token）。
+                        ② 定时器到点时目标已不是 paused / 已 detach → 定时器
+                           自己退出并记 `auto_resume_skipped`，不报假成功。
+                        ③ 同一个 token 只登记一次（_sync_hits 可能重复扫描）。
+                        ④ detach_target 时清空全部定时器，避免对已关闭会话 post。
+            返回里标 auto_resume_ms（0 表示不自动放行）。
         """
+        try:
+            auto_ms = int(auto_resume_after_ms or 0)
+        except (TypeError, ValueError) as exc:
+            raise DynError("BAD_REQUEST",
+                           "auto_resume_after_ms 必须是毫秒整数") from exc
+        if auto_ms < 0:
+            raise DynError("BAD_REQUEST", "auto_resume_after_ms 不能为负数")
+        if auto_ms > 0 and not hold:
+            # 不 hold 就没有线程被挂住，自动放行没有意义。这里**不静默忽略**——
+            # 静默会让调用方以为自己受到了保护，实际没有。
+            raise DynError(
+                "BAD_REQUEST",
+                f"auto_resume_after_ms={auto_ms} 需要 hold=True；"
+                "hold=False 时命中即继续，没有线程需要放行")
         if int(static_addr) % 4 != 0:
             raise DynError(
                 "BAD_ALIGNMENT",
@@ -281,7 +335,17 @@ class DynamicService:
                         rec = _rec
                         break
         if rec is not None and bool(rec.get("hold")) == bool(hold):
-            return {**rec, "existing": True, "policy_changed": False}
+            # (21) 第二十一次修改（2026-11-16）：幂等早退也要处理自动放行---
+            #      早退只针对"钩子不用重下"，但 auto_resume_ms 是记录上的策略，
+            #      调用方这次改了这个值就必须落库，否则返回的那个数会骗人。
+            if auto_ms != int(rec.get("auto_resume_ms") or 0):
+                with self._lock:
+                    rec["auto_resume_ms"] = auto_ms
+                self._emit(tgt, "breakpoint_policy", bp_id=bp_id,
+                           so_name=so_name, static_addr=static_addr,
+                           hold=bool(hold), auto_resume_ms=auto_ms)
+            return {**rec, "existing": True, "policy_changed": False,
+                    "auto_resume_ms": int(rec.get("auto_resume_ms") or 0)}
         mod = self._require_module(tgt, so_name)
         runtime_addr = tgt.rb.to_runtime(static_addr, mod)
         # (10) 第十次修改（2026-11-06）：
@@ -338,6 +402,8 @@ class DynamicService:
             "hold": bool(hold),
             "mechanism": BREAKPOINT_MECHANISM,
             "armed": True,
+            # (21) 自动放行毫秒数（0=不自动放行）。记录里保留，命中时按它起定时器。
+            "auto_resume_ms": auto_ms,
         }
         with self._lock:
             tgt.breakpoints[bp_id] = bp
@@ -346,11 +412,13 @@ class DynamicService:
         self._emit(tgt, "breakpoint_set", bp_id=bp_id, so_name=so_name,
                    static_addr=static_addr, hold=bool(hold),
                    mechanism=BREAKPOINT_MECHANISM, armed=True,
-                   policy_changed=rec is not None)
+                   policy_changed=rec is not None,
+                   auto_resume_ms=auto_ms)
         return {**bp, "existing": rec is not None,
                 # 记录本来就有、只是这次把 hold 改了：明确告知调用方策略被重下发，
                 # 避免把"改了策略"误读成"重复下断被忽略"。
-                "policy_changed": rec is not None}
+                "policy_changed": rec is not None,
+                "auto_resume_ms": auto_ms}
 
     def remove_breakpoint(self, bp_id: str) -> dict:
         """撤销断点：真的调 debugger 的撤销接口，撤不掉就如实说 partial。
@@ -502,6 +570,56 @@ class DynamicService:
     def hits(self, serial: str, pid: int) -> list[dict]:
         tgt = self._target(serial, pid)
         return [_hit_dict(h) for h in _dbg_hits(tgt.dbg)]
+
+    def timeline(self, serial: str, pid: int, duration: float = 10.0,
+                 limit: int = 500) -> dict:
+        """把**断点命中 + 事件流**合并成一条按时间排序的统一时间线。
+
+        (21) 第二十一次修改（2026-11-16）：新增。
+            解决什么问题：同时 hook 好几个点（不同 so 的不同地址）时，
+            事件分散在 hits 与 poll_events 两个来源里，只能靠人拿 ts 手动
+            对齐；而 ts 是各自打印的墙钟，误差几十毫秒，根本分不出先后。
+
+        ## 精度从哪来，能到多少（真机实测，不猜）
+
+        所有时间戳的来源是**设备侧 frida 消息到达 Python 的那一刻**
+        （debugger._on_message 里的 BreakpointHit.ts 就是 time.time()），
+        真实**命中时刻在设备侧**，两者之间隔着一次 IPC。因此：
+
+          · 设备侧单调时钟本身的分辨率约 **6µs**（CLOCK_MONOTONIC 实测），
+            不是瓶颈；
+          · 真正的误差是**设备→主机的单向传输延迟**，实测一次 frida RPC
+            往返中位数 **2.8ms**（p90 4.6ms，最大 13.9ms），单向约 **1.4ms**；
+          · 命中载荷比一次空 RPC 大（36 个寄存器 + 24 帧 + 256 字节栈），
+            所以实际单向误差按 **~2ms** 估计是稳妥的。
+
+        结论：**同一条时间线上的相对间隔可信到毫秒级（约 ±2ms 量级），
+        不是"几十毫秒"。** 但两个**不同来源**（断点命中 vs 内存写入）
+        之间还多一层，见下。
+
+        ## 排序用的键：单调时钟，不是墙钟
+
+        所有事件先按 ts（墙钟秒）收集，再按 (ts, seq) 排序。墙钟会被 NTP
+        校时，但同一台主机的两次 time.time() 之间若发生跳变，间隔会变成
+        负数——这里用 time.monotonic() 做一次**合理性校正**：
+        详见 _order_events 的说明。**不假装纳秒级精确**，返回里一律标 precision。
+
+        参数：
+            duration  只取"最后 duration 秒"内的命中（0/负数 = 不按时间过滤）。
+                      为什么要有它：hits 缓冲保留最近 2000 条，长会话里
+                      最早的那些和当前操作无关，混进来会把时间轴撑得很长。
+            limit     最多返回多少条（按时间取最新的 limit 条）。
+
+        返回：见 _build_timeline。
+        """
+        tgt = self._target(serial, pid)
+        # 先把还没转成事件的命中同步进来（不推进 poll 游标，纯只读）
+        self._sync_hits(tgt)
+        hits = [_hit_dict(h) for h in _dbg_hits(tgt.dbg)]
+        events = [dict(ev) for ev in self._events if ev.get("key") == tgt.key]
+        return _build_timeline(tgt, hits, events,
+                               duration=float(duration or 0.0),
+                               limit=int(limit or 500))
 
     def hit_count_for(self, serial: str, pid: int, so_name: str = "",
                       static_addr: int = -1) -> dict:
@@ -668,10 +786,135 @@ class DynamicService:
 
         with self._lock:
             tgt.state = STATE_ATTACHED
+        # (21) 第二十一次修改（2026-11-16）：手动放行成功 → 取消该目标全部自动放行
+        #      定时器。不取消就会在 N 毫秒后再 post 一次，而那时的 token 早已
+        #      被消费掉，JS 侧收到一个不存在的 token 只会空转；更糟的是事件流里
+        #      会出现一条让人看不懂的 auto_resumed（明明是我手动放的）。
+        cancelled = self._cancel_auto_resume(tgt)
         self._emit(tgt, "resumed")
-        return _result("resumed", {"resumed": True, "reason": "",
-                                   "state": tgt.state,
-                                   "woken": facts.get("woken")})
+        out = {"resumed": True, "reason": "", "state": tgt.state,
+               "woken": facts.get("woken")}
+        if cancelled:
+            out["auto_resume_cancelled"] = cancelled
+        return _result("resumed", out)
+
+    # ---------- 自动放行（hold 的兜底） ----------
+
+    def _schedule_auto_resume(self, tgt: "Target", bp: dict,
+                              token: str | None, delay_ms: int) -> bool:
+        """为一个被挂住的 token 起守护定时器，到点自动放行。
+
+        (21) 第二十一次修改（2026-11-16）：新增。
+            bug 原因：hold=True 忘了 resume，线程永久阻塞在 recv().wait()，
+                      目标进程最终 ANR 被杀（debugger.py 里已有同类事故记录）。
+            解决方案：每个命中一个 threading.Timer（守护线程），到点调本类的
+                      resume()。所有放行逻辑复用 resume()，不另写一套——
+                      否则"自动放行"会绕过 R3/R7 那一堆状态机判据，
+                      变成第二个真值来源。
+
+        返回是否真的登记了定时器。以下情形**不登记**（都已经没有可放行的东西）：
+          · token 为空（debugger 没给 token，说明没挂住，没什么可放）
+          · 目标已 detach（墓碑不能复活）
+          · 同一个 token 已登记过（_sync_hits 可能重复扫描同一批命中）
+        """
+        if not token or tgt.state == STATE_DETACHED:
+            return False
+        key = (tgt.key, str(token))
+        with self._lock:
+            if key in self._auto_resume:
+                return False
+            delay_s = max(0.0, float(delay_ms) / 1000.0)
+            timer = threading.Timer(delay_s, self._auto_resume_fire,
+                                    args=(tgt.key, str(token), tgt))
+            timer.daemon = True      # 进程要退出时不阻塞
+            timer.name = f"mda-auto-resume-{tgt.key}"
+            self._auto_resume[key] = {
+                "timer": timer,
+                "deadline": time.monotonic() + delay_s,
+                "bp_id": (bp or {}).get("id"),
+                "ms": int(delay_ms),
+            }
+        timer.start()
+        # 登记成功也要进事件流：用户事后复盘时得看到"这里被自动放行保护过"
+        self._emit(tgt, "auto_resume_armed", token=str(token),
+                   bp_id=(bp or {}).get("id"), delay_ms=int(delay_ms))
+        return True
+
+    def _auto_resume_fire(self, target_key: str, token: str,
+                          tgt: "Target") -> None:
+        """定时器到点：真的放行，并把结果如实写进事件流。
+
+        (21) 第二十一次修改（2026-11-16）：新增。
+
+        边界（每条都会出现在返回/事件里，不静默）：
+          · 用户已经手动 resume 过 → 定时器已被取消，正常走不到这里；
+            万一走到（竞态），resume() 会返回 not_paused，事件记 skipped。
+          · 到期但目标不再是 paused（例如另一条线程先被放行）→ skipped。
+          · 放行本身失败（partial_resume 等）→ 事件记 auto_resume_failed，
+            并把 reason 透出；**不重试**（重试会在目标卡死时无限 post）。
+        """
+        key = (target_key, token)
+        with self._lock:
+            self._auto_resume.pop(key, None)
+        serial, _, pid_text = target_key.partition(":")
+        try:
+            pid = int(pid_text)
+        except (TypeError, ValueError):
+            return
+        if tgt.state == STATE_DETACHED:
+            return
+        try:
+            res = self.resume(serial, pid)
+        except Exception as exc:                          # noqa: BLE001 - 定时器线程不能炸
+            self._emit(tgt, "auto_resume_failed", token=token,
+                       reason=f"{type(exc).__name__}: {exc}")
+            return
+        if dict.get(res, "resumed"):
+            self._emit(tgt, "auto_resumed", token=token,
+                       woken=res.get("woken"),
+                       note="命中后到点自动放行（set_breakpoint auto_resume_after_ms）")
+        else:
+            self._emit(tgt, "auto_resume_skipped", token=token,
+                       reason=res.get("reason") or "not_paused",
+                       state=res.get("state"))
+
+    def _cancel_auto_resume(self, tgt: "Target") -> int:
+        """取消某目标的全部自动放行定时器，返回取消个数。
+
+        (21) 第二十一次修改（2026-11-16）：新增。
+            手动 resume / detach / remove_breakpoint 都要清，否则定时器
+            事后还会 post 一次（对已关闭会话 post 会抛异常，而它跑在守护线程里，
+            异常只会静默打日志，排查起来很难）。
+        """
+        with self._lock:
+            keys = [k for k in self._auto_resume if k[0] == tgt.key]
+            items = [self._auto_resume.pop(k) for k in keys]
+        for item in items:
+            try:
+                item["timer"].cancel()
+            except Exception:                             # noqa: BLE001
+                pass
+        return len(items)
+
+    def auto_resume_state(self, serial: str, pid: int) -> dict:
+        """只读：该目标还有几个自动放行定时器在等、分别什么时候到点。
+
+        (21) 第二十一次修改（2026-11-16）：新增。
+            为什么需要：调用方要能判断"我现在不 resume 安全吗"。
+            只报**还剩多久**（剩余毫秒），不泄漏 token 原文。
+        """
+        key = f"{serial}:{pid}"
+        now = time.monotonic()
+        with self._lock:
+            rows = []
+            for (tkey, _tok), item in self._auto_resume.items():
+                if tkey != key:
+                    continue
+                rows.append({"bp_id": item.get("bp_id"),
+                             "delay_ms": item.get("ms"),
+                             "remaining_ms": max(0, int(
+                                 (item["deadline"] - now) * 1000))})
+        return {"count": len(rows), "pending": rows}
 
     # ---------- 内存 ----------
 
@@ -965,6 +1208,14 @@ class DynamicService:
                            if k not in ("ts", "token", "held")}
                 self._emit(tgt, "breakpoint_hit", ts=d.get("ts"), hold=held,
                            held=held, bp_id=(bp or {}).get("id"), **payload)
+                # (21) 第二十一次修改（2026-11-16）：hold 命中且断点记录要求自动
+                #      放行时，为该 token 起一个守护定时器。
+                #      必须在**锁内**登记（_schedule_auto_resume 自己也拿锁，
+                #      这里是 RLock 可重入），避免"命中已发生、定时器还没登记"
+                #      期间用户手动 resume 导致定时器事后又 post 一次的竞态。
+                if held and bp is not None and int(bp.get("auto_resume_ms") or 0) > 0:
+                    self._schedule_auto_resume(tgt, bp, d.get("token"),
+                                               int(bp.get("auto_resume_ms") or 0))
             tgt.hit_cursor = len(hits)
             return len(fresh)
 
@@ -1032,6 +1283,262 @@ def _result(truth_key: str, data: dict) -> _Result:
     out = _Result(data)
     out._truth_key = truth_key
     return out
+
+
+def _event_kind(ev: dict) -> str | None:
+    """把一条内部事件映射成时间线里的 kind；与时间先后无关的事件返回 None。
+
+    (21) 第二十一次修改（2026-11-16）：新增。
+        为什么需要映射而不是原样输出：内部事件类型是给"状态机"用的
+        （attached / breakpoint_set / resumed / resume_partial ...），
+        时间线关心的是"发生了什么有观测意义的事"。两类混在一起，
+        时间轴会被大量状态迁移淹没，真正要看的命中反而找不到。
+
+    映射规则（只保留有观测意义的）：
+        breakpoint_hit        → bp       命中了一次断点
+        auto_resumed          → auto     自动放行（用户要知道这件事发生过）
+        auto_resume_armed     → auto     自动放行定时器已布防
+        auto_resume_skipped   → auto     到点了但没东西可放（如实保留）
+        auto_resume_failed    → auto     自动放行失败
+        resumed/resume_*      → auto     手动放行也算时间线里的一次事件
+        其余（attached/detached/breakpoint_set/...）→ None，不进时间线
+    """
+    t = str(ev.get("type") or "")
+    if t == "breakpoint_hit":
+        return "bp"
+    if t in ("auto_resumed", "auto_resume_armed", "auto_resume_skipped",
+             "auto_resume_failed", "resumed", "resume_partial",
+             "resume_failed"):
+        return "auto"
+    return None
+
+
+def _describe_event(kind: str, ev: dict) -> str:
+    """给一条时间线事件写一句人能读的 detail（英文键值，不写死任何 App 特征）。"""
+    if kind == "bp":
+        addr = ev.get("static_addr")
+        try:
+            addr_text = f"{int(addr):#x}"
+        except (TypeError, ValueError):
+            addr_text = str(addr)
+        parts = [f"hit {ev.get('so_name') or '?'}+{addr_text}",
+                 f"tid={ev.get('thread_id')}"]
+        if ev.get("held"):
+            parts.append("held")
+        return " ".join(parts)
+    t = str(ev.get("type") or "")
+    if t == "auto_resumed":
+        return (f"auto-resumed after {ev.get('delay_ms') or '?'}ms"
+                if ev.get("delay_ms") else
+                f"auto-resumed (woken={ev.get('woken')})")
+    if t == "auto_resume_armed":
+        return f"auto-resume armed: {ev.get('delay_ms')}ms"
+    if t == "auto_resume_skipped":
+        return f"auto-resume skipped: {ev.get('reason')}"
+    if t == "auto_resume_failed":
+        return f"auto-resume failed: {ev.get('reason')}"
+    if t == "resumed":
+        return f"resumed manually (woken={ev.get('woken')})"
+    if t == "resume_partial":
+        return f"resume partial: {ev.get('reason')}"
+    if t == "resume_failed":
+        return f"resume failed: {ev.get('reason')}"
+    return t
+
+
+def _build_timeline(tgt: "Target", hits: list[dict], events: list[dict],
+                    duration: float = 0.0, limit: int = 500) -> dict:
+    """把命中列表与事件流合并成一条按时间排序的统一时间线。
+
+    (21) 第二十一次修改（2026-11-16）：新增。
+
+    ## 为什么不用"再采一次"，而是合并已有数据
+
+    断点命中（debugger._hits）与事件流（service._events）是两份独立数据：
+    命中带完整现场（36 寄存器 + 栈），事件流带状态迁移与 seq。时间线要回答
+    的是"谁先发生"，那正好需要两者都在同一条轴上——重新采一遍反而会丢掉
+    已经发生过的现场（hold 命中被放行后现场就没了）。
+
+    ## 时间键与精度（这是本函数最需要如实交代的地方）
+
+    每个事件有一个 ts（墙钟秒，time.time()）。墙钟会被 NTP/手动校时改动，
+    所以同一批数据里可能出现"后面的比前面的 ts 还小"。用 ts 直接排序会
+    把因果顺序排反。
+
+    处理方式：
+      ① 主排序键是 **(ts, seq)**：seq 是服务级自增序号，严格反映**入队顺序**，
+         所以当 ts 出现回退时，seq 仍然给出真实的先后；
+      ② 回退了多大，用 `wall_clock_backwards_ms` 如实报出来，不隐藏；
+      ③ t_rel_ms 一律用"相对第一条"的差值，负值保留（它本身就是墙钟跳变的证据）。
+
+    精度上限（真机实测，见 tests/manual_timeline_clock.py 与
+    tests/manual_timeline_precision.py）：
+      · 设备 CLOCK_MONOTONIC 分辨率 ≈ 6µs —— 不是瓶颈
+      · frida RPC 往返中位数 2.8ms / p90 4.6ms → 单向约 1.4ms
+      · 命中载荷更大（寄存器 + 栈），单向按 ~2ms 估
+      · 所以**同源事件之间的相对间隔可信到毫秒级（±2ms 量级）**
+      · **不同来源**（断点命中 vs 内存写入）不能直接混排：
+        内存写入的时间戳来自设备侧 helper（CLOCK_MONOTONIC，相对 daemon
+        启动），要落回墙钟轴必须用"读状态文件的墙钟 - age_ms"反推，
+        而状态文件约 1s 才刷新一次 → 该来源的绝对时刻误差可达 **1 秒量级**。
+        因此本函数**只合并同源（都来自 frida 消息）的事件**，
+        内存写入由调用方另行处理并在返回里明示（见 precision.sources）。
+    """
+    # ---- ① 收集：命中 + 有观测意义的事件 ----
+    #
+    # (22) 第二十二次修改（2026-11-16）：**不能把命中与 breakpoint_hit 事件都收**。
+    #      bug 原因：_sync_hits 会把每条命中**同时**放进 debugger._hits 和
+    #                service._events（type=breakpoint_hit）。两处都收就等于
+    #                每条命中在时间线上出现两次——实测 2 条命中给出 count=4，
+    #                间隔被算成 0（两条重复项时间完全一样），
+    #                使用者会以为"断点命中了两次"而去看错误的方向。
+    #      解决方案：命中以**事件流里的 breakpoint_hit** 为准（它带 seq，
+    #                排序更可靠），只在事件流里**还没有**任何 breakpoint_hit
+    #                时才退回用 hits（例如 debugger 直接写入 hits 而未走
+    #                service 事件通道的旧路径）。
+    event_addrs = {(ev.get("static_addr"), ev.get("thread_id"))
+                   for ev in events if ev.get("type") == "breakpoint_hit"}
+    has_hit_events = any(ev.get("type") == "breakpoint_hit" for ev in events)
+    rows: list[dict] = []
+    for idx, h in enumerate(hits):
+        addr = h.get("static_addr")
+        tid = h.get("thread_id")
+        if has_hit_events and (addr, tid) in event_addrs:
+            continue          # 已由事件流覆盖，避免重复
+        ts = _safe_float(h.get("ts"))
+        rows.append({
+            "kind": "bp",
+            "ts": ts,
+            "seq": 0,                     # 命中没有事件 seq，靠列表下标兜底排序
+            "_tie": idx,
+            "so": h.get("so_name") or "",
+            "addr": _hex_or_none(addr),
+            "tid": tid,
+            "detail": f"hit {h.get('so_name') or '?'}+"
+                      f"{_hex_or_none(addr)} tid={tid}"
+                      + (" held" if h.get("held") else ""),
+            "_src": "hit",
+        })
+    for ev in events:
+        kind = _event_kind(ev)
+        if kind is None:
+            continue
+        rows.append({
+            "kind": kind,
+            "ts": _safe_float(ev.get("ts")),
+            "seq": int(ev.get("seq") or 0),
+            "_tie": 0,
+            "so": ev.get("so_name") or "",
+            "addr": _hex_or_none(ev.get("static_addr")),
+            "tid": ev.get("thread_id") or ev.get("tid"),
+            "detail": _describe_event(kind, ev),
+            "_src": "event",
+        })
+
+    # ---- ② 时间窗过滤（duration>0 时只留最后 duration 秒） ----
+    dropped_by_window = 0
+    if duration and duration > 0 and rows:
+        t_latest = max(r["ts"] for r in rows)
+        floor = t_latest - float(duration)
+        kept = [r for r in rows if r["ts"] >= floor]
+        dropped_by_window = len(rows) - len(kept)
+        rows = kept
+
+    # ---- ③ 排序：(ts, seq) ----
+    rows.sort(key=lambda r: (r["ts"], r["seq"], r["_tie"]))
+    # 截断到最新的 limit 条（时间线通常只关心最近发生的事）
+    truncated = 0
+    if limit and len(rows) > limit:
+        truncated = len(rows) - int(limit)
+        rows = rows[-int(limit):]
+
+    # ---- ④ 量化墙钟回退（有回退就说明 ts 不可全信，seq 才是真值） ----
+    #
+    # (22) 第二十二次修改（2026-11-16）：必须在**到达顺序**上量回退，
+    #      不能在排序后的结果上量。
+    #      bug 原因：排序键是 (ts, seq)，排完之后 ts 必然非降——
+    #                在这个结果上找"后面的 ts 比前面小"永远找不到，
+    #                于是墙钟明明跳过（NTP 校时）也报 wall_clock_backwards_ms=0，
+    #                使用者会把 t_rel_ms 当成真值，而被跳变污染的那段间隔是错的。
+    #      解决方案：先按**seq（即事件入队顺序）**复现一遍原始时间序列，
+    #                在它上面找回退；没有 seq 的命中（seq=0）按列表顺序参与。
+    backwards_ms = 0.0
+    arrival = sorted(rows, key=lambda r: (r["seq"] or 0, r["_tie"]))
+    prev = None
+    for r in arrival:
+        if prev is not None and r["ts"] < prev:
+            backwards_ms = max(backwards_ms, (prev - r["ts"]) * 1000.0)
+            prev = r["ts"]          # 回退后以新的（更小的）为基准继续比
+        else:
+            prev = r["ts"] if prev is None else max(prev, r["ts"])
+
+    # ---- ⑤ 相对时间与输出 ----
+    t0 = rows[0]["ts"] if rows else 0.0
+    out_events = []
+    for r in rows:
+        item = {
+            "t_rel_ms": round((r["ts"] - t0) * 1000.0, 3),
+            "kind": r["kind"],
+            "so": r["so"],
+            "addr": r["addr"],
+            "tid": r["tid"],
+        }
+        if r["detail"]:
+            item["detail"] = r["detail"]
+        if r["seq"]:
+            item["seq"] = r["seq"]
+        item["ts"] = round(r["ts"], 6)
+        out_events.append(item)
+
+    precision = {
+        "basis": "device frida message arrival time (wall clock) ordered with "
+                 "service seq; monotonic sequence is authoritative",
+        "same_source_resolution_ms": 2.0,
+        "same_source_note": ("measured on-device: CLOCK_MONOTONIC granularity ~6us; "
+                             "frida RPC round-trip median 2.8ms (p90 4.6ms) "
+                             "=> one-way ~1.4ms; hit payload is larger, ~2ms is a "
+                             "safe estimate for same-source ordering"),
+        "cross_source_note": ("memory-write events (perfwatch helper) carry a "
+                              "device-monotonic ts relative to daemon start and need "
+                              "the ~1s-cadence state file to map back to wall clock, "
+                              "so their absolute error can reach the second level; "
+                              "they are NOT mixed into this timeline"),
+        "sources": sorted({r["_src"] for r in rows}),
+        "wall_clock_backwards_ms": round(backwards_ms, 3),
+    }
+    if backwards_ms > 0:
+        precision["wall_clock_warning"] = (
+            f"检测到墙钟回退 {backwards_ms:.1f}ms（NTP/校时）。"
+            "t_rel_ms 已按 (ts, seq) 排序，顺序仍可信，但该段差值含跳变量")
+
+    return {
+        "ok": True,
+        "count": len(out_events),
+        "events": out_events,
+        "target": tgt.key,
+        "duration": float(duration or 0),
+        "dropped_by_window": dropped_by_window,
+        "truncated_by_limit": truncated,
+        "precision": precision,
+    }
+
+
+def _safe_float(value, default: float = 0.0) -> float:
+    """把可能是字符串/None 的时间戳转成 float；转不了给默认值（不抛）。"""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _hex_or_none(value):
+    """把可能是 int/字符串/None 的地址转成 "0x..." 文本；转不了原样转字符串。"""
+    if value is None:
+        return None
+    try:
+        return f"{int(value):#x}"
+    except (TypeError, ValueError):
+        return str(value)
 
 
 def _match_bp(tgt: Target, so_name, static_addr) -> dict | None:

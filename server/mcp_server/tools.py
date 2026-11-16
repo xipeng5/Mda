@@ -382,6 +382,42 @@ def plugin_run(name: str, args: str = "{}") -> str:
 # ---------------- 会话与静态分析 ----------------
 
 
+def _so_table_warning(so, auto_discover: bool = False,
+                      discover_result: dict | None = None) -> dict:
+    """函数表不完整时的警告与下一步（load_so 的复用处，两条路径都要过）。
+
+    (22) 第二十二次修改（2026-11-16）：抽出本函数。
+        bug 原因：上一版只在**首次加载**的分支里 warning，`reused=True`
+                  的幂等分支直接 return 了——而"再 load 一次看看"正是
+                  使用者最可能的动作，那一次恰好什么警告都没有。
+                  警告只出现在他不会再看的第一次调用上，等于没有。
+        解决方案：两条分支共用本函数；判定与文案完全一致。
+
+    另外把 auto_discover 的执行结果如实带出（added / skipped / error），
+    不再 try/except 吞掉——静默失败的补全比不补全更危险：
+    调用方会以为已经补好了。
+
+    阈值为什么是 100：正常 NDK 库的 FDE/dynsym 初扫就有上百（liblog 111、
+    libcutils 168），而加固样本初扫可以只有个位数（实测 1 个），
+    补全后到数千。100 是这两类的分界，不是拍脑袋的魔数。
+    """
+    n = len(so.functions)
+    out: dict = {"functions": n}
+    if discover_result is not None:
+        out["auto_discover"] = discover_result
+    if n >= 100:
+        return out
+    out["warning"] = (
+        f"函数表只有 {n} 个，可能不完整。"
+        "基于它得出的『没有某个符号/函数』这类**否定结论不可信**——"
+        "先补全再下结论（曾有人因这一步漏掉，误判某个 so 没有某个导入而"
+        "排除了一整个方向）。")
+    out["next_step"] = (
+        "调 build_xrefs 或 load_so(auto_discover=True)"
+        "（会递归补出 bl 目标与跳转表入口；大样本约 40 秒）")
+    return out
+
+
 @server.tool()
 @logged()
 def load_so(path: str, auto_discover: bool = False) -> str:
@@ -390,13 +426,17 @@ def load_so(path: str, auto_discover: bool = False) -> str:
     加载成功后广播 UI 同步事件：GUI 的模块树/函数表/Output
     立即显示新模块，与 AI 看到的一致。
 
-    ## 函数表可能不完整（重要）
+    ## 函数表可能不完整（重要，踩过的坑）
 
-    刚加载时函数表只有 FDE / dynsym 的初扫结果。加固样本实测只有 1 个，
-    补全后能到 5476 个。**函数数 < 100 时返回里会带 warning**，
-    并给出补全方式——请务必先补全再下「没有某个符号」这类否定结论。
+    刚加载时函数表只有 FDE / dynsym 的**初扫结果**。加固样本实测只有 1 个，
+    补全后到 5476 个。**函数数 < 100 时返回里必带 warning + next_step**，
+    两条路径（首次加载 / 已加载复用）都一样。
 
-    auto_discover=True 会在加载后立即补全（大样本约 40 秒）。
+    为什么这条特别重要：曾有人没做补全这一步，就基于 1 个函数的表得出
+    「这个 so 没有某个导入」的结论，并据此排除了一整个排查方向。
+
+    auto_discover=True 会在加载后**立即补全**（大样本约 40 秒）；
+    默认 False，因为补全很慢，不该在只想看个模块列表时被强制等待。
     """
     # 幂等：同一路径已加载就直接复用，避免 liblog_2/_3 这样的副本堆积
     import os as _os
@@ -404,39 +444,53 @@ def load_so(path: str, auto_discover: bool = False) -> str:
     real = _os.path.abspath(path)
     for existing in list(_session.modules.values()):
         if _os.path.abspath(getattr(existing, "path", "") or "") == real:
+            # (22) 复用分支也要给同样的警告——见 _so_table_warning 的说明
+            discover_result = None
+            if auto_discover and int(getattr(existing, "functions", {}) and
+                                     len(existing.functions) or 0) < 100:
+                discover_result = _run_auto_discover(existing.name)
             return _j({
                 "loaded": existing.name,
-                "functions": len(existing.functions),
                 "reused": True,
+                **_so_table_warning(existing, auto_discover, discover_result),
             })
 
     so = _session.add(path)
 
     # (135) 加载后函数表可能只有 FDE/dynsym 初扫结果（实测某个加固样本只有 1 个），
     #       而真正可用要 build_xrefs 后发现 bl 目标。不提示会导致后续结论全错。
-    if auto_discover:
-        try:
-            _session.discover_functions(so.name)
-        except Exception:                                 # noqa: BLE001
-            pass
+    discover_result = _run_auto_discover(so.name) if auto_discover else None
 
     get_plugins().emit("after_load", {"so_name": so.name})
-    _notify_ui({"type": "so_loaded", "so_name": so.name, "functions": len(so.functions), "path": path})
-    out = {"loaded": so.name, "functions": len(so.functions)}
+    out = {"loaded": so.name, **_so_table_warning(so, auto_discover, discover_result)}
+    _notify_ui({"type": "so_loaded", "so_name": so.name,
+                "functions": len(so.functions), "path": path})
     if getattr(so, "renamed_from", None):
         out["renamed_from"] = so.renamed_from  # BUG-14：同名自动改名提示
-
-    # 函数数为 0 或极少时必须警告——这是"看着加载成功、实际没法用"的陷阱
-    if len(so.functions) < 100:
-        out["warning"] = (
-            f"函数表只有 {len(so.functions)} 个，**很可能不完整**。"
-            "基于它得出的『没有某个符号/函数』这类否定结论不可信——"
-            "先补全再下结论。")
-        out["next_step"] = (
-            "① 调 build_xrefs（大样本约 40 秒，会补出 bl 目标与跳转表入口）；"
-            "② 或重新 load_so(auto_discover=true)；"
-            "③ 或 search_insn(discover=true)")
     return _j(out)
+
+
+def _run_auto_discover(so_name: str) -> dict:
+    """执行函数发现并把**真实结果**返回（不吞异常）。
+
+    (22) 第二十二次修改（2026-11-16）：新增。
+        bug 原因：上一版 `try: _session.discover_functions(...)
+                  except Exception: pass`——补全失败时调用方看到的是
+                  和成功一模一样的返回（只有一个仍很小的 functions 数），
+                  会误以为"补全过了，函数就这么多"。
+        解决方案：成功返回 {ok, added, total, rounds}；失败返回
+                  {ok: false, error, hint}，并让 warning 仍然生效。
+    """
+    try:
+        res = _session.discover_functions(so_name)
+        return {"ok": True,
+                "added": int(res.get("added") or 0),
+                "total": int(res.get("total") or 0),
+                "rounds": int(res.get("rounds") or 0),
+                "skipped": bool(res.get("skipped"))}
+    except Exception as exc:                              # noqa: BLE001 - 坏样本不该让工具崩
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}",
+                "hint": "函数发现失败；改用 build_xrefs 后台任务重试"}
 
 
 @server.tool()
@@ -1796,72 +1850,51 @@ def set_breakpoint(serial: str, pid: int, so_name: str, static_addr: int,
 
     返回里会标 `auto_resume_ms`；真正触发自动放行时，
     事件流里会有一条 `auto_resumed`，**不是静默发生**。
+
+    (21) 第二十一次修改（2026-11-16）：透传给 service，并修掉三个真缺陷。
+        bug 原因：上一版把定时器**建在 set_breakpoint 那一刻**（tools.py 里的
+                  _start_auto_resume），命中后并不会重新计时。于是
+                  「下断点 → 60 秒后才命中」时，定时器早已到期并空转放过，
+                  真正的命中照样永久挂住——兜底完全失效，而返回值里写着
+                  auto_resume_ms=2000，属于静默的假保护。
+                  另外它的去重键是 (serial,pid)，同一进程下第二个 hold 断点
+                  会把第一个的定时器取消掉；也从未往**事件流**写 auto_resumed
+                  （只写了 UI 日志），poll_events 看不到。
+        解决方案：改为由 service 在**每个命中**上按 token 起定时器
+                  （见 dyn/service.py 的 _schedule_auto_resume），
+                  手动 resume 会取消对应定时器，到期/跳过/失败都进事件流。
+                  本层只负责透传参数与把 pending 情况告诉调用方。
     """
     # (1) 第一次修改
     # bug 原因：原实现既不保存 dbg 也不 detach，函数一返回脚本就被回收，
     #           实测连续调用 attach=3 / detach=0，既泄漏又查不到断点。
     # (2) 第二次修改：改走 DynSession 注册表，断点由单例持有 → 真正持久。
     #     契约：保留 set 字段，新增 id/runtime_addr/persistent 等。
+    # (135) 函数表警告 + auto_discover 见 load_so；此处仅断点。
     from server.dyn.service import get_dyn
 
-    bp = get_dyn().set_breakpoint(serial, pid, so_name, static_addr, hold=hold)
-    out = {"set": True, "persistent": True, **bp,
-           "addr_facts": _addr_facts(so_name, static_addr)}
-
-    # (136) 自动放行：命中后 N 毫秒自动 resume，防「忘了 resume → 目标被 ANR 杀掉」
+    svc = get_dyn()
     try:
-        delay = int(auto_resume_after_ms or 0)
-    except (TypeError, ValueError):
-        delay = 0
-    if delay > 0 and hold:
-        out["auto_resume_ms"] = delay
-        _start_auto_resume(serial, int(pid), delay)
-    elif delay > 0 and not hold:
-        out["auto_resume_note"] = ("hold=False 时命中即刻继续，"
-                                   "auto_resume_after_ms 不起作用（也不需要）")
-    return _j(out)
-
-
-# 自动放行的守护定时器（按键去重：同一目标只保留最新一个）
-_AUTO_RESUME: dict = {}
-_AUTO_RESUME_LOCK = __import__("threading").Lock()
-
-
-def _start_auto_resume(serial: str, pid: int, delay_ms: int) -> None:
-    """起一个守护线程，到点对目标做一次 resume。
-
-    重复调用会取消上一个（只保留最新），避免多个定时器叠加。
-    """
-    import threading
-
-    key = f"{serial}:{pid}"
-    with _AUTO_RESUME_LOCK:
-        old = _AUTO_RESUME.get(key)
-        if old is not None:
-            try:
-                old.set()
-            except Exception:                             # noqa: BLE001
-                pass
-        cancel = threading.Event()
-        _AUTO_RESUME[key] = cancel
-
-    def _worker() -> None:
-        if cancel.wait(max(0.05, delay_ms / 1000.0)):
-            return                                        # 被新的请求取消
+        bp = svc.set_breakpoint(serial, int(pid), so_name, int(static_addr),
+                                hold=bool(hold),
+                                auto_resume_after_ms=int(auto_resume_after_ms or 0))
+    except Exception as exc:                      # noqa: BLE001 - DynError 带 code
+        # 参数校验失败（例如给了 auto_resume 但 hold=False）必须让调用方能自纠，
+        # 所以带上 code，而不是包装成一段人话。
+        return _j({"error": f"{type(exc).__name__}: {exc}",
+                   "code": getattr(exc, "code", "BREAKPOINT_FAILED")})
+    out = {"set": True, "persistent": True, **bp,
+           "addr_facts": _addr_facts(so_name, int(static_addr))}
+    if int(bp.get("auto_resume_ms") or 0) > 0:
+        # 让 AI 一眼看到"兜底已经布防"，而不是只看到一个数字
+        out["auto_resume_note"] = (
+            f"命中后 {int(bp['auto_resume_ms'])}ms 自动放行；"
+            "事件流里会出现 auto_resume_armed / auto_resumed")
         try:
-            from server.dyn.service import get_dyn
-
-            got = get_dyn().resume(serial, pid)
-            # 明确记录这次是**自动**放行，不是用户主动调的
-            _activity("auto_resume", {"serial": serial, "pid": pid},
-                      f"auto_resumed after {delay_ms}ms", 0.0)
-            _notify_ui({"type": "auto_resumed", "serial": serial,
-                        "pid": pid, "delay_ms": delay_ms,
-                        "result": got})
-        except Exception:                                 # noqa: BLE001
+            out["auto_resume_pending"] = svc.auto_resume_state(serial, int(pid))
+        except Exception:                         # noqa: BLE001 - 只读信息，失败不影响下断
             pass
-
-    threading.Thread(target=_worker, daemon=True).start()
+    return _j(out)
 
 
 @server.tool()
@@ -3776,81 +3809,69 @@ def watch_memory(serial: str, pid: int, addr: str, size: int = 8,
 
 @server.tool()
 @logged()
-def timeline(serial: str, pid: int) -> str:
+def timeline(serial: str, pid: int, duration: float = 10.0,
+             limit: int = 500) -> str:
     """把断点命中与事件流合并成**单一时间线**，按时间排序。
 
     为什么需要它：同时 hook 好几个点时（不同 so 的不同地址），
-    事件输出是分散的，靠各自的时间戳手动对齐误差几十毫秒。
-    这个工具直接给出「谁先发生、间隔多久」。
+    事件输出是分散的，靠各自的时间戳手动对齐误差几十毫秒（实测 IPC 单向 ~1.4ms，
+    而旧版实现按毫秒粗对齐）。这个工具直接给出「谁先发生、间隔多久」。
 
         timeline(serial, pid)
         → events: [{t_rel_ms, kind, so, addr, tid, detail}]
-          +0.000ms  metasec+0x1f734c  (tid 24232)
-          +0.012ms  sscronet+0x2da314 (tid 24232)
+          +0.000ms  metasec_ml.so+0x1f734c  tid=24232
+          +0.012ms  sscronet.so+0x2da314    tid=24232
 
-    ## 精度说明（如实标注）
+    ## 数据来源（两类合并，不是重新采）
 
-    时间戳来自 frida 侧的 `Date.now()`，是**墙钟毫秒**。
-    同一线程内相邻事件的相对顺序可信，绝对精度约 1ms；
-    跨线程比较时可能因调度有偏差。**不假装是纳秒级精确**。
+    ① 断点命中（get_dyn().hits，含完整现场）
+    ② 事件流（poll_events 同一份内部队列，含 auto_resumed 等状态事件）
+
+    合并而不是重采，是因为 hold 命中放行后现场就没了——重采会丢掉已经发生的事。
+
+    ## 精度（真机实测，见 tests/manual_timeline_clock.py / _precision.py）
+
+        · 设备 CLOCK_MONOTONIC 分辨率 ≈ 6µs —— 不是瓶颈
+        · frida RPC 往返中位数 2.8ms（p90 4.6ms）→ 单向 ≈ 1.4ms
+        · 命中载荷更大（36 寄存器 + 24 帧 + 栈），单向按 ~2ms 估
+
+    结论：**同源事件的相对间隔可信到毫秒级（±2ms 量级）**。
+    排序键用 (ts, seq)——seq 是服务级自增序号，墙钟被 NTP 校时回退时
+    仍能给出真实先后；回退了多大由 precision.wall_clock_backwards_ms 如实报出。
+
+    **内存写入事件（perfwatch）不进这条时间线**：它的时间戳来自设备 helper
+    的单调时钟（相对 daemon 启动），落回墙钟要靠约 1s 才刷新一次的状态文件
+    反推，绝对误差可达秒级。混进来会让"毫秒级对齐"变成假精度。
+
+    ## 参数
+
+        duration  只取最后 duration 秒的命中（<=0 表示不限）
+        limit     最多返回多少条（取最新的 limit 条）
+
+    没有命中时返回 code=NO_HITS 并给下一步，而不是给一个空数组了事。
     """
     from server.dyn.service import get_dyn
 
     svc = get_dyn()
     try:
-        hits = svc.hits(serial, int(pid))
+        out = svc.timeline(serial, int(pid), duration=float(duration),
+                           limit=int(limit))
     except Exception as exc:                              # noqa: BLE001
         return _j({"error": f"{type(exc).__name__}: {exc}",
-                   "code": "NOT_ATTACHED"})
-
-    if not hits:
-        return _j({"error": "还没有任何断点命中，无法生成时间线",
-                   "code": "NO_HITS",
-                   "hint": "先 set_breakpoint 下断，再触发目标执行"})
-
-    # 统一成 (ts, event) 再排序
-    rows: list[dict] = []
-    for h in hits:
-        ts = h.get("ts")
-        if ts is None:
-            continue
-        rows.append({
-            "ts": float(ts),
-            "kind": "bp",
-            "so": h.get("so") or "",
-            "addr": h.get("static_hex") or h.get("addr"),
-            "tid": h.get("tid"),
-            "held": bool(h.get("held")),
+                   "code": getattr(exc, "code", "NOT_ATTACHED"),
+                   "hint": "先 attach（或任意动态工具）建立会话，再下断点"})
+    if not out.get("count"):
+        return _j({
+            "ok": True,
+            "count": 0,
+            "events": [],
+            "code": "NO_HITS",
+            "hint": ("还没有任何断点命中：先 set_breakpoint 下断，"
+                     "再触发目标执行；hold 断点记得配 auto_resume_after_ms"),
+            "precision": out.get("precision"),
+            **_target_state(svc, serial, int(pid)),
         })
-
-    if not rows:
-        return _j({"error": "命中记录里没有可用时间戳", "code": "NO_TIMESTAMP"})
-
-    rows.sort(key=lambda r: r["ts"])
-    t0 = rows[0]["ts"]
-    out_events = []
-    prev = t0
-    for r in rows:
-        out_events.append({
-            "t_rel_ms": round((r["ts"] - t0) * 1000.0, 3),
-            "delta_ms": round((r["ts"] - prev) * 1000.0, 3),
-            "kind": r["kind"],
-            "so": r["so"],
-            "addr": r["addr"],
-            "tid": r["tid"],
-            "held": r["held"],
-        })
-        prev = r["ts"]
-
-    return _j({
-        "ok": True,
-        "count": len(out_events),
-        "span_ms": round((rows[-1]["ts"] - t0) * 1000.0, 3),
-        "events": out_events,
-        "precision_note": ("时间戳来自 frida 的 Date.now()（墙钟毫秒）。"
-                           "同线程相邻事件的相对顺序可信；"
-                           "跨线程比较可能有调度偏差"),
-    })
+    return _j({**out, **_target_state(svc, serial, int(pid))})
 
 
 @server.tool()
@@ -3878,13 +3899,34 @@ def trace_alloc(serial: str, pid: int, tid: int = 0,
 
     ## 返回
 
-    records[{ts, comm, tid, func, size}] / dropped / mechanism="uprobe" / limits[]
+    records[{ts, pid, tid, func, addr, size, caller_off, caller_mod}]
+    / dropped / mechanism="uprobe" / threads / threads_covered / window_ms
 
-    ## 能力边界（如实说明）
+    `caller_off` 是调用者返回地址（`%lr`）减去所在模块基址，`caller_mod`
+    是那个模块的文件名；两者合起来可直接喂 disassemble / xrefs_to 做回溯。
 
-    uprobe **拿不到返回地址**（除内核支持 `$stack` 语法）。
-    所以记录里没有 caller 时表示「拿不到」，不是「没有调用者」。
-    `size` 为 null 同理——部分内核版本不导出函数参数。
+    ## 实测语法结论（不同内核差别很大）
+
+    本机（Android 12 / 内核 4.19.113）的 `uprobe_events` 只认 `%REG`：
+
+        可用：  %x0 %x1 %x2 %lr %sp %pc
+        不可用：$arg1 $tgid $pid $stack $ustack
+
+    所以"拿完整调用栈"这条路在本机不存在，能拿到的最有价值的现场是 `%lr`。
+
+    ## 如实声明的限制
+
+    · `addr` 恒为 None —— malloc **入口**还没有返回值。要分配到的地址必须
+      额外挂 `r:` 返回探针，那会让内核开销翻倍，本工具不挂。
+    · `free` 的 size 恒为 None —— 它的参数是待释放指针，不是大小。
+    · 拿不到完整调用栈（uprobe 不做栈展开）。
+    · **libc 是全系统共享页**：探针对系统里每个进程的每次 malloc 都会触发。
+      因此强制 tid 过滤；过滤表达式受内核长度上限约束，超长会**静默失效**
+      并泄漏别的进程的事件——代码里已硬截断，并在结果里报
+      `threads_covered` / `threads_skipped`。
+    · **0 条结果是正常结果**：空闲的 App 几秒内可能一次 malloc 都没有
+      （实测 com.android.settings 多次如此）。要验证功能可用，
+      挑一个确实在干活的进程，或边跑边操作目标 App。
     """
     from server.dyn.uprobe import UprobeError, trace_alloc as _impl
 

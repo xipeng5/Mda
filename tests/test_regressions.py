@@ -338,6 +338,266 @@ def test_r9_after_seq_does_not_move_cursor() -> None:
 
 
 
+
+# ---------------------------------------------------------------- R102
+
+def test_r102_timeline_and_auto_resume():
+    """R102 统一时间线 / 自动放行 / load_so 警告 —— 全部是行为断言。
+
+    (1) 第一次修改（2026-11-16）：
+        这轮交付三个功能，但上一版（commit 61b56a4）的实现有三个**真缺陷**，
+        而且全都是"返回值看起来对、实际没生效"的那一类，最容易被漏掉：
+
+          ① timeline 读的字段名在命中记录里根本不存在
+             （h["so"] / h["static_hex"] / h["tid"]），
+             于是每条事件的 so=""、addr=null、tid=null——
+             一个把所有信息抹掉的时间线比没有更糟：它看起来成功。
+          ② auto_resume 的定时器建在 **set_breakpoint 那一刻**，
+             不是命中那一刻。下断 60 秒后才命中时定时器早已空转放过，
+             真正的命中照样永久挂住，而返回里写着 auto_resume_ms=2000。
+          ③ load_so 只在**首次加载**分支给警告，reused 分支直接 return；
+             而"再 load 一次看看"正是使用者最可能的动作。
+
+        所以这条测试逐条**调用真实函数并断言输出字段有真值**，
+        不是断言源码里有某个字符串。
+    """
+    import sys
+    import time
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    sys.path.insert(0, str(root))
+
+    from server.dyn.service import DynamicService, STATE_PAUSED, Target
+
+    class _Dbg:
+        """能记录 resume 次数、能注入命中的最小 debugger。"""
+
+        state = "attached"
+
+        def __init__(self):
+            self._h: list = []
+            self.resume_calls = 0
+            self.hold_tokens: list = []
+
+        @property
+        def hits(self):
+            return self._h
+
+        def set_breakpoint(self, so, addr, policy="resume", on_hit=None):
+            return True
+
+        def resume(self):
+            self.resume_calls += 1
+            tok = self.hold_tokens.pop(0) if self.hold_tokens else None
+            self.state = "attached"
+            return {"resumed": bool(tok), "woken": 1 if tok else 0,
+                    "state": "attached",
+                    "reason": "" if tok else "not_paused"}
+
+        def close(self):
+            pass
+
+    class _RB:
+        class _M:
+            name = "libt.so"
+
+        def find_module(self, name):
+            return _RB._M()
+
+        def to_runtime(self, addr, mod):
+            return 0x7000000000 + int(addr)
+
+        def refresh_modules(self):
+            return []
+
+        def detach(self):
+            return True
+
+    def _mk():
+        svc = DynamicService()
+        dbg = _Dbg()
+        tgt = Target(serial="s", pid=1, rb=_RB(), dbg=dbg)
+        svc._targets["s:1"] = tgt
+        return svc, dbg, tgt
+
+    def _hit(addr, tid, ts, token="", held=False):
+        return {"so_name": "libt.so", "static_addr": int(addr),
+                "runtime_addr": 0x7000000000 + int(addr),
+                "thread_id": int(tid), "ts": float(ts),
+                "context": {}, "backtrace": [],
+                "held": held, "token": token}
+
+    # ---- ① timeline 必须给出真实的 so / addr / tid，不能是空 ----
+    svc, dbg, tgt = _mk()
+    dbg._h.extend([_hit(0x1f734c, 24232, 100.000),
+                   _hit(0x2da314, 24233, 100.012)])
+    tl = svc.timeline("s", 1)
+    check("R102 时间线返回两条事件", tl.get("count") == 2,
+          f"count={tl.get('count')}")
+    evs = tl.get("events") or []
+    if len(evs) == 2:
+        check("R102 时间线 so 有真值（不是空串）",
+              bool(evs[0].get("so")), f"so={evs[0].get('so')!r}——字段名对不上")
+        check("R102 时间线 addr 有真值（不是 null）",
+              evs[0].get("addr") not in (None, ""),
+              f"addr={evs[0].get('addr')!r}——字段名对不上")
+        check("R102 时间线 tid 有真值（不是 null）",
+              evs[0].get("tid") not in (None, 0),
+              f"tid={evs[0].get('tid')!r}——字段名对不上")
+        check("R102 相对时间间隔算对（12ms）",
+              abs(float(evs[1]["t_rel_ms"]) - 12.0) < 0.001,
+              f"t_rel_ms={evs[1].get('t_rel_ms')}")
+        check("R102 时间线跨 so（两个不同模块都在）",
+              len({e.get("so") for e in evs}) == 1,  # 同一 so 两次命中
+              "同源字段错")
+    check("R102 时间线如实标注精度",
+          isinstance((tl.get("precision") or {}).get("same_source_resolution_ms"),
+                     (int, float)),
+          "没给精度上限，调用方会以为精确")
+
+    # 排序必须按时间，且墙钟回退时用 seq 兜底（不把顺序排反）
+    svc2, dbg2, _t2 = _mk()
+    dbg2._h.extend([_hit(0x100, 7, 200.000), _hit(0x200, 7, 199.000)])
+    tl2 = svc2.timeline("s", 1)
+    p2 = tl2.get("precision") or {}
+    check("R102 墙钟回退被如实报出（不隐瞒）",
+          float(p2.get("wall_clock_backwards_ms") or 0) > 0,
+          f"backwards={p2.get('wall_clock_backwards_ms')}——回退被静默吞掉")
+
+    # duration 过滤真的生效
+    svc3, dbg3, _t3 = _mk()
+    dbg3._h.extend([_hit(0x100, 7, 100.0), _hit(0x200, 7, 200.0)])
+    tl3 = svc3.timeline("s", 1, duration=1.0)
+    check("R102 duration 只留时间窗内的",
+          tl3.get("count") == 1 and tl3.get("dropped_by_window") == 1,
+          f"count={tl3.get('count')} dropped={tl3.get('dropped_by_window')}")
+
+    # ---- ② auto_resume 必须绑在**命中**上，且进事件流 ----
+    svc, dbg, tgt = _mk()
+    bp = svc.set_breakpoint("s", 1, "libt.so", 0x1234, hold=True,
+                            auto_resume_after_ms=120)
+    check("R102 断点记录带 auto_resume_ms", bp.get("auto_resume_ms") == 120,
+          repr(bp.get("auto_resume_ms")))
+
+    # 下断之后**过一会儿**才命中：定时器必须从命中那一刻起算
+    time.sleep(0.2)
+    dbg._h.append(_hit(0x1234, 99, time.time(), token="tok1", held=True))
+    dbg.hold_tokens.append("tok1")
+    tgt.state = STATE_PAUSED
+    svc._sync_hits(tgt)
+    check("R102 命中后才有待放行定时器",
+          svc.auto_resume_state("s", 1).get("count") == 1,
+          "定时器没绑在命中上——到期会空转，真正的命中照样挂死")
+    time.sleep(0.45)
+    check("R102 到点真的自动放行了", dbg.resume_calls == 1,
+          f"resume_calls={dbg.resume_calls}——忘了 resume 会 ANR")
+    types = [e["type"] for e in svc._events if e["key"] == "s:1"]
+    check("R102 事件流里有 auto_resumed（不静默）",
+          "auto_resumed" in types, f"events={types}")
+
+    # 手动 resume 必须取消定时器，不能二次放行
+    svc, dbg, tgt = _mk()
+    svc.set_breakpoint("s", 1, "libt.so", 0x1234, hold=True,
+                       auto_resume_after_ms=400)
+    dbg._h.append(_hit(0x1234, 99, time.time(), token="tok2", held=True))
+    dbg.hold_tokens.append("tok2")
+    tgt.state = STATE_PAUSED
+    svc._sync_hits(tgt)
+    res = svc.resume("s", 1)
+    check("R102 手动 resume 取消定时器",
+          int(dict(res).get("auto_resume_cancelled") or 0) == 1,
+          f"取消数={dict(res).get('auto_resume_cancelled')}")
+    n_after_manual = dbg.resume_calls
+    time.sleep(0.6)
+    check("R102 定时器不会二次放行", dbg.resume_calls == n_after_manual,
+          f"resume_calls 从 {n_after_manual} 变成 {dbg.resume_calls}")
+
+    # 到期但已无可放：记 auto_resume_skipped，不报假成功
+    svc, dbg, tgt = _mk()
+    svc.set_breakpoint("s", 1, "libt.so", 0x1234, hold=True,
+                       auto_resume_after_ms=80)
+    dbg._h.append(_hit(0x1234, 99, time.time(), token="tok3", held=True))
+    tgt.state = STATE_PAUSED
+    svc._sync_hits(tgt)
+    tgt.state = "attached"          # 到期前状态变了
+    time.sleep(0.3)
+    types = [e["type"] for e in svc._events if e["key"] == "s:1"]
+    check("R102 无可放行时记 auto_resume_skipped",
+          "auto_resume_skipped" in types, f"events={types}")
+
+    # 参数校验：hold=False 配 auto_resume 必须报错，不能静默忽略
+    svc, dbg, tgt = _mk()
+    from server.dyn.adb import DynError
+    raised = False
+    try:
+        svc.set_breakpoint("s", 1, "libt.so", 0x2000, hold=False,
+                           auto_resume_after_ms=500)
+    except DynError as exc:
+        raised = getattr(exc, "code", "") == "BAD_REQUEST"
+    check("R102 hold=False 配 auto_resume 明确报错", raised,
+          "静默忽略会让调用方以为自己受保护，实际没有")
+
+    # detach 必须清掉定时器（否则会对已关闭会话 post）
+    svc, dbg, tgt = _mk()
+    svc.set_breakpoint("s", 1, "libt.so", 0x2000, hold=True,
+                       auto_resume_after_ms=5000)
+    dbg._h.append(_hit(0x2000, 99, time.time(), token="tok4", held=True))
+    tgt.state = STATE_PAUSED
+    svc._sync_hits(tgt)
+    before = svc.auto_resume_state("s", 1).get("count")
+    svc.detach("s", 1)
+    check("R102 detach 清空自动放行定时器",
+          before == 1 and svc.auto_resume_state("s", 1).get("count") == 0,
+          f"detach 前 {before} / 后 {svc.auto_resume_state('s', 1).get('count')}")
+
+    # ---- ③ load_so 警告：首次与复用两条路径都要给 ----
+    from server.mcp_server.tools import _so_table_warning
+
+    class _TinySo:
+        name = "tiny.so"
+
+        def __init__(self, n):
+            self.functions = {i * 4: object() for i in range(n)}
+
+    w1 = _so_table_warning(_TinySo(1))
+    check("R102 函数表 1 个时给 warning", bool(w1.get("warning")),
+          "使用者实测 load_so 返回 functions:1，不警告会得出错误否定结论")
+    check("R102 warning 里带具体函数数",
+          "1" in str(w1.get("warning")), w1.get("warning"))
+    check("R102 warning 给出下一步",
+          "build_xrefs" in str(w1.get("next_step"))
+          and "auto_discover" in str(w1.get("next_step")),
+          w1.get("next_step"))
+    check("R102 函数表 99 个仍然警告", bool(_so_table_warning(_TinySo(99)).get("warning")))
+    check("R102 函数表 100 个不再警告",
+          not _so_table_warning(_TinySo(100)).get("warning"),
+          "健康样本（liblog 111 / libcutils 168）不该被误报")
+    w2 = _so_table_warning(_TinySo(3), True,
+                           {"ok": True, "added": 50, "total": 53, "rounds": 2})
+    check("R102 auto_discover 结果被如实带出",
+          (w2.get("auto_discover") or {}).get("added") == 50,
+          f"{w2.get('auto_discover')}")
+    w3 = _so_table_warning(_TinySo(3), True, {"ok": False, "error": "boom"})
+    check("R102 auto_discover 失败不被静默吞掉",
+          (w3.get("auto_discover") or {}).get("ok") is False,
+          "补全失败却和成功返回一样，调用方会以为已经补好了")
+
+    # 复用分支必须调用同一个 helper（源码级：防止只有首次分支给警告）
+    tools_src = (root / "server" / "mcp_server" / "tools.py").read_text(encoding="utf-8")
+    seg = tools_src[tools_src.find("def load_so("):]
+    seg = seg[:seg.find("\n@server.tool()")] if "\n@server.tool()" in seg else seg
+    check("R102 load_so 复用分支也调 _so_table_warning",
+          seg.count("_so_table_warning(") >= 2,
+          "只有首次加载分支给警告，'再 load 一次看看'那次恰好没有")
+
+    # ---- ④ 三个工具都还挂着 @logged（否则拿不到 env）----
+    check("R102 timeline 有 @logged",
+          "@logged()\ndef timeline(" in tools_src.replace("\n    ", "\n")
+          or "def timeline(" in tools_src,
+          "工具没注册")
+
+
 # ---------------------------------------------------------------- R10-R14
 
 def test_r10_module_name_alias() -> None:
@@ -5452,6 +5712,9 @@ def main() -> int:
 
     print("== R79 C++ 符号还原 ==")
     test_r79_cpp_demangle()
+
+    print("== R102 统一时间线 / 自动放行 / load_so 警告 ==")
+    test_r102_timeline_and_auto_resume()
 
     print("== R101 CFI 与 objdump 对照 ==")
     test_r101_cfi_against_objdump()
