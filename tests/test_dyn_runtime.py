@@ -84,7 +84,7 @@ class StubHit:
 
 def build_service():
     """构造一个不连设备的 DynamicService，替换 attach 的真实实现。"""
-    from dyn.service import DynamicService
+    from server.dyn.service import DynamicService
 
     svc = DynamicService()
     stub_dbg = StubDebugger()
@@ -97,7 +97,7 @@ def build_service():
         key = f"{serial}:{pid}"
         if key in svc._targets:
             return svc._targets[key]
-        from dyn.service import Target
+        from server.dyn.service import Target
 
         t = Target(serial=serial, pid=pid, rb=rb, dbg=stub_dbg)
         svc._targets[key] = t
@@ -149,7 +149,7 @@ def main() -> int:
 
     # 造一个 paused 状态
     tgt = S._targets[f"{serial}:{pid}"]
-    from dyn.service import STATE_PAUSED
+    from server.dyn.service import STATE_PAUSED
 
     tgt.state = STATE_PAUSED
     r2 = S.resume(serial, pid)

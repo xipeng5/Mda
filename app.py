@@ -14,7 +14,7 @@ import sys
 
 def main() -> int:
     if "--mcp-stdio" in sys.argv:
-        from mcp_server.proxy import run
+        from server.mcp_server.proxy import run
 
         return run()
 
@@ -31,7 +31,7 @@ def main() -> int:
     if extra:
         print("[MDA] Web 版暂不支持用命令行指定 so，请在界面里打开（后续补）。")
 
-    from web_app import main as web_main
+    from server.web_app import main as web_main
 
     web_main()
     return 0

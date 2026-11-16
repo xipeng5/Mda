@@ -5,7 +5,7 @@
 
   **多 so 静态分析 + 真机动态调试，内置 MCP 让 AI 直接驱动**
 
-  多 so 同会话 · 跨 so 调用链 · 函数球可视化 · 真断点调试 · Java 层 hook
+  多 so 同会话 · 跨 so 调用链 · 实时监控台 · 真断点调试 · Java 层 hook
 </div>
 
 ---
@@ -15,11 +15,11 @@
 AI 驱动的逆向分析平台。**静态看清结构，动态看真值**，两者共享同一份会话。
 
 - **多 so 同会话**：一次加载多个 so，跨模块解析 PLT → GOT → 导出符号，还原完整调用树
-- **函数球**：每个点是一个函数，纬度按地址排序，颜色按被引用次数分级——一眼看出热点
+- **引用密度热力条**：位置=真实地址，颜色=真实引用数——全局看这个模块哪里热
 - **真机动态调试**：真断点（不是采样）、36 个寄存器、按运行时地址读内存、四种跳转表形态全库扫描
 - **Java 层可见**：hook Java 方法、追调用者、通配符批量定位——从 native 跨到上层
-- **内置 MCP（82 个工具）**：AI 可加载文件、反汇编、追调用链、下断点、hook Java、跑 IDC 脚本
-- **人机同屏**：AI 每调一次工具，界面同步高亮对应函数、弹出操作卡、滚动日志——你能**看着 AI 干活**
+- **内置 MCP（102 个工具）**：AI 可加载文件、反汇编、追调用链、下断点、hook Java、跑 IDC 脚本
+- **人机同屏**：AI 每调一次工具，界面上实时出现一行、目标行闪烁、图表跟着动——你能**看着 AI 干活**
 - **加固样本友好**：节表被抹、导出表清空、FDE 不全、控制流平坦化都能处理
 
 > 与 IDA 的取舍：IDA 更擅长交互式单文件深度分析；MDA 擅长**多模块调用关系**与
@@ -29,40 +29,56 @@ AI 驱动的逆向分析平台。**静态看清结构，动态看真值**，两�
 
 界面用 **React + TypeScript** 写，跑在本机 **WKWebView**（系统 WebView，不打包 Chromium）。
 
-![主界面](docs/screenshot_web_main.png)
+主体七个视图 + 左栏两组入口：
 
-**三栏布局**
+```
+主体  实时 · 代码 · 引用 · 图谱 · 时间线 · 工具   （进程从左侧「目标进程」进）
+左栏  字符串 · 段 / 节
+```
 
-- **左**：日志（AI 的每次工具调用）/ 观察列表
-- **中**：函数球——当前 so 放大居中，其余 so 缩成小球停在两侧并显示名字
-- **右**：按 so 分组的函数列表，支持过滤，AI 定位时会自动滚动并高亮
+**顶部常驻**：模块标签（可关闭/新增）+ 跳转框 + **引用密度热力条**。
+热力条不随视图切换，位置=真实地址，颜色=真实引用数，点任意一段直接跳过去。
 
-**操作**
+### 实时监控台
 
-| 动作 | 效果 |
-|---|---|
-| 拖动球体 | 旋转，看不同纬度的函数分布 |
-| 点右侧函数 | 球旋转到该点正面，状态栏显示地址/大小/引用数 |
-| 双击 / 回车 | 反汇编铺满舞台，球缩成右上角方形缩略图 |
-| `Esc` | 从代码返回球体 |
-| 顶部跳转框 | 输入 `0x621d0` 或函数名，跨 so 定位 |
-| 拖入 `.so` | 松手即加载（也可以点「打开 so」走系统文件对话框） |
-| 「建立引用图」 | 真实构建引用图，完成后点云按引用热度着色、画出调用关系线 |
+![实时监控台](docs/ui/10-realtime.png)
 
-**主题**：默认跟随系统深浅色（`prefers-color-scheme`），点顶部按钮可手动锁定。
+三栏：**目标**（前台 App 的进程树 + 模块 + Hook 墙）/ **事件流** / **事件详情**。
 
-<p>
-  <img src="docs/screenshot_web_empty.png" width="49%" alt="空状态">
-  <img src="docs/screenshot_web_dark.png" width="49%" alt="深色主题">
-</p>
+- 事件流是 AI 每次工具调用的真实广播（`@logged` → WebSocket），带工具名、参数、返回、耗时
+- 表头六个筛选项（全部/静态/运行时/VM/行为/进程），可折叠
+- 目标行在被 AI 操作时会**蓝色闪烁 + 因果连线 + 光点**；
+  装了断点/hook/观察点时变成**竖条纹流动**（`armed`），并显示 `◉ N` 待命计数
+- 底部六条泳道按**时间桶**记录真实调用节奏
 
-**代码视图**（真实 ARM64，12k+ 条指令也能秒开——虚拟滚动，DOM 里只保留可视区域）
+### 代码
 
-![代码视图](docs/screenshot_web_code.png)
+热力条 + 函数列表 + **内联展开反汇编**。点函数头看真实指令，
+`bl` 蓝色、`ret` 橙色，助记符加粗、操作数次级色。
 
-**引用关系**（蓝点=被引用/热点，关系线=调用者与被调用者，来自真实 xref 计算）
+**AI 定位**：AI 操作某个函数时，那一行蓝色闪一下并滚进可视区
+（列表是"以当前选中为中心的 60 行窗口"，第 300 个函数也能定位到）。
 
-![引用关系](docs/screenshot_web_relations.png)
+### 引用 / 图谱 / 时间线
+
+- **引用**：谁调用了它、它调用了谁，两栏可点跳转
+- **图谱**：固定三层布局（调用者/当前/被调用）。不用力导向——那玩意每次坐标都不同
+- **时间线**：按真实耗时画甘特条，最慢的标在顶部；长度用 √ 压缩避免短条被压平
+
+### 工具 / 进程
+
+- **工具**：102 个工具的真实清单，被调用时那一行**自动滚进可视区并脉冲**
+- **进程**：一个 App 到底有几个进程、哪个在跑网络（`inet` 按真实 socket inode 判定）
+
+### 右栏：函数检视器
+
+选中函数的**全部已知事实**：概况（引用数/调用者/被调用/所在段）、
+调用者列表、被调用列表（PLT 标 `plt`）、引用字符串、断点/命中状态。
+
+### 主题
+
+默认浅色，可切深色。设计稿的度量与配色（左栏 186px、状态栏 22px、
+`--bg #fbfbfc`、`--live #2563eb`）已对齐。
 
 ## 安装
 
@@ -151,10 +167,10 @@ cd web && npm install && npm run build && cd ..
 ### 联动效果
 
 - AI 用 `load_so` 加载 so → 界面**自动出现**该模块
-- AI 调 `disassemble` / `xrefs_to` → 球旋转定位，弹出「AI 操作」卡，日志记录耗时
+- AI 调 `disassemble` / `xrefs_to` → 代码页那一行闪烁定位，事件流出现一行，右栏检视器跟着更新
 - AI 加载的会话与你手动加载的是**同一份**数据
 
-## 工具一览（82 个）
+## 工具一览（102 个）
 
 ### 加载与概览
 
@@ -339,27 +355,43 @@ MDA 会自动注入 `frida_tools` 自带的 `bridges/java.js`，**不需要额�
 ## 架构
 
 ```
-web/          React + TypeScript 前端（Vite 构建，产物被后端托管）
-server/       Starlette 传输层：静态托管 + REST + WebSocket（8766）
-core/         ELF 解析、反汇编、引用图、函数发现、字符串、伪代码
-mcp_server/   MCP 工具层（82 个工具）、HTTP 服务、stdio→进程内代理
-dyn/          动态能力
-              ├─ adb.py        设备与 frida-server 管理、进程活性探测
-              ├─ service.py    动态会话注册表、断点、事件流
-              ├─ debugger.py   断点实现（Interceptor）、命中现场
-              ├─ rebase.py     ASLR 换算、模块表
-              ├─ tracer.py     trace / watch / probe / 调用树
-              ├─ bridge.py     resolve_br / read_jump_table / 命中上下文
-              ├─ memread.py    VM 状态、内存批量读、指令解码
-              ├─ stepper.py    单步规划与执行
-              ├─ java_bridge.py Java bridge 注入、hook、类搜索、调用者
-              ├─ jni.py        JNI 注册表扫描
-              ├─ dispatch.py   跳转表全库扫描
-              └─ frida_server.py 服务端版本对齐
-scripting/    Python 脚本执行器、IDC 直译器
-plugins/      可插拔分析插件（敏感字符串扫描、函数画像）
-tests/        回归与冒烟测试
+app.py            启动器：默认开界面；--mcp-stdio 走 stdio 转发
+mda.py            命令行：mcp / analyze / chain
+server/           ← 全部后端 Python（mda 的功能代码）
+  api.py          Starlette 传输层：静态托管 + REST + WebSocket（8766）
+  web_app.py      原生窗口（pywebview）+ 服务生命周期
+  version.py      版本号唯一来源
+  models.py       数据模型
+  core/           ELF 解析、反汇编、引用图、函数发现、字符串、伪代码
+  mcp_server/     MCP 工具层（103 个工具）、HTTP 服务、stdio→进程内代理
+  dyn/            动态能力
+                  ├─ adb.py        设备与 frida-server 管理、进程活性探测
+                  ├─ appproc.py    进程全貌、前台 App 探测
+                  ├─ service.py    动态会话注册表、断点、事件流
+                  ├─ debugger.py   断点实现（Interceptor）、命中现场
+                  ├─ rebase.py     ASLR 换算、模块表
+                  ├─ tracer.py     trace / watch / probe / 调用树
+                  ├─ bridge.py     resolve_br / read_jump_table / 命中上下文
+                  ├─ memread.py    VM 状态、内存批量读、指令解码
+                  ├─ stepper.py    单步规划与执行
+                  ├─ java_bridge.py Java bridge 注入、hook、类搜索、调用者
+                  ├─ jni.py        JNI 注册表扫描
+                  ├─ dispatch.py   跳转表全库扫描
+                  └─ frida_server.py 服务端版本对齐
+  scripting/      Python 脚本执行器、IDC 直译器
+  plugins/        可插拔分析插件（敏感字符串扫描、函数画像）
+web/              React + TypeScript 前端（Vite 构建，产物被后端托管）
+assets/           图标等静态资源
+tests/            回归与冒烟测试
+packaging/        PyInstaller 配置
 ```
+
+> 为什么要 `server/` 这一层：**后端功能代码全部收在一个包里**，
+> 根目录只留启动器（`app.py` / `mda.py`）。看代码时不用先分辨
+> "这个 py 是前端的还是后端的"——一眼就知道。
+> 迁移时所有导入改为 `server.xxx`，`api.py` 用 `dirname(dirname(__file__))`
+> 仍能正确指回仓库根，`core/plugins.py` 的 `parent.parent` 也自然落到
+> `server/plugins`，不需要额外硬编码。
 
 **数据流**：界面 → `server/api.py` → `core.Session`（与 MCP 共用同一实例）→ 返回 JSON；
 AI → MCP 工具 → 同一个 `Session` → 通过 `on_activity` / `on_ui_sync` 推事件到
@@ -373,8 +405,15 @@ AI → MCP 工具 → 同一个 `Session` → 通过 `on_activity` / `on_ui_sync
 | `POST /api/load` `POST /api/load_upload` | 按路径 / 按上传字节加载 |
 | `GET /api/functions` `GET /api/disasm` | 函数表（含引用数）、反汇编 |
 | `GET /api/xrefs` `GET /api/strings` `POST /api/xrefs/build` | 引用、字符串、构建引用图 |
+| `GET /api/tools` | 102 个工具的真实清单（读 MCP 注册表） |
+| `GET /api/nav_stats` | 左栏全部计数（函数/引用/字符串/段/会话事实/hook 状态） |
+| `GET /api/heatmap` | 引用密度（按真实地址分桶） |
+| `GET /api/sections` `GET /api/strings` | 段表（含权限位）、字符串表 |
+| `GET /api/xref_tree` `GET /api/fn_detail` | 调用关系、单函数完整检视（含引用字符串） |
+| `GET /api/app_processes` | 进程树 + socket/inet 连接数 + 加载的 so 总数 |
+| `GET /api/foreground` `GET /api/armed` `POST /api/armed/clear` | 前台包名、待命状态 |
 | `GET /api/mcp-config` | 生成给 AI 用的 MCP 配置 |
-| `WS /api/events` | AI 活动、UI 回放、引用图进度 |
+| `WS /api/events` | AI 活动、模块快照、待命变化、引用图进度 |
 
 ## 打包
 
@@ -470,18 +509,32 @@ cd web && npm run build
 前端源码结构：
 
 ```
-web/src/App.tsx                       布局、状态、AI 事件接线
-web/src/components/SphereCanvas.tsx   球体画布（拖拽/旋转/选中）
-web/src/lib/sphere.ts                 球面投影、分桶绘制、关系线、进度环
-web/src/components/CodeOverlay.tsx    代码视图（虚拟滚动）
-web/src/components/LeftPanel.tsx      日志 / 观察
-web/src/components/RightPanel.tsx     函数列表（虚拟滚动）
+web/src/App.tsx                        布局、状态、AI 事件接线、代码页窗口/闪烁
+web/src/lib/api.ts                     后端接口封装（含缓存破坏）
+web/src/components/RealtimeMonitor.tsx 实时监控台（三栏 + 泳道 + 筛选 + 因果特效）
+web/src/components/LeftNav.tsx         左栏五组导航（计数全部真实）
+web/src/components/HeatBar.tsx         引用密度热力条（全局）
+web/src/components/Inspector.tsx       右栏函数检视器
+web/src/components/XrefView.tsx        引用（调用者/被调用）
+web/src/components/GraphView.tsx       图谱（固定三层）
+web/src/components/TimelineView.tsx    时间线（真实耗时甘特）
+web/src/components/ToolsView.tsx       工具清单（调用时自动定位）
+web/src/components/ProcessesView.tsx   进程与网络
+web/src/components/FlatTable.tsx       字符串 / 段节
+web/src/components/ArmedBar.tsx        待命状态
+web/src/components/LeftPanel.tsx       日志 / 观察
+web/src/components/CodeOverlay.tsx     单函数反汇编浮层
+```
+
+> `SphereCanvas.tsx` 与 `lib/sphere.ts` 仍留在仓库里，但**已不在渲染路径上**
+> ——球体在 2026-11 的改版里被移除（它的位置是哈希、没有语义，
+> 等于把右侧函数列表又画了一遍）。
 ```
 
 ## 测试
 
 ```bash
-# 四个测试集（不需要设备）
+# 四个测试集（不需要设备），合计 619 项
 .venv/bin/python tests/test_e2e.py
 .venv/bin/python tests/test_shell_sample.py
 .venv/bin/python tests/test_dyn_runtime.py

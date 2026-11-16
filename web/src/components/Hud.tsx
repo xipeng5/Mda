@@ -12,7 +12,14 @@ export function Hud({ hud, onClose }: { hud: HudData | null; onClose: () => void
         <i className="dot live" />
         <span>{hud ? KIND[hud.kind] ?? hud.kind : "操作"}</span>
         <span className="grow" />
-        <span style={{ color: "var(--fg3)", cursor: "pointer" }} onClick={onClose}>ESC 关闭</span>
+        <button
+          className="hud-x"
+          onClick={onClose}
+          title="关闭（也可以按 ESC）"
+          aria-label="关闭"
+        >
+          ✕
+        </button>
       </div>
       <div className="hud-scan" />
       <div className="hud-body">

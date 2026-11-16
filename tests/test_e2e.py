@@ -8,7 +8,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from core.session import Session
+from server.core.session import Session
 
 SAMPLES = Path(__file__).parent.parent / "samples"
 PASS = 0
@@ -60,7 +60,7 @@ def main() -> int:
     check("跨 so 链深入到 liblog", "liblog.so!__android_log_set_default_tag" in text)
 
     print("== 伪代码 ==")
-    from core.pseudocode import PseudocodeGenerator
+    from server.core.pseudocode import PseudocodeGenerator
     gen = PseudocodeGenerator(log, s._xrefs["liblog.so"].disasm)
     pc = gen.generate(0x5020, lambda so, a: (
         (l := s.resolve_call(so, a)) and (l.callee_so, l.callee, l.callee_addr)) or None)
@@ -68,7 +68,7 @@ def main() -> int:
     check("伪代码无未解析 !name", "!calloc" not in pc)
 
     print("== 脚本通道 ==")
-    from scripting.runner import run_in_session
+    from server.scripting.runner import run_in_session
     r = run_in_session(s, 'result = len(session.get("liblog.so").functions)')
     import json
     # bug 原因：result 经 json.dumps 后是字符串 "111"，需二次 loads 还原为 int

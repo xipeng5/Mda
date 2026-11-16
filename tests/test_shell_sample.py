@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 # 本测试验证「本进程内」的行为，必须关闭转发，否则会打到运行中的 GUI。
 os.environ["MDA_IS_GUI"] = "1"
 
-from mcp_server.tools import _session, search_bytes  # noqa: E402
+from server.mcp_server.tools import _session, search_bytes  # noqa: E402
 
 SAMPLE = Path(
     "/Users/waterclean/Desktop/ProJect/py/pythonProject1/咸鱼web/hooks/out/sg/"
@@ -68,7 +68,7 @@ def main() -> int:
     check("命中已知分发器地址 0x5201c", "0x5201c" in addrs, str(sorted(addrs)[:5]))
 
     print("== 转发链路可判定 ==")
-    from mcp_server import link
+    from server.mcp_server import link
 
     check("GUI 进程自身不转发（防自环）", link.should_forward() is False)
     check("GUI 进程视为同会话", link.gui_online() is True)

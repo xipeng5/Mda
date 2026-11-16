@@ -40,7 +40,7 @@ def check(name: str, cond: bool, detail: str = "") -> None:
 
 def test_r1_held_is_exposed() -> None:
     """R1：命中必须透出 debugger 侧的真实挂起状态。"""
-    from dyn.service import _hit_dict, _resolve_held
+    from server.dyn.service import _hit_dict, _resolve_held
 
     # debugger 亲口说挂住了，但断点表里没有这条记录（报告 #1 的场景）
     hit = {"so_name": "libx.so", "static_addr": 0x100,
@@ -70,7 +70,7 @@ def test_r1_held_is_exposed() -> None:
 
 def test_r2_no_cross_segment_concat() -> None:
     """R2：读取不得越出所在段/节的范围。"""
-    from core.elf_model import SoFile
+    from server.core.elf_model import SoFile
 
     sample = Path(__file__).parent.parent / "so_test" / "dump" / (
         "libsgmainso-5.5.110.so.758a6e6000.bin")
@@ -95,7 +95,7 @@ def test_r2_no_cross_segment_concat() -> None:
     check("R2 段外读取返回空", so.read(0x227798, 4) == b"")
 
     # 上层必须报错而不是伪造数值
-    from dyn.memread import MemReadError, read_typed
+    from server.dyn.memread import MemReadError, read_typed
 
     raised = False
     try:
@@ -112,7 +112,7 @@ def test_r2_no_cross_segment_concat() -> None:
 
 def test_r3_resume_respects_verdict() -> None:
     """R3：debugger 拒绝放行时不得谎报成功。"""
-    from dyn.service import _resume_verdict
+    from server.dyn.service import _resume_verdict
 
     ok, reason = _resume_verdict({"resumed": False, "reason": "thread_gone"})
     check("R3 明确拒绝被判为失败", ok is False, f"ok={ok}")
@@ -125,7 +125,7 @@ def test_r3_resume_respects_verdict() -> None:
           _resume_verdict({"ok": False})[0] is False)
 
     # 端到端：service 不得把拒绝写成成功，且状态要保持 paused
-    from dyn.service import STATE_PAUSED, DynamicService, Target
+    from server.dyn.service import STATE_PAUSED, DynamicService, Target
 
     class RejectDbg:
         state = "paused"
@@ -165,7 +165,7 @@ def test_r3_resume_respects_verdict() -> None:
 
 def test_r4_stepper_condition() -> None:
     """R4：ARM64 条件码别名与 ret 操作数必须正确处理。"""
-    from dyn.stepper import _COND_DIRECT, _RET, _classify
+    from server.dyn.stepper import _COND_DIRECT, _RET, _classify
 
     check("R4 b.hs 在条件跳转表内", "b.hs" in _COND_DIRECT,
           "capstone 对 b.cs 输出 b.hs，漏收会导致落点算错")
@@ -204,7 +204,7 @@ def test_r4_stepper_condition() -> None:
 
 def test_r5_addr_parsing() -> None:
     """R5：地址字符串解析不得把十进制当十六进制。"""
-    from mcp_server.tools import _as_int_addr
+    from server.mcp_server.tools import _as_int_addr
 
     check("R5 '12' 解析为 12", _as_int_addr("12") == 12,
           f"实际 {_as_int_addr('12')}（修复前是 18）")
@@ -217,7 +217,7 @@ def test_r5_addr_parsing() -> None:
 
 def test_r6_threads_empty_not_success() -> None:
     """R6：线程枚举返回空列表时必须继续降级，不能报"0 线程"成功。"""
-    from mcp_server.tools import _threads_from_layers
+    from server.mcp_server.tools import _threads_from_layers
 
     class Svc:
         def threads(self, serial, pid):
@@ -240,7 +240,7 @@ def test_r6_threads_empty_not_success() -> None:
 
 def test_r7_bad_events_no_crash() -> None:
     """R7：事件里混入非字典元素不得抛异常。"""
-    from mcp_server.tools import _bases_from_hit_events
+    from server.mcp_server.tools import _bases_from_hit_events
 
     try:
         bases, note = _bases_from_hit_events([1, 2])
@@ -261,7 +261,7 @@ def test_r8_detached_is_terminal() -> None:
     """R8：detached 是终态，迟到事件不得把它改回 paused。"""
     import time as _t
 
-    from dyn.service import STATE_DETACHED, DynamicService, Target
+    from server.dyn.service import STATE_DETACHED, DynamicService, Target
 
     class Dbg:
         state = "detached"
@@ -306,7 +306,7 @@ def test_r8_detached_is_terminal() -> None:
 
 def test_r9_after_seq_does_not_move_cursor() -> None:
     """R9：显式 after_seq 属只读回溯，不得推进增量游标。"""
-    from dyn.service import DynamicService, Target
+    from server.dyn.service import DynamicService, Target
 
     class Dbg:
         state = "attached"
@@ -342,7 +342,7 @@ def test_r9_after_seq_does_not_move_cursor() -> None:
 
 def test_r10_module_name_alias() -> None:
     """R10：真机模块名带路径/壳前缀时仍要能符号化。"""
-    from mcp_server.tools import _pick_so_by_name, _session, _symbolize_frame
+    from server.mcp_server.tools import _pick_so_by_name, _session, _symbolize_frame
 
     so = _session.add("samples/liblog.so")
 
@@ -365,7 +365,7 @@ def test_r10_module_name_alias() -> None:
 
 def test_r11_linear_scan_stops() -> None:
     """R11：无条件跳转/返回必须终止线性扫描，不能给出不会命中的地址。"""
-    from dyn.stepper import _stops_linear_scan
+    from server.dyn.stepper import _stops_linear_scan
 
     for m in ("b", "b.al", "ret", "br"):
         check(f"R11 {m} 终止线性扫描", _stops_linear_scan(m) is True)
@@ -375,7 +375,7 @@ def test_r11_linear_scan_stops() -> None:
 
 def test_r12_module_timeline_shorthand() -> None:
     """R12：{模块名: 基址} 简写要被识别；缺 size 与错 size 语义要分开。"""
-    from dyn.bridge import module_load_timeline
+    from server.dyn.bridge import module_load_timeline
 
     r = module_load_timeline({"a.so": 0x1000, "b.so": 0x5000})
     check("R12 {name: base} 简写被识别", r.get("count") == 2,
@@ -406,7 +406,7 @@ def test_r13_token_registered_before_symbolize() -> None:
     _sys.path.insert(0, str(_P(__file__).parent))
     from fake_frida import FakeRebase, FakeModule, make_breakpoint_payload
 
-    from dyn.debugger import STATE_PAUSED, Debugger
+    from server.dyn.debugger import STATE_PAUSED, Debugger
 
     rb = FakeRebase([FakeModule("libtarget.so", 0x7000000000, 0x10000)])
     dbg = Debugger(rb)
@@ -436,7 +436,7 @@ def test_r13_token_registered_before_symbolize() -> None:
 
 def test_r14_execute_step_contract() -> None:
     """R14：execute_step 的核心契约——不许把"没停到"报成成功。"""
-    from dyn.stepper import execute_step
+    from server.dyn.stepper import execute_step
 
     class Hit:
         def __init__(self, static_addr):
@@ -530,8 +530,8 @@ def test_r14_execute_step_contract() -> None:
 
 def test_r15_runtime_read_contract() -> None:
     """R15：runtime 读取必须真的走目标进程，且读失败不许返回零填充。"""
-    from core.elf_model import SoFile
-    from dyn.memread import MemReadError, read_typed
+    from server.core.elf_model import SoFile
+    from server.dyn.memread import MemReadError, read_typed
 
     # 用真实 SoFile（_resolve_so 只认真实例）；只把 rb 换成桩，
     # 这样验证的是"运行时读取这条路径"，而不是伪造的 so。
@@ -597,7 +597,7 @@ def test_r16_execute_step_after_existing_hit() -> None:
     而它的语义是"有未取过的命中就立即返回"，于是第二次单步必然 0 秒超时。
     """
     import time as _time
-    from dyn.stepper import execute_step
+    from server.dyn.stepper import execute_step
 
     class Hit:
         def __init__(self, static_addr):
@@ -654,7 +654,7 @@ def test_r16_execute_step_after_existing_hit() -> None:
 
 def test_r17_step_out_address_space() -> None:
     """R17：plan_step_out 必须返回**静态**地址（set_breakpoint 还要再加基址）。"""
-    from dyn.stepper import plan_step_out
+    from server.dyn.stepper import plan_step_out
 
     class Mod:
         name = "liblog.so"
@@ -697,8 +697,8 @@ def test_r17_step_out_address_space() -> None:
 
 def test_r18_runtime_read_bounds() -> None:
     """R18：runtime 读取越界必须报错，绝不返回"格式正确的假值"。"""
-    from core.elf_model import SoFile
-    from dyn.memread import MemReadError, read_typed
+    from server.core.elf_model import SoFile
+    from server.dyn.memread import MemReadError, read_typed
 
     so = SoFile("samples/liblog.so")
 
@@ -731,8 +731,8 @@ def test_r18_runtime_read_bounds() -> None:
 
 def test_r19_hit_context_fallback() -> None:
     """R19：模块表缺失时 hit_context 必须优雅降级，不能崩。"""
-    from dyn.bridge import hit_context
-    from mcp_server.tools import _session
+    from server.dyn.bridge import hit_context
+    from server.mcp_server.tools import _session
 
     _session.add("samples/liblog.so")
     try:
@@ -752,11 +752,11 @@ def test_r19_hit_context_fallback() -> None:
 
 def test_r20_address_parsing_unified() -> None:
     """R20：四个地址解析入口必须给出同样的结果（尤其"含 a-f 无 0x 前缀"）。"""
-    from core.addr import parse_addr
-    from dyn.bridge import _as_int
-    from dyn.debugger import _parse_addr
-    from dyn.tracer import _to_int
-    from mcp_server.tools import _as_int_addr
+    from server.core.addr import parse_addr
+    from server.dyn.bridge import _as_int
+    from server.dyn.debugger import _parse_addr
+    from server.dyn.tracer import _to_int
+    from server.mcp_server.tools import _as_int_addr
 
     # 核心规则：这些输入的解析结果必须四家一致
     cases = {
@@ -791,8 +791,8 @@ def test_r20_address_parsing_unified() -> None:
 
 def test_r21_mixed_timeline() -> None:
     """R21：模块加载事件与断点命中必须能上同一条时间轴，且算出间隔。"""
-    from dyn.bridge import trace_to_timeline
-    from dyn.tracer import TraceEvent, KIND_CODE, KIND_MODULE_LOAD
+    from server.dyn.bridge import trace_to_timeline
+    from server.dyn.tracer import TraceEvent, KIND_CODE, KIND_MODULE_LOAD
 
     events = [
         {"kind": "added", "name": "liba.so", "ts": 100.0, "path": "/data/liba.so"},
@@ -820,7 +820,7 @@ def test_r22_module_event_fields() -> None:
     """R22：模块加载事件必须带 ts，否则时间轴无从谈起。"""
     import inspect as _insp
 
-    from dyn.tracer import start_trace_module_load as fn
+    from server.dyn.tracer import start_trace_module_load as fn
 
     src = _insp.getsource(fn)
     check("R22 spawn 模式存在", "dev.spawn" in src, "源码里找不到 dev.spawn")
@@ -840,12 +840,12 @@ def test_r23_startup_trace_contract() -> None:
     """R23：trace_app_startup 必须区分两类事件、分类限额、并给结构化洞察。"""
     import inspect as _insp
 
-    from dyn.tracer import trace_app_startup as fn
+    from server.dyn.tracer import trace_app_startup as fn
 
     src = _insp.getsource(fn)
     sig = _insp.signature(fn)
     # JS 模板在模块级常量里，不在函数源码里 —— 两处都要看
-    import dyn.tracer as _t
+    import server.dyn.tracer as _t
     js_src = getattr(_t, "_JS_APP_STARTUP", "")
     all_src = src + js_src
 
@@ -881,7 +881,7 @@ def test_r24_timeline_sections() -> None:
             "args": ["0x10"], "tid": 1} for i in range(500)]
     )
     # 复用 trace_to_timeline 的混合能力确认两类都能进同一条轴
-    from dyn.bridge import trace_to_timeline
+    from server.dyn.bridge import trace_to_timeline
 
     r = trace_to_timeline(events)
     items = r.get("items") or []
@@ -901,8 +901,8 @@ def test_r25_static_breakpoints_in_startup() -> None:
     """R25：trace_app_startup 必须支持按静态地址下断点，且支持延迟补下。"""
     import inspect as _insp
 
-    import dyn.tracer as _t
-    from dyn.tracer import trace_app_startup as fn
+    import server.dyn.tracer as _t
+    from server.dyn.tracer import trace_app_startup as fn
 
     src = _insp.getsource(fn)
     js = getattr(_t, "_JS_APP_STARTUP", "")
@@ -937,8 +937,8 @@ def test_r26_startup_backtrace() -> None:
     """R26：启动期调用必须带调用栈，且用 FUZZY 而非 ACCURATE。"""
     import inspect as _insp
 
-    import dyn.tracer as _t
-    from dyn.tracer import trace_app_startup as fn
+    import server.dyn.tracer as _t
+    from server.dyn.tracer import trace_app_startup as fn
 
     src = _insp.getsource(fn)
     js = getattr(_t, "_JS_APP_STARTUP", "")
@@ -959,7 +959,7 @@ def test_r26_startup_backtrace() -> None:
           "没有完整模块表就无法把裸地址折回函数名")
 
     # MCP 层的符号化要过滤 FUZZY 误报
-    import mcp_server.tools as _tools
+    import server.mcp_server.tools as _tools
 
     tools_src = _insp.getsource(_tools.trace_app_startup)
     check("R26 过滤不在模块内的误报帧",
@@ -976,7 +976,7 @@ def test_r27_runtime_address_read() -> None:
     """R27：必须能按运行时绝对地址读（断点现场的 x0/lr 就是这种地址）。"""
     import inspect as _insp
 
-    import dyn.service as _svc
+    import server.dyn.service as _svc
 
     src_svc = _insp.getsource(_svc.DynamicService.read_runtime)
     src_str = _insp.getsource(_svc.DynamicService.read_runtime_string)
@@ -998,7 +998,7 @@ def test_r27_runtime_address_read() -> None:
     check("R27 截断要标出来", "truncated" in src_str, "读不全不能装作读全了")
 
     # 地址解析：0x 前缀与十进制都要支持
-    from core.addr import parse_addr
+    from server.core.addr import parse_addr
 
     check("R27 解析 0x 形式", parse_addr("0x7bcae6055f") == 0x7BCAE6055F)
     check("R27 解析十进制", parse_addr("1234") == 1234)
@@ -1009,7 +1009,7 @@ def test_r28_runtime_tools_exposed() -> None:
     """R28：两个运行时地址读工具必须暴露给 AI。"""
     import asyncio as _aio
 
-    from mcp_server.tools import server
+    from server.mcp_server.tools import server
 
     names = [t.name for t in _aio.get_event_loop().run_until_complete(server.list_tools())]
     check("R28 read_runtime_memory 已暴露", "read_runtime_memory" in names)
@@ -1020,8 +1020,8 @@ def test_r28_runtime_tools_exposed() -> None:
 
 def test_r29_module_name_matching() -> None:
     """R29：设备模块名带版本号时必须能匹配本地文件（通用能力，非某个 app 特例）。"""
-    from dyn.tracer import _module_name_candidates
-    from mcp_server.tools import _strip_version_tag
+    from server.dyn.tracer import _module_name_candidates
+    from server.mcp_server.tools import _strip_version_tag
 
     cases = [
         ("libsgmainso-6.7.260202.so", "libsgmainso.so"),
@@ -1049,7 +1049,7 @@ def test_r30_br_resolution() -> None:
     """R30：resolve_br 必须区分 direct/table，且算不出时不编造目标。"""
     import inspect as _insp
 
-    from dyn.bridge import resolve_br as fn
+    from server.dyn.bridge import resolve_br as fn
 
     src = _insp.getsource(fn)
     check("R30 有 direct 模式", '"direct"' in src)
@@ -1069,7 +1069,7 @@ def test_r31_detach_thread_safety() -> None:
     import time as _t
     import inspect as _insp
 
-    import dyn.tracer as _tr
+    import server.dyn.tracer as _tr
 
     check("R31 有 in-flight 登记表", hasattr(_tr, "_DETACH_PENDING"))
     check("R31 有并发上限", "len(_DETACH_PENDING) >= 16" in _insp.getsource(_tr._detach_async))
@@ -1097,7 +1097,7 @@ def test_r32_new_tools_exposed() -> None:
     """R32：五个补齐能力的工具必须都暴露给 AI。"""
     import asyncio as _aio
 
-    from mcp_server.tools import server
+    from server.mcp_server.tools import server
 
     names = [t.name for t in _aio.get_event_loop().run_until_complete(server.list_tools())]
     for want in ("watch_module", "verify_breakpoint", "resolve_br",
@@ -1106,16 +1106,39 @@ def test_r32_new_tools_exposed() -> None:
 
 
 def test_r33_find_module_version_match() -> None:
-    """R33：Rebase.find_module 必须能按去版本号匹配（否则 set_breakpoint 报未加载）。"""
+    """R33：Rebase.find_module 必须能按去版本号匹配（否则 set_breakpoint 报未加载）。
+
+    (2) 第二次修改（2026-11-13）：断言目标从"find_module 源码里有这段字"
+        改成"统一规则 match_name 里确实做了这件事，且 find_module 委托给它"。
+        bug 原因：原断言查的是 find_module 自身的源码文本。别名规则收敛到
+                  core.session.match_name 之后，find_module 只剩一行委托，
+                  源码里当然没有 len(hits)==1 —— 于是这条**行为仍成立**的测试
+                  变红。源码文本断言会随重构失效，锁不住它真正关心的东西。
+        解决方案：① 对 match_name 做**行为断言**（真实名字表里跑一遍）；
+                  ② 再断言 find_module 确实调用了它，防止有人又抄一份规则回去。
+    """
     import inspect as _insp
 
-    from dyn.rebase import Rebase
+    from server.core.session import match_name
+    from server.dyn.rebase import Rebase
 
+    # 行为断言：设备名带版本号 / 本地存短名，双向都要能对上
+    dev = ["libsgmainso-6.7.260202.so"]
+    hit, how, amb = match_name("libsgmainso.so", dev)
+    check("R33 去版本号能匹配设备模块名", hit == "libsgmainso-6.7.260202.so",
+          f"本地 libsgmainso.so 对不上设备名，实际 {hit!r}/{how!r}")
+    check("R33 匹配方式标为 version", how == "version", f"实际 {how!r}")
+
+    # 唯一命中要求：两个版本同时存在时不能瞎选
+    both = ["libutils-1.so", "libutils-2.so"]
+    hit2, _how2, amb2 = match_name("libutils.so", both)
+    check("R33 多命中时不瞎选", hit2 is None and len(amb2) == 2,
+          f"应返回歧义候选，实际 hit={hit2!r} amb={amb2!r}")
+
+    # 委托断言：防止别名规则又被抄回 find_module
     src = _insp.getsource(Rebase.find_module)
-    check("R33 用了去版本号逻辑", "_strip_version_tag" in src,
+    check("R33 find_module 复用统一规则", "match_name" in src,
           "只做全名/basename 精确匹配时，本地改名后永远匹配不上")
-    check("R33 要求唯一命中", "len(hits) == 1" in src,
-          "多命中时不能瞎选一个")
 
 
 
@@ -1124,7 +1147,7 @@ def test_r34_watch_module_sampling() -> None:
     """R34：watch_module 必须均匀采样、支持 batch 间隔、给出决策依据。"""
     import inspect as _insp
 
-    from dyn.tracer import watch_module as fn
+    from server.dyn.tracer import watch_module as fn
 
     src = _insp.getsource(fn)
     sig = _insp.signature(fn)
@@ -1160,7 +1183,7 @@ def test_r35_probe_hits() -> None:
     """R35：probe_hits 必须能区分「没执行」与「挂不上」。"""
     import inspect as _insp
 
-    import dyn.tracer as _tr
+    import server.dyn.tracer as _tr
 
     src = _insp.getsource(_tr.probe_hits)
     js = getattr(_tr, "_JS_PROBE_HITS", "")
@@ -1180,7 +1203,7 @@ def test_r36_jump_table() -> None:
     """R36：read_jump_table 必须支持有符号偏移 + code_base 相加。"""
     import inspect as _insp
 
-    from dyn.bridge import read_jump_table as fn
+    from server.dyn.bridge import read_jump_table as fn
 
     src = _insp.getsource(fn)
     sig = _insp.signature(fn)
@@ -1197,11 +1220,11 @@ def test_r37_stack_hex() -> None:
     import dataclasses as _dc
     import inspect as _insp
 
-    from dyn.debugger import BreakpointHit
+    from server.dyn.debugger import BreakpointHit
 
     names = {f.name for f in _dc.fields(BreakpointHit)}
     check("R37 BreakpointHit 有 stack_hex", "stack_hex" in names)
-    js = _insp.getsource(__import__("dyn.debugger", fromlist=["x"]))
+    js = _insp.getsource(__import__("server.dyn.debugger", fromlist=["x"]))
     check("R37 JS 侧抓了栈", "readByteArray(0x100)" in js,
           "命中瞬间抓 sp..sp+0x100")
 
@@ -1211,7 +1234,7 @@ def test_r38_function_list() -> None:
     import sys as _sys
 
     _sys.path.insert(0, ".")
-    from core.elf_model import SoFile
+    from server.core.elf_model import SoFile
 
     # 用仓库自带样本；没有样本就跳过（不让测试因缺样本而失败）
     import os
@@ -1236,7 +1259,7 @@ def test_r39_runtime_jump_table() -> None:
     """R39：read_jump_table 必须支持从运行时内存读（加固样本的表运行时才填）。"""
     import inspect as _insp
 
-    from dyn.bridge import read_jump_table as fn
+    from server.dyn.bridge import read_jump_table as fn
 
     sig = _insp.signature(fn)
     src = _insp.getsource(fn)
@@ -1264,7 +1287,7 @@ def test_r40_probe_vm_from_hits() -> None:
     """R40：必须能从已有命中的寄存器里挖出 VM 上下文。"""
     import inspect as _insp
 
-    import dyn.memread as _mr
+    import server.dyn.memread as _mr
 
     src = _insp.getsource(_mr.probe_vm_from_hits)
     check("R40 函数存在", hasattr(_mr, "probe_vm_from_hits"))
@@ -1282,7 +1305,7 @@ def test_r41_trace_call_tree() -> None:
     """R41：trace_call_tree 必须能区分「没被调用」与「挂不上」。"""
     import inspect as _insp
 
-    import dyn.tracer as _tr
+    import server.dyn.tracer as _tr
 
     src = _insp.getsource(_tr.trace_call_tree)
     js = getattr(_tr, "_JS_CALL_TREE", "")
@@ -1300,7 +1323,7 @@ def test_r42_hits_fallback() -> None:
     """R42：probe_vm_from_hits 取命中记录要有回退（会话断开也能读缓存）。"""
     import inspect as _insp
 
-    import mcp_server.tools as _T
+    import server.mcp_server.tools as _T
 
     src = _insp.getsource(_T.probe_vm_from_hits)
     check("R42 先试 service.hits", "svc.hits(serial" in src)
@@ -1315,7 +1338,7 @@ def test_r43_array_pointer_validation() -> None:
     """R43：VM 上下文里的数组指针校验必须能拦住假指针，又不能误杀合法地址。"""
     import inspect as _insp
 
-    import dyn.memread as _mr
+    import server.dyn.memread as _mr
 
     src = _insp.getsource(_mr.probe_vm_from_hits)
     check("R43 有去 tag 处理", "0x00FFFFFFFFFFFFFF" in src,
@@ -1344,7 +1367,7 @@ def test_r44_runtime_decode() -> None:
     """R44：运行时指令解码必须支持 ARM64 定长、分支分类、对齐校验。"""
     import inspect as _insp
 
-    import dyn.memread as _mr
+    import server.dyn.memread as _mr
 
     src = _insp.getsource(_mr.decode_runtime_insn)
     check("R44 函数存在", hasattr(_mr, "decode_runtime_insn"))
@@ -1357,7 +1380,7 @@ def test_r44_runtime_decode() -> None:
     check("R44 数量有上限", "min(int(count), 64)" in src)
 
     # 分支分类（纯函数，可离线验证）
-    from dyn.memread import _branch_kind
+    from server.dyn.memread import _branch_kind
 
     cases = [("bl", "call"), ("blr", "call"), ("blraa", "call"),
              ("ret", "return"), ("br", "indirect_jump"), ("braa", "indirect_jump"),
@@ -1376,7 +1399,7 @@ def test_r44_runtime_decode() -> None:
             break
     if sample:
         import capstone
-        from core.elf_model import SoFile
+        from server.core.elf_model import SoFile
 
         so = SoFile(sample)
         fns = so.function_list
@@ -1399,7 +1422,7 @@ def test_r45_process_probe() -> None:
     """R45：必须能区分「进程死了」和「代码没跑」——这是最容易误判的地方。"""
     import inspect as _insp
 
-    import dyn.adb as _adb
+    import server.dyn.adb as _adb
 
     check("R45 probe_process_alive 存在", hasattr(_adb.Adb, "probe_process_alive"))
     src = _insp.getsource(_adb.Adb.probe_process_alive)
@@ -1413,7 +1436,7 @@ def test_r45_process_probe() -> None:
     check("R45 三条证据都缺一不可", 'alive' in src and 'status' in src and 'injectable' in src)
 
     # probe_hits 的异常路径也要带活性探测（否则进程死了只报冷冰冰的 ProcessNotFound）
-    import dyn.tracer as _tr
+    import server.dyn.tracer as _tr
 
     psrc = _insp.getsource(_tr.probe_hits)
     check("R45 probe_hits 异常路径有探测", "probe_process_alive" in psrc)
@@ -1425,7 +1448,7 @@ def test_r46_hits_trimming() -> None:
     """R46：hits 必须能裁剪，否则大数据会被客户端截断成残缺 JSON。"""
     import inspect as _insp
 
-    import mcp_server.tools as _T
+    import server.mcp_server.tools as _T
 
     sig = _insp.signature(_T.hits)
     for param in ("bp_id", "limit", "since_seq", "include_context",
@@ -1452,8 +1475,8 @@ def test_r47_jni_and_dispatch() -> None:
     """R47：JNI 注册表与跳转表扫描必须能用，且找不到时如实说明。"""
     import inspect as _insp
 
-    import dyn.jni as _jni
-    import dyn.dispatch as _dsp
+    import server.dyn.jni as _jni
+    import server.dyn.dispatch as _dsp
 
     check("R47 find_jni_registrations 存在", hasattr(_jni, "find_jni_registrations"))
     check("R47 find_dispatch_tables 存在", hasattr(_dsp, "find_dispatch_tables"))
@@ -1479,7 +1502,7 @@ def test_r48_symbol_not_clobbered() -> None:
     """
     import inspect as _insp
 
-    from core.elf_model import SoFile
+    from server.core.elf_model import SoFile
 
     src = _insp.getsource(SoFile._parse_symbols)
     # 关键：探测 .dynsym 必须在重置之前
@@ -1509,7 +1532,7 @@ def test_r49_java_bridge() -> None:
     """R49：Java bridge 必须能自动注入（frida 17 起不再内置）。"""
     import inspect as _insp
 
-    import dyn.java_bridge as _jb
+    import server.dyn.java_bridge as _jb
 
     check("R49 bridge_status 存在", hasattr(_jb, "bridge_status"))
     check("R49 wrap_with_java_bridge 存在", hasattr(_jb, "wrap_with_java_bridge"))
@@ -1551,7 +1574,7 @@ def test_r50_java_tools() -> None:
     """R50：三个 Java 工具必须在且不返回假数据。"""
     import inspect as _insp
 
-    import dyn.java_bridge as _jb
+    import server.dyn.java_bridge as _jb
 
     for fn, args in (("java_list_methods", ("s", 1, "cls")),
                      ("java_find_classes", ("s", 1)),
@@ -1603,7 +1626,7 @@ def test_r51_java_batch_hook() -> None:
     """R51：java_hook 必须支持通配符批量、参数深挖、0 命中诊断。"""
     import inspect as _insp
 
-    import dyn.java_bridge as _jb
+    import server.dyn.java_bridge as _jb
 
     sig = _insp.signature(_jb.java_hook)
     for p in ("pattern", "package", "max_classes", "capture", "sibling_probe"):
@@ -1635,7 +1658,7 @@ def test_r52_java_callers() -> None:
     """R52：java_find_callers 必须跳过取栈自身帧（否则调用者全是 getStackTrace）。"""
     import inspect as _insp
 
-    import dyn.java_bridge as _jb
+    import server.dyn.java_bridge as _jb
 
     check("R52 函数存在", hasattr(_jb, "java_find_callers"))
     src = _insp.getsource(_jb.java_find_callers)
@@ -1678,7 +1701,7 @@ def test_r53_js_pattern_semantics() -> None:
     import subprocess
     import tempfile
 
-    import dyn.java_bridge as _jb
+    import server.dyn.java_bridge as _jb
 
     src = _insp.getsource(_jb)
     names = ["java.lang.String", "com.taobao.mtopsdk.ANetworkConverter",
@@ -1775,7 +1798,7 @@ def test_r54_hits_register_filter() -> None:
     """R54：hits 必须支持按寄存器值过滤（2000 条里精准挑出想要的）。"""
     import inspect as _insp
 
-    import mcp_server.tools as _T
+    import server.mcp_server.tools as _T
 
     sig = _insp.signature(_T.hits)
     for p in ("filter", "group_by", "group_top"):
@@ -1809,7 +1832,7 @@ def test_r54_hits_register_filter() -> None:
 
 def test_r55_hits_group_by() -> None:
     """R55：hits 必须支持聚合统计——比返回 2000 条原始数据有用得多。"""
-    import mcp_server.tools as _T
+    import server.mcp_server.tools as _T
 
     items = [{"context": {"x2": "0x1"}}, {"context": {"x2": "0x1"}},
              {"context": {"x2": "0x4"}}, {"context": {"x2": "0x5"}},
@@ -1853,8 +1876,8 @@ def test_r56_mcp_schema_matches_dyn() -> None:
     """
     import inspect as _insp
 
-    import dyn.java_bridge as _jb
-    import mcp_server.tools as _T
+    import server.dyn.java_bridge as _jb
+    import server.mcp_server.tools as _T
 
     # 由 MCP 层自己持有、不下传给 dyn 的参数
     skip = {"serial", "pid"}
@@ -1876,7 +1899,7 @@ def test_r56_mcp_schema_matches_dyn() -> None:
     # —— 这里用注册后的 input_schema 核对，必须与函数签名一致
     import asyncio
 
-    from mcp_server.tools import server as _srv
+    from server.mcp_server.tools import server as _srv
 
     async def _schemas():
         return {t.name: t for t in await _srv.list_tools()}
@@ -1913,7 +1936,7 @@ def test_r57_perf_watch() -> None:
       · 长度只能 1/2/4/8
       · watchpoint 只有 4 个槽位
     """
-    import dyn.perfwatch as _pw
+    import server.dyn.perfwatch as _pw
 
     check("R57 perf_watch 存在", hasattr(_pw, "perf_watch"))
     check("R57 probe 存在", hasattr(_pw, "perf_watch_probe"))
@@ -1974,7 +1997,7 @@ def test_r58_perf_watch_daemon() -> None:
     """
     import inspect as _insp
 
-    import dyn.perfwatch as _pw
+    import server.dyn.perfwatch as _pw
 
     for fn in ("perf_watch_daemon", "perf_watch_poll",
                "perf_watch_stop", "perf_watch_list"):
@@ -2038,7 +2061,7 @@ def test_r59_vm_breakpoint() -> None:
     """
     import inspect as _insp
 
-    import dyn.vmbreak as _vb
+    import server.dyn.vmbreak as _vb
 
     for fn in ("vm_breakpoint", "vm_regs_snapshot", "find_dispatch_points"):
         check(f"R59 {fn} 存在", hasattr(_vb, fn))
@@ -2094,7 +2117,7 @@ def test_r60_vm_trace() -> None:
     """R60：VM 执行轨迹采集。"""
     import inspect as _insp
 
-    import dyn.vmtrace as _vt
+    import server.dyn.vmtrace as _vt
 
     check("R60 vm_trace 存在", hasattr(_vt, "vm_trace"))
     sig = _insp.signature(_vt.vm_trace)
@@ -2123,7 +2146,7 @@ def test_r61_mem_snapshot_diff() -> None:
     import inspect as _insp
     import os as _os
 
-    import dyn.memdiff as _md
+    import server.dyn.memdiff as _md
 
     for fn in ("mem_snapshot", "mem_diff", "mem_snapshot_clear",
                "ensure_memsnap_helper"):
@@ -2172,7 +2195,7 @@ def test_r62_vm_break_no_nameerror() -> None:
     import inspect as _insp
     import types as _types
 
-    import dyn.vmbreak as _vb
+    import server.dyn.vmbreak as _vb
 
     # 静态：形参必须存在
     params = _insp.signature(_vb._run_vm_break).parameters
@@ -2245,7 +2268,7 @@ def test_r63_vm_idx_not_faked() -> None:
     import inspect as _insp
     import re as _re
 
-    import dyn.vmbreak as _vb
+    import server.dyn.vmbreak as _vb
 
     src = open(_vb.__file__, encoding="utf-8").read()
 
@@ -2306,7 +2329,7 @@ def test_r65_module_unload() -> None:
     """
     import inspect as _insp
 
-    from core.session import Session
+    from server.core.session import Session
 
     for fn in ("unload", "clear", "memory_usage", "_break_references",
                "_purge_helper", "_resolve_key"):
@@ -2340,7 +2363,7 @@ def test_r64_behavior_monitor() -> None:
     """
     import inspect as _insp
 
-    import dyn.behavior as _bh
+    import server.dyn.behavior as _bh
 
     for fn in ("behavior_monitor_start", "behavior_monitor_poll",
                "behavior_monitor_stop"):
@@ -2392,7 +2415,7 @@ def test_r66_app_processes() -> None:
     #   只有 /proc/<pid>/fd 的 socket 数是进程级准确的
     import inspect as _insp
 
-    import dyn.appproc as _ap
+    import server.dyn.appproc as _ap
 
     check("R66 list_app_processes 存在", hasattr(_ap, "list_app_processes"))
     check("R66 probe_network_processes 存在",
@@ -2455,7 +2478,7 @@ def test_r67_behavioral_not_source() -> None:
     import threading
     import types
 
-    from core.session import Session
+    from server.core.session import Session
 
     # ---------- ① 卸载后真的释放 ----------
     so_path = None
@@ -2529,7 +2552,7 @@ def test_r67_behavioral_not_source() -> None:
         check("R67 找不到样本，跳过卸载测试", True)
 
     # ---------- ④ 常驻监控 poll 能拿到事件（用假 frida）----------
-    import dyn.behavior as bh
+    import server.dyn.behavior as bh
 
     class _Script:
         def __init__(self, src):
@@ -2625,7 +2648,7 @@ def test_r67_behavioral_not_source() -> None:
         bh._ACTIVE.clear()
 
     # ---------- 行为 hook 必须覆盖无参重载 ----------
-    import dyn.behavior as _bh2
+    import server.dyn.behavior as _bh2
 
     check("R67 有 digest 无参重载", "digest.overload()" in _bh2._JS_BEHAVIOR,
           "无参 digest() 是最常见用法，不挂就抓不到密文")
@@ -2634,7 +2657,7 @@ def test_r67_behavioral_not_source() -> None:
           "只挂 getInstance 却声称抓输入输出，是文档与实现不符")
 
     # ---------- appproc 判定口径 ----------
-    import dyn.appproc as _ap2
+    import server.dyn.appproc as _ap2
 
     check("R67 用 inet_conns 判定网络", "inet_conns" in
           __import__("inspect").getsource(_ap2),
@@ -2642,6 +2665,1977 @@ def test_r67_behavioral_not_source() -> None:
     check("R67 inode 取第 9 列", "parts[9]" in
           __import__("inspect").getsource(_ap2),
           "按行尾取数字会拿到标志位（实测得到 0/2/4/7/10）")
+
+
+def test_r68_xref_int_type():
+    """R68 xref_tree 不把 int 当 hex 字符串解析。
+
+    (1) 第一次修改（2026-11-11）：
+        bug 原因：xref_tree 里写 int(c, 16)，但 callers_of_fn/callees_of_fn
+                  返回的是 **int**（实测 0x5020 的 callees = [57408]），
+                  int(57408, 16) 抛 TypeError → 500 Internal Server Error。
+        解决方案：统一用 _as_int() 兼容 int / "0x.." / "123"，
+                  并用本测试锁死三种形态都能解析。
+    """
+    def as_int(v):
+        if isinstance(v, int):
+            return v
+        return int(str(v), 0)
+
+    cases = [(57408, 57408), ("0xe040", 0xe040), ("57408", 57408)]
+    bad = []
+    for raw, want in cases:
+        got = as_int(raw)
+        if got != want:
+            bad.append(f"{raw!r}->{got}（应为 {want}）")
+    check("int/hex/十进制三种形态都能解析", not bad, " / ".join(bad))
+
+
+def test_r69_css_vars_exist():
+    """R69 前端 CSS 只使用项目里真实存在的变量。
+
+    (1) 第一次修改（2026-11-11）：
+        bug 原因：按原型 HTML 的变量名写了 --livebg/--ok/--err，但生产项目的
+                  变量是 --live-soft/--attention/--danger。CSS 变量不存在时
+                  var() 整条声明失效 -> SVG 节点 fill 退化成浏览器默认黑色，
+                  实测图谱中心节点变成黑块、文字完全看不见。
+        解决方案：扫描 styles.css 里所有 var(--x)，断言都在 :root 定义里。
+    """
+    import re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    css = (root / "web" / "src" / "styles.css").read_text(encoding="utf-8")
+
+    defined = set(re.findall(r"(--[a-z0-9-]+)\s*:", css))
+    used = set(re.findall(r"var\((--[a-z0-9-]+)\)", css))
+    missing = sorted(used - defined)
+
+    check(f"styles.css 的 {len(used)} 个变量都有定义", not missing,
+          f"未定义: {missing}（var 会整条失效）")
+
+
+def test_r70_api_endpoints_registered():
+    """R70 新增的 API 端点必须都注册到路由表。
+
+    为什么要有这条：新建了处理函数却忘记加 Route(...) 的话，
+    前端拿到的是 404，看起来像"功能没做"，排查成本很高。
+    """
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parent.parent / "server" / "api.py").read_text(encoding="utf-8")
+    tail = src.split("Route(", 1)[-1]
+    for name in ("tools_catalog", "app_processes", "xref_tree"):
+        has_fn = f"async def {name}(" in src
+        has_route = name in tail
+        check(f"{name} 已实现并注册", has_fn and has_route,
+              f"实现={has_fn} 注册={has_route}")
+
+
+def test_r71_section_flags_from_booleans():
+    """R71 段表权限位由 is_exec/is_write 生成，不读不存在的 flags 字段。
+
+    (1) 第一次修改（2026-11-11）：
+        bug 原因：Section 对象没有 flags 属性（实测只有 name/addr/offset/
+                  size/sec_type/is_exec/is_write），接口返回的 flags 恒为空，
+                  界面上「权限」列全是 "—"。
+        解决方案：按 is_exec/is_write 拼 rwx 串。本测试锁住这个映射。
+    """
+    def rwx(is_write: bool, is_exec: bool) -> str:
+        return "r" + ("w" if is_write else "-") + ("x" if is_exec else "-")
+
+    cases = [(False, False, "r--"), (True, False, "rw-"), (False, True, "r-x"), (True, True, "rwx")]
+    bad = [f"{w},{x}->{rwx(w, x)}" for w, x, want in cases if rwx(w, x) != want]
+    check("段权限位映射正确", not bad, " / ".join(bad))
+
+
+def test_r72_no_debug_hooks_in_frontend():
+    """R72 交付前不留调试钩子（__mda* / client_state）。
+
+    为什么要有这条：这一轮为了排查窗口里看不见 console 的问题，
+    在前端埋了大量 __mda* 调试变量和一个 /api/client_state 上报端点。
+    它们会一直发请求（实测交付前 console 报 26 个 405）。
+    这条测试保证清理干净，避免以后又忘。
+    """
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    app = (root / "web" / "src" / "App.tsx").read_text(encoding="utf-8")
+    api = (root / "server" / "api.py").read_text(encoding="utf-8")
+
+    check("前端无 __mda 调试钩子", "__mda" not in app,
+          f"还有 {app.count('__mda')} 处")
+    check("前端不再上报 client_state", "client_state" not in app, "仍有引用")
+    check("后端无 client_state 端点", "client_state" not in api, "仍有定义")
+
+
+
+def test_r73_linear_scan_supplement():
+    """R73 数据引用必须包含线性扫描补充（不能只靠函数边界内的反汇编）。
+
+    (1) 第一次修改（2026-11-12）：
+        bug 原因：数据引用只从「已发现函数的反汇编」里收，而函数边界由
+                  FDE/dynsym 决定。加固 so 里大量代码不在这两类符号内
+                  （sscronet.so 实测：初始 651 个函数 vs 补全后 12160），
+                  这些代码发出的 adrp+add 全部看不见。
+                  实测 mda 收 11910 个数据目标，线性扫描 31670 个，漏 64%。
+        解决方案：build() 末尾跑一遍 _linear_scan，结果并入索引（取并集）。
+
+    这条测试锁三件事：
+      ① 线性扫描函数存在且被 build 调用
+      ② 扫描结果只收 in_load 的目标（不产生野指针）
+      ③ 过滤条件不能被去掉（否则整个索引会被垃圾地址灌满）
+    """
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    src = (root / "server" / "core" / "xref.py").read_text(encoding="utf-8")
+
+    check("xref 有线性扫描通道", "_linear_scan" in src, "找不到 _linear_scan")
+    check("build() 调用了线性扫描", "_merge_linear_scan()" in src,
+          "build 里没有调用合并逻辑")
+    check("线性扫描过滤 PT_LOAD", "so.in_load(tgt)" in src,
+          "缺少 in_load 过滤，会灌入野指针")
+
+    # ② 用一个真实样本验证：data_refs 里不应出现模块外的地址
+    import sys
+    sys.path.insert(0, str(root))
+    from server.core.session import Session
+
+    sample = root / "samples" / "liblog.so"
+    if not sample.exists():
+        return
+    s = Session()
+    so = s.add(str(sample))
+    x = s.ensure_xrefs("liblog.so")
+    bad = [a for a in x.data_refs if not so.in_load(a)]
+    check("data_refs 全部落在 PT_LOAD 内", not bad,
+          f"有 {len(bad)} 个越界地址，例：{[hex(b) for b in bad[:3]]}")
+
+
+
+def test_r74_build_progress_stages():
+    """R74 构建进度必须真的分阶段回调，不能只有 0 和 100。
+
+    (1) 第一次修改（2026-11-12）：
+        bug 原因：Xref.build() 一直支持 progress 回调，但 ensure_xrefs 从不传，
+                  于是后台 job 只能报 0%/100%，用户等 221 秒不知道在干什么。
+        解决方案：ensure_xrefs 增加 progress 参数，分三阶段报告：
+                  函数发现(0-15) / 反汇编(15-85) / 归并字符串(85-100)。
+
+    这条测试锁三件事：
+      ① 小样本上回调必须产生多个不同百分比（不是只有两端）
+      ② 必须出现"反汇编 N/M"这种带计数的阶段
+      ③ 百分比单调不减，且最终到 100
+    """
+    import sys
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    sys.path.insert(0, str(root))
+    from server.core.session import Session
+
+    sample = root / "samples" / "liblog.so"
+    if not sample.exists():
+        return
+
+    s = Session()
+    s.add(str(sample))
+    seen: list[tuple[int, str]] = []
+
+    def prog(pct: int, _total: int, stage: str = "") -> None:
+        seen.append((pct, stage or ""))
+
+    s.ensure_xrefs("liblog.so", progress=prog)
+
+    pcts = [p for p, _ in seen]
+    stages = [st for _, st in seen]
+
+    check("构建有进度回调", len(seen) > 3, f"只回调了 {len(seen)} 次")
+    check("进度不是只有两端", len(set(pcts)) > 2,
+          f"只出现百分比 {sorted(set(pcts))}")
+    check("有反汇编计数阶段", any(st.startswith("反汇编") for st in stages),
+          f"阶段样本：{stages[:4]}")
+    check("百分比单调不减", all(pcts[i] <= pcts[i + 1] for i in range(len(pcts) - 1)),
+          "出现回退")
+    check("最终到 100", pcts and pcts[-1] == 100, f"最后是 {pcts[-1] if pcts else '无'}")
+
+
+
+def test_r75_env_injected_into_dyn_tools():
+    """R75 动态工具必须随返回值带上运行环境（前台是谁 / 目标是否在前台）。
+
+    (1) 第一次修改（2026-11-13）：
+        bug 原因：set_breakpoint / java_hook / perf_watch 这些直接作用于目标
+                  App 的工具，返回里完全没有"当前前台是谁"。模型看不到屏幕，
+                  操作到后台 App 时那些代码路径根本不会执行，断点装上也不命中，
+                  模型会误判成"代码没跑到"或"钩子失效"。
+        解决方案：在 @logged 的统一出口给所有带 serial 的调用注入 env 字段。
+                  并且**不缓存**——用户切 App 随时发生，缓存会让模型拿到过期值，
+                  而它没有任何办法主动要求刷新。
+
+    这条测试锁三件事：
+      ① 注入逻辑只在带 serial 时生效（静态工具不受影响）
+      ② 返回值不是 JSON 时不炸（纯文本/错误结果原样返回）
+      ③ 已含 env 的不重复注入（转发链上会被注入两次）
+    """
+    import json
+
+    from server.mcp_server.tools import _env_facts, _inject_env
+
+    # ① 无 serial：原样返回
+    raw = '{"ok": true, "x": 1}'
+    check("无 serial 不注入", _inject_env(raw, {}) == raw,
+          "静态工具被误加 env")
+
+    # ② 非 JSON：原样返回，不能抛
+    check("非 JSON 不炸", _inject_env("plain text", {"serial": "x"}) == "plain text",
+          "纯文本结果被破坏")
+
+    # ③ 已注入不重复
+    pre = json.dumps({"ok": True, "env": {"foreground": None}}, ensure_ascii=False)
+    again = _inject_env(pre, {"serial": "x", "pid": 1})
+    check("不重复注入", json.loads(again)["env"] == {"foreground": None},
+          "转发链上被重复注入")
+
+    # ④ _env_facts 无设备时要给出可解释的结果，不能抛
+    got = _env_facts("", 1)
+    check("空 serial 返回结构完整", set(got) >= {"foreground", "target_package",
+                                              "target_in_foreground", "warning"},
+          f"字段缺失：{got}")
+
+
+
+def test_r76_layout_all_backend_under_server():
+    """R76 后端功能代码必须全部在 server/ 下，根目录只留启动器。
+
+    (1) 第一次修改（2026-11-13）：
+        背景：原来后端散在根目录（core/ dyn/ mcp_server/ plugins/ scripting/
+              version.py models.py web_app.py），前端在 web/，
+              看代码时得先分辨"这个 py 属于哪一层"，使用者反馈"代码包有点乱"。
+        解决方案：全部后端 Python 收进 server/，根目录只留 app.py / mda.py
+                  两个启动器；所有导入改成 server.xxx。
+
+    这条测试锁住结构，防止以后新增模块又放回根目录：
+      ① 根目录不允许出现 core/ dyn/ mcp_server/ plugins/ scripting/
+      ② server/ 下这些包必须存在
+      ③ 全仓库不允许出现 `from core` / `from dyn` 这类旧式绝对导入
+    """
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+
+    stray = [d for d in ("core", "dyn", "mcp_server", "plugins", "scripting")
+             if (root / d).is_dir()]
+    check("根目录没有后端包", not stray, f"又跑回根目录了：{stray}")
+
+    missing = [d for d in ("core", "dyn", "mcp_server", "plugins", "scripting")
+               if not (root / "server" / d).is_dir()]
+    check("server/ 下有全部后端包", not missing, f"缺少：{missing}")
+
+    for f in ("api.py", "web_app.py", "version.py", "models.py"):
+        check(f"server/{f} 存在", (root / "server" / f).is_file(), "文件不在 server/ 下")
+
+    check("根目录只有启动器", (root / "app.py").is_file() and (root / "mda.py").is_file(),
+          "启动器缺失")
+
+    # 扫描旧式绝对导入（排除构建产物与依赖）
+    import re as _re
+    bad = []
+    pat = _re.compile(r"^\s*(?:from|import)\s+(core|dyn|mcp_server|plugins|scripting)"
+                      r"(?:[.\s]|$)")
+    self_path = Path(__file__).resolve()
+    for p2 in root.rglob("*.py"):
+        sp = str(p2)
+        if any(x in sp for x in (".venv", "node_modules", "__pycache__",
+                                 "/dist/", "/build/")):
+            continue
+        # 本文件的 docstring 必须举例说明旧包名长什么样，跳过自身
+        if p2.resolve() == self_path:
+            continue
+        try:
+            for i, line in enumerate(p2.read_text(encoding="utf-8").splitlines(), 1):
+                if pat.match(line):
+                    bad.append(f"{p2.relative_to(root)}:{i}")
+        except Exception:                                 # noqa: BLE001
+            continue
+    check("没有旧式绝对导入", not bad, f"残留 {len(bad)} 处：{bad[:5]}")
+
+
+
+def test_r77_no_stale_string_module_imports():
+    """R77 字符串形式的模块名不能停留在迁移前的旧包名。
+
+    (1) 第一次修改（2026-11-13）：
+        bug 原因：后端整体移入 server/ 时，批量改写只覆盖了 `from dyn import x`
+                  这种静态导入，漏掉了 `_load_dyn_module("dyn.memread", ...)`
+                  这种字符串形式的动态导入。实测 import_module("dyn.memread")
+                  直接 ModuleNotFoundError，50 个工具全报 MODULE_UNAVAILABLE。
+                  而 639 项测试没抓到——测试全是 `from server.dyn.X import` 直调，
+                  生产代码走字符串导入，两条路径完全不同。
+        解决方案：字符串改成 server.xxx；_load_dyn_module 内做兼容回退。
+
+    这条测试锁两件事：
+      ① 全仓库不存在指向旧包名的字符串模块引用
+      ② _load_dyn_module 必须保留兼容回退（防止以后再漏）
+    """
+    import re as _re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+
+    bad = []
+    pat = _re.compile(
+        r"(?:import_module|_load_dyn_module|__import__)\s*\(\s*['\"]"
+        r"(?:core|dyn|mcp_server|scripting|plugins)\.")
+    self_path = Path(__file__).resolve()
+    for p2 in root.rglob("*.py"):
+        sp = str(p2)
+        if any(x in sp for x in (".venv", "node_modules", "__pycache__",
+                                 "/dist/", "/build/")):
+            continue
+        # 本文件的 docstring 必须举例说明旧包名长什么样，跳过自身
+        if p2.resolve() == self_path:
+            continue
+        try:
+            txt = p2.read_text(encoding="utf-8")
+        except Exception:                                 # noqa: BLE001
+            continue
+        # 只认「行首是代码」的行：docstring 里会举旧包名做例子，那不是真导入。
+        # 判定方式简单可靠——真正的导入语句一定有缩进且不以引号开头。
+        for i, line in enumerate(txt.splitlines(), 1):
+            stripped = line.lstrip()
+            if not stripped or stripped[0] in "#\"'":
+                continue
+            # 整行不含引号说明不是字符串字面量（导入用的模块名一定有引号）
+            if pat.search(line) and ("\"" in line or chr(39) in line):
+                bad.append(f"{p2.relative_to(root)}:{i}")
+    check("没有旧包名的字符串导入", not bad,
+          f"残留 {len(bad)} 处：{bad[:5]}")
+
+    tools_src = (root / "server" / "mcp_server" / "tools.py").read_text(encoding="utf-8")
+    check("_load_dyn_module 有 server 前缀回退",
+          '"server." + module_path' in tools_src,
+          "回退逻辑被删了，将来漏改一处就会整片失效")
+    check("导入失败能区分路径问题与真缺失",
+          "exists_on_disk" in tools_src,
+          "提示文案又把路径问题说成\"模块不存在\"")
+
+
+
+def test_r78_plt_stub_exact_addr():
+    """R78 PLT 桩地址必须是精确地址，不能 `& ~0xF` 向下对齐。
+
+    (1) 第一次修改（2026-11-13）：
+        bug 原因：elf_model 解析 PLT 时用 `insn.address & ~0xF` 作桩地址。
+                  但 AArch64 的 PLT 桩里 adrp 可能落在桩头 +0x0 也可能 +0x8，
+                  一旦落在 +0x8 就被拉回上一个桩，两个桩抢同一个键。
+                  实测 liblog.so：106 个 adrp 里 53 个（50%）地址被拉错，
+                  xrefs_to(0xe028) 查不到（实际有 1 处调用），
+                  plt_map 里 0xe020 抢走了它的名字。
+        解决方案：直接以 insn.address 为键。
+
+    这条测试锁住：桩地址不能被人为对齐，且 plt_map 键必须是真实指令地址。
+    """
+    import sys
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    src = (root / "server" / "core" / "elf_model.py").read_text(encoding="utf-8")
+    check("PLT 桩地址不再 & ~0xF",
+          "insn.address & ~0xF" not in src,
+          "又把 adrp 地址向下对齐了，会丢掉一半桩")
+
+    sys.path.insert(0, str(root))
+    from server.core.session import Session
+
+    sample = root / "samples" / "liblog.so"
+    if not sample.exists():
+        return
+    s = Session()
+    so = s.add(str(sample))
+    pm = getattr(so, "plt_map", {}) or {}
+    check("liblog PLT 有条目", len(pm) > 50, f"只有 {len(pm)} 条")
+
+    # 桩地址必须是 4 字节对齐（AArch64 指令边界），且至少一半不是 16 对齐
+    # （16 对齐大多说明又被修正坏了）
+    off16 = sum(1 for a in pm if a % 16 != 0)
+    check("桩地址保留真实偏移", off16 > 10,
+          f"只有 {off16} 个非 16 对齐，可能又被对齐修正了")
+
+
+def test_r79_cpp_demangle():
+    """R79 C++ mangled 名要能还原，否则人按可读名搜不到函数。
+
+    (1) 第一次修改（2026-11-13）：
+        bug 原因：function_by_name 只做原样子串匹配，而 Android so 里
+                  206/386 个函数名是 mangled 形式。人按 "SendFileDescriptor"
+                  搜不到 _ZN7android4base24SendFileDescriptorVector...。
+                  本机也没有 c++filt。
+        解决方案：实现 Itanium ABI 常见子集，function_by_name 同时匹配两种名字。
+
+    这条测试锁三件事：
+      ① 常见 mangled 名能还原
+      ② 非 mangled 名原样返回（不能改坏）
+      ③ function_by_name 同时匹配原名与还原名
+    """
+    import sys
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    sys.path.insert(0, str(root))
+    from server.core.elf_model import demangle
+
+    got = demangle("_ZN7android4base24SendFileDescriptorVectorEiPKvm")
+    check("mangled 名能还原", "android::base::SendFileDescriptorVector" in got,
+          f"还原成 {got!r}")
+    check("还原出参数表", "int" in got, f"没有参数：{got!r}")
+    check("普通名原样返回", demangle("__cxa_finalize") == "__cxa_finalize",
+          "普通名被改坏了")
+    check("下划线开头但非 mangled 不被误伤",
+          demangle("_init") == "_init", "_init 被当成 mangled 处理了")
+
+    tools_src = (root / "server" / "mcp_server" / "tools.py").read_text(encoding="utf-8")
+    check("function_by_name 用了 demangle",
+          "demangle as _demangle" in tools_src and "pretty.lower()" in tools_src,
+          "搜索仍然只匹配原名")
+
+
+
+def test_r83_android_ui_operations():
+    """R83 Android 界面操作能力（读 XML / 找控件 / 点击输入滑动按键）。
+
+    (1) 第一次修改（2026-11-13）：
+        背景：mda 原有能力都在 so 层面。但很多问题必须先让设备走到某个
+              界面才能复现（登录态、某设置项、滑到第几屏），
+              没有 UI 操作就只能靠人手点，AI 完全帮不上。
+
+    这条测试锁住几个**踩过的坑**，防止后人改回去：
+      ① uiautomator dump 的退出码不可信（文件没写出来也 rc=0），
+         必须「能解析成 XML」才算成功
+      ② 非 ASCII 输入要明确拒绝，不能静默丢字符
+      ③ 坐标必须过整数校验（防命令注入：x="0; reboot"）
+      ④ 默认输出必须紧凑（曾出现 1.9 万字符撑爆上下文）
+      ⑤ 6 个工具都注册了
+    """
+    import sys
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    ui_p = root / "server" / "dyn" / "ui.py"
+    check("ui 模块存在", ui_p.is_file(), "server/dyn/ui.py 不见了")
+    src = ui_p.read_text(encoding="utf-8")
+
+    # ① dump 判据
+    check("dump 不以退出码为准", "<hierarchy" in src and "raw_dump" in src,
+          "又只按 returncode 判断成败了")
+
+    # ② 非 ASCII
+    check("非 ASCII 输入明确拒绝", "NON_ASCII" in src or "ASCII" in src,
+          "中文输入会静默丢字符")
+
+    # ③ 坐标校验
+    check("坐标过整数校验", "_int_arg" in src,
+          "坐标被直接拼进 shell，存在注入面")
+
+    # ④ 紧凑输出
+    check("节点输出有 compact 模式", "compact" in src,
+          "没有压缩，大界面会撑爆上下文")
+
+    # ⑤ 工具注册
+    tools_src = (root / "server" / "mcp_server" / "tools.py").read_text(encoding="utf-8")
+    for name in ("ui_dump", "ui_find", "ui_click", "ui_input",
+                 "ui_swipe", "ui_key"):
+        check(f"MCP 工具 {name} 已注册",
+              f"def {name}(" in tools_src, "工具没注册")
+
+    # ⑥ 不硬编码任何具体 App
+    import re as _re
+    bad = _re.findall(r'"(com\.[a-z0-9_.]+)"', src)
+    real_bad = [b for b in bad if "android" not in b]
+    check("不硬编码第三方 App 包名", not real_bad, f"发现 {real_bad[:3]}")
+
+
+def _r84_render_hook_js(**kwargs) -> str:
+    """用真实的 java_hook 渲染出实际会注入的 JS（不发往设备）。
+
+    为什么要走 java_hook 而不是直接读 _JS_JAVA_HOOK_MULTI：
+    R84 要验证的是**渲染后**的行为——占位符替换、阈值注入都发生在这一步。
+    只读模板会把"模板对但 replace 链漏了"这类 bug 放过去（R85 专门治那个，
+    但降级测试也必须建立在真实渲染结果上）。
+    """
+    import server.dyn.java_bridge as _jb
+
+    box: dict = {}
+    orig = _jb._run_java_hook
+
+    def _grab(serial, pid, user_js, duration=5.0, **_kw):
+        # (2) 第二次修改（2026-11-13）：桩签名要能吸收新增的关键字参数。
+        #     bug 原因：_run_java_hook 后来加了 method 参数（0 命中诊断要用它
+        #               比对重载数），而这里写着固定 4 个形参。于是
+        #               java_hook → _run_java_hook(..., method=...) 直接抛
+        #               TypeError，**R84 整条测试崩掉**（不是断言失败，是异常）。
+        #     解决方案：加 **_kw 吸收未来的新增参数——桩的职责是"接住并记录"，
+        #               不该与真实签名逐一对齐，那会让每次签名演化都崩测试。
+        box["js"] = user_js
+        return {"ok": True}
+
+    _jb._run_java_hook = _grab
+    try:
+        params = {"class_name": "com.r84.Sample", "method": "onTick",
+                  "sibling_probe": False}
+        params.update(kwargs)
+        _jb.java_hook("SERIAL", 1, **params)
+    finally:
+        _jb._run_java_hook = orig
+    return box.get("js") or ""
+
+
+def test_r84_hot_method_auto_degrade() -> None:
+    """R84：热方法必须在 **JS 侧**按实测速率分级降级，且降级必须被报告。
+
+    (1) 第一次修改（2026-11-13）：新增。
+
+    为什么这条测试必须用 node 真跑、而不是查源码字符串：
+        降级的全部逻辑（速率统计、分级、单向性、跳过取栈）都在 onEnter 里，
+        是**运行时行为**。查 "mdaDegradeTick" 在不在字符串里，完全验不出
+        "阈值算错了""降级后还在取栈""速率回落又升回去"这些真问题。
+        所以这里用假 Java 环境 + 可控时钟驱动真实的 onEnter，
+        并统计"贵操作"（取栈 / 参数 toString）的实际调用次数。
+
+    锁死的四条：
+        ① 低于一级阈值不许降级（否则正常业务也被削掉观测）
+        ② 跨档阈值必须触发对应级别
+        ③ 降级后**真的不再取栈/转参数**（否则等于没降，这是本 bug 的核心）
+        ④ 降级单向，速率回落不许升回去
+    """
+    import json as _json
+    import os
+    import shutil
+    import subprocess
+    import tempfile
+
+    import server.dyn.java_bridge as _jb
+
+    # ---- ① 签名与默认值：不能改掉原有默认行为 ----
+    import inspect as _insp
+
+    sig = _insp.signature(_jb.java_hook)
+    for p in ("auto_degrade", "degrade_l1_rate", "degrade_l2_rate",
+              "degrade_l3_rate", "degrade_window_ms"):
+        check(f"R84 暴露参数 {p}", p in sig.parameters)
+    check("R84 降级默认开启", sig.parameters["auto_degrade"].default is True)
+    # 关键：不改默认值 —— include_stack 仍为 True，want_args 仍默认 True
+    check("R84 不改 include_stack 默认值",
+          sig.parameters["include_stack"].default is True)
+    check("R84 默认阈值 200/1000/5000",
+          (sig.parameters["degrade_l1_rate"].default,
+           sig.parameters["degrade_l2_rate"].default,
+           sig.parameters["degrade_l3_rate"].default) == (200.0, 1000.0, 5000.0))
+
+    # ---- ② 阈值校验：非法配置必须整体回退默认，不能造出坏组合 ----
+    cfg = _jb._degrade_config(True, 1000, 200, 5000, 200)   # 递增关系反了
+    check("R84 乱序阈值回退默认",
+          (cfg["l1"], cfg["l2"], cfg["l3"]) == (200.0, 1000.0, 5000.0), str(cfg))
+    cfg = _jb._degrade_config(True, 0, -1, 5000, 200)
+    check("R84 非正阈值回退默认",
+          (cfg["l1"], cfg["l2"], cfg["l3"]) == (200.0, 1000.0, 5000.0), str(cfg))
+    cfg = _jb._degrade_config(False, 200, 1000, 5000, 99999)
+    check("R84 窗口被夹在上限内", 50 <= cfg["window_ms"] <= 5000, str(cfg))
+    check("R84 可关闭降级", cfg["enabled"] is False)
+
+    # ---- ③ 报告文案：必须说清"热方法 + 实测 N 次/秒" ----
+    note = _jb._degrade_note({
+        "count": 3, "hot_methods": 1, "max_level": 2, "max_rate": 1042,
+        "thresholds": {"l1": 200, "l2": 1000, "l3": 5000},
+        "points": [{"point": "com.r84.Sample#onTick", "level": 2}]})
+    check("R84 报告写明已自动降级", "已自动降级" in note, note)
+    check("R84 报告写明是热方法", "热方法" in note, note)
+    check("R84 报告带实测速率", "1042 次/秒" in note, note)
+    check("R84 报告带本次降级次数", "共降级 3 次" in note, note)
+    check("R84 报告说明降了哪一级", "参数转换" in note, note)
+
+    if not shutil.which("node"):
+        # 没有 node 时至少验到渲染产物里带上了降级状态机
+        js = _r84_render_hook_js()
+        check("R84 渲染结果含降级状态机",
+              "mdaDegradeTick" in js and "mdaDegradeReport" in js)
+        return
+
+    # ---- ④ node 真跑：驱动真实 onEnter ----
+    js_path = os.path.join(tempfile.gettempdir(), "_r84_hook.js")
+    with open(js_path, "w", encoding="utf-8") as fh:
+        fh.write(_r84_render_hook_js())
+
+    harness = r"""
+globalThis.__sent = []; globalThis.__cbs = [];
+globalThis.send = function (o) { globalThis.__sent.push(o); };
+globalThis.recv = function (n, cb) { globalThis.__cbs.push([n, cb]); };
+var NOW = 1000000; Date.now = function () { return NOW; };
+var COST = { stack: 0, toStr: 0 };
+var METHOD_DEFS = {};
+function makeOv(sig) {
+  var f = function () {}; f.toString = function () { return sig; };
+  var impl = null;
+  Object.defineProperty(f, 'implementation',
+    { set: function (v) { impl = v; }, get: function () { return impl; } });
+  return f;
+}
+function fakeClassObj(cn) {
+  return { getName: function () { return cn; },
+           getSuperclass: function () { return null; },
+           getInterfaces: function () { return []; },
+           getClassLoader: function () { return null; },
+           getModifiers: function () { return 1; },
+           getDeclaredMethods: function () {
+             return Object.keys(METHOD_DEFS).map(function (n) {
+               return { getName: function () { return n; },
+                        toString: function () { return n; } }; }); } };
+}
+function fakeJavaUse(cn) {
+  if (cn === 'java.lang.Thread') {
+    return { currentThread: function () {
+      return { getStackTrace: function () {
+        COST.stack++; return [{ toString: function () { return 'x'; } }]; } }; } };
+  }
+  var jc = { class: fakeClassObj(cn) };
+  for (var n in METHOD_DEFS) { jc[n] = METHOD_DEFS[n]; }
+  return jc;
+}
+globalThis.Java = { available: true, androidVersion: '12',
+  perform: function (f) { return f(); }, use: fakeJavaUse,
+  enumerateLoadedClassesSync: function () { return ['com.r84.Sample']; } };
+function Arg() {}
+Arg.prototype.toString = function () { COST.toStr++; return 'arg'; };
+METHOD_DEFS['onTick'] = { overloads: [makeOv('void onTick(java.lang.Object)')] };
+eval(require('fs').readFileSync(JS_PATH, 'utf8'));
+var impl = METHOD_DEFS['onTick'].overloads[0].implementation;
+if (typeof impl !== 'function') {
+  console.log(JSON.stringify({ fatal: 'hook 未装上' })); process.exit(0);
+}
+var arg = new Arg();
+function drive(rate, ms) {
+  var perMs = rate / 1000, acc = 0;
+  for (var m = 0; m < ms; m++) {
+    acc += perMs;
+    while (acc >= 1) { impl.call({}, arg); acc -= 1; }
+    NOW += 1;
+  }
+}
+var stopCb = globalThis.__cbs.filter(function (x) { return x[0] === 'stop'; })[0][1];
+function snap() {
+  globalThis.__sent.length = 0; stopCb();
+  var r = globalThis.__sent.filter(function (s) { return s.kind === 'result'; }).pop();
+  return r ? r.data : null;
+}
+function cost(fn) {
+  var b = { stack: COST.stack, toStr: COST.toStr };
+  fn();
+  return { stack: COST.stack - b.stack, toStr: COST.toStr - b.toStr };
+}
+var out = {};
+// ① 150 次/秒：不许降级，且必须真的在取栈（证明观测本来是全量）
+out.l0_seg = cost(function () { drive(150, 1200); });
+var d0 = snap();
+out.l0_degrade = d0.degrade;
+// ② 拉到 300 次/秒 → 一级
+out.l1_seg = cost(function () { drive(300, 1200); });
+var d1 = snap();
+out.l1_level = d1.degrade && d1.degrade.max_level;
+out.l1_rate = d1.degrade && d1.degrade.max_rate;
+// ③ 2000 次/秒 → 二级
+out.l2_seg = cost(function () { drive(2000, 1200); });
+var d2 = snap();
+out.l2_level = d2.degrade && d2.degrade.max_level;
+// ④ 9000 次/秒 → 三级
+out.l3_seg = cost(function () { drive(9000, 1200); });
+var d3 = snap();
+out.l3_level = d3.degrade && d3.degrade.max_level;
+out.l3_count = d3.degrade && d3.degrade.count;
+// ⑤ 单向性：掉回 10 次/秒，级别不许回流
+drive(10, 2000);
+var d4 = snap();
+out.cool_level = d4.degrade && d4.degrade.max_level;
+out.events = d3.degrade && d3.degrade.events;
+console.log(JSON.stringify(out));
+""".replace("JS_PATH", _json.dumps(js_path))
+
+    h_path = os.path.join(tempfile.gettempdir(), "_r84_harness.js")
+    with open(h_path, "w", encoding="utf-8") as fh:
+        fh.write(harness)
+    try:
+        proc = subprocess.run(["node", h_path], capture_output=True, text=True,
+                              timeout=60)
+        if proc.returncode != 0:
+            check("R84 node 执行成功", False, (proc.stderr or "")[:300])
+            return
+        res = _json.loads((proc.stdout or "{}").strip() or "{}")
+    finally:
+        for p in (js_path, h_path):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+
+    if res.get("fatal"):
+        check("R84 hook 能装上", False, str(res["fatal"]))
+        return
+
+    # ① 低于阈值不降级
+    check("R84 150 次/秒不降级", res.get("l0_degrade") in (None, False),
+          str(res.get("l0_degrade")))
+    # 未降级时确实是全量观测（每次命中都取栈）
+    l0 = res.get("l0_seg") or {}
+    check("R84 未降级时每次命中都取栈", int(l0.get("stack") or 0) > 100,
+          f"stack={l0.get('stack')}")
+
+    # ② 300 次/秒 → 一级，且**栈采集必须停**
+    check("R84 300 次/秒降到一级", res.get("l1_level") == 1, str(res.get("l1_level")))
+    check("R84 一级实测速率接近 300",
+          280 <= int(res.get("l1_rate") or 0) <= 340, str(res.get("l1_rate")))
+    l1 = res.get("l1_seg") or {}
+    # 该段前若干次命中仍会取栈（降级在窗口边界才触发），但远少于命中数
+    check("R84 一级后取栈次数骤降", int(l1.get("stack") or 0) < 120,
+          f"stack={l1.get('stack')}（若接近命中数说明降级没生效）")
+
+    # ③ 2000 次/秒 → 二级，栈与参数转换都归零
+    check("R84 2000 次/秒降到二级", res.get("l2_level") == 2, str(res.get("l2_level")))
+    l2 = res.get("l2_seg") or {}
+    check("R84 二级后不再取栈", int(l2.get("stack") or 0) == 0,
+          f"stack={l2.get('stack')}")
+    check("R84 二级后不再转参数", int(l2.get("toStr") or 0) == 0,
+          f"toString={l2.get('toStr')}")
+
+    # ④ 9000 次/秒 → 三级
+    check("R84 9000 次/秒降到三级", res.get("l3_level") == 3, str(res.get("l3_level")))
+    l3 = res.get("l3_seg") or {}
+    check("R84 三级后不取栈不转参数",
+          int(l3.get("stack") or 0) == 0 and int(l3.get("toStr") or 0) == 0,
+          f"stack={l3.get('stack')} toStr={l3.get('toStr')}")
+
+    # ⑤ 单向
+    check("R84 降级单向不回升", res.get("cool_level") == 3,
+          f"速率回落后级别变成 {res.get('cool_level')}")
+    # ⑥ 每次降级都有记录，且逐级上升
+    evs = res.get("events") or []
+    check("R84 降级动作逐级记录", len(evs) >= 3, str(evs))
+    if evs:
+        levels = [e.get("to_level") for e in evs]
+        check("R84 降级序号递增", levels == sorted(levels), str(levels))
+        check("R84 每条事件带实测速率",
+              all(int(e.get("rate") or 0) > 0 for e in evs), str(evs))
+
+
+def test_r85_js_template_placeholders() -> None:
+    """R85：JS 模板里的每个 __XXX__ 占位符都必须被替换掉。
+
+    (1) 第一次修改（2026-11-13）：新增。
+
+    bug 原因：_JS_JAVA_HOOK_MULTI 里声明了 PARENT_PROBE / DEEP_DIAG /
+              DIAG_SIBLINGS 三个变量，但 java_hook 的 replace 链一处都没替换。
+              渲染出的脚本带着裸标识符 __PARENT_PROBE__，**加载即抛
+              ReferenceError**——整个 java_hook 不可用。
+              之所以长时间没被发现，是因为 `node --check` 认为 __X__ 是
+              合法标识符，语法检查全绿；错误只发生在 frida 脚本 load 阶段，
+              而那时的报错信息里只有一句 JS 异常。
+    解决方案：渲染一次真实脚本，用正则找出所有残留的 __大写__ 占位符，
+              非空即失败。java_hook 自己也加了同样的自检
+              （JS_TEMPLATE_BROKEN），两层都拦。
+    """
+    import re as _re
+
+    js = _r84_render_hook_js()
+    check("R85 渲染出非空脚本", len(js) > 1000, f"len={len(js)}")
+    left = sorted(set(_re.findall(r"__[A-Z][A-Z0-9_]*__", js)))
+    check("R85 没有残留占位符", not left, f"残留: {left}")
+    # node --check 会把 __X__ 当成合法标识符，所以**不能**只靠语法检查
+    check("R85 残留自检已内置", "JS_TEMPLATE_BROKEN" in
+          __import__("inspect").getsource(
+              __import__("server.dyn.java_bridge", fromlist=["x"]).java_hook))
+
+
+def test_r86_ui_parse_and_targeting():
+    """R86：UI 层的解析与选目标逻辑（不连设备，纯逻辑锁死）。
+
+    (1) 第一次修改（2026-11-13）：新增。
+        背景：R83 只做了「源码里有某某关键字」的形态检查（例如
+              `"compact" in src`）。那种检查挡不住真正的行为回退——
+              把 pick_target 改回"命中多个就报歧义"、把 label 改回
+              "拼所有后代文本"，R83 依然全绿。
+        本测试直接构造节点，验证**行为**。
+
+    锁定五件实测踩出来的事：
+      ① bounds 解析要容忍格式变体
+      ② 列表行「可点容器 + 内层容器 + TextView」三层同高时不能报歧义，
+         且要挑到可点击的那个（这是真实 App 列表的普遍结构）
+      ③ 命中真的分布在不同行时才报歧义
+      ④ simplify 只留可交互/叶子/输入控件，中间的布局容器要压掉
+      ⑤ 坐标/时长参数必须挡掉注入与非数字
+    """
+    import sys
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    sys.path.insert(0, str(root))
+    from server.dyn.adb import DynError
+    from server.dyn.ui import (UiNode, _int_arg, _parse_bounds, flatten,
+                               pick_target)
+
+    # ① bounds 解析
+    check("bounds 正常解析", _parse_bounds("[0,0][1080,2201]") == (0, 0, 1080, 2201),
+          f"得到 {_parse_bounds('[0,0][1080,2201]')}")
+    check("bounds 带空格也能解析",
+          _parse_bounds(" [74,237][426,354] ") == (74, 237, 426, 354),
+          "尾部/首部空格让解析失败")
+    check("bounds 为空时不崩", _parse_bounds("") == (0, 0, 0, 0),
+          "空字符串应给全零元组")
+
+    # ② 同一行的三层结构（真实 App 列表的普遍形态）
+    outer = UiNode(cls="android.widget.LinearLayout", bounds=(0, 1509, 1080, 1669),
+                   clickable=True,
+                   children=[UiNode(cls="android.widget.LinearLayout",
+                                    bounds=(74, 1509, 1080, 1669),
+                                    children=[UiNode(cls="android.widget.TextView",
+                                                     text="百度地图",
+                                                     content_desc="百度地图",
+                                                     bounds=(74, 1509, 1080, 1669))])])
+    row = [outer, outer.children[0], outer.children[0].children[0]]
+    target, ambiguous = pick_target(row)
+    check("同一行三层不算歧义", ambiguous is False,
+          "把每一行都报成歧义，模型将被逼着加 index")
+    check("同一行优先挑可点击的", target.clickable is True,
+          f"挑到了不可点的 {target.cls}")
+
+    # ③ 不同行才是真歧义
+    a = UiNode(text="确定", bounds=(0, 100, 100, 200), clickable=True)
+    b = UiNode(text="确定", bounds=(0, 900, 100, 1000), clickable=True)
+    _, amb2 = pick_target([a, b])
+    check("不同行的同名控件报歧义", amb2 is True,
+          "点错行会产生不可逆操作，必须报歧义")
+
+    # ③b 同一行内"行容器 y=595"与"行内文字 y=563"要算同一行。
+    #     这是实测踩到的坑：容差写死 3 像素时两者差 32 就被判成不同行，
+    #     条件点击在通知栏/列表上完全不可用。
+    row_box = UiNode(cls="android.widget.FrameLayout",
+                     bounds=(0, 480, 1080, 710), clickable=True)
+    text_box = UiNode(cls="android.widget.LinearLayout",
+                      bounds=(74, 508, 1080, 618))
+    t3, amb3 = pick_target([row_box, text_box])
+    check("行容器与其偏上的文字算同一行", amb3 is False and t3 is row_box,
+          f"ambiguous={amb3}，挑到 {t3.cls}")
+
+    # ④ simplify 压缩：中间布局容器要压掉，叶子/可点/输入框要留
+    tree = [UiNode(cls="android.widget.FrameLayout", bounds=(0, 0, 1080, 2400),
+                   children=[
+                       UiNode(cls="android.widget.LinearLayout",
+                              bounds=(0, 0, 1080, 200), clickable=True,
+                              children=[UiNode(cls="android.widget.TextView",
+                                               text="设置",
+                                               bounds=(0, 0, 200, 200))]),
+                       UiNode(cls="android.widget.EditText",
+                              bounds=(0, 300, 1080, 400)),
+                       UiNode(cls="android.view.View",
+                              bounds=(0, 500, 10, 510)),
+                   ])]
+    rows = flatten(tree, simplify=True, include_invisible=False)
+    classes = [r["class"] for r in rows]
+    texts = [r.get("text", "") for r in rows]
+    check("压缩掉无意义的中间容器", classes.count("FrameLayout") == 0,
+          f"布局容器没被压掉：{classes}")
+    check("可点击容器保留", "LinearLayout" in classes, classes)
+    check("输入框即使无文本也保留", "EditText" in classes, classes)
+    lb = [r.get("label") for r in rows if r["class"] == "LinearLayout"]
+    check("可点容器带上后代文本作为 label", lb and lb[0] == "设置",
+          f"label 聚合不对：{lb}")
+    # 叶子文本与可点父容器的 label 内容相同时不重复输出：
+    # 同一信息出现两次只会白占上下文（实测真实列表里每行都如此）
+    texts_all = [r.get("text") or r.get("label") or "" for r in rows]
+    check("同名叶子文本不重复输出", texts_all.count("设置") == 1,
+          f"同一行名出现了 {texts_all.count('设置')} 次：{texts_all}")
+
+    # ⑤ 参数校验：注入与非数字一律拒绝
+    for bad in ("0; reboot", "1e9", "", None, "abc"):
+        try:
+            _int_arg(bad, "x")
+            check(f"拒绝非法坐标 {bad!r}", False, "没抛错，坐标会被拼进 shell")
+        except DynError as exc:
+            check(f"拒绝非法坐标 {bad!r}", exc.code == "BAD_ARGUMENT", exc.code)
+    try:
+        _int_arg(1081, "x", lo=0, hi=1080)
+        check("超范围坐标被拒", False, "1081 > 1080 却通过了")
+    except DynError:
+        check("超范围坐标被拒", True)
+
+    # ⑥ 设备不在线 vs 界面读不到，必须是两种不同的错误码。
+    #    实测踩过：serial 不存在时 adb 只往 stderr 写 "device not found"，
+    #    stdout 为空，旧代码据此报 UI_DUMP_FAILED（说成"屏幕锁定/无障碍被禁"），
+    #    把排查方向完全带偏。
+    from server.dyn.ui import _run as _ui_run
+    try:
+        _ui_run("echo mda_probe", "mda_no_such_device_zzz", timeout=8)
+        check("不存在的 serial 报设备级错误", False,
+              "没抛错，说明设备校验缺失")
+    except DynError as exc:
+        check("不存在的 serial 报设备级错误",
+              exc.code in ("DEVICE_NOT_FOUND", "DEVICE_AMBIGUOUS"), exc.code)
+
+
+def test_r87_hook_hint_candidates():
+    """R87：候选探查工具（java_hook_hint）必须能排序、必须通用、必须只读。
+
+    (1) 第一次修改（2026-11-13）：新增。
+
+    bug 原因：使用者 hook 了 `CommentRealApi` 全类 0 命中，然后**不知道该换
+              哪个类**——旧的 java_find_classes 只能给一串类名，不知道该先
+              看哪个；java_hook 一次试一个要十几秒。缺少一个"把像它的类一次
+              列出来并排序"的入口。
+    解决方案：新增 java_hook_hint（四个线索维度 + 命名相似度排序 +
+              网络层通用候选 + 可选低成本计数）。
+
+    这条测试锁四件事：
+      ① name_similarity 的排序真的把"像的"排前面（不是枚举顺序）
+      ② 内置的类名/方法模式表**不含任何具体 App 的包名**（通用性红线）
+      ③ 网络层候选覆盖 okhttp Interceptor / setRequestProperty 三个标准入口
+      ④ 默认参数下**完全不 hook**（只读），必须显式给 count_seconds 才计数
+    """
+    import inspect as _insp
+
+    import server.dyn.java_bridge as _jb
+    import server.mcp_server.tools as _T
+
+    check("R87 java_hook_hint 存在", hasattr(_jb, "java_hook_hint"))
+    check("R87 MCP 层已注册", hasattr(_T, "java_hook_hint"))
+
+    # ---- ① 排序：CommentRealApi 的近似度顺序必须符合直觉 ----
+    q = "CommentRealApi"
+    sc = {n: _jb.name_similarity(q, n) for n in (
+        "com.x.net.CommentRealApi", "com.x.net.CommentApi",
+        "com.x.net.CommentHelper", "com.x.net.CommentManager",
+        "com.x.net.OrderApi", "android.util.Log")}
+    check("R87 完全同名得满分", sc["com.x.net.CommentRealApi"] == 1.0, str(sc))
+    check("R87 子串最像（CommentApi）",
+          sc["com.x.net.CommentApi"] > sc["com.x.net.CommentHelper"],
+          f"CommentApi={sc['com.x.net.CommentApi']} "
+          f"CommentHelper={sc['com.x.net.CommentHelper']}")
+    check("R87 同词元前缀更像（Helper/Manager）",
+          sc["com.x.net.CommentHelper"] > sc["com.x.net.OrderApi"],
+          f"Helper={sc['com.x.net.CommentHelper']} "
+          f"OrderApi={sc['com.x.net.OrderApi']}")
+    # 只共享 "api" 这类通用后缀不能当证据 —— 这是第二版回归的核心
+    check("R87 通用后缀不算相似",
+          sc["com.x.net.OrderApi"] < 0.5,
+          f"OrderApi 得了 {sc['com.x.net.OrderApi']}，"
+          "只共享 'api' 不该被当成相近")
+    check("R87 完全不相关得 0 分", sc["android.util.Log"] == 0.0, str(sc))
+
+    # 驼峰切词必须在**转小写之前**做，否则 CommentRealApi 变单个词元，
+    # Helper/Manager 全部退化到与 OrderApi 同分（第三版回归）
+    check("R87 驼峰词元切分正确",
+          _jb.name_similarity("CommentApi", "CommentHelper") > 0.5,
+          "驼峰边界丢了，所有 Comment* 会退化成同一分")
+
+    # ---- ② 通用性红线：不许出现具体 App 的包名 ----
+    import re as _re
+
+    blob = (" ".join(_jb.NETWORK_CLASS_PATTERNS)
+            + " ".join(_jb.NETWORK_METHOD_PATTERNS)
+            + str(_jb.NETWORK_CANDIDATES))
+    # 已知的商业 App 包名/特征类名一个都不许有
+    banned = ["idlefish", "taobao", "alibaba", "tencent", "mtopsdk", "anetwork",
+              "xianyu", "goofish", "pdd", "meituan", "xiaomi", "bytedance",
+              "com.taobao", "com.tencent", "com.xiaomi"]
+    hit = [b for b in banned if b in blob.lower()]
+    check("R87 模式表不含具体 App 特征", not hit, f"发现: {hit}")
+    # 正向：必须是 Android/okhttp/JDK 的标准名字
+    for must in ("Interceptor", "addHeader", "setRequestProperty"):
+        check(f"R87 覆盖标准入口 {must}", must in blob, f"缺少 {must}")
+
+    # ---- ③ 网络层候选必须自带"下一步怎么挂" ----
+    net = _jb._hint_network_lines()
+    check("R87 网络候选非空", len(net) >= 4, f"只有 {len(net)} 条")
+    check("R87 每条网络候选带 how",
+          all(x.get("how") for x in net),
+          "没有 how 就只是类名清单，AI 还得自己想参数")
+    check("R87 每条网络候选带 why",
+          all(x.get("why") for x in net))
+
+    # ---- ④ 默认只读：不给 count_seconds 不能挂 hook ----
+    sig = _insp.signature(_jb.java_hook_hint)
+    check("R87 count_seconds 默认 0（只读）",
+          float(sig.parameters["count_seconds"].default) == 0.0,
+          str(sig.parameters["count_seconds"].default))
+    check("R87 include_network 默认开",
+          sig.parameters["include_network"].default is True)
+    # 四个线索维度都要在
+    for p in ("query", "package", "method", "include_network", "count_seconds"):
+        check(f"R87 支持参数 {p}", p in sig.parameters)
+
+    # 无任何线索时必须明确报错，不能静默返回空
+    empty = _jb.java_hook_hint("S", 1, include_network=False)
+    check("R87 无线索明确报错",
+          empty.get("ok") is False and empty.get("code") == "NEED_HINT",
+          str(empty))
+
+
+def test_r88_count_calls_lightweight():
+    """R88：调用计数必须**轻量**（只加整数），且失败如实报。
+
+    (1) 第一次修改（2026-11-13）：新增。
+
+    bug 原因：探查阶段用 java_hook 挂整类方法测"谁在干活"，每次命中都要取
+              Java 栈（遍历整个栈 + 构造 StackTraceElement）再对每个参数
+              toString，实测 0.5~3 毫秒/次。挂几十个方法后目标明显变慢，
+              还会触发 java_hook 自己的自动降级，探到的数据已经是降级后的。
+    解决方案：新增 _java_count_calls —— 单次命中只做一次整数加法。
+              本测试在真实渲染出的 JS 上验证"确实没取栈、没碰参数"。
+
+    这条测试锁三件事：
+      ① 计数脚本里**不存在** mdaJavaStack / mdaDescribe 调用（轻量的证据）
+      ② 只挂声明方法、跳过初始化方法、接口明确跳过（不白跑）
+      ③ 记录 hook 结果里的整数自增形态（不是构造对象）
+    """
+    import inspect as _insp
+
+    import server.dyn.java_bridge as _jb
+    import server.mcp_server.tools as _T
+
+    check("R88 计数实现存在", hasattr(_jb, "_java_count_calls"))
+    check("R88 MCP 工具已注册", hasattr(_T, "java_count_calls"))
+
+    src = _insp.getsource(_jb._java_count_calls)
+    # 轻量性：脚本正文里不能出现任何"重"的观测
+    check("R88 计数脚本不取 Java 栈",
+          "mdaJavaStack" not in src,
+          "取栈是单次命中里最贵的一步，计数阶段不该有")
+    check("R88 计数脚本不转参数",
+          "mdaDescribe" not in src and "mdaExpand" not in src,
+          "参数 toString 每个参数一次，计数阶段不该有")
+    check("R88 命中只做整数加法",
+          "counts[cn2]++" in src,
+          "这是全部开销：一个闭包 + 一次加法")
+    check("R88 不构造记录对象",
+          "entry.calls" not in src and "rec.args" not in src)
+
+    # 不做无用功：接口/系统类/初始化方法要跳过并说明原因
+    check("R88 接口明确跳过并给原因",
+          "0x200" in src and "接口" in src,
+          "接口声明方法没有实现体，挂了必然 0 命中——必须提前说")
+    check("R88 系统类跳过", "SKIP" in src and "java.lang." in src)
+    check("R88 跳过初始化方法", "<init>" in src and "<clinit>" in src)
+    check("R88 有每类方法数上限", "MAXM" in src,
+          "不加上限会一次挂几千个方法把目标拖垮")
+
+    # 失败如实报：0 次时必须提示"先触发功能"，不能只说"没调用"
+    check("R88 0 次时给出下一步动作",
+          "先去触发一次对应功能" in src,
+          "只报 0 会让人以为工具坏了")
+    check("R88 未就位有明确 code", "NOT_READY" in src)
+
+    # MCP 层参数要与实现对齐（照 R56 的教训：dyn 有、MCP 没有就传不进去）
+    mcp_sig = _insp.signature(_T.java_count_calls)
+    for p in ("classes", "method", "seconds", "max_methods_per_class"):
+        check(f"R88 MCP 暴露参数 {p}", p in mcp_sig.parameters)
+
+
+def test_r89_diagnosis_next_actions():
+    """R89：0 命中诊断必须给出**可直接照抄**的下一步，且优先级正确。
+
+    (1) 第一次修改（2026-11-13）：新增。
+
+    bug 原因：原诊断只回答"类在不在 / 方法在不在 / 兄弟方法有没有被调"，
+              使用者真正卡住的是"那我该 hook 谁"。而 suggestion 只是一句
+              话，读的人还得自己把它翻译成工具参数——翻译就是新的出错点，
+              错一次又是一轮十几秒的 hook。
+    解决方案：诊断增加三层：
+              class_refs[]（ClassLoader / 接口 / 抽象 / **重载数**）
+              → parent_hits（祖先链同名方法的真实计数）
+              → next_actions[]（tool + args + why，可直接执行）
+
+    这条测试锁：五种场景下**优先级判断正确**（接口 > 父类命中 > 兄弟方法 >
+    重载 > 无从下手），且每条 next_action 都带 why、参数非空。
+    """
+    import inspect as _insp
+
+    import server.dyn.java_bridge as _jb
+
+    # ---- ① 接口：结构性原因，必须排最高优先级 ----
+    d = {"class_refs": [{"class": "com.x.ICommentApi", "is_interface": True}]}
+    s = _jb._diag_suggestion(d, method="add", duration=5)
+    check("R89 接口识别为根本原因", "接口" in s and "实现" in s, s)
+
+    # ---- ② 父类命中：有数字的证据，压过"方法存在但没调用" ----
+    d2 = {"class_refs": [{"class": "com.x.CommentApi", "is_interface": False}],
+          "parent_hits": [{"where": "com.x.BaseApi.add [父类/祖先]", "hits": 12}]}
+    s2 = _jb._diag_suggestion(d2, method="add", duration=5)
+    check("R89 父类命中给父类建议", "com.x.BaseApi" in s2 and "12" in s2, s2)
+    a2 = _jb._diag_next_actions(d2, [])
+    check("R89 父类命中生成可执行动作", bool(a2))
+    check("R89 动作带 why", all(x.get("why") for x in a2))
+    check("R89 动作带 tool+args",
+          all(x.get("tool") and isinstance(x.get("args"), dict) for x in a2))
+    if a2:
+        got = a2[0]["args"]
+        check("R89 父类动作指向父类",
+              got.get("class_name") == "com.x.BaseApi", str(got))
+        check("R89 父类动作方法名正确", got.get("method") == "add", str(got))
+
+    # ---- ③ 兄弟方法 ----
+    d3 = {"class_refs": [{"class": "com.x.CommentApi"}],
+          "sibling_methods_called": [
+              {"method": "com.x.CommentApi.fetch", "hits": 9}]}
+    s3 = _jb._diag_suggestion(d3, method="add", duration=5)
+    check("R89 兄弟方法被点名", "fetch" in s3 and "9" in s3, s3)
+    a3 = _jb._diag_next_actions(d3, [])
+    check("R89 兄弟动作换到该方法",
+          any(x["args"].get("method") == "fetch" for x in a3), str(a3))
+
+    # ---- ④ 重载：hook 错了重载是最常见的"方法存在但 0 命中" ----
+    d4 = {"class_refs": [{"class": "com.x.CommentApi",
+                          "overloads_of_target": 3,
+                          "overload_signatures": ["void add(java.lang.String)"]}]}
+    s4 = _jb._diag_suggestion(d4, method="add", duration=5)
+    check("R89 指出重载问题", "重载" in s4 and "3" in s4, s4)
+    a4 = _jb._diag_next_actions(d4, [])
+    ov = [x for x in a4 if x["args"].get("overload")]
+    check("R89 重载动作带 overload 参数", bool(ov), str(a4))
+    if ov:
+        # method 必须是**方法名**，不能是整条签名里的 "void"
+        check("R89 overload 动作的 method 是方法名",
+              ov[0]["args"].get("method") == "add",
+              f"得到 {ov[0]['args'].get('method')!r}")
+
+    # ---- ⑤ 同包邻居：CommentRealApi 0 命中 → 建议看 CommentApi/Helper ----
+    d5 = {"class_refs": [{"class": "com.x.net.CommentRealApi"}],
+          "neighbors": [{"class": f"com.x.net.Comment{s}", "score": 0.7}
+                        for s in ("Api", "Helper", "Manager")]}
+    a5 = _jb._diag_next_actions(d5, [])
+    cnt = [x for x in a5 if x["tool"] == "java_count_calls"]
+    check("R89 邻居先做低成本计数", bool(cnt),
+          "先花 5 秒计数，比直接 hook 每个候选划算得多")
+    if cnt:
+        check("R89 计数覆盖邻居类",
+              len(cnt[0]["args"].get("classes") or []) >= 3, str(cnt[0]))
+    hook = [x for x in a5 if x["tool"] == "java_hook"
+            and x["args"].get("pattern")]
+    check("R89 也给一次性批量 hook", bool(hook),
+          "pattern 一次挂多个候选，按命中数判胜负")
+
+    # ---- ⑥ 完全没有线索：指向只读的候选探查 ----
+    a6 = _jb._diag_next_actions({"class_refs": [{"class": "com.x.A"}]}, [])
+    check("R89 无线索时指向 hint 工具",
+          any(x["tool"] == "java_hook_hint" for x in a6), str(a6))
+
+    # ---- ⑦ 签名抽方法名（overload 参数依赖它）----
+    check("R89 从签名抽方法名",
+          _jb._overload_method_name("public final okhttp3.Request build()")
+          == "build")
+    check("R89 裸方法名原样返回",
+          _jb._overload_method_name("intercept") == "intercept")
+    check("R89 空签名返回空串", _jb._overload_method_name("") == "")
+
+    # ---- ⑧ 诊断必须真的接进 _run_java_hook（不能只是写了函数没人调）----
+    src = _insp.getsource(_jb._run_java_hook)
+    for key in ("class_refs", "parent_hits", "neighbors", "next_actions"):
+        check(f"R89 诊断含 {key}", f'"{key}"' in src or f"'{key}'" in src)
+    check("R89 诊断调用了建议生成", "_diag_suggestion(" in src)
+    check("R89 诊断调用了动作生成", "_diag_next_actions(" in src)
+    check("R89 诊断调用了邻居查找", "_diag_neighbors(" in src)
+
+    # JS 侧必须把 parent_hits 回传，否则父类建议永远为空
+    js = getattr(_jb, "_JS_JAVA_HOOK_MULTI", "")
+    check("R89 JS 回传 parent_hits", "result.parent_hits = parentHits" in js)
+    check("R89 JS 有祖先链探测", "PARENT_PROBE" in js and "parentHits" in js)
+    check("R89 JS 回传同包类列表", "same_package" in js)
+
+
+def test_r80_hold_policy_redispatch():
+    """R80 已存在的断点改 hold 时，必须把新 policy 重新下发给 debugger。
+
+    (1) 第一次修改（2026-11-13）：
+        bug 原因：server/dyn/service.py 的 set_breakpoint 在**下发 policy 之前**
+                  就早退——只要 bp_id 已在断点表里就直接 return 旧记录。于是
+                  「先 hold=False 下断，再 hold=True 调一次」返回的仍是 hold=False，
+                  而且真正的 dbg.set_breakpoint(policy="hold") 从未执行，
+                  debugger 侧那条 hook 还是 resume。使用者实测报
+                  「set_breakpoint(hold=true) 返回 hold: false」，
+                  命中照跑不停——接口说成了、实际没成，属静默的策略失效。
+        解决方案：早退只留给 hold 值相同的幂等情形；值不同则继续下发 policy，
+                  成功后才写回记录，返回的 hold 恒为最终生效值。
+
+    这条测试锁四件事：
+      ① 升级 hold 时**真的**调用 debugger 且 policy="hold"
+      ② 返回值与落库记录都反映最终 hold（不是旧值）
+      ③ hold 值相同时保持幂等（不重复下钩、不多发一次 dispatch）
+      ④ 降级回 hold=False 同样要真的下发
+    """
+    from server.dyn.adb import DynError
+    from server.dyn.service import DynamicService, Target
+
+    class TrackDbg:
+        """记录每次下断的 policy；顺带模拟"拒绝 hold"的可控失败。"""
+
+        state = "attached"
+        hits: list = []
+
+        def __init__(self):
+            self.calls: list[tuple[str, int, str]] = []
+            self.refuse_hold = False
+
+        def set_breakpoint(self, so_name, static_addr, policy="resume", on_hit=None):
+            if self.refuse_hold and policy == "hold":
+                return False
+            self.calls.append((so_name, static_addr, policy))
+            return True
+
+        def resume(self):
+            pass
+
+        def close(self):
+            pass
+
+        def wait_hits(self, timeout=1.0):
+            return []
+
+    class RB:
+        class _M:
+            name = "libtarget.so"
+
+        def find_module(self, name):
+            return RB._M() if name in ("libtarget.so", "/data/app/libtarget.so") else None
+
+        def to_runtime(self, static_addr, mod):
+            return 0x7000000000 + int(static_addr)
+
+        def refresh_modules(self):
+            return []
+
+        def detach(self):
+            return True
+
+    svc = DynamicService()
+    dbg = TrackDbg()
+    tgt = Target(serial="s", pid=1, rb=RB(), dbg=dbg)
+    svc._targets["s:1"] = tgt
+
+    # ---- ① 首次 hold=False ----
+    bp1 = svc.set_breakpoint("s", 1, "libtarget.so", 0x1234, hold=False)
+    check("R80 首次 hold=False 如实返回", bp1.get("hold") is False, repr(bp1.get("hold")))
+    check("R80 首次 existing=False", bp1.get("existing") is False)
+    check("R80 首次下发 resume", dbg.calls and dbg.calls[-1][2] == "resume",
+          str(dbg.calls))
+
+    # ---- ② 升级为 hold：必须重下发 ----
+    bp2 = svc.set_breakpoint("s", 1, "libtarget.so", 0x1234, hold=True)
+    check("R80 升级后返回 hold=True",
+          bp2.get("hold") is True,
+          f"实际 {bp2.get('hold')!r}——这就是用户报的 hold 不生效")
+    check("R80 升级时真的重下发 hold 策略",
+          dbg.calls[-1][2] == "hold",
+          f"debugger 从未收到 hold，最后一次是 {dbg.calls[-1] if dbg.calls else None}")
+    check("R80 升级时标记 policy_changed", bp2.get("policy_changed") is True,
+          repr(bp2.get("policy_changed")))
+    check("R80 断点记录同步为 hold=True",
+          tgt.breakpoints[bp1["id"]].get("hold") is True,
+          repr(tgt.breakpoints[bp1["id"]].get("hold")))
+
+    # ---- ③ 幂等：hold 相同不重复下钩 ----
+    n_calls = len(dbg.calls)
+    bp3 = svc.set_breakpoint("s", 1, "libtarget.so", 0x1234, hold=True)
+    check("R80 hold 相同时不重复下发", len(dbg.calls) == n_calls,
+          f"多下了 {len(dbg.calls) - n_calls} 次钩")
+    check("R80 幂等调用返回 existing=True", bp3.get("existing") is True)
+    check("R80 幂等调用 hold 仍为 True", bp3.get("hold") is True)
+    check("R80 幂等调用不标 policy_changed", bp3.get("policy_changed") is False,
+          repr(bp3.get("policy_changed")))
+
+    # ---- ④ 降级回 resume 也要真的下发 ----
+    bp4 = svc.set_breakpoint("s", 1, "libtarget.so", 0x1234, hold=False)
+    check("R80 降级为 resume 时重下发", dbg.calls[-1][2] == "resume", str(dbg.calls))
+    check("R80 降级后返回 hold=False", bp4.get("hold") is False)
+
+    # ---- ⑤ 下发失败：不许装成功，记录保持旧值 ----
+    dbg.refuse_hold = True
+    try:
+        svc.set_breakpoint("s", 1, "libtarget.so", 0x1234, hold=True)
+        raised = False
+    except DynError as exc:
+        raised = getattr(exc, "code", "") == "BREAKPOINT_FAILED" or "BREAKPOINT_FAILED" in str(exc)
+    check("R80 下发生效失败时抛 BREAKPOINT_FAILED", raised,
+          "拒绝了 hold 却报成功，等于又造一次假成功")
+    check("R80 失败后记录仍是 hold=False",
+          tgt.breakpoints[bp1["id"]].get("hold") is False,
+          repr(tgt.breakpoints[bp1["id"]].get("hold")))
+
+
+def test_r81_idc_function_ranges():
+    """R81 IDC 建函数后必须同步刷新 function_at 的索引。
+
+    (1) 第一次修改（2026-11-13）：
+        bug 原因：server/scripting/idc.py 的 _refresh_ranges 只重算
+                  `so._func_ranges`，而 function_at() 二分用的是 `so._starts`
+                  （由 elf_model._refresh_functions 维护）。IDC 刚建的函数进得了
+                  `so.functions`、也进了 `_func_ranges`，却**从未进 `_starts`**。
+                  实测 `0xdf5c in so.functions == True` 而
+                  `function_at(0xdf5c) == None`。后果：MakeFunction/MakeName 之后
+                  反汇编、伪代码、UI 打开、引用归属都看不到这个函数，
+                  等于建了个不可见的函数。
+        解决方案：改为调用 elf_model 的唯一权威入口 `_refresh_functions()`，
+                  它同时维护 `_starts` 与 `_func_ranges`，并顺带修正 size 让区间
+                  互不重叠（function_at 二分的另一前提）。
+
+    这条测试锁三件事：
+      ① MakeFunction 之后 function_at 能找到**刚建的那个**函数（起点等于自身）
+      ② MakeName 之后按地址取名字正确（这是用户实际使用的入口）
+      ③ MakeFunction(ea, BADADDR) 走边界推断后同样可见
+    """
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    sys.path.insert(0, str(root))
+    from server.core.session import Session
+    from server.scripting.idc import BADADDR, IdcContext
+
+    sample = root / "samples" / "libbase.so"
+    if not sample.exists():
+        return
+
+    s = Session()
+    so = s.add(str(sample))
+
+    # 找一个 .text 内、4 字节对齐、**不是**函数起点的地址。
+    # 不写死偏移：不同样本/不同版本都成立（通用性要求）。
+    text = None
+    for sec in getattr(so, "sections", []) or []:
+        if sec.name == ".text":
+            text = sec
+            break
+    if text is None:
+        return
+    probe = None
+    for a in range(text.addr, text.addr + int(text.size) - 4, 4):
+        if a not in so.functions:
+            probe = a
+            break
+    if probe is None:
+        return
+
+    ctx = IdcContext(s, so.name)
+    before = so.function_at(probe)
+    check("R81 前置：该地址本身不是函数起点", probe not in so.functions,
+          f"{probe:#x} 已是函数起点，测不到该缺陷")
+    check("R81 前置：建函数前 function_at 指不到它",
+          before is None or before.addr != probe,
+          f"建函数前就返回了 {before.addr:#x} 的函数")
+
+    # ---- ① MakeFunction（显式边界） ----
+    ctx.MakeFunction(probe, probe + 0x40)
+    got = so.function_at(probe)
+    check("R81 MakeFunction 后 function_at 能找到该函数",
+          got is not None and got.addr == probe,
+          f"实际 {None if got is None else hex(got.addr)}"
+          "——这就是 idc 建函数后函数看不见的缺陷")
+    check("R81 函数进了 so.functions", probe in so.functions)
+
+    # ---- ② MakeName 之后按地址取名 ----
+    ctx.MakeName(probe, "r81_probe_fn")
+    named = so.function_at(probe)
+    check("R81 MakeName 后能按地址取到新名字",
+          named is not None and named.name == "r81_probe_fn",
+          f"实际 {None if named is None else named.name!r}")
+    check("R81 get_func_name 也走同一索引",
+          ctx.get_func_name(probe) == "r81_probe_fn",
+          ctx.get_func_name(probe))
+
+    # ---- ③ BADADDR 边界推断路径同样可见 ----
+    probe2 = None
+    for a in range(probe + 0x100, text.addr + int(text.size) - 4, 4):
+        if a not in so.functions:
+            probe2 = a
+            break
+    if probe2 is not None:
+        ctx.MakeFunction(probe2, BADADDR)
+        got2 = so.function_at(probe2)
+        check("R81 BADADDR 推断后 function_at 也能找到",
+              got2 is not None and got2.addr == probe2,
+              f"实际 {None if got2 is None else hex(got2.addr)}")
+
+    # ---- ④ 索引必须与区间表一致（防止两套索引再次各算一份） ----
+    starts = set(getattr(so, "_starts", []) or [])
+    missing = [hex(a) for a in so.functions if a not in starts]
+    check("R81 _starts 覆盖全部已登记函数", not missing,
+          f"缺 {len(missing)} 个：{missing[:5]}")
+
+
+def test_r82_short_and_utf8_strings():
+    """R82 字符串提取必须覆盖 2~3 字符的短串与 UTF-8（且不能退化性能）。
+
+    (1) 第一次修改（2026-11-13）：
+        bug 原因：server/core/strings.py 的 `_MIN_LEN = 4` 且逐字节只认
+                  `0x20 <= c < 0x7F`。实测 libbase.so 的 237 个 data_refs 目标里
+                  128 个查不到字符串：其中 32 个是 ≤3 字符的真实常量
+                  （"ms"、']'、", "、'.'），50 个含非 ASCII 字节。
+                  因为查不到 StringRef，这些引用永远归不到引用者身上——
+                  string_refs / 伪代码 / 界面"这个函数引用了哪些字符串"全都静默漏掉。
+        解决方案：字符集扩到「ASCII 可打印 ∪ 合法 UTF-8 多字节序列」，
+                  下限降到 2；单字符只在**紧跟 NUL** 时收（`'h'\\0 'm'\\0 's'\\0`
+                  这类单位表是真实字符串表，用 NUL 结尾这个客观依据区分，不猜内容）；
+                  全空白（对齐填充）不算字符串。
+
+    这条测试锁五件事：
+      ① 2~3 字符的短串被提取（'ms' / ', ' / ']'）
+      ② 单字符仅在 NUL 结尾时收（既有 ']' 也有被排除的偶然单字节）
+      ③ UTF-8 非 ASCII 字符串完整提取（中文 / 重音字符），且中段地址能反查
+      ④ 全空白串被排除
+      ⑤ 扫描没有退化：libc 61KB .rodata 的提取耗时在宽松上界内
+    """
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    sys.path.insert(0, str(root))
+    import server.core.strings as S
+
+    check("R82 最小长度已降到 2", S._MIN_LEN <= 2, f"_MIN_LEN={S._MIN_LEN}")
+
+    # ---- ①②③④ 合成数据：每条规则各一个断言 ----
+    blob = (b"\x00ms\x00, \x00]"
+            b"\x00abc\x00Zbc\x00"                     # 'Z' 后不是 NUL：单字符分支不该命中
+            b"    \x00"                               # 全空白，排除
+            + "中文".encode("utf-8") + b"\x00"
+            + "\u00e9t\u00e9".encode("utf-8") + b"\x00")
+    found = S._extract_printable(blob, 0x1000)
+    got = {r.value for r in found}
+    addrs = {r.value: r.addr for r in found}
+
+    check("R82 2 字符串短串被提取", "ms" in got, f"实际 {sorted(got)}")
+    check("R82 2 字符符号串被提取", ", " in got, f"实际 {sorted(got)}")
+    check("R82 NUL 结尾的单字符被提取", "]" in got, f"实际 {sorted(got)}")
+    check("R82 非 NUL 结尾的单字符被排除", not any(v == "Z" for v in got),
+          f"实际 {sorted(got)}")
+    check("R82 全空白串被排除", not any(not v.strip() for v in got), f"实际 {sorted(got)}")
+    check("R82 中文 UTF-8 完整提取", "中文" in got, f"实际 {sorted(got)}")
+    check("R82 重音字符 UTF-8 完整提取", "\u00e9t\u00e9" in got, f"实际 {sorted(got)}")
+
+    # ---- ③ 中段地址反查：UTF-8 的字符数 != 字节数，上界必须按字节算 ----
+    class _Sec:
+        def __init__(self, addr, size, name):
+            self.addr, self.size, self.name = addr, size, name
+
+    class _So:
+        def __init__(self, data):
+            self._data = data
+            self.sections = [_Sec(0x1000, len(data), ".rodata")]
+            self._loads = []
+
+        def read(self, addr, size):
+            off = addr - 0x1000
+            return self._data[off:off + size] if 0 <= off < len(self._data) else b""
+
+    an = S.StringAnalyzer(_So(blob))
+    an.build()
+    cn_addr = addrs["中文"]
+    # "中文" 占 6 字节：addr .. addr+6 都应能反查到同一条（+1 是结尾 NUL）
+    check("R82 UTF-8 串中部地址能反查（按字节算上界）",
+          all((hit := an.string_starting_at_or_before(cn_addr + k)) is not None
+              and hit.value == "中文" for k in range(6)),
+          f"起点 {cn_addr:#x} 的 6 字节内有位置查不到")
+    # 越过 NUL 之后必须落到**下一条**字符串，不能还返回"中文"
+    tail = an.string_starting_at_or_before(cn_addr + 7)
+    check("R82 越过结尾 NUL 后不再命中上一条",
+          tail is None or tail.value != "中文",
+          f"越界仍返回 {None if tail is None else tail.value!r}")
+
+    # ---- ⑤ 真样本：短串与 UTF-8 真的出现在表里，且扫描没有退化 ----
+    import time
+
+    base = root / "samples" / "libbase.so"
+    if base.exists():
+        from server.core.session import Session
+
+        s = Session()
+        so = s.add(str(base))
+        strs = s.strings(so.name)
+        strs.build()
+        vals = {x.value for x in strs.all_strings()}
+        check("R82 真样本里短串可查（libbase 的 'ms'）", "ms" in vals,
+              "短串仍然整类缺失")
+        check("R82 真样本里有非 ASCII 串",
+              any(not v.isascii() for v in vals),
+              "UTF-8 支持没有真正生效")
+
+        # 每个 ≤3 字符的真实短串都必须能被反查回它自己
+        short = [x for x in strs.all_strings() if len(x.value) <= 3][:40]
+        bad = [x.value for x in short
+               if (hit := strs.string_starting_at_or_before(x.addr)) is None
+               or hit.addr != x.addr]
+        check("R82 短串起点反查必须命中自身", not bad, f"错位 {bad[:5]}")
+
+    big = root / "samples" / "device" / "libc.so"
+    if big.exists():
+        from server.core.session import Session
+
+        s2 = Session()
+        so2 = s2.add(str(big))
+        data_list = []
+        for sec in getattr(so2, "sections", []) or []:
+            if sec.name and sec.name not in S._STRING_SECTIONS:
+                continue
+            d = so2.read(sec.addr, sec.size)
+            if d:
+                data_list.append((sec.addr, d))
+        total = sum(len(d) for _, d in data_list)
+        t0 = time.perf_counter()
+        n = 0
+        for a, d in data_list:
+            n += len(S._extract_printable(d, a))
+        dt = time.perf_counter() - t0
+        check("R82 扫描到数据（libc）", total > 0 and n > 0, f"{total}B -> {n} 条")
+        # 宽松上界：现在约 10ms，给 100 倍余量，只拦"退化成逐字节 Python 循环"
+        check("R82 61KB 级 .rodata 扫描未退化（<1s）", dt < 1.0,
+              f"{dt * 1000:.1f}ms / {total}B")
+
+
+def test_r90_so_name_alias_unified() -> None:
+    """R90 so 名字别名解析收敛到一处，所有工具自动受益。
+
+    (1) 第一次修改（2026-11-13）：
+        bug 原因：设备模块名与 mda 会话里的键经常不一致——
+                  设备 libsscronet.so ↔ 本地 sscronet.so；
+                  设备 libsgmainso-6.7.260202.so ↔ 本地 libsgmainso.so；
+                  设备还可能给完整路径 /data/app/xxx/lib/arm64/libfoo.so。
+                  而 Session.get() 是严格字典查找，miss 就抛
+                  `KeyError: 未加载的 so: xxx，当前有 []`。使用者实测因此
+                  反复踩"未加载"至少 8 次，每次都要人工确认设备名与本地名。
+                  更糟的是别名规则此前散在四份实现里（core.session /
+                  mcp_server.tools._pick_so_by_name / dyn.bridge._match_so /
+                  dyn.rebase.find_module），各写一套已经开始分叉。
+        解决方案：规则收敛成 core.session 的纯函数 match_name，
+                  Session.resolve/get/xref/strings/discover_functions 统一走它。
+                  本测试用**真实样本**锁住四件事：
+                    ① 别名能取到（liblog.so / log.so / liblog / log / 全路径）
+                    ② 唯一命中才采用，多候选必须报错并列出候选（不能瞎猜）
+                    ③ 报错信息带已加载列表与最接近的候选（能自愈）
+                    ④ 四处入口用同一套规则（防止又抄一份出去）
+    """
+    from server.core.session import Session, match_name
+
+    log_path = Path(__file__).resolve().parent.parent / "samples" / "liblog.so"
+    if not log_path.exists():
+        check("R90 样本存在", False, f"缺少 {log_path}")
+        return
+
+    s = Session()
+    so = s.add(str(log_path))
+    check("R90 加载后键是文件名", so.name == "liblog.so", so.name)
+
+    # ① 别名：任务要求的四种写法 + 真机两种形态
+    for alias in ("liblog.so", "log.so", "liblog", "log",
+                  "/system/lib64/liblog.so",
+                  "/data/app/xxx/lib/arm64/liblog.so"):
+        got = s.get(alias)
+        check(f"R90 get({alias}) 取到 liblog", got is so,
+              f"别名未解析，实际 {getattr(got, 'name', got)!r}")
+
+    # ② 唯一命中才采用：两个版本同时加载时，核心名必须报歧义
+    amb = Session()
+    amb.modules["libutils-1.so"] = object()
+    amb.modules["libutils-2.so"] = object()
+    try:
+        amb.resolve("libutils.so")
+        check("R90 多候选必须报错", False, "居然挑了一个，会让人在错的样本上分析")
+    except KeyError as exc:
+        msg = exc.args[0] if exc.args else str(exc)
+        check("R90 多候选报错并列出候选",
+              "libutils-1.so" in msg and "libutils-2.so" in msg, msg)
+        check("R90 多候选的 code 是 SO_AMBIGUOUS",
+              getattr(exc, "mda_code", "") == "SO_AMBIGUOUS",
+              getattr(exc, "mda_code", ""))
+
+    # ③ 报错能自愈：带已加载列表 + 最接近的候选
+    try:
+        s.get("sscronet.so")
+        check("R90 不存在的名字必须抛错", False, "静默返回了")
+    except KeyError as exc:
+        msg = exc.args[0] if exc.args else str(exc)
+        check("R90 报错带已加载列表", "liblog.so" in msg, msg)
+        check("R90 报错不吞掉原名", "sscronet.so" in msg, msg)
+    try:
+        s.get("log2.so")
+        check("R90 相近名要抛错", False, "静默返回了")
+    except KeyError as exc:
+        msg = exc.args[0] if exc.args else str(exc)
+        check("R90 报错给'你是不是想找'", "你是不是想找" in msg and "liblog.so" in msg, msg)
+
+    # 空会话：明确提示先 load_so，而不是给个空列表了事
+    empty = Session()
+    try:
+        empty.get("nope.so")
+    except KeyError as exc:
+        msg = exc.args[0] if exc.args else str(exc)
+        check("R90 空会话提示先 load_so", "load_so" in msg, msg)
+
+    # ④ 后缀级不能乱配：get 现在自动解析，误配会让人在错的样本上得结论
+    suffix = Session()
+    suffix.modules["libsscronet.so"] = object()
+    hit, how, _amb = match_name("sscronet.so", ["libsscronet.so"])
+    check("R90 去 lib 前缀能命中", hit == "libsscronet.so" and how == "lib",
+          f"{hit!r}/{how!r}")
+    check("R90 半截词不误配（cronet.so）",
+          match_name("cronet.so", ["libsscronet.so"])[0] is None,
+          "net.so/cronet.so 这类半截词被当成后缀命中")
+    check("R90 分隔符边界可命中（bar.so）",
+          match_name("bar.so", ["libfoo_bar.so"])[0] == "libfoo_bar.so",
+          "合法的下划线分段后缀被误拒")
+
+    # ⑤ 四处入口必须同口径（防止别名规则又被抄回某个模块）
+    import inspect as _insp
+
+    from server.dyn.bridge import _match_so
+    from server.dyn.rebase import Rebase
+    from server.mcp_server.tools import _pick_so_by_name
+
+    check("R90 Session.get 走统一入口",
+          "_resolve" in _insp.getsource(Session.get) or "resolve" in _insp.getsource(Session.get),
+          "get 又变回严格字典查找")
+    check("R90 tools._pick_so_by_name 委托统一规则",
+          "session.resolve" in _insp.getsource(_pick_so_by_name)
+          or "match_name" in _insp.getsource(_pick_so_by_name),
+          "又自持一套匹配")
+    check("R90 bridge._match_so 复用统一规则",
+          "match_name" in _insp.getsource(_match_so), "又自持一套匹配")
+    check("R90 rebase.find_module 复用统一规则",
+          "match_name" in _insp.getsource(Rebase.find_module), "又自持一套匹配")
+
+    # 四处对同一个别名必须给出同一个结论（真实样本上跑）
+    b = Session()
+    b.add(str(log_path))
+    same = []
+    for entry in (_pick_so_by_name(b, "log"),
+                  b.get("log"),
+                  _match_so(b, "log")[1],
+                  b.resolve("log")[0]):
+        same.append(getattr(entry, "name", None))
+    check("R90 四处入口结论一致", len(set(same)) == 1 and same[0] == "liblog.so", str(same))
+
+    # ⑥ 别名进来之后，依赖规范键的内部路径也得跟着解析
+    x1 = s.xref("log")
+    x2 = s.xref("liblog.so")
+    check("R90 xref 别名与全名同一对象", x1 is x2,
+          "xref 仍按原始名索引，别名会 KeyError")
+    strs = s.strings("log")
+    check("R90 strings 别名可用", strs is s.strings("liblog.so"))
+    prog = s.xref_progress("log")
+    check("R90 xref_progress 别名可用", isinstance(prog, dict), str(type(prog)))
+
+    # call_chain 的节点名必须是规范键，否则 seen 去重会把同一函数算成两个节点
+    chain = s.call_chain("log.so", 0x5020, depth=1)
+    check("R90 call_chain 节点用规范键", chain.so_name == "liblog.so", chain.so_name)
+
+
+
+
+def test_r91_java_hook_method_cap():
+    """R91 java_hook 不指定 method 时必须限制 hook 方法数。
+
+    (1) 第一次修改（2026-11-13）：
+        bug 原因：java_hook 不传 method 时会把该类的**所有**方法全挂上。
+                  实测 hook android.app.Activity 挂了 415 个方法，
+                  每个都取栈+参数转换——这是把目标拖死最快的方式
+                  （使用者实测因此 ANR 2 次）。java_count_calls 早有
+                  max_methods_per_class=60 的保护，唯独 java_hook 没有。
+        解决方案：加方法数硬上限 max_methods（默认 60），超了截断并明确告知。
+
+    这条测试锁三件事：
+      ① JS 模板里有上限常量且被 replace 链接线
+      ② 上限用在该 hook 的作用域里（曾经写成 out.cap_note，整个 ReferenceError）
+      ③ 不指定 method 时给 cap_note 提示
+    """
+    import sys
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    src = (root / "server" / "dyn" / "java_bridge.py").read_text(encoding="utf-8")
+
+    check("有方法数上限常量", "MAX_METHODS_PER_CLASS" in src,
+          "没有上限，hook 整个类会挂几百个方法")
+    check("占位符已接线", '.replace("__MAXMETHODS__"' in src,
+          "占位符没接进 replace 链，脚本加载会 ReferenceError")
+    check("上限作用域正确", "entry.cap_note" in src,
+          "又写成了不存在的变量（曾经是 out.cap_note）")
+    check("超限时给提示", "declaredTotal > methods.length" in src,
+          "截断后不告知，调用方以为全 hook 了")
+
+    # ③ 真渲染一次模板，确认没有残留占位符、且能拿到 cap 参数
+    sys.path.insert(0, str(root))
+    from server.dyn.java_bridge import _JS_JAVA_HOOK_MULTI, _JS_HELPERS
+    check("模板里有上限引用", "__MAXMETHODS__" in _JS_JAVA_HOOK_MULTI,
+          "JS 模板里没用上限常量")
+    check("helpers 可拼接", isinstance(_JS_HELPERS, str) and _JS_HELPERS,
+          "_JS_HELPERS 不是非空字符串")
+
+
+
+def test_r92_every_tool_reports_runtime_env():
+    """R92 所有工具都必须经过 @logged()，从而自动带上运行环境（env）。
+
+    (1) 第一次修改（2026-11-13）：
+        用户明确要求：「反查 app 是必须的，所有工具都要引用这个模块」。
+        背景：AI 看不到屏幕，调动态工具时不知道目标 App 在不在前台。
+              目标在后台时渲染/网络/生命周期代码根本不执行，
+              断点装上了也永远不命中——AI 会误判成"代码没跑到"。
+
+    这条测试是**硬约束的守卫**，锁四件事：
+      ① 每个 @server.tool() 都有 @logged()（否则不会注入 env）
+      ② env 模块存在且被 logged 引用
+      ③ probe 三态齐全（resolved / no-target / failed）——AI 必须能区分
+         "查过了" 与 "没查成"，把 failed 当没事会导致误判
+      ④ ui_* 屏幕级工具给出 is-foreground，而不是含糊的 null
+    """
+    import re as _re
+    import sys
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    tools_src = (root / "server" / "mcp_server" / "tools.py").read_text(encoding="utf-8")
+
+    # ① 每个工具都要有 @logged
+    blocks = _re.findall(r"@server\.tool\(\)([\s\S]{0,200}?)def (\w+)", tools_src)
+    missing = [nm for blk, nm in blocks if "@logged" not in blk]
+    check("每个工具都经过 @logged（否则不会注入 env）",
+          not missing, f"这些工具绕过了：{missing[:5]}")
+
+    # ② env 模块接线
+    check("runtime_env 模块存在",
+          (root / "server" / "dyn" / "runtime_env.py").is_file(), "模块不见了")
+    check("logged 调用了 inject_env", "_inject_env(result, call_args" in tools_src,
+          "logged 没注入 env")
+
+    # ③ probe 三态
+    env_src = (root / "server" / "dyn" / "runtime_env.py").read_text(encoding="utf-8")
+    for state in ("resolved", "no-target", "failed"):
+        check(f"probe 有 {state} 态", f'"{state}"' in env_src,
+              "AI 无法区分'查过了'与'没查成'")
+
+    # ④ 屏幕级工具
+    check("ui_* 标 is-foreground", "is-foreground" in env_src,
+          "屏幕级操作留了含糊的 null")
+
+    # 真跑一次：带 pid 的调用必须 resolved
+    sys.path.insert(0, str(root))
+    from server.dyn.runtime_env import inject_env
+    import json as _json
+    # 没有 serial 时不注入（静态工具不受影响）
+    raw = inject_env('{"ok":true}', {}, tool_name="preflight")
+    check("无 serial 不注入 env", '"env"' not in raw, "静态工具被加了 env")
+
+    # 有 serial 但无目标：必须注入，且 probe 落在三态内。
+    # 注意：没有设备时 probe 会是 failed（adb 连不上），这是**正确行为**，
+    # 不是缺陷——如实报"探测失败"比假装"没关系"安全。
+    got = _json.loads(inject_env('{"ok":true}', {"serial": "x"},
+                                 tool_name="preflight"))["env"]
+    check("有 serial 必注入且 probe 合法",
+          got.get("probe") in ("no-target", "resolved", "failed"),
+          f"实际 {got.get('probe')}")
+    check("探测失败时要说清楚",
+          got.get("probe") != "failed" or got.get("warning"),
+          "failed 却没给 warning，AI 会以为是小事")
+
+    # 数组返回值也要带 env（list_processes 曾是裸数组，等于从没带过）
+    arr = inject_env('[{"pid":1}]', {"serial": "x"}, tool_name="list_processes")
+    check("数组返回也带 env", '"env"' in arr and '"items"' in arr,
+          "裸数组被跳过了，list_processes 这类工具拿不到环境信息")
+
+    # keyword 像包名时要当 package 反查（否则 probe=no-target）
+    from server.dyn.runtime_env import resolve_target as _rt
+    pid2, pkg2 = _rt({"serial": "x", "keyword": "com.foo.bar"})
+    check("keyword 被识别为包名", pkg2 == "com.foo.bar",
+          f"实际 {pkg2!r}，AI 得不到目标判定")
+
+
+
+def test_r94_no_view_renders_blank():
+    """R94 每个视图在没有 so 时都必须给出说明，不能留白。
+
+    (1) 第一次修改（2026-11-13）：
+        bug 原因：两个问题叠在一起——
+                  ① 「实时」页在没有 so 时被空状态整页占满，AI 操作设备时
+                     用户看到的是死页面（用户原话："这逻辑不合理呀"）
+                  ② 左栏「字符串」「段 / 节」配了 view 但渲染条件是 `&& mod`，
+                     没 so 时**什么都不渲染**，主区域只剩布局骨架
+                  ③ 左栏 11 个动态入口一直 disabled（注释写"原型同样不可点"），
+                     可 AI 确实在操作断点/命中/内存这些数据
+        解决方案：① 实时页永远渲染监控台；② 需要 so 的视图给 NeedSoView 说明；
+                  ③ 11 个动态入口全部配上 dyn:* 真实视图。
+
+    这条测试锁住结构与数据通路，防止以后又出现"点了白屏"：
+      ① 前端有 NeedSoView（需要 so 的视图有说明页）
+      ② 动态视图组件与接口都在
+      ③ 左栏动态入口都配了 view（不再 disabled）
+      ④ mainView 类型不再收窄成字面量联合（否则新增视图会被类型挡住）
+    """
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+
+    app = (root / "web" / "src" / "App.tsx").read_text(encoding="utf-8")
+    nav = (root / "web" / "src" / "components" / "LeftNav.tsx").read_text(encoding="utf-8")
+    api_py = (root / "server" / "api.py").read_text(encoding="utf-8")
+
+    check("有 NeedSoView 说明页", "NeedSoView" in app,
+          "需要 so 的视图又留白了")
+    check("字符串页有兜底", 'mainView === "strings" && !mod' in app,
+          "字符串页没 so 时会白屏")
+    check("段节页有兜底", 'mainView === "sections" && !mod' in app,
+          "段节页没 so 时会白屏")
+
+    dyn_p = root / "web" / "src" / "components" / "DynStateView.tsx"
+    check("动态视图组件存在", dyn_p.is_file(), "DynStateView.tsx 不见了")
+    check("后端有 dyn_state 接口", "/api/dyn_state" in api_py,
+          "动态状态接口没注册")
+
+    # 左栏动态入口必须都有 view（不再 disabled）
+    for label in ("断点", "命中", "内存", "派发点", "寄存器", "轨迹"):
+        hit = [ln for ln in nav.splitlines() if f'label: "{label}"' in ln]
+        check(f"左栏「{label}」可点击", hit and "view:" in hit[0],
+              f"「{label}」还是 disabled")
+
+    # mainView 不能收窄成字面量联合
+    check("mainView 类型已放开",
+          'useState<string>("monitor")' in app,
+          "类型又收窄了，新增视图会被挡住")
+
+
+
+def test_r95_env_on_all_paths_including_errors():
+    """R95 env 注入必须覆盖**所有返回路径**，包括失败。
+
+    (1) 第一次修改（2026-11-13）：
+        bug 原因：审计 72 个带 serial 的工具时发现两个缺口——
+                  ① 工具**抛异常**时返回 CallToolResult 对象，绕过了
+                     _inject_env（它只处理字符串）→ 所有失败的工具都没有 env。
+                     而失败时恰恰最需要知道目标状态："模块没加载"和
+                     "目标在后台"是两回事，分不清就会往错方向查。
+                  ② perf_watch_* 只有 slot 没有 pid，判不出"观察点盯的 App
+                     在不在前台"；list_processes / mem_snapshot_clear 同样缺。
+        解决方案：① 异常分支也注入 env；② 启动观察点时记 slot→pid；
+                  ③ 给缺 pid 的工具补参数。
+
+    这条测试锁四件事：
+      ① 成功路径有 env
+      ② **失败路径也有 env**（这是本次修的核心）
+      ③ 数组返回被包成 {items, env}
+      ④ perf_watch 的 slot→pid 映射存在且被 resolve_target 使用
+    """
+    import json as _json
+    import sys
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    sys.path.insert(0, str(root))
+
+    from server.dyn.runtime_env import inject_env
+
+    # ① 成功对象
+    ok = _json.loads(inject_env('{"ok":true}', {"serial": "x", "pid": 1},
+                                tool_name="probe_process"))
+    check("成功路径有 env", "env" in ok, "正常返回没注入")
+
+    # ② 失败对象（形态与 logged 的异常分支一致）
+    err = _json.loads(inject_env(
+        '{"error":"boom","tool":"x","traceback_tail":[]}',
+        {"serial": "x", "pid": 1}, tool_name="set_breakpoint"))
+    check("失败路径也有 env", "env" in err,
+          "异常返回绕过了注入——失败时最需要知道目标状态")
+
+    # ③ 数组返回
+    arr = _json.loads(inject_env('[]', {"serial": "x"}, tool_name="list_processes"))
+    check("数组返回被包 env", "env" in arr and "items" in arr,
+          "裸数组会跳过注入")
+
+    # ④ slot→pid
+    from server.dyn.perfwatch import (remember_slot_pid, lookup_slot_pid,
+                                      forget_slot_pid)
+    from server.dyn.runtime_env import resolve_target
+    remember_slot_pid("__t__", 2, 4321)
+    check("perf_watch slot→pid 可反查", lookup_slot_pid("__t__", 2) == 4321,
+          "观察点判不出目标进程")
+    pid2, _ = resolve_target({"serial": "__t__", "slot": 2})
+    check("resolve_target 用了 slot 映射", pid2 == 4321,
+          "perf_watch_poll 仍判不出目标")
+    forget_slot_pid("__t__", 2)
+    check("停止后清掉记录", lookup_slot_pid("__t__", 2) is None,
+          "映射残留，会指向已停的观察点")
+
+    # ⑤ 异常分支确实调用了注入（源码级确认，防止有人删掉那行）
+    tools_src = (root / "server" / "mcp_server" / "tools.py").read_text(encoding="utf-8")
+    idx = tools_src.find("err_text = _inject_env")
+    check("异常分支调用了 _inject_env", idx > 0,
+          "有人把异常路径的注入删了")
+
+
+
+def test_r96_method_filter_scope():
+    """R96 指定 method 时只能 hook 那一个方法，不能整个类全挂。
+
+    (1) 第一次修改（2026-11-16）：
+        bug 原因：JS 模板里 methRe 声明在 `} else {`（按 pattern 枚举类）
+                  分支内部。用户传 class_name 时走 `if (CLASS_NAME)` 分支，
+                  **methRe 从未被赋值 → undefined**，于是筛选条件
+                  `if (methRe && !methRe.test(mn))` 恒为 false，
+                  该类的所有方法全被 hook，method 参数完全失效。
+
+                  实测：hook EncryptorUtil method="LIZ"，
+                  hooked_methods 却是 ["LIZ", "ttEncrypt"] 两个。
+                  更迷惑的是 sibling_probe 同时在给 ttEncrypt 挂计数，
+                  两个方法次数一模一样（都是 4 次），
+                  使用者误判成"java_hook 对 static 方法捕获有问题"。
+
+        解决方案：methRe 提到两条分支之外统一声明 + 赋值。
+
+    这条测试锁住：methRe 必须在 CLASS_NAME 分支**之前**就已赋值，
+    否则 class_name 路径下筛选失效（整个类被 hook，目标可能被拖死）。
+    """
+    import re as _re
+    import sys
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    sys.path.insert(0, str(root))
+    from server.dyn.java_bridge import _JS_JAVA_HOOK_MULTI
+
+    src = _JS_JAVA_HOOK_MULTI
+
+    # ① methRe 的赋值必须出现在 `if (CLASS_NAME)` 之前
+    i_assign = src.find("methRe = makeRe(METHOD")
+    i_class = src.find("if (CLASS_NAME)")
+    check("methRe 在 CLASS_NAME 分支之前赋值",
+          i_assign > 0 and i_class > 0 and i_assign < i_class,
+          "methRe 又在分支里赋值了，class_name 路径下会失效")
+
+    # ② 不能出现「在 else 分支内声明 methRe」的写法
+    check("methRe 不在 else 分支内单独声明",
+          not _re.search(r"}\s*else\s*\{[^}]{0,400}?var methRe", src, _re.S),
+          "又写回了 else 分支里")
+
+    # ③ 顶层必须有 var methRe 声明
+    check("methRe 有顶层声明", "var methRe" in src, "没有变量声明")
+
+    # ④ 真实渲染一次，确认占位符都被替换（漏接会 ReferenceError）
+    render = src.replace("__METHOD__", '"LIZ"')
+    left = _re.findall(r"__[A-Z_]+__", render)
+    check("METHOD 占位符已替换", "__METHOD__" not in left or "LIZ" in render,
+          "占位符没替换")
+
+    # ⑤ 行为验证：用 node 跑一小段，确认 ^LIZ$ 只匹配 LIZ
+    import shutil
+    import subprocess
+    if shutil.which("node"):
+        js = ("var re = new RegExp('^LIZ$', 'i');"
+              "var names = ['LIZ','ttEncrypt'];"
+              "var picked = names.filter(function(n){return re.test(n);});"
+              "process.stdout.write(JSON.stringify(picked));")
+        got = subprocess.run(["node", "-e", js], capture_output=True,
+                             text=True, timeout=10).stdout.strip()
+        check("^LIZ$ 只匹配 LIZ", got == '["LIZ"]', f"实际 {got}")
 
 
 def main() -> int:
@@ -2779,6 +4773,90 @@ def main() -> int:
     test_r62_vm_break_no_nameerror()
     print("== R63 vm_idx 不伪造 ==")
     test_r63_vm_idx_not_faked()
+
+    print("== R68 xref int 类型 ==")
+    test_r68_xref_int_type()
+
+    print("== R69 CSS 变量存在 ==")
+    test_r69_css_vars_exist()
+
+    print("== R70 API 端点已注册 ==")
+    test_r70_api_endpoints_registered()
+
+    print("== R71 段权限位 ==")
+    test_r71_section_flags_from_booleans()
+
+    print("== R72 无调试钩子 ==")
+    test_r72_no_debug_hooks_in_frontend()
+
+    print("== R73 线性扫描补充 ==")
+    test_r73_linear_scan_supplement()
+
+    print("== R74 构建进度分阶段 ==")
+    test_r74_build_progress_stages()
+
+    print("== R75 动态工具带环境信息 ==")
+    test_r75_env_injected_into_dyn_tools()
+
+    print("== R76 后端代码结构 ==")
+    test_r76_layout_all_backend_under_server()
+
+    print("== R77 字符串模块名不能是旧包名 ==")
+    test_r77_no_stale_string_module_imports()
+
+    print("== R78 PLT 桩精确地址 ==")
+    test_r78_plt_stub_exact_addr()
+
+    print("== R79 C++ 符号还原 ==")
+    test_r79_cpp_demangle()
+
+    print("== R96 method 筛选作用域 ==")
+    test_r96_method_filter_scope()
+
+    print("== R95 env 覆盖失败路径 ==")
+    test_r95_env_on_all_paths_including_errors()
+
+    print("== R94 视图不留白 ==")
+    test_r94_no_view_renders_blank()
+
+    print("== R92 所有工具带运行环境 ==")
+    test_r92_every_tool_reports_runtime_env()
+
+    print("== R91 java_hook 方法数上限 ==")
+    test_r91_java_hook_method_cap()
+
+    print("== R90 so 名字别名统一解析 ==")
+    test_r90_so_name_alias_unified()
+
+    print("== R83 Android 界面操作 ==")
+    test_r83_android_ui_operations()
+
+    print("== R84 热方法自动降级 ==")
+    test_r84_hot_method_auto_degrade()
+
+    print("== R85 JS 模板占位符全接线 ==")
+    test_r85_js_template_placeholders()
+
+    print("== R86 UI 解析与选目标行为 ==")
+    test_r86_ui_parse_and_targeting()
+
+    print("== R87 候选探查（不知道该 hook 谁）==")
+    test_r87_hook_hint_candidates()
+
+    print("== R88 轻量调用计数 ==")
+    test_r88_count_calls_lightweight()
+
+    print("== R89 0 命中诊断的可执行下一步 ==")
+    test_r89_diagnosis_next_actions()
+
+    print("== R80 已存在的断点改 hold 要重下发 ==")
+    test_r80_hold_policy_redispatch()
+
+    print("== R81 IDC 建函数后函数索引同步 ==")
+    test_r81_idc_function_ranges()
+
+    print("== R82 短串与 UTF-8 字符串提取 ==")
+    test_r82_short_and_utf8_strings()
 
     print(f"\n结果: {PASS} 通过 / {FAIL} 失败")
     return 0 if FAIL == 0 else 1

@@ -16,13 +16,13 @@ def _cmd_mcp(_args: list[str]) -> int:
     优先代理到运行中的 GUI（AI 操作可视化 + 共享同一分析会话）；
     GUI 未运行时降级为内置 stdio 服务（离线可用，界面不同步）。
     """
-    from mcp_server.proxy import run
+    from server.mcp_server.proxy import run
 
     return run()
 
 
 def _cmd_analyze(args: list[str]) -> int:
-    from core.session import Session
+    from server.core.session import Session
 
     s = Session()
     for p in args:
@@ -40,7 +40,7 @@ def _cmd_chain(args: list[str]) -> int:
         print("用法: mda chain <so路径...> <函数名或0x地址>")
         return 2
     addr = int(args[-1], 0)
-    from core.session import Session
+    from server.core.session import Session
 
     s = Session()
     for p in args[:-1]:

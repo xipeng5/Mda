@@ -29,7 +29,7 @@ VARIANT = os.environ.get("MDA_PROTO", "current").strip() or "current"
 
 def patch_services() -> None:
     """把会自动起端口/调 adb 的部分替换成空实现，保证渲染无副作用。"""
-    from mcp_server import service as svc
+    from server.mcp_server import service as svc
 
     svc.McpService.start_http = lambda self: None
     svc.McpService.status = lambda self: "（评审渲染，MCP 未启动）"

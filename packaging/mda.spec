@@ -19,12 +19,18 @@ ROOT = os.path.dirname(SPECPATH)          # 仓库根目录（spec 在 packaging
 
 # 版本号唯一来源（version.py），避免 spec 与代码各写一份
 _ver_ns = {}
-with open(os.path.join(ROOT, "version.py"), encoding="utf-8") as _f:
+with open(os.path.join(ROOT, "server", "version.py"), encoding="utf-8") as _f:
     exec(_f.read(), _ver_ns)
 VERSION = _ver_ns["__version__"]
 
 def _scan_pkg_modules(root: str, pkg: str) -> list:
     """扫描某个包目录下的**全部** .py，返回 "pkg.mod" 形式的模块名列表。
+
+    (4) 第四次修改（2026-11-13）：支持带斜线的相对路径（如 "server/dyn"）。
+        原因：所有 Python 包整体移入 server/ 后，模块名变成 server.dyn.xxx，
+        而这个助手原来只拼 "dyn.xxx"。现在把路径按 / 拆成点号，
+        两种写法都能用。
+    
 
     (3) 第三次修改（2026-11-06）：新增。
 
@@ -38,17 +44,19 @@ def _scan_pkg_modules(root: str, pkg: str) -> list:
     """
     import os as _os
 
-    pkg_dir = _os.path.join(root, pkg)
+    parts = [x for x in str(pkg).replace("\\", "/").split("/") if x]
+    pkg_dir = _os.path.join(root, *parts)
     out = []
     if not _os.path.isdir(pkg_dir):
         return out
+    prefix = ".".join(parts)
     for name in sorted(_os.listdir(pkg_dir)):
         if not name.endswith(".py"):
             continue
         stem = name[:-3]
         if stem in ("__init__", "__main__"):
             continue
-        out.append(f"{pkg}.{stem}")
+        out.append(f"{prefix}.{stem}")
     return out
 
 
@@ -72,9 +80,10 @@ datas = [
     #              perf_watch 直接报 HELPER_NOT_BUILT —— 而源码环境完全正常。
     #              这与之前 frida_tools/bridges/*.js 漏收是同一类问题。
     #     解决方案：显式把整个目录作为 datas 收进去（保留相对路径 dyn/device）。
-    (os.path.join(ROOT, "dyn", "device"), os.path.join("dyn", "device")),
+    (os.path.join(ROOT, "server", "dyn", "device"),
+     os.path.join("server", "dyn", "device")),
     (os.path.join(ROOT, "assets"), "assets"),
-    (os.path.join(ROOT, "plugins"), "plugins"),
+    (os.path.join(ROOT, "server", "plugins"), os.path.join("server", "plugins")),
     (os.path.join(ROOT, "web", "dist"), os.path.join("web", "dist")),   # 前端产物
 ]
 
@@ -83,7 +92,7 @@ hiddenimports = (
     # mcp.cli 是官方命令行入口，依赖 typer 且 import 期会 sys.exit
     + collect_submodules("mcp", filter=lambda n: not n.startswith("mcp.cli"))
     + collect_submodules("webview")      # pywebview 按平台动态选后端
-    + collect_submodules("dyn")          # 动态分析按需 import，静态扫不到
+    + collect_submodules("server.dyn")   # 动态分析按需 import，静态扫不到
     # (2) 第二次修改（2026-11-05）：
     #     bug 原因：collect_submodules("dyn") 在 PyInstaller 6.22.3 下
     #              虽然返回 11 个子模块，但 dyn.tracer / dyn.bridge / dyn.memread
@@ -100,7 +109,7 @@ hiddenimports = (
     #              现在这三个），说明"靠人记"的做法本身不可靠。
     #     解决方案：直接扫 dyn/ 目录下的所有 .py，自动生成模块列表。
     #              以后新增文件**不用改 spec**。
-    + _scan_pkg_modules(ROOT, "dyn")
+    + _scan_pkg_modules(ROOT, "server/dyn")
     # (4) 第四次修改（2026-11-06）：把 frida_tools 打进去。
     #     bug 原因：Java bridge 的源码由 `frida_tools/bridges/java.js` 提供
     #              （frida 17 起 bridge 不再内置在 server 里）。frida_tools
@@ -115,7 +124,10 @@ hiddenimports = (
     #               运行期动态导入的，PyInstaller 静态分析扫不到，打包后
     #               该导入失败 →「AI 调用转发到 GUI」的修复在发布版里失效。
     #     解决方案：collect_submodules("mcp_server") 把所有子模块都打进去。
-    + collect_submodules("mcp_server")
+    + collect_submodules("server.mcp_server")
+    + _scan_pkg_modules(ROOT, "server/core")
+    + _scan_pkg_modules(ROOT, "server/mcp_server")
+    + _scan_pkg_modules(ROOT, "server/scripting")
     + ["anyio._backends._asyncio"]
 )
 

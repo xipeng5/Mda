@@ -214,7 +214,7 @@ def main() -> int:
         return 2
 
     # 1) 打桩 MCP 服务：只跳过 HTTP 监听，业务与数据全部走真实代码
-    from mcp_server.service import McpService
+    from server.mcp_server.service import McpService
 
     def _stub_start_http(self, *_args, **_kwargs):  # noqa: ANN001
         return False

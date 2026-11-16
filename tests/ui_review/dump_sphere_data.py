@@ -18,8 +18,8 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from core.disasm import Disassembler  # noqa: E402
-from core.session import Session  # noqa: E402
+from server.core.disasm import Disassembler  # noqa: E402
+from server.core.session import Session  # noqa: E402
 
 SO_PATHS = ["so_test/libanti_complete_patched.so", "samples/libbase.so"]
 OUT_PATH = "docs/ui-review/proto/data.js"

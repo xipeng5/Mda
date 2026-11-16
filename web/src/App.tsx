@@ -1,12 +1,23 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { hex, type ModuleData, type Func } from "./lib/data";
 import { api, hasNativeDialog, pickSoFile } from "./lib/api";
-import type { ApiInsn } from "./lib/api";
+import type { ApiInsn, ApiNavStats } from "./lib/api";
 import { SphereCanvas } from "./components/SphereCanvas";
 import { LeftPanel } from "./components/LeftPanel";
-import { RightPanel } from "./components/RightPanel";
+import { LeftNav } from "./components/LeftNav";
+import { HeatBar } from "./components/HeatBar";
+import { FlatTable } from "./components/FlatTable";
+import { Inspector } from "./components/Inspector";
+import { DynStateView } from "./components/DynStateView";
+import type { DynKind } from "./components/DynStateView";
+import { NeedSoView } from "./components/DynStateView";
 import { RealtimeMonitor, type AiEvent } from "./components/RealtimeMonitor";
-import { Hud, type HudData } from "./components/Hud";
+import { ToolsView } from "./components/ToolsView";
+import { ProcessesView } from "./components/ProcessesView";
+import { XrefView } from "./components/XrefView";
+import { GraphView } from "./components/GraphView";
+import { TimelineView } from "./components/TimelineView";
+import { ArmedBar } from "./components/ArmedBar";
 import { CodeOverlay } from "./components/CodeOverlay";
 import type { Relations, Theme } from "./lib/sphere";
 
@@ -23,20 +34,39 @@ export default function App() {
   const [watch, setWatch] = useState<WatchItem[]>([]);
   // 实时监控台：每次 MCP 工具调用都进这条流（服务端 @logged 广播）
   const [aiEvents, setAiEvents] = useState<AiEvent[]>([]);
+  // 节流 tick：AI 事件再多，依赖它的刷新最多 900ms 一次。
+  // 直接用 aiEvents.length 做依赖会变成"每条事件一次请求"，几百条就把
+  // 浏览器的并发配额打爆（实测 ERR_INSUFFICIENT_RESOURCES）。
+  const [aiTick, setAiTick] = useState(0);
+  const tickTimer = useRef<number | null>(null);
+  // 顶部标签上的计数要真实：引用数来自 nav_stats，工具数来自注册表
+  const [navSt, setNavSt] = useState<ApiNavStats | null>(null);
+  const [toolN, setToolN] = useState<number | null>(null);
   const [aiPaused, setAiPaused] = useState(false);
-  const [mainView, setMainView] = useState<"monitor" | "module">("monitor");
+  // 每个工具被调用过几次（事件流与工具页共用）
+  const [toolCounts, setToolCounts] = useState<Record<string, number>>({});
+  // 视图集合：monitor / module / tools / processes / xref / graph / timeline
+  //         / strings / sections / dyn:*（断点/命中/内存/派发点/寄存器/轨迹/行为）
+  // 用 string 而不是字面量联合：左栏入口会持续增加，字面量类型每加一个都要改这里，
+  // 改了还会忘记同步渲染分支（R83 那种"渲染条件是 mod，没 so 就白屏"的坑）。
+  const [mainView, setMainView] = useState<string>("monitor");
   // (1) 第一次修改：主题默认跟随系统外观（macOS 深色/浅色），不再硬编码 dark。
   //     手动点过切换按钮后锁定用户选择，系统再变也不覆盖。
-  const [theme, setTheme] = useState<Theme>(() =>
-    window.matchMedia?.("(prefers-color-scheme: light)").matches ? "light" : "dark"
-  );
+  // 默认浅色，与设计稿一致（原型 --bg:#fbfbfc）；用户可手动切深色
+  const [theme, setTheme] = useState<Theme>("light");
   const themeLocked = useRef(false);
-  const [hud, setHud] = useState<HudData | null>(null);
   const [code, setCode] = useState<{ open: boolean; rows: ApiInsn[]; live: boolean }>({ open: false, rows: [], live: false });
+  // 代码页内联展开：addr → 反汇编行（按需拉取后缓存）
+  const [expanded, setExpanded] = useState<Record<number, ApiInsn[]>>({});
+  // 代码页列表：以当前选中函数为中心的 60 行窗口。
+  // 只渲染前 60 个的话，AI 操作靠后的函数时列表里没有它，定位就落空了。
+  const codeListRef = useRef<HTMLDivElement | null>(null);
   const [relations, setRelations] = useState<Relations | null>(null);
   const [bps] = useState<Record<string, Set<number>>>({});
   const [progress, setProgress] = useState<{ percent: number } | null>(null);
   const [apiOk, setApiOk] = useState<boolean | null>(null);
+  // 版本号来自 /api/health（唯一来源是 version.py），不在前端硬编码
+  const [ver, setVer] = useState("");
   const [rotateIdx, setRotateIdx] = useState<number | null>(null);
   const [jumpText, setJumpText] = useState("");
   const [busySo, setBusySo] = useState<string | null>(null);
@@ -47,6 +77,12 @@ export default function App() {
   const [dragging, setDragging] = useState(false);
   const flashSeq = useRef(0);
   const backendMods = useRef<Set<string>>(new Set());
+  const wsRef = useRef<WebSocket | null>(null);
+  // 最新 state 的镜像：ws 回调里的闭包拿不到最新值，必须走 ref
+  const modulesRef = useRef<ModuleData[]>([]);
+  const modRef = useRef<ModuleData | undefined>(undefined);
+  // 服务端有、界面还没有的 so（来自 nav_stats 这条可靠路径）
+  const [pendingSo, setPendingSo] = useState("");
   const booted = useRef(false);
 
   const mod = modules[active];
@@ -57,16 +93,95 @@ export default function App() {
     setLogs((prev) => [...prev.slice(-300), { time: now(), text, kind }]);
   }, []);
 
+  /** 展开/收起某个函数的反汇编（内联在代码页里，和原型一致） */
+  const toggleFn = useCallback(
+    async (soName: string, addr: number) => {
+      setExpanded((prev) => {
+        if (prev[addr]) {
+          const next = { ...prev };
+          delete next[addr];
+          return next;
+        }
+        return prev;
+      });
+      if (expanded[addr]) return;               // 刚才是展开态，这次是收起
+      const d = await api.disasm(soName, addr);
+      if (d?.items?.length) {
+        setExpanded((prev) => ({ ...prev, [addr]: d.items }));
+      }
+    },
+    [expanded]
+  );
+
+  /** 跳到指定 so 的指定函数（引用页/图谱点击进出）
+   *  先切回模块视图，否则用户点了没反应会以为坏了 */
+  const jumpToAddr = useCallback(
+    (soName: string, a: number) => {
+      const mi = modules.findIndex((m) => m.so === soName);
+      if (mi < 0) {
+        log(`跳转失败：没有模块 ${soName}`);
+        return;
+      }
+      const i = modules[mi].funcs.findIndex((x) => x.a === a);
+      if (i < 0) {
+        log(`跳转失败：${soName} 里没有 0x${a.toString(16)}`);
+        return;
+      }
+      setActive(mi);
+      setSel((prev) => prev.map((v, k) => (k === mi ? i : v)));
+      setMainView("module");
+    },
+    [modules, log]
+  );
+
+  /* 代码页可见的那 60 个函数：以当前选中为中心 */
+  const codeWindow = (() => {
+    if (!mod) return [];
+    const n = mod.funcs.length;
+    const cur = Math.min(Math.max(sel[active] ?? 0, 0), Math.max(0, n - 1));
+    const win = Math.min(60, n);
+    const start = Math.max(0, Math.min(cur - Math.floor(win / 2), n - win));
+    return mod.funcs.slice(start, start + win);
+  })();
+
+  /* AI 打到某个函数时：那一行蓝色闪一下，并滚到可见处。
+     原来是 flash → SphereCanvas（已不再渲染），等于这个反馈丢了。 */
+  useEffect(() => {
+    if (!flash) return;
+    const box = codeListRef.current;
+    if (!box) return;
+    const row = box.querySelector<HTMLElement>(`.fnrow[data-i="${flash.i}"]`);
+    if (!row) return;
+    row.classList.remove("flash");
+    void row.offsetWidth;              // 强制回流，让动画能重播
+    row.classList.add("flash");
+    const br = box.getBoundingClientRect();
+    const rr = row.getBoundingClientRect();
+    if (rr.top < br.top || rr.bottom > br.bottom) {
+      box.scrollTop += (rr.top + rr.bottom) / 2 - (br.top + br.bottom) / 2;
+    }
+    const t = window.setTimeout(() => row.classList.remove("flash"), 1300);
+    return () => window.clearTimeout(t);
+  }, [flash?.seq]);
+
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
   }, [theme]);
 
-  // 跟随系统外观变化（用户未手动切换时）
+  // 把最新的 modules / 当前模块镜像到 ref，供 WebSocket 回调读取
+  useEffect(() => {
+    modulesRef.current = modules;
+    modRef.current = mod;
+  }, [modules, mod]);
+
+  // 跟随系统外观变化 —— **仅在用户手动切过主题之后**才生效。
+  // 启动时不跟随：设计稿是浅色基准，且 WKWebView 启动会派发一次媒体查询事件，
+  // 若不设门槛，窗口会在这时被改回深色（浏览器里没有这个行为，实测踩到）。
   useEffect(() => {
     const mq = window.matchMedia?.("(prefers-color-scheme: light)");
     if (!mq) return;
     const onChange = (e: MediaQueryListEvent) => {
-      if (!themeLocked.current) setTheme(e.matches ? "light" : "dark");
+      if (themeLocked.current) setTheme(e.matches ? "light" : "dark");
     };
     mq.addEventListener?.("change", onChange);
     return () => mq.removeEventListener?.("change", onChange);
@@ -78,7 +193,11 @@ export default function App() {
 
   /** 后端已解析完成 → 拉函数表、建模块、选中第一个导出函数 */
   const appendModule = useCallback(async (so: string, path: string) => {
+    const mark = (m: string) => {
+    };
+    mark(`enter:${so}`);
     const fn = await api.functions(so, "", 200000);
+    mark(`funcs:${so}:${fn?.items?.length ?? "null"}`);
     if (!fn) throw new Error("后端没有返回函数表");
     const funcs: Func[] = fn.items.map((it) => ({
       n: it.name, a: it.addr, s: it.size, e: it.is_export ? 1 : 0, r: it.refs ?? 0,
@@ -184,6 +303,43 @@ export default function App() {
   }, [buildModule]);
 
   // 启动：后端若已有会话就重建模块；没有就停在空状态（不再有任何内置示例数据）
+  /** 启动时从服务端拉模块列表并补齐。
+   *  用 nav_stats 而不是 /api/modules：后者在 WKWebView 里会被缓存成旧空数组。 */
+  const bootstrapModules = useCallback(async () => {
+    // 优先用服务端**内联**进 HTML 的初始模块（最可靠：
+    // WKWebView 里 /api/modules 的响应恒为空，实测没找到根治办法）
+    const boot = (window as unknown as {
+      __MDA_BOOT__?: { modules?: { so: string; path: string }[] };
+    }).__MDA_BOOT__;
+    for (const m of boot?.modules ?? []) {
+      if (backendMods.current.has(m.so)) continue;
+      try {
+        await appendModule(m.so, m.path);
+      } catch {
+        /* 坏文件交给日志 */
+      }
+    }
+    if (boot?.modules?.length) return;
+
+    // 定时问一次"服务端有哪些模块"：nav_stats 不带 so 时返回 serverModules。
+    // 这是在 /api/modules 不可用时唯一能拿到列表的通道。
+    try {
+      const r = await api.navStats("");
+      const live = new Set((r?.serverModules ?? []).map((m) => m.so));
+      void live;
+      for (const m of r?.serverModules ?? []) {
+        if (backendMods.current.has(m.so)) continue;
+        try {
+          await appendModule(m.so, m.path);
+        } catch {
+          /* 坏文件交给日志 */
+        }
+      }
+    } catch {
+      /* 启动探测失败不影响其它功能 */
+    }
+  }, [appendModule]);
+
   useEffect(() => {
     if (booted.current) return;
     booted.current = true;
@@ -191,11 +347,13 @@ export default function App() {
       const h = await api.health();
       const ok = !!h?.ok;
       setApiOk(ok);
+      if (h?.version) setVer(h.version);
       if (!ok) {
         setLogs([{ time: now(), text: "后端未连接：请用 python app.py 启动（不要直接开 HTML）" }]);
         return;
       }
       setLogs([{ time: now(), text: `MDA Web 启动 · 后端已连接（${location.host}）` }]);
+      await bootstrapModules();
       for (const so of h.modules ?? []) {
         setLoading({ name: so });
         try {
@@ -210,25 +368,251 @@ export default function App() {
   }, []);
 
   // 真实 AI 事件（MCP 调用 → 日志/观察/脉冲）
-  useEffect(() => {
-    let ws: WebSocket | null = null;
+  /** 把界面模块列表和服务端对齐（新增 + 删除）。
+   *  抽成独立函数是因为 hello / modules_changed 两条路径都要用；
+   *  用 useCallback 保持稳定引用，避免 ws 因它重建。 */
+  const syncSeq = useRef(0);
+
+  const doSync = useCallback(async (mySeq: number) => {
+    // 直接问 nav_stats（不带 so）：后端会返回 serverModules。
+    // 不再先用 /api/modules 判断"要不要查"——那一步在 WKWebView 里恒空，
+    // 会让整条链在第一环就断掉（实测：anySo="" 导致 navStats 根本不调用）。
+    const nav = await api.navStats("");
+    const serverMods = nav?.serverModules ?? [];
+    setNavSt(nav ?? null);
+    const mods = { modules: serverMods };
+    const alive = new Set((mods?.modules ?? []).map((m) => m.so));
+
+    // ① 先把服务端有、本地没有的模块数据全部取好（异步阶段）
+    // 注意：mods 来自 nav_stats（更可靠），不是 /api/modules
+    const needLoad = (mods?.modules ?? []).filter((m) => !backendMods.current.has(m.so));
+    const loaded: ModuleData[] = [];
+    for (const m of needLoad) {
+      try {
+        const fn = await api.functions(m.so, "", 200000);
+        if (!fn?.items?.length) continue;
+        const fns: Func[] = fn.items.map((it) => ({
+          n: it.name, a: it.addr, s: it.size, e: it.is_export ? 1 : 0, r: it.refs ?? 0,
+        }));
+        loaded.push({
+          so: m.so, path: m.path, size: 0, sections: [], funcs: fns,
+          disasm: {}, callers: {}, callees: {},
+        });
+        backendMods.current.add(m.so);
+      } catch {
+      }
+    }
+
+    // ② 只有最新一次同步能落地（旧请求的结果丢弃，防覆盖）
+    if (mySeq !== syncSeq.current) return;
+    // 注意：**不在这里删模块**。alive 来自 /api/modules，而它在 WKWebView
+    // 里恒返回空——拿它做过滤会把刚加进去的模块又删掉（实测就是这个原因
+    // 导致 backendMods 有值而 modules 恒空）。
+    // 删除统一由 unload / clear_modules 的 modules_changed 处理。
+    if (loaded.length) {
+      setModules((prev) => {
+        const merged = [...prev];
+        for (const d of loaded) {
+          if (!merged.some((x) => x.so === d.so)) merged.push(d);
+        }
+        return merged;
+      });
+      for (const d of loaded) log(`已打开 ${d.so} · ${d.funcs.length} 函数`, "ai");
+    }
+    if (loaded.length) {
+      setActive(0);
+      setSel((prev) => {
+        const next = prev.slice();
+        next[0] = 0;
+        return next;
+      });
+    }
+  }, [appendModule, log]);
+
+  /** 串行包装：并发调用会互相覆盖 setModules，必须互斥 */
+  /** nav_stats 带回来的服务端模块列表 → 补齐本地。
+   *  这是 /api/modules 被 WKWebView 缓存时的可靠替代路径。 */
+  const handleServerModules = useCallback(
+    (mods: { so: string; path: string }[]) => {
+      for (const m of mods) {
+        if (backendMods.current.has(m.so)) continue;
+        setPendingSo(m.so);
+        void (async () => {
+          try {
+            await appendModule(m.so, m.path);
+          } catch {
+            /* 坏文件交给日志 */
+          }
+        })();
+      }
+    },
+    [appendModule]
+  );
+
+  const syncModules = useCallback(async () => {
+    // 不用锁：用请求号保证只有最新一次的结果落地。
+    // 锁在这里反复卡死（ref + useCallback 重建的组合不可靠），
+    // 而"旧结果不落地"这个需求用序号就能满足，且不可能卡死。
+    syncSeq.current += 1;
+    const mySeq = syncSeq.current;
     try {
-      const proto = location.protocol === "https:" ? "wss" : "ws";
-      ws = new WebSocket(`${proto}://${location.host}/api/events`);
-    } catch { return; }
+      await doSync(mySeq);
+    } catch (e) {
+      log(`同步模块失败：${String(e).slice(0, 80)}`, "ai");
+    }
+  }, [doSync, log]);
+
+  /** WebSocket 心跳：每 3 秒要一次模块快照。
+   *  独立于连接生命周期——连接重建不该让同步停摆（实测 sent 会卡住）。 */
+  useEffect(() => {
+    const ask = () => {
+      const ws = wsRef.current;
+      try {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: "sync" }));
+        }
+      } catch {
+        /* 断线下一轮再试 */
+      }
+    };
+    ask();
+    const id = setInterval(ask, 3000);
+    return () => {
+      clearInterval(id);
+    };
+  }, []);
+
+  // 顶栏计数：按当前模块查，事件到来时刷新（左栏与顶栏必须同源）
+  useEffect(() => {
+    void (async () => {
+      const r = await api.navStats(mod?.so ?? "");
+      if (r) setNavSt(r);
+    })();
+  }, [mod?.so, aiTick]);
+
+  // 工具注册表大小（顶栏「工具 N」用）。只取一次，注册表不会在运行中变。
+  useEffect(() => {
+    void (async () => {
+      const r = await api.tools();
+      if (r?.tools) setToolN(r.tools.length);
+    })();
+  }, []);
+
+  /** 轮询服务端模块列表（3 秒）。
+   *  为什么必须轮询：模块通常是页面加载**之后**才加进来的，
+   *  启动时那一次探测拿不到；而 /api/modules 在 WKWebView 里不可靠。
+   *  nav_stats（不带 so）会返回 serverModules，这是验证可用的通道。 */
+  useEffect(() => {
+    let stop = false;
+    const tick = async () => {
+      if (stop) return;
+      try {
+        const r = await api.navStats("");
+        for (const m of r?.serverModules ?? []) {
+          if (backendMods.current.has(m.so)) continue;
+          try {
+            await appendModule(m.so, m.path);
+          } catch (e) {
+          }
+        }
+      } catch (e) {
+      }
+    };
+    void tick();
+    const id = setInterval(tick, 3000);
+    return () => {
+      stop = true;
+      clearInterval(id);
+    };
+  }, [appendModule]);
+
+
+
+  // 事件流连接状态（与 HTTP「后端已连接」是两回事）
+  const [wsAlive, setWsAlive] = useState(false);
+  const retryDelay = useRef(1000);
+  const closed = useRef(false);
+
+  useEffect(() => {
+    closed.current = false;
+    let ws: WebSocket | null = null;
+
+    // 注意：必须读 modulesRef，不能读 modules —— 这个 effect 只在挂载时跑一次，
+    // 闭包里的 modules 永远是空数组（AI 定位因此一直失效，实测 hit 恒为 null）。
     const findName = (so: string, addr: number): string => {
-      const m = modules.find((x) => x.so === so);
+      const m = modulesRef.current.find((x) => x.so === so);
       return m?.funcs.find((x) => x.a === addr)?.n ?? hex(addr);
     };
     const toIdx = (so: string, addr: number): { mi: number; i: number } | null => {
-      const mi = modules.findIndex((m) => m.so === so);
+      const cur = modulesRef.current;
+      const mi = cur.findIndex((m) => m.so === so);
       if (mi < 0) return null;
-      const i = modules[mi].funcs.findIndex((x) => x.a === addr);
+      const i = cur[mi].funcs.findIndex((x) => x.a === addr);
       return i < 0 ? null : { mi, i };
     };
-    ws.onmessage = (ev) => {
+
+    /** 给一条连接挂上全部 handler（新建/重连共用同一套） */
+    const wire = (sock: WebSocket) => {
+    sock.onopen = () => {
+      wsRef.current = sock;
+      setWsAlive(true);
+      retryDelay.current = 1000;
+    };
+    sock.onclose = () => {
+      setWsAlive(false);
+      wsRef.current = null;
+      if (closed.current) return;
+      const delay = retryDelay.current;
+      retryDelay.current = Math.min(delay * 2, 10_000);
+      window.setTimeout(() => { if (!closed.current) connect(); }, delay);
+    };
+    sock.onerror = () => { setWsAlive(false); };
+
+    sock.onmessage = (ev) => {
       let msg: { type?: string; tool?: string; args?: Record<string, unknown>; summary?: string; ms?: number; ts?: string; event?: Record<string, unknown> };
       try { msg = JSON.parse(ev.data); } catch { return; }
+      // hello：刚连上时服务端把已有模块报一次，必须对齐（之前完全没处理）
+      if (msg.type === "hello") {
+        void syncModules();
+        return;
+      }
+      // WebSocket 推来的模块快照：这是 WKWebView 里唯一可靠的通道
+      // （/api GET 会被复用成旧响应，实测请求到达后端但 body 是旧的）
+      if (msg.type === "modules_snapshot") {
+        type FnRow = {
+          name: string; addr: number; size: number; is_export: boolean; refs: number;
+        };
+        const details = (msg as {
+          details?: { so: string; path: string; functions?: FnRow[] }[];
+        }).details ?? [];
+        for (const m of details) {
+          if (backendMods.current.has(m.so)) continue;
+          const rows = m.functions ?? [];
+          if (!rows.length) continue;
+          // 直接用快照里的函数表建模块 —— 不走 /api/functions。
+          // 那条 HTTP GET 在 WKWebView 里会被复用成旧/空响应（实测）。
+          const funcs: Func[] = rows.map((it) => ({
+            n: it.name, a: it.addr, s: it.size,
+            e: it.is_export ? 1 : 0, r: it.refs ?? 0,
+          }));
+          const data: ModuleData = {
+            so: m.so, path: m.path, size: 0, sections: [],
+            funcs, disasm: {}, callers: {}, callees: {},
+          };
+          backendMods.current.add(m.so);
+          setModules((prev) =>
+            prev.some((x) => x.so === m.so) ? prev : [...prev, data]
+          );
+          setActive(0);
+          setSel((prev) => {
+            const next = prev.slice();
+            next[0] = funcs.findIndex((x) => x.e) >= 0 ? funcs.findIndex((x) => x.e) : 0;
+            return next;
+          });
+          log(`已打开 ${m.so} · ${funcs.length} 函数（WebSocket 快照）`, "ai");
+        }
+        return;
+      }
       // (3) 第三次修改（2026-11-11）：
       //     bug 原因：服务端在卸载/清空后会广播 modules_changed，
       //               但前端只处理 ai / ui 两类消息——于是 AI 通过 MCP 调
@@ -236,33 +620,54 @@ export default function App() {
       //               点一下就是 404，与「AI 与界面同会话」的目标相悖。
       //     解决方案：收到 modules_changed 就按服务端给的模块列表对齐本地状态。
       if (msg.type === "modules_changed") {
-        const alive = new Set(
-          ((msg as { modules?: string[] }).modules ?? []));
-        setModules((prev) => {
-          const kept = prev.filter((m) => alive.has(m.so));
-          if (kept.length !== prev.length) {
-            backendMods.current = new Set(kept.map((m) => m.so));
-            log(`模块已释放，界面同步（剩余 ${kept.length} 个）`, "ai");
-          }
-          return kept.length === prev.length ? prev : kept;
-        });
+        void syncModules();
         return;
       }
       if (msg.type === "ai" && msg.tool === "load_so") {
         // (2) 第一次修改：AI 通过 MCP 加载 so 后，界面自动出现该模块。
         //     原因：之前只有 AI 自己看得见，人要在窗口里手动再开一次。
         void (async () => {
-          const mods = await api.modules();
+          try {
+          // 直接问 nav_stats（不带 so）：后端会返回 serverModules。
+    // 不再先用 /api/modules 判断"要不要查"——那一步在 WKWebView 里恒空，
+    // 会让整条链在第一环就断掉（实测：anySo="" 导致 navStats 根本不调用）。
+    const nav = await api.navStats("");
+    const serverMods = nav?.serverModules ?? [];
+    setNavSt(nav ?? null);
+    const mods = { modules: serverMods };
           for (const m of mods?.modules ?? []) {
-            if (modules.some((x) => x.so === m.so)) continue;
+            // backendMods 是 ref，比 state 可靠（state 在闭包里会过期）
+            if (backendMods.current.has(m.so)) continue;
             setLoading({ name: m.so });
             try { await appendModule(m.so, m.path); } catch { /* 坏文件交给日志 */ }
           }
-          setLoading(null);
+          } finally {
+            // 无论成功失败都必须收遮罩，否则整屏被盖住
+            setLoading(null);
+          }
         })();
       }
+      if (msg.type === "armed_changed") {
+        // 待命状态是持久状态，单独走一条通道给 ArmedBar
+        const list = (msg as { items?: unknown }).items;
+        window.dispatchEvent(
+          new CustomEvent("mda:armed", { detail: Array.isArray(list) ? list : [] })
+        );
+      }
       if (msg.type === "ai") {
+        // 节流：900ms 内只让 tick 前进一次
+        if (tickTimer.current == null) {
+          tickTimer.current = window.setTimeout(() => {
+            tickTimer.current = null;
+            setAiTick((v) => v + 1);
+          }, 900);
+        }
         // 每次工具调用都进实时流。暂停时不再追加（但也不丢已有数据）。
+        setToolCounts((prev) => {
+          const k = msg.tool ?? "";
+          if (!k) return prev;
+          return { ...prev, [k]: (prev[k] ?? 0) + 1 };
+        });
         setAiEvents((prev) => {
           if (aiPaused) return prev;
           const next = [
@@ -285,7 +690,6 @@ export default function App() {
             flashSeq.current += 1;
             setFlash({ i: hit.i, seq: flashSeq.current });
           }
-          setHud({ kind: "ai", so, fn: findName(so, addr), addr: hex(addr), detail: msg.tool ?? "" });
         }
         setBusySo(so || null);
         setTimeout(() => setBusySo((v) => (v === so ? null : v)), 1600);
@@ -299,9 +703,28 @@ export default function App() {
         }
       }
     };
-    return () => ws?.close();
+    };  // ← wire() 结束
+
+    /** 建一条新连接；断线后由 onclose 再次调用（指数退避） */
+    const connect = () => {
+      try {
+        const proto = location.protocol === "https:" ? "wss" : "ws";
+        ws = new WebSocket(`${proto}://${location.host}/api/events`);
+      } catch {
+        return;
+      }
+      wire(ws);
+    };
+    connect();
+
+    return () => {
+      closed.current = true;      // 告诉 onclose 别再重连
+      wsRef.current = null;
+      ws?.close();
+    };
+    // 只依赖 appendModule：modules 变化不应重建连接（否则消息会丢）
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [modules, appendModule]);
+  }, [appendModule, syncModules]);
 
   // 选中变化：取真实 xrefs + 反汇编
   useEffect(() => {
@@ -329,7 +752,7 @@ export default function App() {
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") { setCode((c) => ({ ...c, open: false })); setHud(null); return; }
+      if (e.key === "Escape") { setCode((c) => ({ ...c, open: false })); return; }
       if (e.key === "Enter" && !(e.target instanceof HTMLInputElement)) void openCode();
     };
     window.addEventListener("keydown", onKey);
@@ -432,25 +855,42 @@ export default function App() {
       }}
     >
       <header className="topbar">
-        <div className="brand"><span className="mark" />MDA<small>0.3.9 · web</small></div>
+        <div className="brand">
+          <span className="mark" />MDA
+          <small>{ver ? `${ver} · web` : "web"}</small>
+        </div>
         <div className="divider" />
         <div className="so-tabs">
           {modules.map((m, i) => (
-            <button
+            <span
               key={m.so}
               className={"so-tab" + (i === active ? " on" : "") + (busySo === m.so ? " busy" : "")}
-              onClick={() => setActive(i)}
             >
-              {m.so}<span className="n">{m.funcs.length}</span>
-            </button>
+              <button className="so-tab-main" onClick={() => setActive(i)}>
+                {m.so}<span className="n">{m.funcs.length}</span>
+              </button>
+              <button
+                className="so-tab-x"
+                title={`释放 ${m.so}（只清界面与解析结果，不影响设备）`}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  void unloadModule(m.so);
+                }}
+              >
+                ✕
+              </button>
+            </span>
           ))}
+          <button className="so-add" onClick={openSo} title="打开 so">+</button>
         </div>
         <div className="divider" />
         <button className="btn primary" onClick={openSo}>打开 so</button>
         <div className="grow" />
         <input
           className="jump"
-          placeholder="跳转到地址或函数名…"
+          disabled={empty}
+          title={empty ? "先打开一个 so 才能跳转" : ""}
+          placeholder={empty ? "打开 so 后可跳转地址 / 函数名" : "跳转到地址或函数名…"}
           value={jumpText}
           onChange={(e) => setJumpText(e.target.value)}
           onKeyDown={(e) => {
@@ -460,10 +900,18 @@ export default function App() {
             const i = mod.funcs.findIndex((fn) => fn.n.toLowerCase().includes(v) || hex(fn.a) === v);
             if (i < 0) { log(`未找到「${jumpText}」`); return; }
             selectFn(active, i);
+            setMainView("module");   // 跳转 = 过去看它，不能只改选中
             log(`跳转到 ${mod.funcs[i].n} @ ${hex(mod.funcs[i].a)}`);
           }}
         />
-        <button className="btn" onClick={buildXrefs} disabled={empty}>建立引用图</button>
+        <button
+          className="btn"
+          onClick={buildXrefs}
+          disabled={empty}
+          title={empty ? "先打开一个 so 才能建引用图" : "真实构建引用图（全库扫描入边）"}
+        >
+          建立引用图
+        </button>
         <button className="btn" onClick={() => { themeLocked.current = true; setTheme(theme === "dark" ? "light" : "dark"); }}>
           {theme === "dark" ? "◑ 深色" : "◒ 浅色"}
         </button>
@@ -471,32 +919,100 @@ export default function App() {
         <button className="btn" onClick={copyMcpConfig} title="复制 MCP 配置，粘到 AI 客户端的 mcpServers 里">
           复制 MCP 配置
         </button>
-        <span className="chip"><i className={"dot " + (apiOk ? "ok" : "")} />后端 {apiOk ? "已连接" : "未连接"}</span>
+        <span className="chip" title={wsAlive ? "事件流正常，界面在实时更新" : "事件流已断开，界面可能停在旧数据；正在自动重连"}>
+          <i className={"dot " + (wsAlive ? "ok" : "")} />
+          事件流 {wsAlive ? "实时" : "重连中"}
+        </span>
+        <span className="chip" title="HTTP 接口可用性（与事件流独立）">
+          <i className={"dot " + (apiOk ? "ok" : "")} />
+          {apiOk ? "接口正常" : "接口断开"}
+        </span>
+        <span className="chip" id="modcount">模块 {modules.length} / 函数 {mod?.funcs.length ?? 0}</span>
       </header>
 
       <main className="workspace">
-        <LeftPanel logs={logs} watch={watch} onPickWatch={(w) => log(`观察：${w.name} @ ${hex(w.addr)}`)} />
+        <div className="side">
+          <LeftNav
+            so={mod?.so ?? ""}
+            activeView={mainView}
+            onPick={(v) => setMainView(v as typeof mainView)}
+            onServerModules={handleServerModules}
+            fnCount={mod?.funcs.length}
+            tick={aiTick}
+          />
+          <LeftPanel
+            logs={logs}
+            watch={watch}
+            onPickWatch={(w) => log(`观察：${w.name} @ ${hex(w.addr)}`)}
+          />
+        </div>
         <section className={"stage" + (code.open ? " compact" : "")}>
           {/* 主视图切换：实时监控台（AI 在做什么） / 模块视图（so 结构） */}
           <div className="viewtabs">
+            {/* 标签顺序与原型一致：实时 / 代码 / 引用 / 图谱 / 时间线 / 工具。
+                计数都来自真实数据：引用=xref 边数，函数=真实函数数，
+                工具=注册表大小，时间线=事件条数。
+                「进程」不再是独立标签——原型把它放在左栏「目标进程」，
+                这里同样通过左栏进入（视图仍然存在）。 */}
             <button
               className={"vtab" + (mainView === "monitor" ? " on" : "")}
               onClick={() => setMainView("monitor")}
             >
-              实时 <b>{aiEvents.length}</b>
+              <i className={"vdot" + (aiPaused ? "" : " live")} />
+              实时
             </button>
             <button
               className={"vtab" + (mainView === "module" ? " on" : "")}
               onClick={() => setMainView("module")}
               disabled={empty}
+              title={empty ? "先打开一个 so" : modules[active]?.so ?? ""}
             >
-              模块{!empty && active >= 0 && modules[active] ? ` · ${modules[active].so}` : ""}
+              代码{!empty && mod ? ` ${mod.funcs.length}` : ""}
+            </button>
+            <button
+              className={"vtab" + (mainView === "xref" ? " on" : "")}
+              onClick={() => setMainView("xref")}
+              disabled={!f}
+              title={f ? "谁调用了它 / 它调用了谁" : "先选一个函数"}
+            >
+              引用{navSt?.refs != null ? ` ${navSt.refs}` : ""}
+            </button>
+            <button
+              className={"vtab" + (mainView === "graph" ? " on" : "")}
+              onClick={() => setMainView("graph")}
+              disabled={!f}
+              title={f ? "调用关系图" : "先选一个函数"}
+            >
+              图谱
+            </button>
+            <button
+              className={"vtab" + (mainView === "timeline" ? " on" : "")}
+              onClick={() => setMainView("timeline")}
+            >
+              时间线{aiEvents.length ? ` ${aiEvents.length}` : ""}
+            </button>
+            <button
+              className={"vtab" + (mainView === "tools" ? " on" : "")}
+              onClick={() => setMainView("tools")}
+            >
+              工具{toolN != null ? ` ${toolN}` : ""}
             </button>
             <span className="grow" />
+            <ArmedBar />
           </div>
 
+          {/* 引用密度：全局背景信息，不属于任何一个视图（原型同位置） */}
+          {!empty && mod && (
+            <HeatBar so={mod.so} onPickAddr={(a) => jumpToAddr(mod.so, a)} />
+          )}
+
+          {/* 「实时」页永远渲染监控台：动态操作不依赖 so 文件。
+              没模块时监控台自己引导，而不是整页换成空状态——
+              否则 AI 在 hook/操作设备时，用户看到的是死页面。 */}
           {mainView === "monitor" && (
             <RealtimeMonitor
+              mods={modules.map((m) => ({ so: m.so, n: m.funcs.length }))}
+              hooksProp={navSt?.hooks ?? null}
               events={aiEvents}
               paused={aiPaused}
               onTogglePause={() => setAiPaused((v) => !v)}
@@ -504,40 +1020,115 @@ export default function App() {
             />
           )}
 
-          {mainView === "module" && !empty && (
-            <div className="stage-canvas">
-            <SphereCanvas
-              modules={modules}
-              active={active}
-              selected={sel}
-              theme={theme}
-              relations={relations}
-              breakpoints={bps}
-              progress={progress}
-              rotateTo={rotateIdx}
-              compact={code.open}
-              flash={flash}
-              pulseKey={pulseKey}
+          {mainView === "xref" && f && mod && (
+            <XrefView
+              so={mod.so}
+              addr={f.a}
+              fnName={f.n}
+              onJump={(a) => jumpToAddr(mod.so, a)}
             />
-            {!empty && (
-              <>
-                <div className="legend">
-                  <div><i className="hi" />热点（被引用 ≥5）</div>
-                  <div><i className="mid" />有引用</div>
-                  <div><i />无引用</div>
+          )}
+
+          {mainView === "graph" && f && mod && (
+            <GraphView
+              so={mod.so}
+              addr={f.a}
+              fnName={f.n}
+              onJump={(a) => jumpToAddr(mod.so, a)}
+            />
+          )}
+
+          {mainView === "strings" && !mod && !loading && (
+            <NeedSoView what="字符串表" why="字符串来自 ELF 的 .rodata 段，必须先载入一个 so" />
+          )}
+
+          {mainView === "strings" && mod && (
+            <FlatTable so={mod.so} kind="strings" />
+          )}
+
+          {mainView === "sections" && !mod && !loading && (
+            <NeedSoView what="段 / 节表" why="段表是 ELF 文件结构的一部分，必须先载入一个 so" />
+          )}
+
+          {mainView === "sections" && mod && (
+            <FlatTable so={mod.so} kind="sections" />
+          )}
+
+          {mainView === "timeline" && (
+            <TimelineView events={aiEvents} />
+          )}
+
+          {mainView === "tools" && (
+            <ToolsView counts={toolCounts} />
+          )}
+
+          {mainView === "processes" && (
+            <ProcessesView />
+          )}
+
+          {mainView.startsWith("dyn:") && (
+            <DynStateView kind={mainView.slice(4) as DynKind} />
+          )}
+
+          {mainView === "module" && !empty && mod && (
+            <>
+            <div className="stage-canvas">
+              {/* 反汇编列表：热力条下面的主体（原型代码页） */}
+              <div className="code-listing" ref={codeListRef}>
+                {codeWindow.map((fn) => (
+                  <div key={fn.a}>
+                    <div
+                      className={"fnrow" + (f && f.a === fn.a ? " sel" : "")}
+                      data-i={mod.funcs.findIndex((x) => x.a === fn.a)}
+                      onClick={() => toggleFn(mod.so, fn.a)}
+                    >
+                      <span className="fn-t">
+                        {expanded[fn.a] ? "▾" : "▸"}
+                      </span>
+                      <span className="fn-n">{fn.n}</span>
+                      {fn.e && <span className="fn-tag">导出</span>}
+                      <span className="fn-a">0x{fn.a.toString(16)}</span>
+                    </div>
+                    {expanded[fn.a] && (
+                      <div className="ins-list">
+                        {(expanded[fn.a] ?? []).map((ins) => (
+                          <div className="ins-row" key={ins.addr}>
+                            <span className="ins-a">
+                              0x{ins.addr.toString(16)}
+                            </span>
+                            <span className="ins-b">{ins.bytes}</span>
+                            {/* 指令拆成 助记符 + 操作数 分别着色，
+                                跳转/返回再单独标色（原型是这么分的） */}
+                            <span
+                              className={
+                                "ins-x" +
+                                (ins.is_call ? " call" : "") +
+                                (ins.is_ret ? " ret" : "")
+                              }
+                            >
+                              <b className="ins-mn">
+                                {ins.text.includes(" ")
+                                  ? ins.text.slice(0, ins.text.indexOf(" "))
+                                  : ins.text}
+                              </b>
+                              {ins.text.includes(" ") && (
+                                <span className="ins-op">
+                                  {ins.text.slice(ins.text.indexOf(" ") + 1)}
+                                </span>
+                              )}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                ))}
+                <div className="fn-more">
+                  … 其余 {Math.max(0, mod.funcs.length - 60)} 个函数
                 </div>
-                <div className="lat">
-                  纬度 = 地址<br />{hex(mod.funcs[0].a)} → {hex(mod.funcs[mod.funcs.length - 1].a)}
-                </div>
-                <div className="active-label">
-                  {mod.so}<span>{mod.funcs.length} 函数 · 导出 {mod.funcs.filter((x) => x.e).length}</span>
-                </div>
-                <div className="hint">
-                  {code.open ? "Esc 返回球体" : "拖动旋转 · 点右侧函数定位 · 双击 / 回车展开代码"}
-                </div>
-              </>
-            )}
+              </div>
             </div>
+            </>
           )}
 
           {mainView === "module" && empty && !loading && (
@@ -562,7 +1153,6 @@ export default function App() {
           )}
 
 
-          <Hud hud={hud} onClose={() => setHud(null)} />
           <CodeOverlay
             open={code.open}
             fnName={f?.n ?? "—"}
@@ -574,7 +1164,15 @@ export default function App() {
             onClose={() => setCode((c) => ({ ...c, open: false }))}
           />
         </section>
-        <RightPanel modules={modules} active={active} selected={sel} onActivate={setActive} onSelect={selectFn} onOpen={(mi, i) => { selectFn(mi, i); void openCode(); }} onUnload={unloadModule} />
+        {/* 右栏：实时页自带「事件详情」，不需要再挂一个函数列表（原型也是这样） */}
+        {/* 右侧：函数检视器（原型 aside.insp）。实时页自带事件详情，不显示。 */}
+        {mainView !== "monitor" && (
+          <Inspector
+            mods={modules}
+            current={mod && f ? { so: mod.so, addr: f.a, name: f.n } : null}
+            onPickFn={(soName, addr2) => jumpToAddr(soName, addr2)}
+          />
+        )}
       </main>
 
       {dragging && (
