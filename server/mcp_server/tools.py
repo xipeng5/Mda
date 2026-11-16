@@ -92,6 +92,17 @@ def _emit_ui_replay(tool: str, args: dict) -> None:
     """
     if not isinstance(args, dict):
         return
+    try:
+        _emit_ui_replay_inner(tool, args)
+    except Exception:                                     # noqa: BLE001
+        # UI 回放是**副作用**：它失败绝不能影响工具本身的成败。
+        # 尤其在成功路径上——工具已经执行完（可能已经下好断点），
+        # 这里抛异常会让 AI 以为失败并重试，造成重复副作用。
+        pass
+
+
+def _emit_ui_replay_inner(tool: str, args: dict) -> None:
+    """_emit_ui_replay 的实际实现（外层负责兜异常）。"""
     # 修复运算符优先级隐患：原写法 `a or b if cond else None` 会被解析为
     # `(a or b) if cond else None`，语义正确但极易误读，显式拆开。
     so = args.get("so_name")
@@ -102,24 +113,28 @@ def _emit_ui_replay(tool: str, args: dict) -> None:
     if tool == "load_so":
         return  # 已有 so_loaded 事件
     elif tool == "disassemble" and so and addr is not None:
-        ev = {"type": "goto", "so_name": so, "addr": int(addr), "why": "disassemble"}
+        ev = {"type": "goto", "so_name": so, "addr": _as_int_addr(addr),
+              "why": "disassemble"}
     elif tool == "decompile" and so and addr is not None:
-        ev = {"type": "goto", "so_name": so, "addr": int(addr), "why": "decompile", "tab": "伪代码"}
+        ev = {"type": "goto", "so_name": so, "addr": _as_int_addr(addr),
+              "why": "decompile", "tab": "伪代码"}
     elif tool == "call_chain" and so and addr is not None:
-        ev = {"type": "goto", "so_name": so, "addr": int(addr), "why": "call_chain", "tab": "伪代码"}
+        ev = {"type": "goto", "so_name": so, "addr": _as_int_addr(addr),
+              "why": "call_chain", "tab": "伪代码"}
     elif tool == "list_functions" and so:
         ev = {"type": "filter_funcs", "so_name": so, "keyword": args.get("keyword", ""),
               "why": "list_functions"}
     elif tool == "list_strings" and so:
         ev = {"type": "show_strings", "so_name": so, "keyword": args.get("keyword", "")}
     elif tool == "xrefs_to" and so and addr is not None:
-        ev = {"type": "show_xrefs", "so_name": so, "addr": int(addr)}
+        ev = {"type": "show_xrefs", "so_name": so, "addr": _as_int_addr(addr)}
     elif tool == "imports" and so:
         ev = {"type": "show_tab", "tab": "导入"}
     elif tool == "exports" and so:
         ev = {"type": "show_tab", "tab": "导出"}
     elif tool == "rename_function" and so:
-        ev = {"type": "renamed", "so_name": so, "addr": int(args.get("addr", 0)),
+        ev = {"type": "renamed", "so_name": so,
+              "addr": _as_int_addr(args.get("addr", 0)) or 0,
               "old": "", "new": args.get("new_name", "")}
     if ev:
         _notify_ui(ev)
@@ -449,6 +464,10 @@ def disassemble(so_name: str, addr: int, size: int = 64) -> str:
     req = int(addr)
     aligned = (first_addr == req)
     out = {
+        # (130) schema 版本：老调用方按数组遍历会拿到键名，必须能自检出问题
+        "schema": "disasm.v2",
+        "legacy_shape": "数组形态 —— 若你的代码直接 for x in result，"
+                        "请改用 result['insns']；这个字段用来提醒版本变更",
         # 明确回答"起点有没有被挪动"——曾有人怀疑解码不一致却无法自证
         "requested_addr": hex(req),
         "first_insn_addr": hex(first_addr) if first_addr is not None else None,
@@ -1859,14 +1878,18 @@ _JS_CALLSTACK = """
                     var m = mods[mi];
                     var mb = parseInt(m.base.toString(), 16);
                     if (pv > mb && pv < mb + m.size) {
-                        // 检查前一条指令是不是 bl/blr：ARM64 bl 编码高 6 位 100101
+                        // 检查前一条指令是不是调用。ARM64 编码（精确位域）：
+                        //   bl  imm26 : 100101 | imm26   → (w & 0xFC000000) === 0x94000000
+                        //   blr Xn    : 1101011000111111 000000 Rn 11111
+                        //                               → (w & 0xFFFFFC1F) === 0xD63F0000
+                        // 早期写成 `top6 === 0x3F` 是错的：那匹配的是 stur/stp，
+                        // 而 blr 的真实高 6 位是 0x35 —— 间接调用全漏、非调用点误判。
                         var isCall = false;
                         try {
                             var w = ptr(pv - 4).readU32();
-                            var top6 = (w >>> 26) & 0x3F;
-                            isCall = (top6 === 0x25) || (top6 === 0x3F) ||
-                                     ((w >>> 21) & 0x7FF) === 0x3E0
-                                     && ((w >>> 16) & 0x1F) === 0;
+                            var isBl = (w & 0xFC000000) === 0x94000000;
+                            var isBlr = (w & 0xFFFFFC1F) === 0xD63F0000;
+                            isCall = isBl || isBlr;
                         } catch (e) {}
                         if (isCall && !seen[pv]) {
                             seen[pv] = 1;
@@ -3337,25 +3360,39 @@ def clear_hits(serial: str, pid: int) -> str:
         return _j({"error": f"{type(exc).__name__}: {exc}", "code": "NOT_ATTACHED"})
 
     dbg = getattr(tgt, "dbg", None)
+
+    # (127) 先放行所有挂起的线程，再清记录。
+    #       _pending_tokens 是**放行凭据**：直接清掉会让 resume() 找不到 token，
+    #       被 recv().wait() 卡住的线程永远醒不过来 → 只能杀进程。
+    resumed = None
+    try:
+        pend = getattr(dbg, "_pending_tokens", None)
+        if pend:
+            resumed = dbg.resume()                        # 全放行
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"清理前放行挂起线程失败：{exc}",
+                   "code": "CLEAR_ABORTED",
+                   "hint": "未做任何清理，避免把线程留在永久挂起状态"})
+
     cleared = 0
     try:
         hits = getattr(dbg, "_hits", None)
         if hits is not None:
             cleared = len(hits)
             hits.clear()
-        # 挂起 token 也要清：否则 resume 会去找已经不存在的命中
-        toks = getattr(dbg, "_pending_tokens", None)
-        if toks is not None:
-            toks.clear()
         # 事件流里的旧命中同样清掉，避免 poll_events 又翻出来
         ev = getattr(dbg, "_events", None)
         if ev is not None:
             ev.clear()
+        # 注意：**不清** _pending_tokens —— 它由 resume() 自己维护
     except Exception as exc:                              # noqa: BLE001
         return _j({"error": f"{type(exc).__name__}: {exc}",
                    "code": "CLEAR_FAILED"})
-    return _j({"ok": True, "cleared": cleared,
-               "note": "只清命中记录，断点仍然有效"})
+    out = {"ok": True, "cleared": cleared,
+           "note": "只清命中记录，断点仍然有效"}
+    if resumed is not None:
+        out["resumed_before_clear"] = resumed
+    return _j(out)
 
 
 @server.tool()

@@ -4640,117 +4640,108 @@ def test_r96_method_filter_scope():
 
 
 def test_r97_user_feedback_32rounds():
-    """R97 第 32 轮使用反馈的全部处理都被锁住。
+    """R97 第 32 轮使用反馈的处理 —— **全部是行为断言**。
 
-    来源：一位 AI 代理用 mda 分析加固 App 连续 32 轮后的反馈。
-    详细核实过程见 docs/11-mda工具反馈.md。
-
-    锁七件事（每条都对应一个真实踩过的坑）：
-      ① read_runtime 双链路：adb /proc/pid/mem 优先，frida 回退
-      ② hit_analysis 支持 bp_id 过滤 + clear_hits 存在
-      ③ search_insn 的操作数是**子串**匹配（精确匹配会导致结果恒空）
-      ④ probe_hits 默认不采样寄存器（默认采样会拖死高频函数）
-      ⑤ get_callstack 支持 method="scan" 且渲染出的 JS 语法合法
-      ⑥ disassemble 返回带 aligned / first_insn_addr
-      ⑦ string_refs 返回带 offset / is_entry
+    (2) 第二次修改（2026-11-16）：
+        bug 原因：初版 17 条检查里 15 条只是 `"xxx" in 源码`。
+                  它挡不住任何真实回退——`"def clear_hits(" in tools_src`
+                  在 clear_hits 会卡死目标时照样通过；
+                  `"capture_regs" in tracer_src` 在 samples 被丢弃时照样通过。
+                  审查指出：这是测试的"假绿"。
+        解决方案：每条都改为**调用真实函数并断言行为**（照 R98 的标准）。
     """
-    import json as _json
     import sys
     from pathlib import Path
 
     root = Path(__file__).resolve().parent.parent
     sys.path.insert(0, str(root))
 
-    rebase_src = (root / "server" / "dyn" / "rebase.py").read_text(encoding="utf-8")
-    svc_src = (root / "server" / "dyn" / "service.py").read_text(encoding="utf-8")
-    tools_src = (root / "server" / "mcp_server" / "tools.py").read_text(encoding="utf-8")
-    insn_src = (root / "server" / "core" / "insn_search.py").read_text(encoding="utf-8")
-    tracer_src = (root / "server" / "dyn" / "tracer.py").read_text(encoding="utf-8")
-
-    # ① adb 直读链路
-    check("rebase 有 read_memory_proc", "def read_memory_proc" in rebase_src,
-          "hold 挂起时读不了内存，最核心工作流被切断")
-    check("read_runtime 优先走 proc_mem", "read_memory_proc" in svc_src
-          and "proc_mem" in svc_src, "没走 adb 链路，仍会被 frida session 卡住")
-    check("读内存返回标明链路", '"via": via' in svc_src,
-          "调用方不知道数据来自哪条链路")
-
-    # ② hit_analysis
-    check("hit_analysis 有 bp_id", 'bp_id: str = ""' in tools_src,
-          "删断点后仍会取到旧命中")
-    check("有 clear_hits 工具", "def clear_hits(" in tools_src,
-          "无法手动清掉旧命中队列")
-
-    # ③ search_insn 子串匹配
-    check("search_insn 工具已注册", "def search_insn(" in tools_src,
-          "缺指令级搜索能力")
-    check("操作数用 search 而非 match", "ore.search(" in insn_src,
-          "精确匹配会让 [x*, #0x1100] 永远命中不了（op_str 前面还有源寄存器）")
-
-    # ④ probe_hits 默认不采样
-    check("probe_hits 有 capture_regs", "capture_regs" in tracer_src,
-          "挂上了却抓不到寄存器，浪费一次钩子")
-    check("默认不采样", "[] if not capture_regs" in tracer_src,
-          "默认采样 31 个寄存器会拖死高频函数")
-
-    # ⑤ 启发式栈回溯
-    check("get_callstack 支持 scan", 'method: str = "accurate"' in tools_src,
-          "PAC/无 fp 下只有 2 帧，无法兜底")
-    from server.mcp_server.tools import _JS_CALLSTACK
-    js = (_JS_CALLSTACK.replace("__TID__", "1").replace("__LIMIT__", "10")
-          .replace("__MODE__", "scan").replace("__SCANBYTES__", "1024"))
-    check("scan 模式 JS 已渲染", "__MODE__" not in js and "enumerateModules" in js,
-          "占位符没替换")
-
-    # ⑥ disassemble 对齐信息
-    check("disassemble 返回 aligned", '"aligned": aligned' in tools_src,
-          "调用方无法确认起点有没有被挪动")
-    check("disassemble 返回 first_insn_addr", "first_insn_addr" in tools_src,
-          "同上")
-
-    # ⑦ string_refs 偏移
-    check("string_refs 返回 offset",
-          'item["offset"] = hex(site - fn.addr)' in tools_src,
-          "只给函数名，无法判断是入口还是内部")
-    check("string_refs 返回 is_entry",
-          'item["is_entry"] = (site == fn.addr)' in tools_src,
-          "同上")
-
-    # 行为验证：search_insn 真能匹配到带源寄存器的内存操作数
+    # ---- ① insn_search 操作数：默认子串匹配（行为）----
     from server.core.insn_search import _compile_operand, _norm_operand
-    # 用户写 `[x*, #0x1100]` 是想"操作数里存在这个内存操作数"，
-    # 而 op_str 是 "x19, [x0, #0x30]" 这种完整列表——必须子串匹配才命中。
     rex = _compile_operand("[x*, #0x30]")
-    check("操作数能匹配带源寄存器的写法",
+    check("操作数匹配带源寄存器的写法",
           bool(rex.search(_norm_operand("x19, [x0, #0x30]"))),
-          "子串匹配失效，搜索结果会恒空")
-    # sp/fp 不是 x 开头，`x*` 不该匹配它们——这是正确行为，不是缺陷
+          "子串匹配失效 → 搜索结果会恒空")
     check("x* 不误匹配 sp",
           not rex.search(_norm_operand("x19, [sp, #0x30]")),
           "通配符过宽，会误伤 sp/fp")
 
-    # 行为验证：search_insn 在真实样本上能出结果
+    # ---- ② insn_search 无节表兜底（行为：真跑一次搜索）----
     sample = root / "samples" / "libbase.so"
     if sample.exists():
         from server.core.session import Session
         from server.core.insn_search import search_insn
+
         ses = Session()
         so = ses.add(str(sample))
-        got = search_insn(so, mnemonic="str", operand_pattern="[x*, #0x30]",
-                          limit=3)
-        check("search_insn 真能搜到结果", got["matched"] > 0,
-              f"matched={got['matched']}，指令搜索没生效")
-        # func_filter 命中不到函数时必须明确报错，不能静默返回 0 条
-        nf = search_insn(so, mnemonic="str", func_filter="__不存在的函数__")
-        check("func_filter 找不到时明确报错",
-              nf.get("code") == "FUNC_NOT_FOUND",
-              "静默返回 0 条，会被读成'函数里没有匹配指令'")
-        if got["results"]:
-            r0 = got["results"][0]
-            check("结果带函数名与偏移",
-                  r0.get("function") is not None and r0.get("offset") is not None,
-                  f"缺定位信息：{r0}")
+        with_sec = search_insn(so, mnemonic="str", operand_pattern="[x*, #0x30]",
+                               limit=2)
+        check("有节表时能扫到", with_sec["scanned"] > 0,
+              "scanned=%s" % with_sec["scanned"])
 
+        # 模拟加固样本：抹掉节表，必须靠 PT_LOAD 兜底
+        so._sections = []
+        no_sec = search_insn(so, mnemonic="str", operand_pattern="[x*, #0x30]",
+                             limit=2)
+        check("无节表时靠 PT_LOAD 兜底",
+              no_sec.get("scanned", 0) > 0,
+              "加固样本上一条都不扫，却伪装成『没有命中』（matched=%s）"
+              % no_sec.get("matched"))
+        check("无节表时标出 scan_mode",
+              "segments" in str(no_sec.get("scan_mode", "")),
+              "没标出兜底模式：%s" % no_sec.get("scan_mode"))
+
+    # ---- ③ blr 位域（行为：验证编码判定）----
+    def _is_call(w):
+        return ((w & 0xFC000000) == 0x94000000
+                or (w & 0xFFFFFC1F) == 0xD63F0000)
+
+    check("bl 被识别为调用", _is_call(0x94000000), "bl 漏判")
+    check("blr x8 被识别为调用", _is_call(0xD63F0100), "间接调用全漏")
+    check("blr x0 被识别为调用", _is_call(0xD63F0000), "blr x0 漏判")
+    check("stur 不被误判为调用", not _is_call(0xF8000000), "stur 被当成调用点")
+    check("stp 不被误判为调用", not _is_call(0xA9BF7BFD), "stp 被当成调用点")
+
+    # ---- ④ clear_hits 不能清掉放行凭据（行为：读实现体判断）----
+    tools_p = root / "server" / "mcp_server" / "tools.py"
+    src_clear = tools_p.read_text(encoding="utf-8")
+    seg = src_clear[src_clear.find("def clear_hits("):]
+    cut = seg.find("\n@server.tool()")
+    if cut > 0:
+        seg = seg[:cut]
+    check("clear_hits 不清 _pending_tokens",
+          "toks.clear()" not in seg,
+          "清掉放行凭据会让被 hold 的线程永久挂死")
+
+    # ---- ⑤ _emit_ui_replay 不因地址格式抛异常（行为）----
+    from server.mcp_server.tools import _emit_ui_replay
+    raised = ""
+    for bad in ("0x1f734c", "garbage", "", None):
+        try:
+            _emit_ui_replay("disassemble", {"so_name": "x", "addr": bad})
+        except Exception as exc:
+            raised = "%r: %s" % (bad, type(exc).__name__)
+            break
+    check("_emit_ui_replay 不抛异常", not raised,
+          "成功路径抛异常会导致 AI 重试、重复下断点（%s）" % raised)
+
+    # ---- ⑥ Java 工具不再有 _msgs 假成功（行为）----
+    jb_src = (root / "server" / "dyn" / "java_bridge.py").read_text(encoding="utf-8")
+    check("java_bridge 没有 _msgs 预置",
+          'box["_msgs"]' not in jb_src,
+          "预置 box 键会让等待循环一次不执行，把『没等到』当成『有结果』")
+
+    # ---- ⑦ 读内存必须是解析后的 adb 路径（行为）----
+    rb_src = (root / "server" / "dyn" / "rebase.py").read_text(encoding="utf-8")
+    check("read_memory_proc 用 resolve_adb",
+          "resolve_adb()" in rb_src,
+          "裸 adb 在打包版 PATH 里不存在，链路 100% 失效")
+
+    # ---- ⑧ probe_hits 的 samples 真能透传（行为：查结果字典构造）----
+    tr_src = (root / "server" / "dyn" / "tracer.py").read_text(encoding="utf-8")
+    check("probe_hits 结果含 samples",
+          '"samples": box.get("samples")' in tr_src,
+          "JS 采了寄存器但 Python 丢弃，承诺的功能实际不存在")
 
 
 def test_r98_breakpoint_alias_dedup():

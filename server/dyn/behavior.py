@@ -92,29 +92,11 @@ def _js_str(s) -> str:
     return json.dumps(str(s))
 
 
-def _detach_async(sess, timeout: float = 2.0) -> None:
-    """守护线程里 detach（本设备同步 detach 会阻塞）。"""
-    import threading as _th
 
-    if sess is None:
-        return
+_DETACH_LOCK = __import__("threading").Lock()
+_DETACHING: set = set()
+_DETACH_MAX = 16
 
-    def _w() -> None:
-        try:
-            sess.detach()
-        except Exception:                                 # noqa: BLE001
-            pass
-
-    t = _th.Thread(target=_w, name="mda-behavior-detach", daemon=True)
-    t.start()
-    try:
-        t.join(max(0.1, float(timeout)))
-    except Exception:                                     # noqa: BLE001
-        pass
-
-
-# JS 模板。所有 hook 都用「先取原实现、再包一层」的写法，
-# 保证不改变目标行为（只记录，不拦截、不修改参数和返回值）。
 _JS_BEHAVIOR = r"""
 Java.perform(function () {
     var CFG = __CFG__;
@@ -385,6 +367,46 @@ Java.perform(function () {
 """
 
 
+def _detach_async(sess, timeout: float = 2.0) -> None:
+    """守护线程里 detach（本设备同步 detach 会永久阻塞），带**去重与上限**。
+
+    (5) 第五次修改（2026-11-16）：
+        bug 原因：本地重写的版本丢掉了 tracer 版本的两个关键保护：
+                  ① 按会话 id 去重（同一会话不重复起线程）；
+                  ② 登记集合有上限（防线程无界增长）。
+                  tracer 里明确记录过「20 次连续调用 → 线程 1→21」，
+                  这两处等于把那个已修 BUG 又写回去了。
+        解决方案：**保留本地实现**（不能直接转发给 tracer——
+                  测试用假 session 对象，tracer 版会走 is_detached 等属性），
+                  但把去重与上限两个机制补齐。
+    """
+    import threading as _th
+
+    if sess is None:
+        return
+    with _DETACH_LOCK:
+        sid = id(sess)
+        if sid in _DETACHING:
+            return                          # 同一会话已在 detach 中，不重复起线程
+        if len(_DETACHING) >= _DETACH_MAX:
+            return                          # 上限保护：宁可让 frida 自己回收
+        _DETACHING.add(sid)
+
+    def _w() -> None:
+        try:
+            sess.detach()
+        except Exception:                                 # noqa: BLE001
+            pass
+        finally:
+            with _DETACH_LOCK:
+                _DETACHING.discard(sid)
+
+    t = _th.Thread(target=_w, daemon=True)
+    t.start()
+    t.join(timeout=timeout)
+
+
+
 def behavior_monitor_start(serial: str, pid: int,
                            crypto: bool = True, file: bool = True,
                            activity: bool = True, assets: bool = True,
@@ -467,7 +489,9 @@ def behavior_monitor_start(serial: str, pid: int,
     keep_session = False
     box: dict = {"installed": None, "events": [], "counts": {},
                  "error": None, "done": False, "dumped": False}
-    cfg: dict = {}
+    # (3) 这里原本有一行 `cfg: dict = {}`，会把上面组装好的开关覆盖成空字典，
+    #     导致 crypto/shell 这类风险差一个数量级的类别在下游看起来完全一样。
+    #     直接删掉——上面已经按入参组装好 cfg，不需要重新初始化。
     key = _active_key(serial, int(pid))
     try:
         # ② 重复 start：先停旧的

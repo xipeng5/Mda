@@ -1686,15 +1686,15 @@ def java_find_callers(serial: str, pid: int, class_name: str, method: str,
     Java.perform(function () {
         var SIZE = 0, samples = [], callers = {}, total = 0;
         try {
-            var cls = Java.use(CLASS);
-            var target = cls[METHOD];
+            var cls = Java.use(__CLASS__);
+            var target = cls[__METHOD__];
             if (target === undefined) {
                 send({kind: 'hook_error', code: 'METHOD_NOT_FOUND',
-                      error: '类里没有名为 ' + METHOD + ' 的方法'});
+                      error: '类里没有名为 ' + __METHOD__ + ' 的方法'});
                 return;
             }
             var ovs = target.overloads || [];
-            var wanted = OVERLOAD;
+            var wanted = __OVERLOAD__;
             var hookedN = 0;
             for (var i = 0; i < ovs.length; i++) {
                 if (wanted && String(ovs[i]) !== wanted) { continue; }
@@ -1702,7 +1702,7 @@ def java_find_callers(serial: str, pid: int, class_name: str, method: str,
                     ov.implementation = function () {
                         total++;
                         try {
-                            var frames = mdaJavaStack(DEPTH);
+                            var frames = mdaJavaStack(__DEPTH__);
                             // (9) 第九次修改（2026-11-06）：跳过取栈自身的帧。
                             //     bug 原因：实测调用者被识别成
                             //               "java.lang.Thread.getStackTrace(Thread.java:1724)"——
@@ -1718,18 +1718,18 @@ def java_find_callers(serial: str, pid: int, class_name: str, method: str,
                             // 真正业务代码里偶尔出现的方法名。
                             var skipRe = /^(java\.lang\.Thread\.getStackTrace|dalvik\.system\.VMStack|dalvik\.system\.VMDebug|java\.lang\.Throwable\.)/;
                             var caller = '<无上层帧>';
-                            var selfName = METHOD;
+                            var selfName = __METHOD__;
                             for (var fi = 0; fi < frames.length; fi++) {
                                 var fr = frames[fi];
                                 if (skipRe.test(fr)) { continue; }
-                                // 本方法自身的帧（名字以 METHOD 开头的那条）
+                                // 本方法自身的帧（名字以 __METHOD__ 开头的那条）
                                 if (fr.indexOf(selfName + '(') >= 0 ||
                                     fr.indexOf('.' + selfName + '(') >= 0) { continue; }
                                 caller = fr;
                                 break;
                             }
                             callers[caller] = (callers[caller] || 0) + 1;
-                            if (samples.length < SAMPLES) { samples.push(frames); }
+                            if (samples.length < __SAMPLES__) { samples.push(frames); }
                         } catch (e) {}
                         return ov.apply(this, arguments);
                     };
@@ -1755,10 +1755,20 @@ def java_find_callers(serial: str, pid: int, class_name: str, method: str,
             send({kind: 'result', callers: list, samples: samples, total: total});
         });
     });
-    """.replace("CLASS", _js_str(class_name)).replace(
-        "METHOD", _js_str(method)).replace("OVERLOAD", _js_str(overload or "")).replace(
-        "DEPTH", str(max(2, min(int(stack_depth or 12), 32)))).replace(
-        "SAMPLES", str(cap))
+    """.replace("__CLASS__", _js_str(class_name)).replace(
+        "__METHOD__", _js_str(method)).replace(
+        "__OVERLOAD__", _js_str(overload or "")).replace(
+        "__DEPTH__", str(max(2, min(int(stack_depth or 12), 32)))).replace(
+        "__SAMPLES__", str(cap))
+    # (20) 渲染后自检：占位符漏替换会让脚本加载即抛 ReferenceError，
+    #      而那种错误在 node --check 层面看不出来（__X__ 是合法标识符）。
+    _left = re.findall(r"__[A-Z][A-Z0-9_]*__", user_js)
+    if _left:
+        return {
+            "error": "JS 模板占位符未替换：" + ", ".join(sorted(set(_left))),
+            "code": "JS_TEMPLATE_BROKEN",
+            "hint": "java_find_callers 的 replace 链与模板不一致",
+        }
 
     return _run_java_callers(serial, pid, user_js, duration=float(duration),
                              class_name=class_name, method=method)
@@ -1885,31 +1895,49 @@ def _java_pending(feature: str, reason: str, extra: dict | None = None) -> dict:
     return out
 
 
-def _detach_async(sess, timeout: float = 2.0) -> None:
-    """守护线程里 detach。
 
-    (3) 第三次修改（2026-11-06）：新增。
-        bug 原因：本设备上 session.detach() 会**永久阻塞**（已在 dyn/tracer、
-                  dyn/rebase 多处实测），写在 finally 里等于每次调用都卡死。
-        解决方案：丢进守护线程，主流程最多等 timeout 就走。
+_DETACH_LOCK = __import__("threading").Lock()
+_DETACHING: set = set()
+_DETACH_MAX = 16
+
+def _detach_async(sess, timeout: float = 2.0) -> None:
+    """守护线程里 detach（本设备同步 detach 会永久阻塞），带**去重与上限**。
+
+    (5) 第五次修改（2026-11-16）：
+        bug 原因：本地重写的版本丢掉了 tracer 版本的两个关键保护：
+                  ① 按会话 id 去重（同一会话不重复起线程）；
+                  ② 登记集合有上限（防线程无界增长）。
+                  tracer 里明确记录过「20 次连续调用 → 线程 1→21」，
+                  这两处等于把那个已修 BUG 又写回去了。
+        解决方案：**保留本地实现**（不能直接转发给 tracer——
+                  测试用假 session 对象，tracer 版会走 is_detached 等属性），
+                  但把去重与上限两个机制补齐。
     """
     import threading as _th
 
     if sess is None:
         return
+    with _DETACH_LOCK:
+        sid = id(sess)
+        if sid in _DETACHING:
+            return                          # 同一会话已在 detach 中，不重复起线程
+        if len(_DETACHING) >= _DETACH_MAX:
+            return                          # 上限保护：宁可让 frida 自己回收
+        _DETACHING.add(sid)
 
     def _w() -> None:
         try:
             sess.detach()
         except Exception:                                 # noqa: BLE001
             pass
+        finally:
+            with _DETACH_LOCK:
+                _DETACHING.discard(sid)
 
-    t = _th.Thread(target=_w, name="mda-java-detach", daemon=True)
+    t = _th.Thread(target=_w, daemon=True)
     t.start()
-    try:
-        t.join(max(0.1, float(timeout)))
-    except Exception:                                     # noqa: BLE001
-        pass
+    t.join(timeout=timeout)
+
 
 
 def _run_java_script(serial: str, pid: int, user_js: str,
@@ -1932,8 +1960,9 @@ def _run_java_script(serial: str, pid: int, user_js: str,
         dev = frida.get_device(serial, timeout=15)
         sess = dev.attach(int(pid))
         script = sess.create_script(full)
+        # (19) 不要预置任何键：等待循环的条件是 `while not box`，
+        #      提前塞 key 会让循环一次都不执行，把"没等到"当成"有结果"。
         box: dict = {}
-        box["_msgs"] = []
 
         def _on_msg(msg, data):
             payload = msg.get("payload")

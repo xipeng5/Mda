@@ -43,6 +43,9 @@ export default function App() {
   const [navSt, setNavSt] = useState<ApiNavStats | null>(null);
   const [toolN, setToolN] = useState<number | null>(null);
   const [aiPaused, setAiPaused] = useState(false);
+  // (131) WS 的 onmessage 闭包里读不到最新的 aiPaused（effect 依赖不含它），
+  //       用 ref 镜像，保证暂停立刻生效。
+  const aiPausedRef = useRef(false);
   // 每个工具被调用过几次（事件流与工具页共用）
   const [toolCounts, setToolCounts] = useState<Record<string, number>>({});
   // 视图集合：monitor / module / tools / processes / xref / graph / timeline
@@ -535,6 +538,9 @@ export default function App() {
 
   useEffect(() => {
     closed.current = false;
+    // (133) 每条连接自己的销毁标记：共享 ref 会被下一次 effect 重置，
+    //       导致旧连接的 onclose 误判为"没销毁"并额外建连（StrictMode 下必现）。
+    let disposed = false;
     let ws: WebSocket | null = null;
 
     // 注意：必须读 modulesRef，不能读 modules —— 这个 effect 只在挂载时跑一次，
@@ -561,10 +567,11 @@ export default function App() {
     sock.onclose = () => {
       setWsAlive(false);
       wsRef.current = null;
-      if (closed.current) return;
+      // (133) 只看**本连接**是否被销毁，不看共享 ref
+      if (disposed) return;
       const delay = retryDelay.current;
       retryDelay.current = Math.min(delay * 2, 10_000);
-      window.setTimeout(() => { if (!closed.current) connect(); }, delay);
+      window.setTimeout(() => { if (!disposed) connect(); }, delay);
     };
     sock.onerror = () => { setWsAlive(false); };
 
@@ -669,7 +676,7 @@ export default function App() {
           return { ...prev, [k]: (prev[k] ?? 0) + 1 };
         });
         setAiEvents((prev) => {
-          if (aiPaused) return prev;
+          if (aiPausedRef.current) return prev;
           const next = [
             { tool: msg.tool ?? "", args: msg.args as Record<string, unknown> | undefined,
               summary: msg.summary, ms: msg.ms, ts: msg.ts },
@@ -718,7 +725,9 @@ export default function App() {
     connect();
 
     return () => {
-      closed.current = true;      // 告诉 onclose 别再重连
+      // (133) 标记本连接已销毁（只影响它自己）
+      disposed = true;
+      closed.current = true;
       wsRef.current = null;
       ws?.close();
     };
@@ -1015,7 +1024,12 @@ export default function App() {
               hooksProp={navSt?.hooks ?? null}
               events={aiEvents}
               paused={aiPaused}
-              onTogglePause={() => setAiPaused((v) => !v)}
+              onTogglePause={() =>
+                setAiPaused((v) => {
+                  aiPausedRef.current = !v;   // (131) 同步给 WS 闭包
+                  return !v;
+                })
+              }
               onClear={() => setAiEvents([])}
             />
           )}
@@ -1080,7 +1094,16 @@ export default function App() {
                     <div
                       className={"fnrow" + (f && f.a === fn.a ? " sel" : "")}
                       data-i={mod.funcs.findIndex((x) => x.a === fn.a)}
-                      onClick={() => toggleFn(mod.so, fn.a)}
+                      onClick={() => {
+                        // (132) 必须先选中：右边检视器/引用/图谱都跟着 f 走，
+                        //       只 toggle 不 select 会让 f 永远停在第一个函数。
+                        const idx = mod.funcs.findIndex((x) => x.a === fn.a);
+                        if (idx >= 0) {
+                          setActive(modules.findIndex((m) => m.so === mod.so));
+                          selectFn(modules.findIndex((m) => m.so === mod.so), idx);
+                        }
+                        toggleFn(mod.so, fn.a);
+                      }}
                     >
                       <span className="fn-t">
                         {expanded[fn.a] ? "▾" : "▸"}

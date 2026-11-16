@@ -3571,6 +3571,9 @@ def probe_hits(serial: str, pid: int, so_name: str, static_addr: int,
                 box["hits"] = int(payload.get("hits") or 0)
                 box["first_hit_ts"] = payload.get("first_hit_ts")
                 box["threads"] = payload.get("threads") or []
+                # (4) 接回寄存器采样：JS 一直在发，之前这里没接，数据白采
+                box["samples"] = payload.get("samples") or []
+                box["sampled"] = bool(payload.get("sampled"))
                 return
             if kind == "note":
                 box.setdefault("notes", []).append(payload.get("message") or "")
@@ -3683,6 +3686,9 @@ def probe_hits(serial: str, pid: int, so_name: str, static_addr: int,
         "mechanism": box["mechanism"] or "Interceptor",
         "duration": duration,
         "hits": hits,
+        # (4) 寄存器采样结果：JS 侧一直在发，之前 Python 没接（数据白采）
+        "samples": box.get("samples") or [],
+        "sampled": bool(box.get("sampled")),
         "first_hit_ts": box["first_hit_ts"],
         "threads": box["threads"],
         "process_probe": proc_probe,

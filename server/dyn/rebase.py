@@ -351,8 +351,13 @@ class Rebase:
         cmd = (f"dd if=/proc/{int(pid)}/mem bs=4096 skip={skip} count=1 "
                f"2>/dev/null | od -An -tx1 -v")
         try:
+            # (2) 必须走 resolve_adb()：打包后 PATH 里没有 homebrew 的 adb，
+            #     硬编码裸 "adb" 会让这条链路在发布版里 100% 失效。
+            from server.dyn.adb import resolve_adb
+
             r = subprocess.run(
-                ["adb", "-s", str(serial), "shell", f"su -c {_shq(cmd)}"],
+                [resolve_adb(), "-s", str(serial), "shell",
+                 f"su -c {_shq(cmd)}"],
                 capture_output=True, text=True, timeout=30,
             )
         except Exception:                                 # noqa: BLE001

@@ -227,13 +227,40 @@ def search_insn(so, mnemonic: str = "", operand_pattern: str = "",
                          "③ 或去掉 func_filter 全库搜，用返回的 function 字段自己筛"),
             }
 
+    # (4) 段表兜底：加固样本常无节表。PT_LOAD 里 flags bit0 = X（可执行）。
+    #      没有这一步时 sections 为空会让整个搜索一次都不执行，
+    #      却返回 matched=0 伪装成"没有命中"。
+    scan_ranges: list[tuple[int, int]] = []
     for sec in getattr(so, "sections", []):
         if text_only and not sec.is_exec:
             continue
         if not text_only and sec.is_exec:
             continue
+        scan_ranges.append((sec.addr, sec.size))
+
+    section_mode = bool(scan_ranges)
+    if not scan_ranges:
+        # 退到 PT_LOAD：只取可执行段
+        for vaddr, end, _off, flags in getattr(so, "_loads", []) or []:
+            if text_only and not (int(flags) & 0x1):
+                continue
+            if end > vaddr:
+                scan_ranges.append((int(vaddr), int(end) - int(vaddr)))
+
+    if not scan_ranges:
+        return {
+            "error": ("这个 so 既没有可用的节表，也没有可执行的 PT_LOAD 段——"
+                      "搜不到任何指令。"),
+            "code": "NO_SCANNABLE_SEGMENT",
+            "count": 0, "matched": 0, "scanned": 0,
+            "truncated": False, "results": [],
+            "hint": "检查该 so 是否被完整 dump（可能被截断或加密）",
+        }
+
+    for _range_addr, _range_size in scan_ranges:
+        sec_addr, sec_size = _range_addr, _range_size
         try:
-            data = so.read(sec.addr, sec.size)
+            data = so.read(sec_addr, sec_size)
         except Exception:                                 # noqa: BLE001
             continue
         if not data:
@@ -242,7 +269,7 @@ def search_insn(so, mnemonic: str = "", operand_pattern: str = "",
         off = 0
         total = len(data)
         while off + 4 <= total:
-            cur = sec.addr + off
+            cur = sec_addr + off
             if ranges is not None and not any(s <= cur < e for s, e in ranges):
                 off += 4
                 continue
@@ -272,10 +299,24 @@ def search_insn(so, mnemonic: str = "", operand_pattern: str = "",
                     ).to_dict())
             off += 4
 
+    # (4) 一条都没扫到时明确报错——绝不能伪装成"没有命中"
+    if scanned == 0:
+        return {
+            "error": (f"扫描了 {len(scan_ranges)} 个可执行区间，"
+                      "但一条指令都没解码出来。这通常不是『没有命中』，"
+                      "而是扫描范围或解码出了问题。"),
+            "code": "NOTHING_SCANNED",
+            "count": 0, "matched": 0, "scanned": 0,
+            "truncated": False, "results": [],
+            "scan_mode": "segments" if not section_mode else "sections",
+            "hint": "检查该 so 是否被完整 dump；或先用 metadata 确认段表可读",
+        }
+
     return {
         "count": len(results),
         "matched": matched,
         "scanned": scanned,
+        "scan_mode": "sections" if section_mode else "segments(PT_LOAD)",
         "truncated": matched > len(results),
         "mnemonic": mnemonic,
         "operand_pattern": operand_pattern,
