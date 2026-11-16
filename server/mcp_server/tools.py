@@ -444,15 +444,37 @@ def disassemble(so_name: str, addr: int, size: int = 64) -> str:
     #           会抛 KeyError，与同文件里已能解析的 get() 行为不一致。
     d = _session.xref(so_name).disasm
     insns = d.disasm_range(addr, size)
-    return _j([
-        {
-            "addr": i.addr,
-            "text": i.text,
-            "call": i.call_target if i.is_call else None,
-            "ref": i.ref_addr,
-        }
-        for i in insns
-    ])
+
+    first_addr = insns[0].addr if insns else None
+    req = int(addr)
+    aligned = (first_addr == req)
+    out = {
+        # 明确回答"起点有没有被挪动"——曾有人怀疑解码不一致却无法自证
+        "requested_addr": hex(req),
+        "first_insn_addr": hex(first_addr) if first_addr is not None else None,
+        "aligned": aligned,
+        "count": len(insns),
+        "insns": [
+            {
+                "addr": i.addr,
+                "addr_hex": hex(i.addr),
+                "text": i.text,
+                "call": i.call_target if i.is_call else None,
+                "ref": i.ref_addr,
+            }
+            for i in insns
+        ],
+    }
+    if not aligned:
+        out["align_note"] = (
+            f"请求地址 {hex(req)} 不是指令起点（AArch64 指令必须 4 字节对齐，"
+            f"实际从 {hex(first_addr)} 开始解码）。"
+            if first_addr is not None else
+            f"请求地址 {hex(req)} 处解码不出任何指令（可能不在可执行段内）")
+    if not insns:
+        out["hint"] = ("没解出指令：① 确认地址落在 .text 等可执行段；"
+                       "② 地址必须 4 字节对齐；③ 该处可能是数据/跳转表")
+    return _j(out)
 
 
 @server.tool()
@@ -711,6 +733,93 @@ def get_comments(so_name: str) -> str:
 
 @server.tool()
 @logged()
+def search_insn(so_name: str, mnemonic: str = "", operand_pattern: str = "",
+                limit: int = 100, func_filter: str = "",
+                discover: bool = False) -> str:
+    """按**指令语义**搜索——找出所有符合模式的指令。
+
+    这是逆向里最常用的动作：「我知道一个结构体偏移 / 一个常量，
+    帮我找出所有访问它的指令」。`search_bytes` 做不到这件事
+    （它是按字节匹配，表达不了"所有 str 到 [x?, #0x1100]"）。
+
+        search_insn(so_name="x.so", mnemonic="str", operand_pattern="[x*, #0x1100]")
+        → [{addr_hex: "0x32dbe0", text: "str x0, [x28, #0x1100]",
+            function: "sub_32c7e0", offset: "0x1400"}]
+
+    ## 参数
+
+    mnemonic      助记符，支持通配：`str` / `str*`（覆盖 str/strb/strh）/ `bl` / `*`
+    operand_pattern
+                  操作数模式，支持 `*`（任意序列）与 `?`（任意单字符）：
+                    `[x*, #0x1100]`   存在一个"基址+偏移0x1100"的内存操作数
+                    `x0, [x1, #*]`    x0 写到 x1 指向的任意偏移
+                    `w*, w0, #*`      寄存器运算
+                  **默认子串匹配**：只要模式出现在操作数里就算命中。
+                  想精确匹配整串时用 `^...$` 显式锚定。
+    limit         最多返回多少条（默认 100，上限 2000）
+    func_filter   只搜函数名包含该子串的函数（大幅提速）
+    discover      搜索前先补全函数表（默认 False）。
+                  **大样本要 40 秒以上**（12160 函数的实测 43s），
+                  而搜索本身只要 3.5 秒——所以默认不做。
+                  需要精确的 function/offset 时才开，或先调 build_xrefs。
+
+    ## 返回
+
+    results 里每条带 addr_hex / text / **function（所在函数）/ offset（函数内偏移）**。
+    不在任何已知函数内的命中会标 note —— 那可能是数据区或未被发现的函数。
+
+    ## 性能
+
+    实测 libbase（4.2 万条指令）0.16s；sscronet（100 万条指令、12160 函数）3.6s。
+    `scanned` 字段是实际反汇编的指令数，可据此判断搜索代价。
+
+    ## 没命中怎么办（hint 里也会给）
+
+    · 立即数常被拆成 `adrp + add`，搜 `add` 往往比搜 `str` 有效
+    · `#0x1100` 要带 `0x` 前缀
+    · 助记符不确定时先用 `mnemonic="*"` + operand_pattern 试
+    """
+    from server.core.insn_search import search_insn as _impl
+
+    so = _session.get(so_name)
+    # (124) 只补函数发现，不建全量引用图。
+    #       搜索不需要引用图（它靠函数表标注 function/offset），
+    #       而 ensure_xrefs 在 12160 函数的样本上要 60-220 秒，
+    #       会让一次搜索直接超时。
+    funcs_before = len(so.functions)
+    funcs_after = funcs_before
+    if discover and funcs_before < 1000:
+        # 先说明为什么这一步慢，免得调用方以为卡死
+        import sys as _sys
+        print(f"[search_insn] 函数表只有 {funcs_before} 个，"
+              f"先补全（大样本约 40 秒）…", file=_sys.stderr, flush=True)
+    if discover:
+        # 显式要求才补函数表：实测 12160 函数的样本要 43 秒，
+        # 默认做会让一次搜索直接超时（搜索本身只要 3.5 秒）。
+        try:
+            _session.discover_functions(so_name)
+        except Exception:                                 # noqa: BLE001
+            pass
+        funcs_after = len(so.functions)
+    out = _impl(so, mnemonic=mnemonic, operand_pattern=operand_pattern,
+                limit=int(limit), func_filter=func_filter)
+    if funcs_after > funcs_before:
+        out.setdefault("notes", []).append(
+            f"搜索前补了 {funcs_after - funcs_before} 个函数"
+            f"（{funcs_before} → {funcs_after}），function/offset 更完整")
+    elif not discover and out.get("results"):
+        # 函数表不全时会有命中落不到函数——如实说明，并给出补救方式
+        no_fn = sum(1 for r in out["results"] if not r.get("function"))
+        if no_fn:
+            out.setdefault("notes", []).append(
+                f"{no_fn} 条命中落不到已知函数（当前函数表只有 {funcs_before} 个）。"
+                "要更完整的 function/offset，传 discover=true（大样本约 40 秒）"
+                "或先调 build_xrefs")
+    return _j(out)
+
+
+@server.tool()
+@logged()
 def search_bytes(so_name: str, hex_pattern: str, limit: int = 50) -> str:
     """按十六进制字节模式搜索（支持 ?? 通配单字节），如 '1f 20 03 d5' 或 '?? 20 03 d5'。"""
     import re
@@ -792,8 +901,21 @@ def string_refs(so_name: str, addr: int) -> str:
     out = []
     for site in ref.referenced_by:
         fn = so.function_at(site)
-        out.append({"site": site, "function": fn.name if fn and fn.name else f"sub_{fn.addr:x}" if fn else None})
-    return _j({"string": ref.value, "refs": out})
+        item: dict = {"site": site, "site_hex": hex(site)}
+        if fn is None:
+            # 落不到任何函数：可能是数据区，也可能是函数未被发现
+            item["function"] = None
+            item["note"] = ("该引用点不在任何已发现函数内——"
+                            "可能是数据区，或所在函数未被函数发现覆盖")
+        else:
+            item["function"] = fn.name if fn and fn.name else f"sub_{fn.addr:x}"
+            item["function_entry"] = hex(fn.addr)
+            item["offset"] = hex(site - fn.addr)
+            # 明确告诉调用方这是不是函数入口：曾经有人把内部偏移当入口用
+            item["is_entry"] = (site == fn.addr)
+        out.append(item)
+    return _j({"string": ref.value, "string_hex": hex(addr),
+               "count": len(out), "refs": out})
 
 
 # 后台构建任务表：job_id → 状态。进程内共享，供轮询。
@@ -1715,6 +1837,55 @@ _JS_CALLSTACK = """
         return;
     }
     var addrs = [];
+    var mode = "__MODE__";
+    if (mode === "scan") {
+        // 启发式扫描：栈上任何"看起来像返回地址"的值都算候选。
+        // 判据（保守，宁可少给也不错给）：
+        //   ① 落在某个已加载模块的 [base, base+size) 内
+        //   ② 该地址 -4 处的指令是 bl / blr（说明它确实是返回点）
+        try {
+            var mods = Process.enumerateModules();
+            var sp = t.context.sp;
+            var scanBytes = Math.min(__SCANBYTES__, 4096);
+            var seen = {};
+            for (var off = 0; off < scanBytes; off += 8) {
+                var v = 0;
+                try { v = ptr(sp).add(off).readPointer(); } catch (e) { continue; }
+                if (v === null) { continue; }
+                var val = v.toUInt32 ? v.toString() : String(v);
+                var pv = parseInt(val, 16);
+                if (!pv || isNaN(pv)) { continue; }
+                for (var mi = 0; mi < mods.length; mi++) {
+                    var m = mods[mi];
+                    var mb = parseInt(m.base.toString(), 16);
+                    if (pv > mb && pv < mb + m.size) {
+                        // 检查前一条指令是不是 bl/blr：ARM64 bl 编码高 6 位 100101
+                        var isCall = false;
+                        try {
+                            var w = ptr(pv - 4).readU32();
+                            var top6 = (w >>> 26) & 0x3F;
+                            isCall = (top6 === 0x25) || (top6 === 0x3F) ||
+                                     ((w >>> 21) & 0x7FF) === 0x3E0
+                                     && ((w >>> 16) & 0x1F) === 0;
+                        } catch (e) {}
+                        if (isCall && !seen[pv]) {
+                            seen[pv] = 1;
+                            addrs.push(ptr(pv).toString());
+                        }
+                        break;
+                    }
+                }
+                if (addrs.length >= limit) { break; }
+            }
+            send({tid: t.id, frames: addrs, heuristic: true,
+                  scanned_bytes: scanBytes,
+                  note: "启发式扫描：只返回落在模块内、且前一条指令是 bl 的候选，不保证完整"});
+            return;
+        } catch (e) {
+            send({err: "扫描栈失败: " + String(e)});
+            return;
+        }
+    }
     try {
         addrs = Thread.backtrace(t.context, Backtracer.ACCURATE)
             .map(function (a) { return a.toString(); });
@@ -1722,7 +1893,7 @@ _JS_CALLSTACK = """
         send({err: "取调用栈失败: " + String(e)});
         return;
     }
-    send({tid: t.id, frames: addrs.slice(0, limit)});
+    send({tid: t.id, frames: addrs.slice(0, limit), heuristic: false});
 })();
 """
 
@@ -2142,7 +2313,8 @@ def list_threads(serial: str, pid: int) -> str:
 
 @server.tool()
 @logged()
-def get_callstack(serial: str, pid: int, thread_id: int = 0, limit: int = 32) -> str:
+def get_callstack(serial: str, pid: int, thread_id: int = 0, limit: int = 32,
+                  method: str = "accurate", scan_bytes: int = 1024) -> str:
     """取指定线程的调用栈，并用 **mda 自己的静态模型**把每一帧符号化。
 
     为什么不用 frida 的 DebugSymbol：stripped 的壳样本上它没有符号表可用，
@@ -2174,9 +2346,13 @@ def get_callstack(serial: str, pid: int, thread_id: int = 0, limit: int = 32) ->
 
     # thread_id=0：优先最近命中的线程，实在没有就由 frida 端取第一个线程
     tid = int(thread_id or 0) or _recent_thread_id(tgt)
+    if method not in ("accurate", "scan"):
+        return _j({"error": f"method 只能是 'accurate' 或 'scan'，收到 {method!r}"})
     js = (_JS_CALLSTACK
           .replace("__TID__", str(tid))
-          .replace("__LIMIT__", str(limit)))
+          .replace("__LIMIT__", str(limit))
+          .replace("__MODE__", str(method))
+          .replace("__SCANBYTES__", str(max(64, min(int(scan_bytes or 1024), 1024)))))
     try:
         payload = _run_frida_script(tgt.rb.session, js)
     except Exception as exc:             # noqa: BLE001 - frida 异常类型不稳定
@@ -2229,187 +2405,88 @@ def get_callstack(serial: str, pid: int, thread_id: int = 0, limit: int = 32) ->
 @server.tool()
 @logged()
 def list_breakpoints() -> str:
-    """列出当前所有断点（AI 与界面共用同一份）。"""
+    """列出当前所有断点（AI 与界面共用同一份），并标出重复登记。
+
+    每条含 duplicate 标记时说明：**同一运行时地址存在多条记录**
+    （历史版本用别名拼 bp_id 留下的）。用 dedupe_breakpoints 清理。
+    """
     from server.dyn.service import get_dyn
 
-    return _j({"breakpoints": get_dyn().list_breakpoints()})
-
-
-# ---------------- 新能力：内存解释 / 单步规划 / trace 聚合 / 静动打通 ----------------
-#
-# 本区块对应 dyn/memread.py、dyn/stepper.py、dyn/tracer.py、dyn/bridge.py，
-# 这四个模块由并行开发提供，可能比本文件晚落地，因此一律**调用期惰性导入**：
-# 模块缺失只让对应工具报不可用，不会拖垮整个 MCP 服务。
-#
-# 统一约定（四条，AI 依赖它判断结果含义）：
-#   1. 占位能力（需真机 frida 但本轮留空）返回 implemented=false 的结构，
-#      **原样透传**，不包装成看起来成功的结果、也不当异常 catch 掉。
-#   2. 静态能力（读 so 文件、规划落点、按函数聚合）完全离线，不连设备。
-#   3. 任何降级都在 notes / diagnostics 里说明，不静默丢信息。
-#   4. 失败统一 {"error": ..., "code": ...}，code 机器可判定。
-
-
-def _load_dyn_module(module_path: str, *names: str):
-    """按需导入动态能力模块，并检查要用的函数是否都在。
-
-    (1) 第一次修改
-    bug 原因：memread / stepper / tracer / bridge 由其他代理并行新建，
-              本文件落地时它们可能还不存在。若写在模块顶层 import，
-              任何一个缺失都会让 mcp_server 整体起不来，既有几十个工具一起失效。
-    解决方案：改为调用期惰性导入 + 缺函数检查；缺失时返回带 code 的结构化错误，
-              模块补齐后无需改动本文件即自动生效。
-
-    返回 (module, None) 或 (None, 错误 dict)。
-    """
-    import importlib
-
-    # (2) 第二次修改（2026-11-13）：
-    #     bug 原因：包整体移入 server/ 之后，字符串形式的模块名（"dyn.memread"）
-    #               不会像 `from dyn import ...` 那样被批量改写覆盖。实测
-    #               import_module("dyn.memread") 直接 ModuleNotFoundError，
-    #               50 个工具全报 MODULE_UNAVAILABLE，而 639 项测试没抓到
-    #               （测试走 `from server.dyn.X import`，生产代码走字符串导入）。
-    #     解决方案：先按传入名导入，失败且不以 server. 开头时自动试 server.<name>。
-    #               这样即使以后又漏改一处，工具也不会整片失效。
-    #     另：hint 原文写着"该模块由并行开发提供"，在模块**已存在但路径不对**时
-    #         会把排查引向完全错误的方向，改成先区分"路径问题"与"真缺失"。
-    tried = [module_path]
-    mod = None
-    last_exc = None
-    for cand in (module_path,
-                 module_path if module_path.startswith("server.") else "server." + module_path):
-        if cand not in tried:
-            tried.append(cand)
-        try:
-            mod = importlib.import_module(cand)
-            break
-        except ModuleNotFoundError as exc:
-            last_exc = exc
-        except Exception as exc:        # noqa: BLE001 - 模块内错误同样算不可用
-            last_exc = exc
-            break
-
-    if mod is None:
-        # 分清两种原因，别让使用者往错方向查
-        exists_on_disk = False
-        try:
-            import os as _os
-            tail = module_path.split(".")[-1]
-            _root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
-            for sub in ("core", "dyn", "scripting"):
-                if _os.path.isfile(_os.path.join(_root, sub, tail + ".py")):
-                    exists_on_disk = True
-                    break
-        except Exception:                                 # noqa: BLE001
-            pass
-        hint = ("模块文件在，但导入路径不对——检查调用处写的是不是 server 前缀"
-                if exists_on_disk else
-                "该模块确实不存在于本仓库，确认功能是否已实现")
-        return None, {
-            "error": f"{module_path} 尚不可用：{type(last_exc).__name__}: {last_exc}",
-            "code": "MODULE_UNAVAILABLE",
-            "available": False,
-            "module": module_path,
-            "tried": tried,
-            "hint": hint,
-        }
-    missing = [n for n in names if not hasattr(mod, n)]
-    if missing:
-        return None, {
-            "error": f"{module_path} 缺少函数：{', '.join(missing)}（接口可能已变更）",
-            "code": "MODULE_INCOMPLETE",
-            "available": False,
-            "module": module_path,
-            "missing": missing,
-        }
-    return mod, None
-
-
-def _so_for_static_read(so_name: str):
-    """取静态 so 对象；未加载时给明确错误（不静默返回空）。
-
-    (27) 第二十七次修改（2026-11-13）：报错带 candidates，并区分"歧义"。
-        bug 原因：原来只有 error 文本 + loaded 列表。名字有歧义（同时匹配
-                  两个模块）时也给 SO_NOT_LOADED，让人以为"没加载"，
-                  去 load 一遍还是同样的错。
-        解决方案：code 区分 SO_AMBIGUOUS / SO_NOT_LOADED，
-                  candidates 给出"你是不是想找"的候选（来自 Session.resolve
-                  挂在 KeyError 上的结构化字段，不必解析错误文本）。
-    """
     try:
-        return _session.get(so_name), None
-    except KeyError as exc:
-        return None, {
-            # str(KeyError) 会给消息套一层引号（'"未加载的 so: x"'），
-            # 直接取 args[0] 才是干净原文
-            "error": exc.args[0] if exc.args else str(exc),
-            "code": getattr(exc, "mda_code", "SO_NOT_LOADED"),
-            "loaded": getattr(exc, "mda_loaded", list(_session.modules)),
-            "candidates": getattr(exc, "mda_candidates",
-                                  _session._near_names(so_name, list(_session.modules))),
-        }
+        bps = get_dyn().list_breakpoints()
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}"})
+    dup = [b for b in bps if b.get("duplicate")]
+    out = {"count": len(bps), "breakpoints": bps}
+    if dup:
+        out["warning"] = (f"{len(dup)} 条断点存在重复登记（同一运行时地址多条记录），"
+                          "用 dedupe_breakpoints 清理")
+    return _j(out)
 
 
-def _backtrace_hints(frames, tool_hint: str = "") -> list[str]:
-    """从符号化后的栈帧里找出"只有模块+偏移、没有函数名"的模块，给 AI 提示。
+@server.tool()
+@logged()
+def dedupe_breakpoints(serial: str = "", pid: int = 0) -> str:
+    """清理**重复登记的断点**（同一运行时地址只保留一条，其余真撤销）。
 
-    (18) 第十八次修改（2026-11-05）：新增。
-        bug 原因：符号化失败时栈帧会退化成 `libc++.so+0x4ce58` 这种形式，
-                  不报错、也不提示，AI 很容易以为"分析到这一步了"，
-                  而实际上函数名一个都没解析出来。实测把 libc++.so 存成
-                  libcxx_lib64.so 时就是这样，改成原名后立刻变成
-                  `libc++.so!_Znwm+0x20`。
-        解决方案：扫描栈帧，把"有 +0x 但没有 !"的模块名收集起来，
-                  由调用方拼一条可执行的提示（去 load_so 载入这些 so）。
+    为什么会有重复：早期版本 bp_id 用调用方传入的原始 so 名拼接，
+    而同一模块有多种写法（`libfoo.so` / `foo.so` / `libfoo-1.2.so`）。
+    两种写法各下一次断点就产生两条指向同一块内存的记录，
+    删掉一条另一条残留——表现为「断点清不干净」。
+
+    本工具是通用清理手段：按**运行时地址**去重，与模块名怎么写的无关。
+    保留最早的一条（通常它是真正生效的那条），其余调 debugger 真撤销。
+
+    serial/pid 都为空时清理所有目标。
     """
-    missing: list[str] = []
-    seen: set[str] = set()
-    for f in frames or []:
-        text = str(f)
-        if "!" in text:
-            continue                      # 已经有函数名，符号化成功
-        marker = "+0x" if "+0x" in text else ("+0X" if "+0X" in text else "")
-        if not marker:
-            continue                      # 裸地址：不属于任何模块，另说
-        mod = text.split(marker)[0].strip()
-        if mod and mod not in seen:
-            seen.add(mod)
-            missing.append(mod)
-    if not missing:
-        return []
-    hint = (f"调用栈里有 {len(missing)} 个模块只解析出偏移、没有函数名：{missing}。"
-            "原因是这些 so 还没载入 mda（或载入时文件名与设备上的不一致）。"
-            "用 load_so 载入后重新取栈即可拿到函数名，例如 "
-            f"load_so(path=\"<本地路径>/{missing[0]}\")")
-    if tool_hint:
-        hint += "；" + tool_hint
-    return [hint]
+    from server.dyn.service import get_dyn
 
-
-def _rb_for_runtime(serial: str, pid: int):
-    """取用于换算运行时地址的 Rebase；未 attach 时给明确错误。
-
-    (12) 第十二次修改（2026-11-03）：新增本函数。
-        背景：frida-server 已对齐 17.23.3，memread 的 source="runtime" 已实现，
-        但 MCP 层此前没把 Rebase 传下去，导致工具仍在走留空分支。
-        这里复用 dyn.service 的单例会话语义（已 attach 则复用，避免重复 attach
-        造成的抖动与句柄泄漏）。
-    """
-    if not serial or not pid:
-        return None, {
-            "error": "source='runtime' 需要 serial 与 pid（指向已 attach 的目标进程）",
-            "code": "NEED_TARGET",
-        }
+    svc = get_dyn()
     try:
-        from server.dyn.service import get_dyn
+        with svc._lock:                                   # noqa: SLF001 - 只读遍历
+            targets = list(svc._targets.values())         # noqa: SLF001
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}"})
 
-        tgt = get_dyn().attach(serial, pid)
-    except Exception as exc:                              # noqa: BLE001 - DynError 带 code
-        return None, {"error": str(exc), "code": getattr(exc, "code", "ATTACH_FAILED")}
-    rb = getattr(tgt, "rb", None)
-    if rb is None:
-        return None, {"error": "该目标没有 Rebase（rb 为空）", "code": "NO_RB"}
-    return rb, None
+    removed: list[dict] = []
+    kept = 0
+    for tgt in targets:
+        if serial and str(getattr(tgt, "serial", "")) != str(serial):
+            continue
+        if pid and int(getattr(tgt, "pid", 0) or 0) != int(pid):
+            continue
+        # 按运行时地址分组
+        by_rt: dict[int, list[str]] = {}
+        for bid, rec in list(getattr(tgt, "breakpoints", {}).items()):
+            rt = int(rec.get("runtime_addr") or -1)
+            if rt > 0:
+                by_rt.setdefault(rt, []).append(bid)
+        for rt, ids in by_rt.items():
+            if len(ids) <= 1:
+                kept += len(ids)
+                continue
+            # 保留第一条，其余真撤销
+            keep = ids[0]
+            kept += 1
+            for bid in ids[1:]:
+                try:
+                    got = svc.remove_breakpoint(bid)
+                    removed.append({"id": bid, "kept": keep,
+                                    "removed": bool(got.get("removed")),
+                                    "partial": bool(got.get("partial"))})
+                except Exception as exc:                  # noqa: BLE001
+                    removed.append({"id": bid, "kept": keep,
+                                    "removed": False,
+                                    "error": f"{type(exc).__name__}: {exc}"})
+
+    return _j({
+        "ok": True,
+        "kept": kept,
+        "removed_count": len(removed),
+        "removed": removed,
+        "note": ("按运行时地址去重，与模块名写法无关；"
+                 "保留最早的一条，其余真撤销"),
+    })
 
 
 def _bases_from_hit_events(events: list) -> tuple[dict, str]:
@@ -2467,34 +2544,6 @@ def _bases_from_hit_events(events: list) -> tuple[dict, str]:
     if conflicts:
         note += f"；{len(conflicts)} 个 so 的基址自相矛盾已跳过：{conflicts}"
     return bases, note
-
-
-def _snapshot_service_events() -> tuple[list, str]:
-    """取动态服务里已有的断点命中事件快照，供 trace_aggregate(events=None) 使用。
-
-    为什么读私有队列：service 没有"列出全部历史事件"的公开接口
-    （poll_events 需要 serial+pid 且会推进游标）。这里**只读拷贝**，
-    不改游标、不发任何 frida 请求，与 state() 一样属于旁观。
-
-    只保留带地址的事件：attached / breakpoint_set 一类没有地址，聚合不了。
-    """
-    try:
-        from server.dyn.service import get_dyn
-
-        svc = get_dyn()
-    except Exception as exc:            # noqa: BLE001 - 服务不可用不该让聚合崩
-        return [], f"动态服务不可用：{type(exc).__name__}: {exc}"
-    queue = getattr(svc, "_events", None)
-    if queue is None:
-        return [], "动态服务没有可读的事件队列，请改用 events 参数显式传入事件"
-    snap = []
-    for ev in list(queue):
-        if not isinstance(ev, dict):
-            continue
-        if ev.get("runtime_addr") is None and ev.get("addr") is None:
-            continue
-        snap.append(dict(ev))
-    return snap, ""
 
 
 @server.tool()
@@ -2571,6 +2620,82 @@ def read_runtime_string(serial: str, pid: int, runtime_addr: str,
     except Exception as exc:                              # noqa: BLE001
         return _j({"error": f"{type(exc).__name__}: {exc}",
                    "code": getattr(exc, "code", "READ_FAILED")})
+
+
+def _load_dyn_module(module_path: str, *names: str):
+    """按需导入动态能力模块，并检查要用的函数是否都在。
+
+    (1) 第一次修改
+    bug 原因：memread / stepper / tracer / bridge 由其他代理并行新建，
+              本文件落地时它们可能还不存在。若写在模块顶层 import，
+              任何一个缺失都会让 mcp_server 整体起不来，既有几十个工具一起失效。
+    解决方案：改为调用期惰性导入 + 缺函数检查；缺失时返回带 code 的结构化错误，
+              模块补齐后无需改动本文件即自动生效。
+
+    返回 (module, None) 或 (None, 错误 dict)。
+    """
+    import importlib
+
+    # (2) 第二次修改（2026-11-13）：
+    #     bug 原因：包整体移入 server/ 之后，字符串形式的模块名（"dyn.memread"）
+    #               不会像 `from dyn import ...` 那样被批量改写覆盖。实测
+    #               import_module("dyn.memread") 直接 ModuleNotFoundError，
+    #               50 个工具全报 MODULE_UNAVAILABLE，而 639 项测试没抓到
+    #               （测试走 `from server.dyn.X import`，生产代码走字符串导入）。
+    #     解决方案：先按传入名导入，失败且不以 server. 开头时自动试 server.<name>。
+    #               这样即使以后又漏改一处，工具也不会整片失效。
+    #     另：hint 原文写着"该模块由并行开发提供"，在模块**已存在但路径不对**时
+    #         会把排查引向完全错误的方向，改成先区分"路径问题"与"真缺失"。
+    tried = [module_path]
+    mod = None
+    last_exc = None
+    for cand in (module_path,
+                 module_path if module_path.startswith("server.") else "server." + module_path):
+        if cand not in tried:
+            tried.append(cand)
+        try:
+            mod = importlib.import_module(cand)
+            break
+        except ModuleNotFoundError as exc:
+            last_exc = exc
+        except Exception as exc:        # noqa: BLE001 - 模块内错误同样算不可用
+            last_exc = exc
+            break
+
+    if mod is None:
+        # 分清两种原因，别让使用者往错方向查
+        exists_on_disk = False
+        try:
+            import os as _os
+            tail = module_path.split(".")[-1]
+            _root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+            for sub in ("core", "dyn", "scripting"):
+                if _os.path.isfile(_os.path.join(_root, sub, tail + ".py")):
+                    exists_on_disk = True
+                    break
+        except Exception:                                 # noqa: BLE001
+            pass
+        hint = ("模块文件在，但导入路径不对——检查调用处写的是不是 server 前缀"
+                if exists_on_disk else
+                "该模块确实不存在于本仓库，确认功能是否已实现")
+        return None, {
+            "error": f"{module_path} 尚不可用：{type(last_exc).__name__}: {last_exc}",
+            "code": "MODULE_UNAVAILABLE",
+            "available": False,
+            "module": module_path,
+            "tried": tried,
+            "hint": hint,
+        }
+    missing = [n for n in names if not hasattr(mod, n)]
+    if missing:
+        return None, {
+            "error": f"{module_path} 缺少函数：{', '.join(missing)}（接口可能已变更）",
+            "code": "MODULE_INCOMPLETE",
+            "available": False,
+            "module": module_path,
+            "missing": missing,
+        }
+    return mod, None
 
 
 @server.tool()
@@ -3086,7 +3211,8 @@ def locate_runtime_addr(serial: str, pid: int, runtime_addr: int | str) -> str:
 
 @server.tool()
 @logged()
-def hit_analysis(serial: str, pid: int, build_xrefs: bool = False) -> str:
+def hit_analysis(serial: str, pid: int, build_xrefs: bool = False,
+                 bp_id: str = "") -> str:
     """最近一次断点命中 → 完整静态上下文（命中点前后指令 / 伪代码 / 调用者）。
 
     这是"停下来之后该看什么"的一站式答案：把命中的运行时现场直接摊成静态视图，
@@ -3122,6 +3248,33 @@ def hit_analysis(serial: str, pid: int, build_xrefs: bool = False) -> str:
         hits = svc.hits(serial, pid)
     except Exception as exc:            # noqa: BLE001 - DynError 带 code
         return _j({"error": f"{type(exc).__name__}: {exc}", "code": "NOT_ATTACHED"})
+
+    # (120) 按 bp_id 过滤：bp_id 形如 "serial:pid:so:2d8a48"，
+    #       末段是十六进制静态地址。删掉旧断点后，旧命中仍在队列里，
+    #       不过滤就会取到旧记录（用户实测过这个坑）。
+    filter_note = ""
+    if bp_id:
+        try:
+            want = int(str(bp_id).rsplit(":", 1)[-1].lstrip("0x"), 16)
+        except Exception:                                 # noqa: BLE001
+            return _j({"error": f"bp_id 格式不对：{bp_id!r}（应形如 "
+                                f"'serial:pid:so:2d8a48'）",
+                       "code": "BAD_BP_ID"})
+        before = len(hits)
+        hits = [h for h in hits
+                if int(h.get("static_addr", h.get("static", -1)) or -1) == want]
+        filter_note = (f"已按 bp_id 过滤到 {len(hits)} 条"
+                       f"（过滤前 {before} 条）")
+        if not hits:
+            return _j({
+                "error": f"bp_id={bp_id} 没有任何命中记录",
+                "code": "NO_HITS",
+                "hint": "① 确认这个地址真的被命中过（poll_events 看 breakpoint_hit）；"
+                        "② 命中可能已被 clear_hits 清掉；"
+                        "③ 不传 bp_id 可以看到全部命中",
+                "hits_total": before,
+            })
+
     if not hits:
         return _j({
             "error": f"{serial}:{pid} 还没有任何断点命中，无法做命中分析",
@@ -3154,8 +3307,55 @@ def hit_analysis(serial: str, pid: int, build_xrefs: bool = False) -> str:
 
     if fallback_note:
         result.setdefault("notes", []).append(fallback_note)
+    if filter_note:
+        result.setdefault("notes", []).append(filter_note)
     result["hits_total"] = len(hits)
     return _j(result)
+
+
+@server.tool()
+@logged()
+def clear_hits(serial: str, pid: int) -> str:
+    """清空某目标的**命中记录队列**（不影响已下的断点）。
+
+    为什么需要它：`hit_analysis` 取"最近一次命中"，而删掉的断点其旧命中
+    还留在队列里。不清掉就会分析到已经废弃的地址，白跑一轮。
+
+    典型用法：
+        1) remove_breakpoint(旧断点)
+        2) clear_hits(serial, pid)          ← 清掉旧记录
+        3) set_breakpoint(新地址) → 触发 → hit_analysis
+
+    注意：只清**命中记录**，断点本身还在；要撤断点用 remove_breakpoint。
+    """
+    from server.dyn.service import get_dyn
+
+    svc = get_dyn()
+    try:
+        tgt = svc._target(serial, pid)                    # noqa: SLF001 - 只读
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}", "code": "NOT_ATTACHED"})
+
+    dbg = getattr(tgt, "dbg", None)
+    cleared = 0
+    try:
+        hits = getattr(dbg, "_hits", None)
+        if hits is not None:
+            cleared = len(hits)
+            hits.clear()
+        # 挂起 token 也要清：否则 resume 会去找已经不存在的命中
+        toks = getattr(dbg, "_pending_tokens", None)
+        if toks is not None:
+            toks.clear()
+        # 事件流里的旧命中同样清掉，避免 poll_events 又翻出来
+        ev = getattr(dbg, "_events", None)
+        if ev is not None:
+            ev.clear()
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}",
+                   "code": "CLEAR_FAILED"})
+    return _j({"ok": True, "cleared": cleared,
+               "note": "只清命中记录，断点仍然有效"})
 
 
 @server.tool()
@@ -4014,8 +4214,22 @@ def read_memory_batch(serial: str, pid: int, regions: list) -> str:
 @server.tool()
 @logged()
 def probe_hits(serial: str, pid: int, so_name: str, static_addr: int,
-               duration: float = 5.0) -> str:
+               duration: float = 5.0, capture_regs: list | None = None,
+               max_samples: int = 20) -> str:
     """**纯计数探针**：只统计某地址被进入多少次，不挂起、不依赖 hold。
+
+    ## 寄存器采样（capture_regs）
+
+    它已经用 Interceptor 挂上了，**顺手抓寄存器几乎零成本**：
+
+        probe_hits(..., capture_regs=["x0", "x1", "lr"])
+
+    → samples: [{x0: "0x...", x1: "0x...", lr: "0x...", tid: 123, n: 4}]
+
+    同一组寄存器值反复命中只留一条并累加 `n`（去重），高频函数下也不会爆。
+    默认不采样（空数组），行为与旧版完全一致。
+
+    这个不需要 hold，风险低，适合**高频函数**——正因如此更该抓现场。
 
     回答的是「这段代码到底跑不跑」——和 verify_breakpoint 分工不同：
 
@@ -4053,7 +4267,9 @@ def probe_hits(serial: str, pid: int, so_name: str, static_addr: int,
         return _j(err)
     try:
         return _j(mod.probe_hits(serial, int(pid), so_name,
-                                 int(static_addr), duration=float(duration)))
+                                 int(static_addr), duration=float(duration),
+                                 capture_regs=capture_regs,
+                                 max_samples=int(max_samples)))
     except Exception as exc:                              # noqa: BLE001
         return _j({"error": f"{type(exc).__name__}: {exc}",
                    "code": getattr(exc, "code", "PROBE_FAILED")})

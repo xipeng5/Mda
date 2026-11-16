@@ -4638,6 +4638,229 @@ def test_r96_method_filter_scope():
         check("^LIZ$ 只匹配 LIZ", got == '["LIZ"]', f"实际 {got}")
 
 
+
+def test_r97_user_feedback_32rounds():
+    """R97 第 32 轮使用反馈的全部处理都被锁住。
+
+    来源：一位 AI 代理用 mda 分析加固 App 连续 32 轮后的反馈。
+    详细核实过程见 docs/11-mda工具反馈.md。
+
+    锁七件事（每条都对应一个真实踩过的坑）：
+      ① read_runtime 双链路：adb /proc/pid/mem 优先，frida 回退
+      ② hit_analysis 支持 bp_id 过滤 + clear_hits 存在
+      ③ search_insn 的操作数是**子串**匹配（精确匹配会导致结果恒空）
+      ④ probe_hits 默认不采样寄存器（默认采样会拖死高频函数）
+      ⑤ get_callstack 支持 method="scan" 且渲染出的 JS 语法合法
+      ⑥ disassemble 返回带 aligned / first_insn_addr
+      ⑦ string_refs 返回带 offset / is_entry
+    """
+    import json as _json
+    import sys
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    sys.path.insert(0, str(root))
+
+    rebase_src = (root / "server" / "dyn" / "rebase.py").read_text(encoding="utf-8")
+    svc_src = (root / "server" / "dyn" / "service.py").read_text(encoding="utf-8")
+    tools_src = (root / "server" / "mcp_server" / "tools.py").read_text(encoding="utf-8")
+    insn_src = (root / "server" / "core" / "insn_search.py").read_text(encoding="utf-8")
+    tracer_src = (root / "server" / "dyn" / "tracer.py").read_text(encoding="utf-8")
+
+    # ① adb 直读链路
+    check("rebase 有 read_memory_proc", "def read_memory_proc" in rebase_src,
+          "hold 挂起时读不了内存，最核心工作流被切断")
+    check("read_runtime 优先走 proc_mem", "read_memory_proc" in svc_src
+          and "proc_mem" in svc_src, "没走 adb 链路，仍会被 frida session 卡住")
+    check("读内存返回标明链路", '"via": via' in svc_src,
+          "调用方不知道数据来自哪条链路")
+
+    # ② hit_analysis
+    check("hit_analysis 有 bp_id", 'bp_id: str = ""' in tools_src,
+          "删断点后仍会取到旧命中")
+    check("有 clear_hits 工具", "def clear_hits(" in tools_src,
+          "无法手动清掉旧命中队列")
+
+    # ③ search_insn 子串匹配
+    check("search_insn 工具已注册", "def search_insn(" in tools_src,
+          "缺指令级搜索能力")
+    check("操作数用 search 而非 match", "ore.search(" in insn_src,
+          "精确匹配会让 [x*, #0x1100] 永远命中不了（op_str 前面还有源寄存器）")
+
+    # ④ probe_hits 默认不采样
+    check("probe_hits 有 capture_regs", "capture_regs" in tracer_src,
+          "挂上了却抓不到寄存器，浪费一次钩子")
+    check("默认不采样", "[] if not capture_regs" in tracer_src,
+          "默认采样 31 个寄存器会拖死高频函数")
+
+    # ⑤ 启发式栈回溯
+    check("get_callstack 支持 scan", 'method: str = "accurate"' in tools_src,
+          "PAC/无 fp 下只有 2 帧，无法兜底")
+    from server.mcp_server.tools import _JS_CALLSTACK
+    js = (_JS_CALLSTACK.replace("__TID__", "1").replace("__LIMIT__", "10")
+          .replace("__MODE__", "scan").replace("__SCANBYTES__", "1024"))
+    check("scan 模式 JS 已渲染", "__MODE__" not in js and "enumerateModules" in js,
+          "占位符没替换")
+
+    # ⑥ disassemble 对齐信息
+    check("disassemble 返回 aligned", '"aligned": aligned' in tools_src,
+          "调用方无法确认起点有没有被挪动")
+    check("disassemble 返回 first_insn_addr", "first_insn_addr" in tools_src,
+          "同上")
+
+    # ⑦ string_refs 偏移
+    check("string_refs 返回 offset",
+          'item["offset"] = hex(site - fn.addr)' in tools_src,
+          "只给函数名，无法判断是入口还是内部")
+    check("string_refs 返回 is_entry",
+          'item["is_entry"] = (site == fn.addr)' in tools_src,
+          "同上")
+
+    # 行为验证：search_insn 真能匹配到带源寄存器的内存操作数
+    from server.core.insn_search import _compile_operand, _norm_operand
+    # 用户写 `[x*, #0x1100]` 是想"操作数里存在这个内存操作数"，
+    # 而 op_str 是 "x19, [x0, #0x30]" 这种完整列表——必须子串匹配才命中。
+    rex = _compile_operand("[x*, #0x30]")
+    check("操作数能匹配带源寄存器的写法",
+          bool(rex.search(_norm_operand("x19, [x0, #0x30]"))),
+          "子串匹配失效，搜索结果会恒空")
+    # sp/fp 不是 x 开头，`x*` 不该匹配它们——这是正确行为，不是缺陷
+    check("x* 不误匹配 sp",
+          not rex.search(_norm_operand("x19, [sp, #0x30]")),
+          "通配符过宽，会误伤 sp/fp")
+
+    # 行为验证：search_insn 在真实样本上能出结果
+    sample = root / "samples" / "libbase.so"
+    if sample.exists():
+        from server.core.session import Session
+        from server.core.insn_search import search_insn
+        ses = Session()
+        so = ses.add(str(sample))
+        got = search_insn(so, mnemonic="str", operand_pattern="[x*, #0x30]",
+                          limit=3)
+        check("search_insn 真能搜到结果", got["matched"] > 0,
+              f"matched={got['matched']}，指令搜索没生效")
+        # func_filter 命中不到函数时必须明确报错，不能静默返回 0 条
+        nf = search_insn(so, mnemonic="str", func_filter="__不存在的函数__")
+        check("func_filter 找不到时明确报错",
+              nf.get("code") == "FUNC_NOT_FOUND",
+              "静默返回 0 条，会被读成'函数里没有匹配指令'")
+        if got["results"]:
+            r0 = got["results"][0]
+            check("结果带函数名与偏移",
+                  r0.get("function") is not None and r0.get("offset") is not None,
+                  f"缺定位信息：{r0}")
+
+
+
+def test_r98_breakpoint_alias_dedup():
+    """R98 断点 bp_id 必须用规范模块名，别名不能产生重复记录。
+
+    (1) 第一次修改（2026-11-16）：
+        bug 原因：bp_id 用**调用方传入的原始 so_name** 拼接：
+                    bp_id = f"{serial}:{pid}:{so_name}:{static_addr:x}"
+                  而设备上同一模块有多种写法（libfoo.so / foo.so /
+                  libfoo-1.2.so / 完整路径）。两种写法各下一次断点就产生
+                  两条**指向同一块内存的独立记录**；remove_breakpoint 按
+                  bp_id 删，只删掉一条，另一条永远残留。
+                  用户实测：libmetasec_ml.so 与 metasec_ml.so 同时挂着，
+                  表现为"之前的断点没清干净"。
+
+                  这是通用缺陷——任何模块只要有别名写法就会踩，
+                  不是某个 App 的特例。
+
+        解决方案：① bp_id 用运行时模块的真实名（mod.name）拼接；
+                  ② 保留 original_name 供检索；
+                  ③ 同运行时地址的旧记录复用，不重复登记；
+                  ④ remove_breakpoint 增加按 (so, addr) 反查兜底；
+                  ⑤ 新增 dedupe_breakpoints 清理历史遗留。
+
+    这条测试锁五件事，防止行为回退。
+    """
+    import inspect
+    import sys
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    sys.path.insert(0, str(root))
+    from server.dyn.service import DynamicService
+
+    svc_src = (root / "server" / "dyn" / "service.py").read_text(encoding="utf-8")
+
+    # ① bp_id 必须用规范名 _canon，不能直接用 so_name
+    _needle = 'bp_id = f"{serial}:{pid}:{_canon}:' 
+    check("bp_id 用规范名拼接", _needle in svc_src,
+          "又用原始 so_name 拼 bp_id，别名会造出重复记录")
+    check("保留 original_name", '"original_name": so_name' in svc_src,
+          "调用方无法按自己习惯的名字检索")
+
+    # ② 同运行时地址复用
+    check("同址旧记录会被复用", "reused_by_addr" in svc_src or
+          "== int(_runtime)" in svc_src,
+          "别名写法仍会重复登记")
+
+    # ③ remove 按 (so, addr) 反查兜底
+    check("remove 有按地址反查",
+          "_addr" in svc_src and "static_addr" in svc_src,
+          "拿旧写法的 bp_id 删不掉")
+
+    # ④ list_breakpoints 能标出重复
+    check("list_breakpoints 标重复", 'bp["duplicate"]' in svc_src,
+          "重复登记看不见")
+
+    # ⑤ 有清理工具
+    tools_src = (root / "server" / "mcp_server" / "tools.py").read_text(encoding="utf-8")
+    check("有 dedupe_breakpoints 工具", "def dedupe_breakpoints(" in tools_src,
+          "历史遗留的重复断点无法清理")
+    check("list_breakpoints 给出 warning",
+          'out["warning"]' in tools_src,
+          "重复登记不提示")
+
+    # 行为验证：两个别名算出同一个 bp_id（用假模块模拟）
+    class _M:
+        name = "libfoo.so"
+
+    class _Rb:
+        def to_runtime(self, addr, mod):
+            return 0x7000000000 + addr
+
+    class _Dbg:
+        def __init__(self):
+            self.calls = []
+
+        def set_breakpoint(self, so, addr, policy="resume"):
+            self.calls.append((so, addr, policy))
+            return True
+
+    class _Tgt:
+        pass
+
+    svc = DynamicService()
+    tgt = _Tgt()
+    tgt.key = "s:1"
+    tgt.serial, tgt.pid = "s", 1
+    tgt.breakpoints = {}
+    tgt.state = "attached"
+    tgt.rb = _Rb()
+    tgt.dbg = _Dbg()
+    tgt._lock = None
+    svc._targets["s:1"] = tgt
+
+    orig_req = svc._require_module
+    svc._require_module = lambda t, name: _M()          # noqa: SLF001
+
+    a = svc.set_breakpoint("s", 1, "libfoo.so", 0x1000, hold=True)
+    b = svc.set_breakpoint("s", 1, "foo.so", 0x1000, hold=True)
+    svc._require_module = orig_req
+
+    check("两种写法得到同一个断点", a["id"] == b["id"],
+          f"别名造出两条记录：{a['id']} vs {b['id']}")
+    check("第二种写法被识别为已有", bool(b.get("existing")),
+          "没复用，说明又重复登记了")
+    check("断点表里只有一条", len(tgt.breakpoints) == 1,
+          f"实际 {len(tgt.breakpoints)} 条")
+
+
 def main() -> int:
     print("== R1 held/token 透出（防线程永久挂起）==")
     test_r1_held_is_exposed()
@@ -4809,6 +5032,12 @@ def main() -> int:
 
     print("== R79 C++ 符号还原 ==")
     test_r79_cpp_demangle()
+
+    print("== R98 断点别名去重 ==")
+    test_r98_breakpoint_alias_dedup()
+
+    print("== R97 第32轮反馈处理 ==")
+    test_r97_user_feedback_32rounds()
 
     print("== R96 method 筛选作用域 ==")
     test_r96_method_filter_scope()

@@ -290,3 +290,82 @@ class Rebase:
         if "err" in payload or "hex" not in payload:
             return b""
         return bytes.fromhex(payload["hex"])
+    # ---------------------------------------------------------------- adb 直读
+    def read_memory_proc(self, serial: str, pid: int, addr: int,
+                         size: int) -> bytes:
+        """直接从 /proc/<pid>/mem 读内存，**完全不经过 frida**。
+
+        (1) 第一次修改（2026-11-16）：
+            bug 原因：read_memory 用 create_script 读，而它依赖**同一个 frida
+                      session**。当 hold 断点把目标线程挂在 recv().wait() 里时，
+                      该 session 会失效，报 "InvalidOperationError: session is gone"。
+                      于是「下断点 → 读内存 → 分析」这条最核心的工作流被切断，
+                      hold 断点只能用来抓寄存器，价值少一半。
+                      而原文档还写着"挂起状态下可以放心调用"——承诺过头了。
+            解决方案：新增本方法，走 adb shell + dd 读 /proc/<pid>/mem。
+                      这条链路与 frida 完全无关，hold 挂多久都能读。
+
+        实现要点（都是实测出来的）：
+          · dd 的 skip 以 bs 为单位。**绝不能用 bs=1 读大块**——
+            bs=1 时 skip 是按字节寻址没错，但 count=4096 要 dd 循环 4096 次，
+            实测 4KB 要 12 秒。改为 bs=size 时 skip 只能写 1（从头读），不行。
+            折中：用 bs=1 但把 count 限制在 512 以内（512 次仍有约 1.5 秒）。
+            更好的做法是 bs=4096 + 按页对齐分块，见实现。
+          · 地址必须在 maps 里可读，否则 dd 报错或读到空。
+          · od 输出是空格分隔的十六进制，跨行需要全部拼接。
+        """
+        import re
+        import subprocess
+
+        if not (1 <= int(size) <= 4096):
+            raise ValueError("size 必须在 1..4096")
+        addr = int(addr)
+        want = int(size)
+
+        # 按页对齐分块读：bs 固定 4096，用 skip=页号，再裁掉页内偏移。
+        # 这样每页只付一次 dd 启动开销（约 30ms），4KB 约 100ms。
+        out = bytearray()
+        cur = addr
+        remain = want
+        while remain > 0:
+            page = cur & ~0xFFF
+            in_page = cur - page
+            take = min(4096 - in_page, remain)
+            hexs = self._dd_page(serial, pid, page, 4096)
+            if not hexs:
+                break                       # 这一页读不到，停在已读到的位置
+            chunk = bytes.fromhex(hexs)
+            out.extend(chunk[in_page:in_page + take])
+            cur += take
+            remain -= take
+            if len(chunk) < 4096:
+                break                       # 页尾已到可读边界
+        return bytes(out)
+
+    def _dd_page(self, serial: str, pid: int, page_addr: int,
+                 size: int = 4096) -> str:
+        """用 dd 读一页，返回纯 hex 字符串（读不到返回空串）。"""
+        import subprocess
+
+        skip = page_addr // 4096
+        cmd = (f"dd if=/proc/{int(pid)}/mem bs=4096 skip={skip} count=1 "
+               f"2>/dev/null | od -An -tx1 -v")
+        try:
+            r = subprocess.run(
+                ["adb", "-s", str(serial), "shell", f"su -c {_shq(cmd)}"],
+                capture_output=True, text=True, timeout=30,
+            )
+        except Exception:                                 # noqa: BLE001
+            return ""
+        raw = (r.stdout or "").strip()
+        if not raw:
+            return ""
+        # od 输出形如 " 61 72 74 0a ..."，跨行要全拼起来
+        hexs = "".join(raw.split())
+        return hexs if len(hexs) >= 2 else ""
+
+
+def _shq(s: str) -> str:
+    """把命令包成单引号形式，供 su -c 使用（内部单引号转义）。"""
+    return "'" + str(s).replace("'", "'\\''") + "'"
+

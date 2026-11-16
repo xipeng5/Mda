@@ -3422,12 +3422,42 @@ _JS_PROBE_HITS = r"""
     var threads = {};
     var mechanism = 'Interceptor';
     var attached = false;
+    // (2) 寄存器采样：CAP_REGS 为空数组时不采样，行为与旧版完全一致
+    var CAP_REGS = __CAPREGS__;
+    var MAX_SAMPLES = __MAXSAMPLES__;
+    var samples = [];
+    var seenKeys = {};
+    function capOne(ctx) {
+        var one = { tid: this.threadId, n: 0 };
+        for (var i = 0; i < CAP_REGS.length; i++) {
+            var rn = CAP_REGS[i];
+            var v = null;
+            try { v = ctx[rn] === undefined ? null : ctx[rn].toString(); } catch (e) {}
+            one[rn] = v;
+        }
+        return one;
+    }
     try {
         Interceptor.attach(target, {
             onEnter: function () {
                 hits++;
                 if (firstTs === null) { firstTs = Date.now() / 1000; }
                 threads[this.threadId] = (threads[this.threadId] || 0) + 1;
+                if (CAP_REGS.length === 0) { return; }
+                if (samples.length >= MAX_SAMPLES) { return; }
+                try {
+                    var one = capOne(this.context);
+                    // 按寄存器值去重：同一个值反复命中只留一条 + 计数，
+                    // 高频函数下能把采样压到可控规模
+                    var key = CAP_REGS.map(function (r) { return one[r] || '-'; }).join('|');
+                    if (seenKeys[key] !== undefined) {
+                        samples[seenKeys[key]].n++;
+                        return;
+                    }
+                    one.n = 1;
+                    seenKeys[key] = samples.length;
+                    samples.push(one);
+                } catch (e) {}
             }
         });
         attached = true;
@@ -3441,14 +3471,16 @@ _JS_PROBE_HITS = r"""
            runtime: target.toString(), mechanism: mechanism });
     recv('stop', function () {
         send({ kind: 'stopped', hits: hits, first_hit_ts: firstTs,
-               threads: Object.keys(threads).map(Number) });
+               threads: Object.keys(threads).map(Number),
+               samples: samples, sampled: CAP_REGS.length > 0 });
     });
 })();
 """
 
 
 def probe_hits(serial: str, pid: int, so_name: str, static_addr: int,
-               duration: float = 5.0) -> dict:
+               duration: float = 5.0, capture_regs=None,
+               max_samples: int = 20) -> dict:
     """**纯计数探针**：只统计某地址被进入多少次，不挂起、不依赖 hold。
 
     (15) 第十五次修改（2026-11-06）：新增。
@@ -3507,6 +3539,11 @@ def probe_hits(serial: str, pid: int, so_name: str, static_addr: int,
     js = (_JS_PROBE_HITS
           .replace("__CANDS__", json.dumps(cands))
           .replace("__OFFSET__", str(int(static_addr)))
+          .replace("__CAPREGS__", json.dumps(
+              [] if not capture_regs
+              else [str(x) for x in (capture_regs if isinstance(capture_regs, (list, tuple))
+                                     else [capture_regs])]))
+          .replace("__MAXSAMPLES__", str(max(1, min(int(max_samples or 20), 200))))
           .replace("__FP__", json.dumps(fp_hex)))
 
     box: dict = {"ready": False, "stopped": False, "hits": 0,

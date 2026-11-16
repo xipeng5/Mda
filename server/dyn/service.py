@@ -187,8 +187,31 @@ class DynamicService:
             return {"targets": targets, "seq": self._seq}
 
     def list_breakpoints(self) -> list[dict]:
+        """列出全部断点，并标出**重复登记**（同一运行时地址多条记录）。
+
+        (20) 为什么标出来：别名写法曾让同一块内存出现多条记录，
+             删一条另一条残留。现在 bp_id 已改用规范名，但**旧记录可能还在**，
+             调用方需要能看到并清理。
+        """
         with self._lock:
-            return [bp for tgt in self._targets.values() for bp in tgt.breakpoints.values()]
+            all_bps = [dict(bp) for tgt in self._targets.values()
+                       for bp in tgt.breakpoints.values()]
+
+        # 统计每个运行时地址出现几次（只统计能算出来的）
+        count: dict[int, int] = {}
+        for bp in all_bps:
+            rt = int(bp.get("runtime_addr") or -1)
+            if rt > 0:
+                count[rt] = count.get(rt, 0) + 1
+
+        for bp in all_bps:
+            rt = int(bp.get("runtime_addr") or -1)
+            if rt > 0 and count.get(rt, 0) > 1:
+                bp["duplicate"] = True
+                bp["duplicate_note"] = (
+                    f"该运行时地址有 {count[rt]} 条断点记录（别名写法导致），"
+                    "建议 remove_breakpoint 掉多余的")
+        return all_bps
 
     def modules(self, serial: str, pid: int, keyword: str = "") -> list[dict]:
         tgt = self.attach(serial, pid)
@@ -222,8 +245,19 @@ class DynamicService:
                 "AArch64 是定长指令集，指令起点必须 4 字节对齐，"
                 f"最近的合法地址是 {int(static_addr) - int(static_addr) % 4:#x} "
                 f"或 {int(static_addr) - int(static_addr) % 4 + 4:#x}")
-        bp_id = f"{serial}:{pid}:{so_name}:{static_addr:x}"   # 不含 '#'，可直接进 URL
+        # (20) 先解析模块，拿到运行时真实名——bp_id 必须用它，
+        #      否则别名写法会各造一条记录（同一块内存对应多个 bp_id）。
         tgt = self.attach(serial, pid)
+        try:
+            _mod = self._require_module(tgt, so_name)
+            _canon = getattr(_mod, "name", "") or so_name
+            _runtime = tgt.rb.to_runtime(int(static_addr), _mod)
+        except Exception:                                 # noqa: BLE001
+            # 模块解析失败：保持旧行为，让后续流程给出明确的 MODULE_NOT_LOADED
+            _canon = so_name
+            _runtime = None
+
+        bp_id = f"{serial}:{pid}:{_canon}:{static_addr:x}"   # 不含 '#'，可直接进 URL
         # (14) 第十四次修改（2026-11-13）：
         # bug 原因：旧实现在**下发 policy 之前**就早退——只要 bp_id 已在断点表里
         #          就直接 `return {...记录, existing: True}`。于是「先 hold=False
@@ -238,6 +272,14 @@ class DynamicService:
         #          下发失败时抛 BREAKPOINT_FAILED，记录保持旧值，不装成功。
         with self._lock:
             rec = tgt.breakpoints.get(bp_id)
+            # (20) 别名防护：bp_id 用规范名后，正常情况不会再有同址多条记录。
+            #      但为兼容**旧版本留下的记录**（它们用的是别名拼的 bp_id），
+            #      这里再按运行时地址查一次，命中就复用。
+            if rec is None and _runtime is not None:
+                for _bid, _rec in tgt.breakpoints.items():
+                    if int(_rec.get("runtime_addr") or -1) == int(_runtime):
+                        rec = _rec
+                        break
         if rec is not None and bool(rec.get("hold")) == bool(hold):
             return {**rec, "existing": True, "policy_changed": False}
         mod = self._require_module(tgt, so_name)
@@ -288,7 +330,9 @@ class DynamicService:
             "id": bp_id,
             "serial": serial,
             "pid": pid,
-            "so_name": so_name,
+            # (20) so_name 用规范名（与 bp_id 一致），original_name 保留调用方写法
+            "so_name": _canon,
+            "original_name": so_name,
             "static_addr": static_addr,
             "runtime_addr": runtime_addr,
             "hold": bool(hold),
@@ -325,6 +369,25 @@ class DynamicService:
                 if bp_id in tgt.breakpoints:
                     hit = (tgt, tgt.breakpoints[bp_id])
                     break
+            # (20) 按 bp_id 没找到时，尝试从 bp_id 里解出 (so, addr) 反查：
+            #      防止调用方拿着旧写法（别名/带版本号）的 bp_id 删不掉。
+            if hit is None:
+                try:
+                    _parts = str(bp_id).rsplit(":", 2)
+                    if len(_parts) == 3:
+                        _so = _parts[1]
+                        _addr = int(_parts[2], 16)
+                        for tgt in self._targets.values():
+                            for _bid, _rec in tgt.breakpoints.items():
+                                if (int(_rec.get("static_addr") or -1) == _addr
+                                        and (str(_rec.get("so_name")) == _so
+                                             or str(_rec.get("original_name")) == _so)):
+                                    hit = (tgt, _rec)
+                                    break
+                            if hit:
+                                break
+                except Exception:                         # noqa: BLE001
+                    pass
         if hit is None:
             # 老接口返回 False 表示"没有这个断点"；这里不抛异常，保持可预期
             return _result("removed", {"id": bp_id, "removed": False,
@@ -646,11 +709,38 @@ class DynamicService:
         if addr <= 0:
             raise DynError("BAD_ADDRESS", f"运行时地址必须为正：{runtime_addr!r}")
         tgt = self.attach(serial, pid)
-        data = tgt.rb.read_memory(addr, size)
+
+        # (19) 先走 adb /proc/<pid>/mem：这条链路与 frida 无关，
+        #      hold 把线程挂住时照样能读（实测 16 字节 0.13s / 4KB 0.17s）。
+        data = b""
+        via = ""
+        try:
+            data = tgt.rb.read_memory_proc(serial, int(pid), addr, int(size))
+            if data:
+                via = "proc_mem"
+        except Exception:                                 # noqa: BLE001
+            data = b""
+
+        if not data:
+            # 回退 frida：正常（未挂起）情况下它更快
+            try:
+                data = tgt.rb.read_memory(addr, size)
+                if data:
+                    via = "frida"
+            except Exception as exc:                      # noqa: BLE001
+                if not data:
+                    raise DynError(
+                        "READ_FAILED",
+                        f"运行时地址 {addr:#x} 读取失败：adb 与 frida 两条链路都没读到"
+                        f"（frida 报 {type(exc).__name__}: {exc}）。"
+                        "常见原因：地址未映射、进程已退出、或 hold 挂起时 frida session 已失效"
+                        "（此时 adb 链路本应可用，说明该地址确实不可读）") from exc
+
         if not data:
             raise DynError("READ_FAILED",
                            f"运行时地址 {addr:#x} 不可读或超时（可能未映射或权限不足）")
-        return {"runtime_addr": addr, "hex": data.hex(), "size": len(data)}
+        return {"runtime_addr": addr, "hex": data.hex(), "size": len(data),
+                "via": via}
 
     def read_runtime_string(self, serial: str, pid: int, runtime_addr: int,
                             max_length: int = 256) -> dict:
