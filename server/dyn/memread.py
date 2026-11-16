@@ -792,7 +792,14 @@ def dump_vm_state(serial: str, pid: int, ctx_ptr: int,
                   array_offset: int = 0x1a0,
                   instr_size: int = 16,
                   max_instr: int = 200,
-                  rb=None) -> dict:
+                  rb=None,
+                  count_size: int = 8,
+                  count_min: int = 0,
+                  count_max: int = 0x100000,
+                  opcode_shift: int = 1,
+                  opcode_bits: int = 4,
+                  func_shift: int = 5,
+                  func_bits: int = 4) -> dict:
     """按约定的 VM 上下文结构，把**指令数组**解出来。
 
     (10) 第十次修改（2026-11-06）：新增。
@@ -821,6 +828,19 @@ def dump_vm_state(serial: str, pid: int, ctx_ptr: int,
         instr_size             每条指令字节数，默认 16
         max_instr              最多解多少条（防止数组巨大时读爆）
         rb                     可选 Rebase 实例（复用会话，避免重复 attach）
+
+    ## (25) 第二十五次修改（2026-11-16）：结构假设全部参数化
+
+        bug 原因：上面四个偏移虽然已经是参数，但仍是**隐含假设**：
+                  ① 计数一定是 u64（count_size 写死 8，只有"退 u32"这一种兜底）；
+                  ② 计数的合理区间写死成 (0, 0x100000]，某个 VM 用索引而非
+                     条数、或条数上万很常见，就会被 COUNT_SUSPICIOUS 挡掉；
+                  ③ opcode / func 的位域规则写死成 bits[4:1] / bits[8:5]，
+                     文档里写着"可覆盖"但**参数根本不存在**——调用方无法覆盖。
+                  用户实测的 metasec_ml.so 一条都不符合，工具直接不可用。
+        解决方案：补齐 count_size / count_min / count_max / opcode_shift /
+                  opcode_bits / func_shift / func_bits 七个参数，**默认值全部
+                  等于原硬编码值**（见签名），因此旧调用方行为逐字节不变。
 
     ## 返回
 
@@ -873,20 +893,35 @@ def dump_vm_state(serial: str, pid: int, ctx_ptr: int,
             arr_raw = bytes.fromhex(first[1]["hex"])
 
         count = 0
-        if len(cnt_raw) >= 8:
-            count = _struct.unpack("<Q", cnt_raw[:8])[0]
-        if count == 0 or count > 0x100000:
-            if len(first) >= 1 and first[0].get("ok"):
-                # 退回 u32：再读一次低 4 字节（复用已读到的 8 字节即可）
-                c4 = _struct.unpack("<I", cnt_raw[:4])[0]
-                if 0 < c4 <= 0x100000:
-                    count = c4
+        # (25) 第二十五次修改（2026-11-16）：计数宽度与合理区间改为参数。
+        #      bug 原因：原来固定先按 u64 解，解不出合理值再"退 u32"；
+        #                但有些 VM 的计数字段就是 u32，高位是别的字段，
+        #                先按 u64 读会得到一个巨大值 -> 直接 COUNT_SUSPICIOUS，
+        #                用户看到的是"偏移不对"，其实是宽度不对。
+        #      解决方案：count_size ∈ {1,2,4,8} 直接决定按几位解；
+        #                count_min / count_max 决定"合理区间"，默认
+        #                (0, 0x100000] 与原逻辑一致。
+        csize = int(count_size) if int(count_size) in (1, 2, 4, 8) else 8
+        fmt = {1: "<B", 2: "<H", 4: "<I", 8: "<Q"}[csize]
+        if len(cnt_raw) >= csize:
+            count = _struct.unpack(fmt, cnt_raw[:csize])[0]
+        cmax = int(count_max) if int(count_max) > 0 else 0x100000
+        cmin = max(0, int(count_min))
+        if not (cmin < count <= cmax) and csize == 8 and len(cnt_raw) >= 4:
+            # 仍保留旧的"u64 读不通就退 u32"兜底：很多壳把 u32 放在低位，
+            # 高位是相邻字段，这在真机上是最常见的布局。
+            c4 = _struct.unpack("<I", cnt_raw[:4])[0]
+            if cmin < c4 <= cmax:
+                count = c4
+                csize = 4
 
-        if count > 0x100000:
+        if count > cmax:
             return {"ok": False, "code": "COUNT_SUSPICIOUS",
-                    "error": (f"指令计数 {count} 明显不合理（>1048576），"
-                              "可能偏移不对；已停止读取避免读爆内存"),
-                    "raw_count": count}
+                    "error": (f"指令计数 {count} 明显不合理（>{cmax}），"
+                              "可能偏移/宽度不对；已停止读取避免读爆内存"),
+                    "raw_count": count,
+                    "count_offset": int(count_offset),
+                    "count_size_used": csize}
 
         arr = 0
         if len(arr_raw) >= 8:
@@ -908,6 +943,16 @@ def dump_vm_state(serial: str, pid: int, ctx_ptr: int,
 
         # 4) 逐条解
         instructions = []
+        # (25) 第二十五次修改（2026-11-16）：位域规则改为参数（原来是硬编码常量）。
+        #      bug 原因：docstring 里写着"用 opcode_bits / func_bits 参数可调"，
+        #                但签名里根本没有这两个参数——文档承诺了一个不存在的能力，
+        #                调用方按文档传参会直接 TypeError。
+        #      解决方案：真正提供 opcode_shift / opcode_bits / func_shift /
+        #                func_bits，默认 (1,4) / (5,4) 即原来的 bits[4:1] / bits[8:5]。
+        osh, obits = int(opcode_shift), max(1, int(opcode_bits))
+        fsh, fbits = int(func_shift), max(1, int(func_bits))
+        omask = (1 << obits) - 1
+        fmask = (1 << fbits) - 1
         for i in range(0, len(raw) // int(instr_size)):
             chunk = raw[i * int(instr_size):(i + 1) * int(instr_size)]
             v0 = _struct.unpack("<I", chunk[:4])[0] if len(chunk) >= 4 else 0
@@ -917,8 +962,8 @@ def dump_vm_state(serial: str, pid: int, ctx_ptr: int,
                 "idx": i,
                 "addr": hex(arr + i * int(instr_size)),
                 "raw_hex": chunk.hex(),
-                "opcode": (v0 >> 1) & 0xF,     # bits[4:1]
-                "func": (v0 >> 5) & 0xF,       # bits[8:5]
+                "opcode": (v0 >> osh) & omask,
+                "func": (v0 >> fsh) & fmask,
                 "words": words,
             })
 
@@ -931,8 +976,18 @@ def dump_vm_state(serial: str, pid: int, ctx_ptr: int,
             "truncated": int(count) > n,
             "array_ptr": hex(arr),
             "instr_size": int(instr_size),
+            "layout_used": {
+                "count_offset": int(count_offset),
+                "count_size": csize,
+                "count_range": [cmin, cmax],
+                "array_offset": int(array_offset),
+                "instr_size": int(instr_size),
+                "opcode": f"bits[{osh + obits - 1}:{osh}]",
+                "func": f"bits[{fsh + fbits - 1}:{fsh}]",
+            },
             "instructions": instructions,
-            "field_rule": "opcode=bits[4:1], func=bits[8:5]（经验规则，可覆盖）",
+            "field_rule": (f"opcode=bits[{osh + obits - 1}:{osh}], "
+                           f"func=bits[{fsh + fbits - 1}:{fsh}]（可覆盖）"),
             "note": ("一次 attach 读完整个数组，避免逐条读打断目标执行。"
                      "位域规则来自汇编观察，不同壳版本可能不同"),
         }
@@ -1225,7 +1280,14 @@ def probe_vm_from_hits(serial: str, pid: int, hits: list,
                        array_offset: int = 0x1a0,
                        instr_size: int = 16,
                        max_instr: int = 64,
-                       max_candidates: int = 40) -> dict:
+                       max_candidates: int = 40,
+                       count_size: int = 8,
+                       count_min: int = 0,
+                       count_max: int = 0x100000,
+                       opcode_shift: int = 1,
+                       opcode_bits: int = 4,
+                       func_shift: int = 5,
+                       func_bits: int = 4) -> dict:
     """从**已有断点命中**的寄存器里找出 VM 上下文指针，再解指令数组。
 
     (19) 第十九次修改（2026-11-06）：新增。
@@ -1253,6 +1315,16 @@ def probe_vm_from_hits(serial: str, pid: int, hits: list,
         hits          命中记录列表。可以是 service.hits() 的返回，
                       或 poll_events 里 type=breakpoint_hit 的事件
         count_offset / array_offset / instr_size / max_instr  同 dump_vm_state
+
+    ## (25) 第二十五次修改（2026-11-16）：结构假设参数化
+
+        bug 原因：与 dump_vm_state 同源——计数宽度写死 u64、候选判定区间写死
+                  (2, 100000]、位域规则写死。这三个假设任意一个不成立，
+                  都会让**正确**的候选被判成"结构不符"丢弃，而返回的
+                  verdict 却说"没有一个寄存器值符合结构"，把排查方向带偏。
+        解决方案：新增 count_size / count_min / count_max / opcode_shift /
+                  opcode_bits / func_shift / func_bits，默认值全部等于原硬编码值，
+                  并且在解码阶段**原样下传**给 dump_vm_state，保证两处口径一致。
 
     ## 返回
 
@@ -1323,6 +1395,16 @@ def probe_vm_from_hits(serial: str, pid: int, hits: list,
         import json as _json
 
         # 2) 一次脚本：对每个候选读 count 和 array 指针
+        #
+        # (25) 第二十五次修改（2026-11-16）：计数读取改用参数化宽度。
+        #      bug 原因：JS 侧固定 readU64，计数字段实际是 u32 时会把相邻
+        #                字段一起读进来，得到一个巨大数，于是这个**正确**的
+        #                候选被判成非法而丢弃——表现为"一个候选都没有"，
+        #                而根因是计数宽度不符。
+        #      解决方案：按 count_size 选择 readU8/U16/U32/U64；判定区间也用
+        #                参数（count_min/count_max），默认与原逻辑等价。
+        csize = int(count_size) if int(count_size) in (1, 2, 4, 8) else 8
+        read_fn = {1: "readU8", 2: "readU16", 4: "readU32", 8: "readU64"}[csize]
         spec = [c["ptr"] for c in cands]
         js = (
             "var P = " + _json.dumps(spec) + ";"
@@ -1331,7 +1413,7 @@ def probe_vm_from_hits(serial: str, pid: int, hits: list,
             "for (var i = 0; i < P.length; i++) {"
             "  try {"
             "    var p = ptr(P[i]);"
-            "    var cnt = p.add(CO).readU64().toNumber();"
+            "    var cnt = p.add(CO)." + read_fn + "().toNumber();"
             "    var arr = p.add(AO).readPointer();"
             "    out.push({cnt: cnt, arr: arr.toString()});"
             "  } catch (e) { out.push(null); }"
@@ -1349,13 +1431,22 @@ def probe_vm_from_hits(serial: str, pid: int, hits: list,
 
         # 3) 结构校验
         ok_list: list[dict] = []
+        # (25) 第二十五次修改（2026-11-16）：候选的计数区间也改为参数。
+        #      bug 原因：原来写死 2 <= cnt <= 100000。某个 VM 的计数从 0 开始、
+        #                或者条数上万（大字节码）都会被判成"结构不符"而丢弃，
+        #                用户看到"没有一个候选符合结构"，方向被彻底带偏。
+        #      解决方案：用 count_min / count_max（默认 0 / 0x100000，
+        #                与 dump_vm_state 一致）；cnt 下限仍要求 >count_min，
+        #                因此 count_min=0 时 cnt=0 的候选仍被排除（合理）。
+        cmin = max(0, int(count_min))
+        cmax = int(count_max) if int(count_max) > 0 else 0x100000
         for i, c in enumerate(cands):
             item = got[i] if i < len(got) else None
             if not item:
                 continue
             cnt = item.get("cnt")
             arr = item.get("arr")
-            if not isinstance(cnt, (int, float)) or not (2 <= cnt <= 100000):
+            if not isinstance(cnt, (int, float)) or not (cmin < cnt <= cmax):
                 continue
             try:
                 arr_i = int(arr, 16) if isinstance(arr, str) else int(arr)
@@ -1407,7 +1498,18 @@ def probe_vm_from_hits(serial: str, pid: int, hits: list,
                                   count_offset=int(count_offset),
                                   array_offset=int(array_offset),
                                   instr_size=int(instr_size),
-                                  max_instr=int(max_instr), rb=rb)
+                                  max_instr=int(max_instr), rb=rb,
+                                  # (25) 第二十五次修改（2026-11-16）：
+                                  #     这些布局参数必须一起下传，否则
+                                  #     校验阶段用的是参数化宽度、解码阶段
+                                  #     却退回默认布局，两处口径不一。
+                                  count_size=int(count_size),
+                                  count_min=int(count_min),
+                                  count_max=int(count_max),
+                                  opcode_shift=int(opcode_shift),
+                                  opcode_bits=int(opcode_bits),
+                                  func_shift=int(func_shift),
+                                  func_bits=int(func_bits))
             except Exception as exc:                      # noqa: BLE001
                 d = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
             out_cands.append({

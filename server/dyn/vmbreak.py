@@ -66,13 +66,34 @@
 所有目标侧细节都是参数：
 
     dispatch_patterns  派发段特征字节（默认就是上面那条）
-    reg_base_offset    VM 寄存器堆在哪个参数寄存器（x25）
-    ctx_offset         VM 上下文在哪个参数寄存器（x27）
-    ip_offset          VM pc 在上下文里的偏移（+8）
+    reg_base_reg       VM 寄存器堆基址在哪个寄存器（x25）
+    reg_base_offset    VM 寄存器堆相对 ctx 的偏移（0 = 不用，改看 reg_base_reg）
+    ctx_reg            VM 上下文在哪个寄存器（x27）
+    ip_mode / ip_reg / ip_offset  VM pc 从哪里取（ctx 解引用 / 寄存器 / 不取）
+    opcode_expr        opcode 从哪里取（"sp+8" / "x8" / "ctx+0x100"）
     slot_size          每条 VM 指令多少字节（16）
-    code_base          VM 代码区在进程里的基址
+    code_base          VM 代码区在进程里的基址（给了才算 idx）
 
 换一个 VM 只改参数，不改代码。
+
+## (4) 第四次修改（2026-11-16）：把结构假设全部参数化
+
+    bug 原因：本模块原先隐含「寄存器堆一定在某个寄存器里、VM pc 一定在
+              [ctx+8]、data_base 一定走 [ctx+0x240]+0x1a0」这三条结构假设。
+              用户实测的 metasec_ml.so 完全不符合：
+                  寄存器堆在 ctx + 0x6070（不是在寄存器里）
+                  opcode 在 sp+8（不在结构体里）
+                  派发点是 adr x22, #0x2F50D0; br x8
+              于是 vm_breakpoint / vm_regs_snapshot 全部用不了，
+              而这不是"偏移填错"，是**取值方式本身**不同。
+    解决方案：引入「取值来源描述（spec）」这一层抽象，把「从哪取」变成参数：
+                  reg      从某个寄存器直接取
+                  off/ctx  相对 ctx 的偏移（可按寄存器堆/结构体字段）
+                  sp       相对 native 栈指针
+                  none     不取（该字段返回 null，不编造）
+              四条来源覆盖了 ctx / 寄存器堆 / pc / opcode 四个关键字段，
+              每个都可独立配置；旧参数（reg_base_reg / ctx_reg / ip_offset /
+              reg_base_offset 默认 0）保持默认值即等于原行为，向后兼容。
 """
 
 from __future__ import annotations
@@ -86,26 +107,137 @@ __all__ = [
     "find_dispatch_points",
     "vm_breakpoint",
     "vm_regs_snapshot",
+    "parse_value_expr",
     "VM_DEFAULT_PATTERN",
+    "VM_DEFAULTS",
+    "SPEC_KINDS",
 ]
+
+# (4) 第四次修改（2026-11-16）：spec 支持的取值来源种类。
+# 对外暴露是为了让调用方/TUI 能自解释，而不是靠读源码猜。
+SPEC_KINDS = ("reg", "sp", "ctx", "regoff", "none", "bad")
 
 # 派发段特征：str x21, [x27, #8]
 # 实测 805 处全部紧跟着 br xN，是「每条 VM 指令执行完」的公共落点。
 VM_DEFAULT_PATTERN = "750700f9"
 
 # 默认寄存器约定（真机验证，见模块注释）
+#
+# (4) 第四次修改（2026-11-16）：新增 reg_base_offset / ip_mode / opcode_expr
+#     三个参数并给**等于原行为**的默认值，保证旧调用方不传也完全一样。
 VM_DEFAULTS = {
     "reg_base_reg": "x25",     # VM 寄存器堆基址
+    "reg_base_offset": 0,      # 寄存器堆相对 ctx 的偏移（0 = 用 reg_base_reg）
     "ip_reg": "x21",           # VM 指令指针
     "ctx_reg": "x27",          # VM 上下文
+    "ip_mode": "ctx",          # ctx=从 [ctx+ip_offset] 读；reg=直接用 ip_reg；none=不取
     "ip_offset": 8,            # [ctx + 8] = 当前 VM pc
+    "opcode_expr": "",         # opcode 取值描述（"" = 不取，如 "sp+8" / "x8"）
     "slot_size": 16,           # 每条 VM 指令 16 字节
     "vm_reg_count": 32,        # VM 寄存器个数
     # data_base 的两跳解引用路径：[ctx + p1_off] → [+ p2_off] = data_base
     # （名为 prog_base_* 是历史兼容；它指向数据区，不是字节码区）
     "prog_base_p1_offset": 0x240,
     "prog_base_p2_offset": 0x1A0,
+    # (4) 第四次修改（2026-11-16）：data_base 的两跳路径也可以整体关掉。
+    #     bug 原因：换一个 VM 时 [ctx+0x240] 可能是任意字段，两跳解引用
+    #               要么读失败、要么读出一个垃圾指针，而调用方无从判断
+    #               这是"结构不同"还是"偏移填错"。
+    #     解决方案：p1_offset 传负数（<0）即表示本 VM 没有这条路径，
+    #               data_base 返回 null 并在返回里注明来源，不再硬读。
+    "data_base_enabled": True,
 }
+
+# 派发点扫到的偏移 → 该处可用的「VM pc 寄存器」（供自动推断）
+# 不写死任何 App：只表达 arm64 通用规律 —— 派发前一刻，VM pc 一定在某个
+# 通用寄存器里，而那些寄存器正是 br 之前的候选。
+_ARM64_GP_REGS = tuple(f"x{i}" for i in range(0, 31))
+
+
+def _spec_from_args(reg: str = "", offset: int = 0, ctx_reg: str = "",
+                    sp_offset: int | None = None) -> dict:
+    """把「从哪取一个值」的几种写法收敛成一个 spec。
+
+    (4) 第四次修改（2026-11-16）：新增。
+        这一层存在的唯一目的：让 JS 侧**不需要知道**这个值到底来自寄存器、
+        结构体偏移还是栈——它只按 spec.kind 执行对应的一条读法。
+        这样换 VM 只是构造出不同的 spec，不再是「改 JS 模板」。
+
+    优先级（同时给了多个时）：
+        1) reg 非空            -> {"kind": "reg", "reg": "x20"}
+        2) sp_offset 不为 None -> {"kind": "sp", "offset": 8}
+        3) ctx_reg 非空且 offset>0 -> {"kind": "ctx", "ctx": "x20", "offset": 0x6070}
+        4) 全空                -> {"kind": "none"}
+    """
+    r = str(reg or "").strip()
+    if r:
+        return {"kind": "reg", "reg": r}
+    if sp_offset is not None:
+        return {"kind": "sp", "offset": int(sp_offset)}
+    c = str(ctx_reg or "").strip()
+    if c and int(offset or 0) > 0:
+        return {"kind": "ctx", "ctx": c, "offset": int(offset)}
+    return {"kind": "none"}
+
+
+def parse_value_expr(expr: str) -> dict:
+    """解析「取值表达式」，把用户写的一行字符串变成 spec。
+
+    (4) 第四次修改（2026-11-16）：新增。
+        bug 原因：参数化之后，如果每个取值点都要调用方传 3~4 个参数
+                  （reg / offset / ctx_reg / sp_offset），接口会变得又长
+                  又容易填错，且无法表达 "sp+8" 这种最自然的写法。
+        解决方案：让表达式字符串成为**第一等输入**，Python 侧统一解析：
+            "x8"             -> 寄存器 x8
+            "sp+8" / "sp-16" -> 栈指针加/减偏移
+            "ctx+0x6070"     -> ctx 指针加偏移（ctx 默认取 ctx_reg）
+            "ctx+x20+0x10"   -> 指定 ctx 所在寄存器再解引用
+            "x20+0x6070"     -> 也认：寄存器 + 偏移
+            "none" / ""      -> 不取
+        **解析失败返回 {"kind": "bad"}**，由调用方明确报错，不静默当成 none
+        （静默会让用户以为结构对了，只是没数据）。
+
+    返回 spec：{kind, reg|offset|ctx, raw}
+    """
+    raw = str(expr or "").strip()
+    if not raw or raw.lower() in ("none", "-", "off"):
+        return {"kind": "none", "raw": raw}
+
+    low = raw.lower().replace(" ", "")
+    # sp+8 / sp-16
+    m = re.fullmatch(r"sp([+-])(0x[0-9a-f]+|\d+)", low)
+    if m:
+        off = int(m.group(2), 16) if m.group(2).startswith("0x") else int(m.group(2))
+        return {"kind": "sp", "offset": off if m.group(1) == "+" else -off,
+                "raw": raw}
+    # ctx+0x6070
+    m = re.fullmatch(r"ctx([+-])(0x[0-9a-f]+|\d+)", low)
+    if m:
+        off = int(m.group(2), 16) if m.group(2).startswith("0x") else int(m.group(2))
+        return {"kind": "ctx", "ctx": "", "offset": off if m.group(1) == "+" else -off,
+                "raw": raw}
+    # ctx+x20+0x10
+    m = re.fullmatch(r"ctx\+?(x\d+)([+-])(0x[0-9a-f]+|\d+)", low)
+    if m:
+        off = int(m.group(3), 16) if m.group(3).startswith("0x") else int(m.group(3))
+        return {"kind": "ctx", "ctx": m.group(1),
+                "offset": off if m.group(2) == "+" else -off, "raw": raw}
+    # x20+0x6070
+    m = re.fullmatch(r"(x\d+)([+-])(0x[0-9a-f]+|\d+)", low)
+    if m:
+        off = int(m.group(3), 16) if m.group(3).startswith("0x") else int(m.group(3))
+        return {"kind": "regoff", "reg": m.group(1),
+                "offset": off if m.group(2) == "+" else -off, "raw": raw}
+    # x8 / w8 / lr / sp
+    m = re.fullmatch(r"(x\d+|w\d+|lr|sp|pc|fp)", low)
+    if m:
+        return {"kind": "reg", "reg": m.group(1), "raw": raw}
+    return {"kind": "bad", "raw": raw}
+
+
+def _js_spec(spec: dict) -> str:
+    """把 spec 转成 JS 字面量（json 结构，键名与 JS 侧约定一致）。"""
+    return json.dumps(spec if isinstance(spec, dict) else {"kind": "none"})
 
 
 def _read_so_bytes(so_name: str, so=None) -> bytes:
@@ -183,7 +315,11 @@ def vm_breakpoint(serial: str, pid: int, so_name: str, target_idx: int = -1,
                   stack_bytes: int = 256,
                   hold: bool = True,
                   max_hits: int = 1,
-                  wait: float = 10.0) -> dict:
+                  wait: float = 10.0,
+                  reg_base_offset: int = VM_DEFAULTS["reg_base_offset"],
+                  ip_mode: str = VM_DEFAULTS["ip_mode"],
+                  opcode_expr: str = VM_DEFAULTS["opcode_expr"],
+                  ctx_expr: str = "") -> dict:
     """在 VM 的某条指令上设断点，停下时给出 VM 寄存器堆与 VM 栈。
 
     ## 参数
@@ -199,9 +335,20 @@ def vm_breakpoint(serial: str, pid: int, so_name: str, target_idx: int = -1,
         pattern_hex      派发段特征字节
         slot_size        每条 VM 指令字节数
         reg_base_reg     VM 寄存器堆基址在哪个寄存器（默认 x25）
-        ip_reg           VM 指令指针在哪个寄存器（默认 x21）
+        reg_base_offset  VM 寄存器堆相对 **ctx** 的偏移（默认 0 = 不用）。
+                         **非 0 时优先于 reg_base_reg**：结构体里放着寄存器堆
+                         的 VM（实测 ctx+0x6070）用这个，不用找寄存器
         ctx_reg          VM 上下文在哪个寄存器（默认 x27）
+        ctx_expr         ctx 指针怎么取，表达式写法（覆盖 ctx_reg）：
+                         "x20" / "sp+0x10" / "x20+0x8"
+        ip_mode          VM pc 怎么取：
+                         "ctx"（默认）= 从 [ctx + ip_offset] 读
+                         "reg"        = 直接用 ip_reg 里的值
+                         "none"       = 不取（该字段返回 null）
         ip_offset        VM pc 在上下文里的偏移（默认 8）
+        opcode_expr      opcode 怎么取：
+                         "sp+8"（从栈）/ "x8"（寄存器）/ "ctx+0x100" / ""
+                         （"" = 不取，返回 null，不编造）
         vm_reg_count     VM 寄存器个数（默认 32）
         capture_regs     捕获多少个 VM 寄存器（默认 32）
         stack_bytes      额外抓多少字节的 native 栈
@@ -273,6 +420,30 @@ def vm_breakpoint(serial: str, pid: int, so_name: str, target_idx: int = -1,
         return {"ok": False, "code": "BAD_SLOT_SIZE",
                 "error": f"slot_size 应为 8/16/32，收到 {slot_size}"}
 
+    # (4) 第四次修改（2026-11-16）：把「从哪取」变成 spec，先在这里解析并校验。
+    #     bug 原因：参数化后 opcode_expr / ctx_expr 是自由文本，写错时
+    #               若静默退化成 none，用户会以为"结构对了只是没数据"，
+    #               实际是表达式拼错——这正是最难排的一类问题。
+    #     解决方案：解析失败直接返回 BAD_EXPR 并说明正确写法，
+    #               不进 JS、不 attach，避免"跑一遍才发现没数据"。
+    if str(ip_mode).lower() not in ("ctx", "reg", "none"):
+        return {"ok": False, "code": "BAD_IP_MODE",
+                "error": f"ip_mode 应为 ctx/reg/none，收到 {ip_mode!r}"}
+
+    opcode_spec = parse_value_expr(opcode_expr)
+    if opcode_spec["kind"] == "bad":
+        return {"ok": False, "code": "BAD_EXPR",
+                "error": (f"opcode_expr 无法解析：{opcode_expr!r}"),
+                "hint": '支持写法："sp+8" / "x8" / "ctx+0x100" / ""（不取）'}
+    if ctx_expr:
+        ctx_spec = parse_value_expr(ctx_expr)
+        if ctx_spec["kind"] == "bad":
+            return {"ok": False, "code": "BAD_EXPR",
+                    "error": f"ctx_expr 无法解析：{ctx_expr!r}",
+                    "hint": '支持写法："x20" / "sp+0x10" / "x20+0x8"'}
+    else:
+        ctx_spec = {"kind": "reg", "reg": str(ctx_reg)}
+
     # 决定挂哪个派发点
     disp = None
     if dispatch_offset is not None:
@@ -298,8 +469,12 @@ def vm_breakpoint(serial: str, pid: int, so_name: str, target_idx: int = -1,
         ("__P1_OFF__", str(int(prog_base_p1_offset))),
         ("__P2_OFF__", str(int(prog_base_p2_offset))),
         ("__REG_BASE_REG__", _js_str(reg_base_reg)),
+        ("__REG_BASE_OFFSET__", str(int(reg_base_offset))),
         ("__IP_REG__", _js_str(ip_reg)),
         ("__CTX_REG__", _js_str(ctx_reg)),
+        ("__CTX_SPEC__", _js_spec(ctx_spec)),
+        ("__IP_MODE__", _js_str(str(ip_mode).lower())),
+        ("__OPCODE_SPEC__", _js_spec(opcode_spec)),
         ("__IP_OFFSET__", str(int(ip_offset))),
         ("__VM_REG_COUNT__", str(int(vm_reg_count))),
         ("__CAPTURE_REGS__", str(int(capture_regs))),
@@ -312,6 +487,9 @@ def vm_breakpoint(serial: str, pid: int, so_name: str, target_idx: int = -1,
         #     解决方案：真正注入；没给就传 null，JS 侧据此不计算 vm_idx。
         ("__CODE_BASE__", _js_code_base(code_base)),
         ("__VM_PC_BYTES__", str(int(vm_pc_bytes))),
+        # (4) 第四次修改（2026-11-16）：spec 取值辅助层只写一份，
+        #     由三个模板共用，避免各写一套导致行为漂移。
+        ("__SPEC_HELPERS__", _JS_SPEC_HELPERS),
     ):
         user_js = user_js.replace(k, v)
 
@@ -322,14 +500,111 @@ def vm_breakpoint(serial: str, pid: int, so_name: str, target_idx: int = -1,
                          slot_size=int(slot_size))
 
 
+_JS_SPEC_HELPERS = r"""
+    // ---------------- 统一取值层（spec → 值） ----------------
+    //
+    // (4) 第四次修改（2026-11-16）：新增。
+    //     bug 原因：三个 JS 模板各自硬编码「ctx 在 x27 / VM pc 在 [ctx+8] /
+    //               寄存器堆在 x25」，换一个 VM 就得改模板，改漏一处
+    //               就静默读错或干脆不命中，而调用方看到的是"0 命中"。
+    //     解决方案：把「从哪取」收敛成 resolveValue()，只按 spec.kind 分支。
+    //               模板里从此不再出现任何具体寄存器名或结构偏移常量。
+    //
+    // spec 形态（由 Python 侧 parse_value_expr / _spec_from_args 产出）：
+    //     {kind:'reg',    reg:'x20'}
+    //     {kind:'sp',     offset:8}
+    //     {kind:'ctx',    offset:0x6070}          // ctx 由调用方先解出
+    //     {kind:'regoff', reg:'x20', offset:8}
+    //     {kind:'none'}
+    function regOf(c, name) {
+        if (!name) { return null; }
+        var n = String(name).toLowerCase();
+        try {
+            if (n === 'sp') { return c.sp; }
+            if (n === 'pc') { return c.pc; }
+            if (n === 'lr') { return c.lr; }
+            if (n === 'fp') { return c.fp; }
+            var v = c[n];
+            return (v === undefined || v === null) ? null : v;
+        } catch (e) { return null; }
+    }
+
+    // 返回 {ptr, src, err}：取不到时 ptr=null 且 err 写明原因，**不伪造地址**
+    function resolveValue(c, spec, ctxp) {
+        if (!spec || spec.kind === 'none') { return {ptr: null, src: 'none', err: ''}; }
+        try {
+            if (spec.kind === 'reg') {
+                var p = regOf(c, spec.reg);
+                if (p === null) { return {ptr: null, src: 'reg:' + spec.reg,
+                                          err: '寄存器无值 ' + spec.reg}; }
+                return {ptr: p, src: 'reg:' + spec.reg, err: ''};
+            }
+            if (spec.kind === 'sp') {
+                return {ptr: c.sp.add(spec.offset),
+                        src: 'sp' + (spec.offset >= 0 ? '+' : '') + spec.offset, err: ''};
+            }
+            if (spec.kind === 'ctx') {
+                // (4) 第四次修改（2026-11-16）：spec 自带 ctx 寄存器名时以它为准
+                //     （"ctx+x20+0x10" 这种写法），否则用调用方已解出的 ctxp。
+                //     原来两种写法会得到同一个结果，等于表达式白写。
+                var base = ctxp;
+                if (spec.ctx) {
+                    base = regOf(c, spec.ctx);
+                    if (base === null) {
+                        return {ptr: null, src: 'ctx:' + spec.ctx,
+                                err: 'ctx 寄存器无值 ' + spec.ctx};
+                    }
+                }
+                if (base === null || base === undefined) {
+                    return {ptr: null, src: 'ctx', err: 'ctx 不可用，无法按 ctx 取偏移'};
+                }
+                return {ptr: base.add(spec.offset),
+                        src: (spec.ctx ? spec.ctx + '+' : 'ctx+')
+                             + '0x' + (spec.offset >>> 0).toString(16), err: ''};
+            }
+            if (spec.kind === 'regoff') {
+                var rp = regOf(c, spec.reg);
+                if (rp === null) { return {ptr: null, src: 'regoff',
+                                           err: '寄存器无值 ' + spec.reg}; }
+                return {ptr: rp.add(spec.offset),
+                        src: spec.reg + '+' + spec.offset, err: ''};
+            }
+        } catch (e) {
+            return {ptr: null, src: spec.kind, err: String(e)};
+        }
+        return {ptr: null, src: 'bad', err: '未知 spec.kind: ' + spec.kind};
+    }
+
+    // 读一个标量（opcode / 字段值）。返回 {n, s, err}：
+    //   s 是**精确十进制字符串**（64 位不丢精度），n 只有在能安全转成
+    //   JS number 时才给，否则为 null —— 不把大整数截断后当成真值。
+    function readScalar(p) {
+        try {
+            var s = p.readU64().toString();
+            var n = Number(s);
+            if (!isFinite(n) || Math.abs(n) > 9007199254740991) { n = null; }
+            return {n: n, s: s, err: ''};
+        } catch (e) { return {n: null, s: null, err: String(e)}; }
+    }
+
+    function hexOf(ptr) {
+        return (ptr === null || ptr === undefined) ? null : ptr.toString();
+    }
+"""
+
+
 _JS_VM_BREAK = r"""
 (function () {
     var DISPATCH_OFFSET = __DISPATCH_OFFSET__;
     var TARGET_IDX = __TARGET_IDX__;
     var SLOT_SIZE = __SLOT_SIZE__;
     var REG_BASE_REG = __REG_BASE_REG__;
+    var REG_BASE_OFFSET = __REG_BASE_OFFSET__;
     var IP_REG = __IP_REG__;
     var CTX_REG = __CTX_REG__;
+    var CTX_SPEC = __CTX_SPEC__;
+    var IP_MODE = __IP_MODE__;
+    var OPCODE_SPEC = __OPCODE_SPEC__;
     var IP_OFFSET = __IP_OFFSET__;
     var P1_OFF = __P1_OFF__;
     var P2_OFF = __P2_OFF__;
@@ -341,7 +616,7 @@ _JS_VM_BREAK = r"""
     var CODE_BASE = __CODE_BASE__;
     // vm_pc 处回读多少字节原始字节码（供调用方比对镜像）
     var VM_PC_BYTES = __VM_PC_BYTES__;
-
+__SPEC_HELPERS__
     var mod = Process.findModuleByName(SO_NAME);
     if (mod === null) {
         send({kind: 'error', code: 'SO_NOT_FOUND', error: '模块未加载：' + SO_NAME});
@@ -350,6 +625,8 @@ _JS_VM_BREAK = r"""
 
     var addr = mod.base.add(DISPATCH_OFFSET);
     var hitCount = 0;
+    var ctxFail = 0;
+    var ipFail = 0;
     var listener = null;
 
     function readVmRegs(basePtr) {
@@ -362,30 +639,76 @@ _JS_VM_BREAK = r"""
         return out;
     }
 
-    function ctxReg(ctx, name) {
-        try { var v = ctx[name]; return v === undefined ? null : v; }
-        catch (e) { return null; }
-    }
-
     // data_base = *(*(ctx + P1_OFF) + P2_OFF)
     // 指向 host 全局变量区（推导链末端是 add host_var, imm），**不是**字节码区。
+    // P1_OFF < 0 表示本 VM 没有这条路径 —— 直接返回 null，不硬读。
     function readDataBase(ctxp) {
+        if (ctxp === null || P1_OFF < 0) { return null; }
         try {
             var p1 = ctxp.add(P1_OFF).readPointer();
             return p1.add(P2_OFF).readPointer();
         } catch (e) { return null; }
     }
 
+    // VM pc 的取法由 IP_MODE 决定（ctx / reg / none），不再写死 [ctx+8]。
+    function readVmPc(c, ctxp) {
+        if (IP_MODE === 'none') { return {ptr: null, src: 'none'}; }
+        if (IP_MODE === 'reg') {
+            var p = regOf(c, IP_REG);
+            return {ptr: p, src: p === null ? 'reg-missing' : 'reg:' + IP_REG};
+        }
+        if (ctxp === null) { return {ptr: null, src: 'ctx-missing'}; }
+        try {
+            return {ptr: ctxp.add(IP_OFFSET).readPointer(),
+                    src: 'ctx+0x' + IP_OFFSET.toString(16)};
+        } catch (e) { return {ptr: null, src: 'ctx-read-failed'}; }
+    }
+
     listener = Interceptor.attach(addr, {
         onEnter: function () {
             var c = this.context;
-            var ctxp = ctxReg(c, CTX_REG);
-            var regbase = ctxReg(c, REG_BASE_REG);
-            if (ctxp === null) { return; }
+            var ctxRes = resolveValue(c, CTX_SPEC, null);
+            var ctxp = ctxRes.ptr;
+            // ctx 是必须的（配置了却取不到 = 配置/结构不匹配），跳过并计数，
+            // 在 stop 时如实报告，不静默当成"0 命中"。
+            var ctxRequired = (CTX_SPEC.kind !== 'none') || (IP_MODE === 'ctx')
+                              || (REG_BASE_OFFSET > 0)
+                              || (OPCODE_SPEC.kind === 'ctx');
+            if (ctxp === null && ctxRequired) { ctxFail++; return; }
 
-            var vmPc;
-            try { vmPc = ctxp.add(IP_OFFSET).readPointer(); }
-            catch (e) { return; }
+            var ipRes = readVmPc(c, ctxp);
+            var vmPc = ipRes.ptr;
+            if (vmPc === null && IP_MODE !== 'none') {
+                // ip_mode=ctx 时 vmPc 读失败 = 结构不符，跳过计数
+                if (IP_MODE === 'ctx') { ipFail++; return; }
+            }
+
+            // 寄存器堆：给了 reg_base_offset(>0) 就按 ctx+offset 取（结构体内嵌），
+            // 否则按 reg_base_reg 从寄存器取。两条路都不写死具体寄存器名。
+            var regbase = null;
+            var regBaseSrc = 'none';
+            if (REG_BASE_OFFSET > 0) {
+                if (ctxp !== null) {
+                    regbase = ctxp.add(REG_BASE_OFFSET);
+                    regBaseSrc = 'ctx+0x' + REG_BASE_OFFSET.toString(16);
+                }
+            } else if (REG_BASE_REG) {
+                regbase = regOf(c, REG_BASE_REG);
+                regBaseSrc = regbase === null ? 'reg-missing' : 'reg:' + REG_BASE_REG;
+            }
+
+            // opcode：按 OPCODE_SPEC 取（"sp+8" / "x8" / "ctx+0x100"），
+            // 取不到就是 null，不编造。
+            var opcodeVal = null;
+            var opcodeSrc = 'none';
+            if (OPCODE_SPEC.kind !== 'none') {
+                var opRes = resolveValue(c, OPCODE_SPEC, ctxp);
+                opcodeSrc = opRes.src;
+                if (opRes.ptr !== null) {
+                    var sv = readScalar(opRes.ptr);
+                    opcodeVal = (sv.n !== null) ? sv.n : sv.s;
+                }
+            }
 
             // data_base = *(*(ctx+P1_OFF)+P2_OFF)
             //
@@ -404,17 +727,19 @@ _JS_VM_BREAK = r"""
             // 在 vm_pc 处读一段原始字节，供调用方自己比对镜像、反推 code_base。
             // 这是「不知道 code_base」时的唯一可靠出路：给出原料，不猜结论。
             var codeBytes = null;
-            try {
-                var nSlots = VM_PC_BYTES / SLOT_SIZE;
-                codeBytes = Array.from(new Uint8Array(vmPc.readByteArray(nSlots * SLOT_SIZE)))
-                    .map(function (b) { return ('0' + b.toString(16)).slice(-2); })
-                    .join('');
-            } catch (e) { codeBytes = null; }
+            if (vmPc !== null) {
+                try {
+                    var nSlots = VM_PC_BYTES / SLOT_SIZE;
+                    codeBytes = Array.from(new Uint8Array(vmPc.readByteArray(nSlots * SLOT_SIZE)))
+                        .map(function (b) { return ('0' + b.toString(16)).slice(-2); })
+                        .join('');
+                } catch (e) { codeBytes = null; }
+            }
 
             // idx 只认显式 code_base
             var idx = null;
             var idxSource = 'unavailable';
-            if (CODE_BASE !== null && CODE_BASE !== 0) {
+            if (CODE_BASE !== null && CODE_BASE !== 0 && vmPc !== null) {
                 // (4) 第四次修改（2026-11-09）：
                 //     bug 原因：原来用 vmPc.sub(base).toInt32()，toInt32 会把
                 //               64 位差值截断成 32 位；当 code_base 与 vm_pc 的
@@ -444,15 +769,20 @@ _JS_VM_BREAK = r"""
             var rec = {
                 kind: 'vm_hit',
                 index: hitCount,
-                vm_pc: vmPc.toString(),
-                data_base: dataBase === null ? null : dataBase.toString(),
+                vm_pc: hexOf(vmPc),
+                ip_source: ipRes.src,
+                opcode: opcodeVal,
+                opcode_source: opcodeSrc,
+                data_base: hexOf(dataBase),
                 vm_idx: idx,
                 vm_idx_source: idxSource,
                 vm_pc_bytes: codeBytes,
                 native_pc: c.pc.toString(),
                 dispatch_addr: addr.toString(),
-                ctx: ctxp.toString(),
-                reg_base: regbase === null ? null : regbase.toString()
+                ctx: hexOf(ctxp),
+                ctx_source: ctxRes.src,
+                reg_base: hexOf(regbase),
+                reg_base_source: regBaseSrc
             };
             if (regbase !== null) { rec.regs = readVmRegs(regbase); }
             try {
@@ -475,12 +805,18 @@ _JS_VM_BREAK = r"""
           dispatch_offset: DISPATCH_OFFSET, target_idx: TARGET_IDX,
           module_base: mod.base.toString(), module: mod.name,
           code_base_used: CODE_BASE,
-          data_base_path: '*(*(ctx+0x' + P1_OFF.toString(16) + ')+0x'
-                          + P2_OFF.toString(16) + ')'});
+          layout: {ctx: CTX_SPEC, ip_mode: IP_MODE, ip_reg: IP_REG,
+                   ip_offset: IP_OFFSET, opcode: OPCODE_SPEC,
+                   reg_base_reg: REG_BASE_REG,
+                   reg_base_offset: REG_BASE_OFFSET},
+          data_base_path: (P1_OFF < 0) ? 'disabled'
+                          : '*(*(ctx+0x' + P1_OFF.toString(16) + ')+0x'
+                            + P2_OFF.toString(16) + ')'});
 
     recv('stop', function () {
         if (listener !== null) { try { listener.detach(); } catch (e) {} }
-        send({kind: 'stopped', hits: hitCount});
+        send({kind: 'stopped', hits: hitCount, ctx_fail: ctxFail,
+              ip_fail: ipFail});
     });
 })();
 """
@@ -576,6 +912,15 @@ def _run_vm_break(serial: str, pid: int, so_name: str, user_js: str,
                 box["hits"].append(payload)
             elif kind == "stopped":
                 box["stopped"] = True
+                # (4) 第四次修改（2026-11-16）：
+                #     bug 原因：命中 0 次时，原实现只能把「指令没执行 / 派发点
+                #               不在路径上 / 会话失效」三种可能都列出来让用户猜。
+                #               参数化之后多了一种**确定性**原因：结构配置不符
+                #               （ctx 取不到、VM pc 读失败），这时本该直接说清楚。
+                #     解决方案：JS 侧统计 ctx 取失败 / ip 读失败次数，
+                #               在 stop 时回传；这里落进 box 供后续 verdict 判定。
+                box["ctx_fail"] = int(payload.get("ctx_fail") or 0)
+                box["ip_fail"] = int(payload.get("ip_fail") or 0)
             elif kind == "error":
                 box["error"] = payload.get("error") or "未知错误"
                 box["error_code"] = payload.get("code")
@@ -629,6 +974,26 @@ def _run_vm_break(serial: str, pid: int, so_name: str, user_js: str,
         #               却是旧的（attach 到已失效会话后一切静默）。
         #     解决方案：把这条也写进 hint，并明确指出 target_idx 过滤只在
         #               code_base 已知时才有意义。
+        ctx_fail = int(box.get("ctx_fail") or 0)
+        ip_fail = int(box.get("ip_fail") or 0)
+        out["ctx_fail"] = ctx_fail
+        out["ip_fail"] = ip_fail
+        if ctx_fail or ip_fail:
+            # (4) 第四次修改（2026-11-16）：结构不符是**确定性**原因，
+            #     不该和"没执行"混在一条模糊提示里。
+            #     bug 原因：参数化后，ctx 取不到 / VM pc 读失败会表现为
+            #               "命中 0 次"，与"VM 没跑"完全同形，用户无从区分。
+            #     解决方案：JS 侧计数并在 stop 回传；这里优先判定为结构不符，
+            #               直接指出该改哪个参数。
+            out["verdict"] = (
+                f"派发点被命中 {ctx_fail + ip_fail} 次，但每次都取不到"
+                f"关键字段（ctx 失败 {ctx_fail} 次 / VM pc 失败 {ip_fail} 次）。"
+                "**这是结构配置不符，不是 VM 没运行**")
+            out["hint"] = (
+                "按失败项改参数：① 取不到 ctx → 检查 ctx_reg / ctx_expr"
+                "（用 probe_hits 的 capture_regs 看哪个寄存器像是结构体指针）；"
+                "② 取不到 VM pc → 改 ip_mode=reg 并指定 ip_reg，或改 ip_offset")
+            return out
         out["verdict"] = (f"{wait:.0f}s 内没有命中 idx={target_idx}。"
                           "可能原因：① 该指令在当前操作下没被执行；"
                           "② 挂的派发点不在它的执行路径上"
@@ -653,18 +1018,62 @@ def vm_regs_snapshot(serial: str, pid: int, so_name: str,
                      dispatch_offset: int | str | None = None,
                      pattern_hex: str = VM_DEFAULT_PATTERN,
                      capture_regs: int = 32,
-                     wait: float = 3.0) -> dict:
+                     wait: float = 3.0,
+                     reg_base_reg: str = VM_DEFAULTS["reg_base_reg"],
+                     reg_base_offset: int = VM_DEFAULTS["reg_base_offset"],
+                     ctx_reg: str = VM_DEFAULTS["ctx_reg"],
+                     ctx_expr: str = "",
+                     ip_mode: str = VM_DEFAULTS["ip_mode"],
+                     ip_reg: str = VM_DEFAULTS["ip_reg"],
+                     ip_offset: int = VM_DEFAULTS["ip_offset"],
+                     opcode_expr: str = VM_DEFAULTS["opcode_expr"],
+                     vm_reg_count: int = VM_DEFAULTS["vm_reg_count"]) -> dict:
     """在派发点抓一次 VM 寄存器堆快照（不判断 idx）。
 
     用途：不确定 code_base 时，先用它把「当前 VM pc」打出来，
     再对照代码区基址反推。
 
-    返回：{ok, vm_pc, ctx, regs{r0..r31}, stack_hex}
+    ## (4) 第四次修改（2026-11-16）参数化
+
+        bug 原因：原实现把寄存器约定**写死**在函数体里（reg_base_reg/ctx_reg/
+                  ip_reg/ip_offset 全取 VM_DEFAULTS，不对外开放），
+                  换一个 VM 时用户即使知道结构也没法告诉工具。
+                  而且它只认「寄存器堆在某个寄存器里」这一种布局，
+                  结构体内嵌寄存器堆（ctx+0x6070）的 VM 完全取不到。
+        解决方案：把四个取值点全部提成参数，并复用 parse_value_expr 的表达式
+                  写法；未传时取 VM_DEFAULTS，**与原行为逐字节一致**。
+
+    ## 参数
+
+        reg_base_reg / reg_base_offset  寄存器堆来源（偏移>0 时优先按 ctx 取）
+        ctx_reg / ctx_expr              ctx 来源
+        ip_mode / ip_reg / ip_offset    VM pc 来源（ctx / reg / none）
+        opcode_expr                     opcode 来源（"sp+8" / "x8" / "ctx+0x100"）
+
+    返回：{ok, vm_pc, ctx, regs{r0..r31}, stack_hex, ...来源标注}
     """
     try:
-        import frida
+        import frida                                     # noqa: F401
     except Exception as exc:                              # noqa: BLE001
         return {"ok": False, "code": "NO_FRIDA", "error": str(exc)}
+
+    if str(ip_mode).lower() not in ("ctx", "reg", "none"):
+        return {"ok": False, "code": "BAD_IP_MODE",
+                "error": f"ip_mode 应为 ctx/reg/none，收到 {ip_mode!r}"}
+
+    opcode_spec = parse_value_expr(opcode_expr)
+    if opcode_spec["kind"] == "bad":
+        return {"ok": False, "code": "BAD_EXPR",
+                "error": f"opcode_expr 无法解析：{opcode_expr!r}",
+                "hint": '支持写法："sp+8" / "x8" / "ctx+0x100" / ""（不取）'}
+    if ctx_expr:
+        ctx_spec = parse_value_expr(ctx_expr)
+        if ctx_spec["kind"] == "bad":
+            return {"ok": False, "code": "BAD_EXPR",
+                    "error": f"ctx_expr 无法解析：{ctx_expr!r}",
+                    "hint": '支持写法："x20" / "sp+0x10" / "x20+0x8"'}
+    else:
+        ctx_spec = {"kind": "reg", "reg": str(ctx_reg)}
 
     disp = None
     if dispatch_offset is not None:
@@ -684,11 +1093,19 @@ def vm_regs_snapshot(serial: str, pid: int, so_name: str,
     for k, v in (
         ("__DISPATCH_OFFSET__", str(int(disp))),
         ("__CAPTURE_REGS__", str(int(capture_regs))),
-        ("__IP_OFFSET__", str(VM_DEFAULTS["ip_offset"])),
-        ("__IP_REG__", _js_str(VM_DEFAULTS["ip_reg"])),
-        ("__CTX_REG__", _js_str(VM_DEFAULTS["ctx_reg"])),
-        ("__REG_BASE_REG__", _js_str(VM_DEFAULTS["reg_base_reg"])),
-        ("__VM_REG_COUNT__", str(VM_DEFAULTS["vm_reg_count"])),
+        # (4) 第四次修改（2026-11-16）：原来这四行取的是 VM_DEFAULTS 常量，
+        #     等于参数不生效。改为取函数形参，未传时形参默认值就是
+        #     VM_DEFAULTS，行为与旧版一致。
+        ("__IP_OFFSET__", str(int(ip_offset))),
+        ("__IP_REG__", _js_str(ip_reg)),
+        ("__IP_MODE__", _js_str(str(ip_mode).lower())),
+        ("__CTX_REG__", _js_str(ctx_reg)),
+        ("__CTX_SPEC__", _js_spec(ctx_spec)),
+        ("__OPCODE_SPEC__", _js_spec(opcode_spec)),
+        ("__REG_BASE_REG__", _js_str(reg_base_reg)),
+        ("__REG_BASE_OFFSET__", str(int(reg_base_offset))),
+        ("__VM_REG_COUNT__", str(int(vm_reg_count))),
+        ("__SPEC_HELPERS__", _JS_SPEC_HELPERS),
     ):
         js = js.replace(k, v)
     js = js.replace("SO_NAME", _js_str(so_name))
@@ -745,46 +1162,109 @@ _JS_VM_SNAPSHOT = r"""
     var CAPTURE_REGS = __CAPTURE_REGS__;
     var IP_OFFSET = __IP_OFFSET__;
     var IP_REG = __IP_REG__;
+    var IP_MODE = __IP_MODE__;
     var CTX_REG = __CTX_REG__;
+    var CTX_SPEC = __CTX_SPEC__;
+    var OPCODE_SPEC = __OPCODE_SPEC__;
     var REG_BASE_REG = __REG_BASE_REG__;
+    var REG_BASE_OFFSET = __REG_BASE_OFFSET__;
     var VM_REG_COUNT = __VM_REG_COUNT__;
+__SPEC_HELPERS__
 
     var mod = Process.findModuleByName(SO_NAME);
     if (mod === null) {
-        send({kind: 'error', error: '模块未加载：' + SO_NAME});
+        send({kind: 'error', code: 'SO_NOT_FOUND', error: '模块未加载：' + SO_NAME});
         return;
     }
     var addr = mod.base.add(DISPATCH_OFFSET);
+    // (4) 第四次修改（2026-11-16）：
+    //     bug 原因：原实现一进来就把 done 置 true，于是「ctx 取不到」
+    //               这种可恢复的失败会**永久关掉采样**，表现为一次都没采到
+    //               就再也采不到，用户只能重启进程重试。
+    //     解决方案：只在**真正 send 出一条快照**后才停；取值失败时继续等下
+    //               一个派发点，并把失败原因累计进 errors 一起回报。
     var done = false;
+    var failCount = 0;
+    var lastErr = '';
 
     var listener = Interceptor.attach(addr, {
         onEnter: function () {
             if (done) { return; }
-            done = true;
             var c = this.context;
             var rec = {kind: 'snapshot', dispatch_addr: addr.toString(),
                        native_pc: c.pc.toString()};
-            try {
-                var ctxp = c[CTX_REG];
-                rec.ctx = ctxp === null ? null : ctxp.toString();
-                rec.vm_pc = ctxp.add(IP_OFFSET).readPointer().toString();
-            } catch (e) { rec.err_ctx = String(e); }
-            try {
-                var rb = c[REG_BASE_REG];
-                rec.reg_base = rb === null ? null : rb.toString();
-                var regs = {};
-                var n = Math.min(CAPTURE_REGS, VM_REG_COUNT);
-                for (var i = 0; i < n; i++) {
-                    regs['r' + i] = rb.add(i * 8).readPointer().toString();
+
+            var ctxRes = resolveValue(c, CTX_SPEC, null);
+            var ctxp = ctxRes.ptr;
+            rec.ctx = hexOf(ctxp);
+            rec.ctx_source = ctxRes.src;
+
+            // VM pc：按 IP_MODE 取，不再写死 [ctx+IP_OFFSET]
+            if (IP_MODE === 'none') {
+                rec.vm_pc = null;
+                rec.ip_source = 'none';
+            } else if (IP_MODE === 'reg') {
+                var ip = regOf(c, IP_REG);
+                rec.vm_pc = hexOf(ip);
+                rec.ip_source = ip === null ? 'reg-missing' : 'reg:' + IP_REG;
+            } else if (ctxp === null) {
+                rec.vm_pc = null;
+                rec.ip_source = ctxRes.err || 'ctx-missing';
+            } else {
+                try {
+                    rec.vm_pc = ctxp.add(IP_OFFSET).readPointer().toString();
+                    rec.ip_source = 'ctx+0x' + IP_OFFSET.toString(16);
+                } catch (e) {
+                    rec.vm_pc = null;
+                    rec.ip_source = 'ctx-read-failed';
+                    rec.err_ip = String(e);
                 }
-                rec.regs = regs;
-            } catch (e) { rec.err_regs = String(e); }
+            }
+
+            // 寄存器堆：ctx+offset（结构体内嵌）优先，否则按寄存器取
+            var rb = null;
+            if (REG_BASE_OFFSET > 0) {
+                rb = (ctxp === null) ? null : ctxp.add(REG_BASE_OFFSET);
+                rec.reg_base_source = 'ctx+0x' + REG_BASE_OFFSET.toString(16);
+            } else if (REG_BASE_REG) {
+                rb = regOf(c, REG_BASE_REG);
+                rec.reg_base_source = rb === null ? 'reg-missing'
+                                                  : 'reg:' + REG_BASE_REG;
+            } else {
+                rec.reg_base_source = 'none';
+            }
+            rec.reg_base = hexOf(rb);
+            if (rb !== null) {
+                try {
+                    var regs = {};
+                    var n = Math.min(CAPTURE_REGS, VM_REG_COUNT);
+                    for (var i = 0; i < n; i++) {
+                        regs['r' + i] = rb.add(i * 8).readPointer().toString();
+                    }
+                    rec.regs = regs;
+                } catch (e) { rec.err_regs = String(e); }
+            }
+
+            // opcode：按 spec 取（"sp+8" / "x8" / "ctx+0x100"）
+            rec.opcode = null;
+            rec.opcode_source = 'none';
+            if (OPCODE_SPEC.kind !== 'none') {
+                var opRes = resolveValue(c, OPCODE_SPEC, ctxp);
+                rec.opcode_source = opRes.src;
+                if (opRes.ptr !== null) {
+                    var sv = readScalar(opRes.ptr);
+                    rec.opcode = (sv.n !== null) ? sv.n : sv.s;
+                    if (sv.err) { rec.err_opcode = sv.err; }
+                }
+            }
+
             try {
                 rec.stack_hex = Array.from(new Uint8Array(c.sp.readByteArray(128)))
                     .map(function (b) { return ('0' + b.toString(16)).slice(-2); })
                     .join('');
             } catch (e) {}
             send(rec);
+            done = true;
             try { listener.detach(); } catch (e) {}
         }
     });

@@ -2337,7 +2337,8 @@ def list_threads(serial: str, pid: int) -> str:
 @server.tool()
 @logged()
 def get_callstack(serial: str, pid: int, thread_id: int = 0, limit: int = 32,
-                  method: str = "accurate", scan_bytes: int = 1024) -> str:
+                  method: str = "accurate", scan_bytes: int = 1024,
+                  so_name: str = "") -> str:
     """取指定线程的调用栈，并用 **mda 自己的静态模型**把每一帧符号化。
 
     为什么不用 frida 的 DebugSymbol：stripped 的壳样本上它没有符号表可用，
@@ -2369,8 +2370,61 @@ def get_callstack(serial: str, pid: int, thread_id: int = 0, limit: int = 32,
 
     # thread_id=0：优先最近命中的线程，实在没有就由 frida 端取第一个线程
     tid = int(thread_id or 0) or _recent_thread_id(tgt)
-    if method not in ("accurate", "scan"):
+    if method not in ("accurate", "scan", "dwarf"):
         return _j({"error": f"method 只能是 'accurate' 或 'scan'，收到 {method!r}"})
+    # (134) dwarf：不经过 frida 取栈，而是拿最近一次断点命中的
+    #        现场寄存器，用 so 的 .eh_frame 规则逐帧展开。
+    if method == "dwarf":
+        from server.core.dwarf import CfiUnavailable, unwind_frames
+
+        # 需要一个 so：优先用参数，否则用会话里第一个已加载的
+        so = None
+        if so_name:
+            try:
+                so = _session.get(so_name)
+            except Exception:                             # noqa: BLE001
+                so = None
+        if so is None:
+            for nm in list(_session.modules):
+                so = _session.get(nm)
+                break
+        if so is None:
+            return _j({"error": "dwarf 回溯需要先 load_so（用它自己的 .eh_frame）",
+                       "code": "NO_SO"})
+
+        # 寄存器来源：最近一次断点命中现场（那里有完整 context）
+        regs: dict = {}
+        try:
+            got = svc.hits(serial, int(pid))
+            if got:
+                last = got[-1]
+                ctx = last.get("context") or {}
+                for k, v in ctx.items():
+                    regs[str(k)] = _as_int_addr(v)
+                frames_bt = last.get("backtrace") or []
+                if not regs.get("sp") and regs.get("pc"):
+                    pass
+        except Exception:                                 # noqa: BLE001
+            regs = {}
+
+        if not regs.get("pc"):
+            return _j({
+                "error": "dwarf 回溯需要一个起点 PC 与 sp——先下断点制造一次命中",
+                "code": "NO_CONTEXT",
+                "hint": ("① set_breakpoint(hold=True) → 命中；"
+                         "② 再调 get_callstack(method='dwarf')；"
+                         "③ 或用 method='scan' 走启发式（不需要现场）"),
+            })
+
+        try:
+            out = unwind_frames(so, int(regs["pc"]), regs, limit=int(limit))
+        except CfiUnavailable as exc:
+            return _j({"error": exc.message, "code": exc.code,
+                       "hint": "改用 method='scan'"})
+        out["thread_id"] = tid
+        out["so"] = so.name if hasattr(so, "name") else so_name
+        return _j(out)
+
     js = (_JS_CALLSTACK
           .replace("__TID__", str(tid))
           .replace("__LIMIT__", str(limit))
@@ -3199,6 +3253,16 @@ def locate_runtime_addr(serial: str, pid: int, runtime_addr: int | str) -> str:
         → locate_runtime_addr 拿 static_addr_int 与 function
         → 用 static_addr_int 调 disassemble / xrefs_to（这两个接口要 int）。
 
+    ## method 三选一
+
+    accurate  frida 的 Backtracer.ACCURATE（默认）。依赖帧指针或 DWARF CFI，
+              **PAC + 无帧指针的加固 so 上通常只有 2 帧**
+    scan      启发式扫栈：找"落在模块内 + 前一条指令是 bl"的值当候选帧。
+              不需要现场，但结果是**候选**不是精确调用栈
+    dwarf     用 so 的 .eh_frame 规则逐帧展开（编译器生成的权威信息）。
+              需要一次断点命中提供现场 PC/SP；so_name 指定用哪个 so 的 CFI。
+              **CFI 被剥离的样本会明告 warning**，不会假装成功
+
     runtime_addr 支持十进制整数或 "0x..." 字符串（调用栈输出就是 hex 串）。
 
     会 attach 目标（幂等，已附加则复用同一会话），本工具**需要设备**。
@@ -3334,6 +3398,101 @@ def hit_analysis(serial: str, pid: int, build_xrefs: bool = False,
         result.setdefault("notes", []).append(filter_note)
     result["hits_total"] = len(hits)
     return _j(result)
+
+
+@server.tool()
+@logged()
+def watch_memory(serial: str, pid: int, addr: str, size: int = 8,
+                 max_records: int = 200, duration: float = 30.0) -> str:
+    """监控内存写入，**记录写入前的内容**——"能在正确时刻停下来"。
+
+    为什么需要它：`perf_watch` 只能给 PC，**拿不到写入前后的内容**；
+    等回头去读，那块内存早被释放/复用了。
+
+    ## 为什么不用其他方案（全是实测结论）
+
+    · frida `MemoryAccessMonitor.enable()` → **直接把目标进程搞崩**
+    · frida `Process.setExceptionHandler` 收不到 SIGSEGV（hits=0）
+    · perf_event 硬件观察点 → 能触发、能拿 IP，但 `read()` 是**计数**，
+      SIGIO 是**异步**投递，信号到达时写入已完成
+
+    ## 本工具的做法
+
+    mprotect(PROT_READ) + 自己处理 SIGSEGV（valgrind 的原理）：
+    写触发段错误 → handler 里读**还没被覆盖**的内容 → 恢复可写让写完成。
+
+    设备实测（3e2ff172 / Android 12 / arm64）：
+
+        before_hex=aaaaaaaaaaaaaaaa   ← 写入前，拿到了
+        after=deadbeefcafebabe
+
+    ## 能力边界（如实说明，不粉饰）
+
+    当前是**进程内**监控：helper 只能保护它自己进程的地址。
+    要监控别的进程需要把 helper 注入目标（ptrace + 远程 mmap），**当前未实现**。
+    所以本工具目前返回的是「机制在本设备可用」的验证结果，
+    不是对 pid 的实时监控——**不会假装能跨进程工作**。
+    """
+    from server.dyn.uprobe import watch_memory as _impl
+
+    try:
+        return _j(_impl(serial, int(pid), str(addr), size=int(size),
+                        max_records=int(max_records),
+                        duration=float(duration)))
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}",
+                   "code": "WATCH_MEMORY_FAILED"})
+
+
+@server.tool()
+@logged()
+def trace_alloc(serial: str, pid: int, tid: int = 0,
+                size_min: int = 0, size_max: int = 0,
+                funcs: list | None = None, max_records: int = 500,
+                duration: float = 10.0) -> str:
+    """低开销**内存分配追踪**——走内核 uprobe，不用 frida。
+
+    为什么需要它：用 frida hook malloc 时，实测 **167358 次 / 60 秒**，
+    目标进程被反调试杀掉。uprobe 只在内核里做一次断点替换，
+    **不改用户代码**，开销低一个数量级，风控信号也小。
+
+        trace_alloc(serial, pid=1234, duration=20)
+        trace_alloc(serial, pid=1234, size_min=48, size_max=96, tid=5678)
+
+    ## 参数
+
+    tid         只跟一个线程（0 = 不限）。高频场景下限定线程能显著降开销
+    size_min/max 只记录该大小区间的分配（0 = 不限）
+    funcs       要追踪的符号，默认 malloc/calloc/realloc/free
+    max_records 硬上限，超出丢弃并计数
+    duration    采集秒数
+
+    ## 返回
+
+    records[{ts, comm, tid, func, size}] / dropped / mechanism="uprobe" / limits[]
+
+    ## 能力边界（如实说明）
+
+    uprobe **拿不到返回地址**（除内核支持 `$stack` 语法）。
+    所以记录里没有 caller 时表示「拿不到」，不是「没有调用者」。
+    `size` 为 null 同理——部分内核版本不导出函数参数。
+    """
+    from server.dyn.uprobe import UprobeError, trace_alloc as _impl
+
+    try:
+        return _j(_impl(serial, int(pid), tid=int(tid or 0),
+                        size_min=int(size_min or 0),
+                        size_max=int(size_max or 0),
+                        funcs=funcs, max_records=int(max_records or 500),
+                        duration=float(duration)))
+    except UprobeError as exc:
+        return _j({"error": exc.message, "code": exc.code,
+                   "hint": ("① 确认设备 root 且 /sys/kernel/tracing 可写；"
+                            "② 换一个正在跑的进程重试；"
+                            "③ 部分内核没开 CONFIG_UPROBE_EVENTS")})
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}",
+                   "code": "TRACE_ALLOC_FAILED"})
 
 
 @server.tool()

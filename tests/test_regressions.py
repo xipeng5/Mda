@@ -4852,6 +4852,98 @@ def test_r98_breakpoint_alias_dedup():
           f"实际 {len(tgt.breakpoints)} 条")
 
 
+
+def test_r99_memory_observation_stack():
+    """R99 内存观察栈：uprobe / mprotect 快照 / DWARF CFI。
+
+    (1) 第一次修改（2026-11-16）：
+        背景：使用者 48 轮的失败都归结为「知道该看哪里，但总是看晚了」。
+              frida hook malloc 167358 次/60s 把进程压死；
+              perf_watch 拿不到写入前内容；
+              PAC + 无帧指针让 backtrace 只有 2 帧。
+
+    这条锁四件事（都是**行为断言**，不是 grep 源码）：
+      ① uprobe trace_pipe 行解析（两种真实格式）
+      ② DWARF .eh_frame 解析出正确数量的 FDE（等于函数数）
+      ③ CFI CFA 规则能算出来
+      ④ CFI 不足时如实警告，不假装成功
+    """
+    import sys
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    sys.path.insert(0, str(root))
+
+    # ---- ① trace_pipe 行解析（行为）----
+    from server.dyn.uprobe import _parse_line
+
+    cases = [
+        ("<...>-24232 [001] .... 12345.678901: mda_alloc_malloc: (malloc+0x0/0x10)",
+         "malloc", 24232),
+        ("app-1234 ( 1234) [002] d..1 99.123456: mda_alloc_free: (free+0x0/0x8)",
+         "free", 1234),
+        ("SurfaceFlinger-808 [003] .... 5.5: mda_alloc_malloc: arg1=0x80",
+         "malloc", 808),
+    ]
+    for line, want_func, want_tid in cases:
+        got = _parse_line(line)
+        check(f"trace_pipe 解析 {want_func}/{want_tid}", got is not None,
+              "两种真实格式（comm-pid 与 comm ( pid)）都要认")
+        if got:
+            check(f"  字段正确 {want_func}",
+                  got.get("func") == want_func and got.get("tid") == want_tid,
+                  f"实际 {got}")
+    check("非目标行不误判", _parse_line("something else entirely") is None,
+          "会把无关行当事件")
+
+    # ---- ② .eh_frame 解析（行为：真样本）----
+    from server.core.dwarf import CfiUnavailable, _cfa_at, parse_eh_frame
+    from server.core.session import Session
+
+    ses = Session()
+    lg = ses.add(str(root / "samples" / "liblog.so"))
+    parsed = parse_eh_frame(lg)
+    cov = parsed["coverage"]
+    check("liblog 解析出 CIE", cov["cies"] >= 1, f"cies={cov['cies']}")
+    check("liblog 的 FDE 数等于函数数",
+          cov["fdes"] == len(lg.functions),
+          f"FDE={cov['fdes']} 函数={len(lg.functions)}"
+          "（不等说明 CIE 偏移或对齐算错了）")
+    check("liblog CFI 充足", cov["enough"] is True, str(cov))
+
+    # ---- ③ CFA 规则（行为）----
+    fde0 = parsed["fdes"][0]
+    rule = _cfa_at(fde0, fde0["pc_begin"] + 4, set())
+    check("能算出 CFA 规则", rule is not None,
+          f"pc=0x{fde0['pc_begin']:x} 算不出 CFA")
+    if rule:
+        check("CFA 规则形状正确",
+              isinstance(rule, tuple) and len(rule) == 3,
+              str(rule))
+
+    # ---- ④ CFI 不足要如实警告（行为：用假 so 模拟被剥离的样本）----
+    class _Sec:
+        name = ".eh_frame"
+        addr = 0
+        size = 32          # 极小
+
+    class _FakeSo:
+        sections = [_Sec()]
+        functions = {}
+
+        def read(self, a, n):
+            return b"\x00" * 32
+
+    try:
+        got = parse_eh_frame(_FakeSo())
+        check("CFI 不足时要标 warning",
+              got["coverage"].get("enough") is False
+              and bool(got["coverage"].get("warning")),
+              "CFI 不够却不说，调用方会信假结果")
+    except CfiUnavailable:
+        check("CFI 不足时抛明确异常", True, "")
+
+
 def main() -> int:
     print("== R1 held/token 透出（防线程永久挂起）==")
     test_r1_held_is_exposed()
@@ -5023,6 +5115,9 @@ def main() -> int:
 
     print("== R79 C++ 符号还原 ==")
     test_r79_cpp_demangle()
+
+    print("== R99 内存观察栈 ==")
+    test_r99_memory_observation_stack()
 
     print("== R98 断点别名去重 ==")
     test_r98_breakpoint_alias_dedup()
