@@ -4875,26 +4875,32 @@ def test_r99_memory_observation_stack():
     sys.path.insert(0, str(root))
 
     # ---- ① trace_pipe 行解析（行为）----
-    from server.dyn.uprobe import _parse_line
+    from server.dyn.uprobe import _parse_trace
 
-    cases = [
-        ("<...>-24232 [001] .... 12345.678901: mda_alloc_malloc: (malloc+0x0/0x10)",
-         "malloc", 24232),
-        ("app-1234 ( 1234) [002] d..1 99.123456: mda_alloc_free: (free+0x0/0x8)",
-         "free", 1234),
-        ("SurfaceFlinger-808 [003] .... 5.5: mda_alloc_malloc: arg1=0x80",
-         "malloc", 808),
-    ]
-    for line, want_func, want_tid in cases:
-        got = _parse_line(line)
-        check(f"trace_pipe 解析 {want_func}/{want_tid}", got is not None,
-              "两种真实格式（comm-pid 与 comm ( pid)）都要认")
-        if got:
-            check(f"  字段正确 {want_func}",
-                  got.get("func") == want_func and got.get("tid") == want_tid,
-                  f"实际 {got}")
-    check("非目标行不误判", _parse_line("something else entirely") is None,
-          "会把无关行当事件")
+    line = ("app-1234 ( 1234) [002] d..1 99.123456: malloc: "
+            "(malloc+0x0/0x10) sz=0x30 lr=0x70001000")
+    recs, total, unmatched = _parse_trace(line, ["malloc"], {1234},
+                                          {"libx.so": 0x70000000})
+    check("trace_pipe 能解析出记录", len(recs) == 1, f"实际 {len(recs)} 条")
+    check("总数统计正确", total == 1, f"total={total}")
+    if recs:
+        r0 = recs[0]
+        check("  提取 func", r0.get("func") == "malloc", str(r0.get("func")))
+        check("  提取 tid", r0.get("tid") == 1234, str(r0.get("tid")))
+        check("  提取 size", r0.get("size") == 0x30, str(r0.get("size")))
+        check("  算出 caller_off", r0.get("caller_off") == 0x1000,
+              str(r0.get("caller_off")))
+        check("  标出 caller 模块", r0.get("caller_mod") == "libx.so",
+              str(r0.get("caller_mod")))
+
+    # tid 不在目标集合时要不计数且计入 unmatched（说明过滤生效）
+    _, total2, un2 = _parse_trace(line, ["malloc"], {9999}, {})
+    check("tid 过滤生效", total2 == 1 and un2 == 1,
+          f"total={total2} unmatched={un2}")
+
+    # 无关行不能被当事件
+    recs3, total3, _ = _parse_trace("hello world", ["malloc"], set(), {})
+    check("无关行不误判", not recs3 and total3 == 0, f"实际 {total3}")
 
     # ---- ② .eh_frame 解析（行为：真样本）----
     from server.core.dwarf import CfiUnavailable, _cfa_at, parse_eh_frame
@@ -4942,6 +4948,337 @@ def test_r99_memory_observation_stack():
               "CFI 不够却不说，调用方会信假结果")
     except CfiUnavailable:
         check("CFI 不足时抛明确异常", True, "")
+
+
+def test_r100_dwarf_cfi_unwind():
+    """R100 DWARF CFI 栈回溯：规则正确性 + 真展开 + CFI 不足如实报告。
+
+    (1) 第一次修改（2026-11-16）：
+        背景：frida 的 Thread.backtrace(ACCURATE) 在 PAC + 无帧指针的 so 上
+              实测只有 2 帧（同一个地址重复），fp 链断了。本次用 .eh_frame 的
+              DWARF CFI 规则逐帧展开替代它（libunwind 的原理）。
+
+    为什么单独立一条而不是并进 R99：
+        R99 只断言"能算出 CFA 规则"（形状是三元组）。**形状对不代表值对**——
+        实测旧实现把 `DW_CFA_def_cfa reg29 +32` 整个吞掉（扫描在 PAC 指令
+        0x2d 处 break），对 0x12094 返回 ('sp', 0, None)，而 objdump 的真值是
+        CFA=reg29+32、reg30=[CFA-24]。两者形状完全一样，R99 全过。
+        所以这里锁的是**真值**，真值来自 `/usr/bin/objdump --dwarf=frames`
+        （独立于本实现的第三方工具）。
+    """
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    sys.path.insert(0, str(root))
+
+    from server.core.dwarf import (CfiUnwinder, _cfa_at, _rules_at,
+                                   _as_internal_fde, parse_eh_frame)
+    from server.core.session import Session
+
+    ses = Session()
+    base_so = ses.add(str(root / "samples" / "libbase.so"))
+    parsed = parse_eh_frame(base_so)
+
+    # ---- ① 规则真值：与 objdump 逐条对照 ----
+    # 这三处覆盖了"无帧 / PAC 标志 / 已建 fp 帧"三种状态
+    fde = None
+    for f in parsed["fdes"]:
+        if f["pc_begin"] == 0x12080:
+            fde = f
+            break
+    check("libbase 找到 0x12080 的 FDE", fde is not None, "样本布局变了？")
+    if fde is not None:
+        got0 = _cfa_at(fde, 0x12080, set())
+        check("0x12080 的 CFA 是 sp+0（objdump: CFA=reg31）",
+              got0 == ("sp", 0, None), f"实际 {got0}")
+        # objdump:  0x12094: CFA=reg29+32: reg19=[CFA-16], reg29=[CFA-32],
+        #                       reg30=[CFA-24], reg34=1
+        got1 = _cfa_at(fde, 0x12094, set())
+        check("0x12094 的 CFA 是 x29+32（objdump: CFA=reg29+32）",
+              got1 is not None and got1[0] == "x29" and got1[1] == 32,
+              f"实际 {got1}——旧实现这里返回 sp+0，因为 def_cfa 被漏执行")
+        check("0x12094 的 RA 规则是 CFA-24（objdump: reg30=[CFA-24]）",
+              got1 is not None and got1[2] == "CFA-24",
+              f"实际 {got1[2] if got1 else None}——旧实现 ra 恒为 None")
+
+        # 各寄存器保存槽位也要对（objdump 同一行）
+        st = _rules_at(_as_internal_fde(fde), 0x12094, set())
+        want_slots = {19: -16, 29: -32, 30: -24}
+        ok_slots = st is not None and all(
+            st.regs.get(r) == ("offset", off) for r, off in want_slots.items())
+        check("0x12094 的三个保存槽位与 objdump 一致", ok_slots,
+              f"实际 {st.regs if st else None}")
+
+    # ---- ② PAC 指令（0x2d）不能被当成 unsupported 而中断扫描 ----
+    # AARCH64_negate_ra_state 是 PAC 编译的必出指令；把它当未知 opcode
+    # break 掉会让后面所有 def_cfa / offset 全部丢失。
+    unsup: set = set()
+    _cfa_at(fde, 0x12094, unsup) if fde else None
+    check("PAC 指令 0x2d 不被报为 unsupported",
+          0x2D not in unsup,
+          f"unsupported={sorted(hex(x) for x in unsup)}"
+          "（这条一旦出现，说明扫描在 PAC 标志处断了）")
+
+    # ---- ③ 真展开：按 CFI 规则布一个自洽的栈，看能否逐帧走通 ----
+    fdes = parsed["fdes"]
+
+    def _fde_at(a):
+        for f in fdes:
+            if f["pc_begin"] <= a < f["pc_end"]:
+                return f
+        return None
+
+    # 选 4 个"帧已建立、且不在行边界上"的调用点
+    pcs = []
+    for f in fdes:
+        if f["pc_end"] - f["pc_begin"] < 0x60:
+            continue
+        for off in (0x28, 0x2c, 0x30, 0x34, 0x38):
+            pc = f["pc_begin"] + off
+            if pc >= f["pc_end"]:
+                continue
+            r1, r0 = _cfa_at(f, pc, set()), _cfa_at(f, pc - 4, set())
+            if r1 and r1[0] == "x29" and r1 == r0:
+                pcs.append(pc)
+                break
+        if len(pcs) == 4:
+            break
+    check("libbase 里找到 4 个可展开的调用点", len(pcs) == 4, f"实际 {len(pcs)}")
+
+    if len(pcs) == 4:
+        MOD_BASE, TOP = 0x7A00000000, 0x7000000000
+        mem: dict[int, int] = {}
+
+        def poke(addr, val):
+            for i in range(8):
+                mem[addr + i] = (val >> (8 * i)) & 0xFF
+
+        def read_mem(addr, size):
+            if addr <= 0:
+                return b""
+            return bytes(mem.get(addr + i, 0) for i in range(size))
+
+        # 逐层抬高 sp（内层地址低、外层高），x29 = sp + 0x40
+        sps, cfas = [], []
+        sp = TOP
+        for pc in pcs:
+            rule = _cfa_at(_fde_at(pc), pc, set())
+            sps.append(sp)
+            cfas.append(sp + 0x40 + rule[1])
+            sp = cfas[-1] + 0x120
+
+        # 按规则把"调用者的返回地址 / x29"写进各自槽位。
+        # 返回地址取 调用点+4：进入该函数时 bl 的下一条才是返回地址，
+        # 展开器用 ra-4 查 FDE 正好落回调用点。
+        for i, pc in enumerate(pcs):
+            f = _fde_at(pc)
+            st = _rules_at(_as_internal_fde(f), pc, set())
+            for regnum, rule in st.regs.items():
+                if rule[0] != "offset":
+                    continue
+                slot = cfas[i] + rule[1]
+                if regnum == f["ra_reg"]:
+                    poke(slot, (MOD_BASE + pcs[i + 1] + 4)
+                         if i + 1 < len(pcs) else 0)
+                elif regnum == 29:
+                    poke(slot, (sps[i + 1] + 0x40)
+                         if i + 1 < len(sps) else 0)
+                else:
+                    poke(slot, 0)
+
+        w = CfiUnwinder(read_mem=read_mem)
+        w.add_module(MOD_BASE, 0x40000, base_so, "libbase.so")
+        out = w.unwind(MOD_BASE + pcs[0],
+                       {"sp": sps[0], "x29": sps[0] + 0x40}, limit=16)
+
+        check("展开出 4 帧（构造了 4 层调用）",
+              out["frame_count"] == 4, f"实际 {out['frame_count']} 帧")
+        got_static = [f.get("static_addr") for f in out["frames"]]
+        check("每帧地址与构造的调用链逐层一致",
+              got_static == pcs,
+              f"期望 {[hex(p) for p in pcs]} 实际 {got_static}")
+        check("每帧都算出了 CFA 与 RA 规则",
+              out["decisive_frames"] == 4, f"实际 {out['decisive_frames']}")
+        check("完整 CFI 时 covered_pc=True",
+              out["cfi_coverage"].get("covered_pc") is True, "")
+        check("完整 CFI 时 enough=True",
+              out["cfi_coverage"].get("enough") is True, "")
+        check("栈顶正确停止（返回地址为 0）",
+              "返回地址为 0" in out["stop_reason"], out["stop_reason"])
+
+        # ---- ④ 死循环防护 ----
+        # 把最后一帧的 RA 指回自己：不设上限必须能停下来
+        last = pcs[-1]
+        f = _fde_at(last)
+        st = _rules_at(_as_internal_fde(f), last, set())
+        for regnum, rule in st.regs.items():
+            if regnum == f["ra_reg"] and rule[0] == "offset":
+                poke(cfas[-1] + rule[1], MOD_BASE + last + 4)
+        w2 = CfiUnwinder(read_mem=read_mem)
+        w2.add_module(MOD_BASE, 0x40000, base_so, "libbase.so")
+        loop_out = w2.unwind(MOD_BASE + last, {"sp": sps[-1], "x29": sps[-1] + 0x40},
+                             limit=64)
+        check("自指返回地址不会无限循环",
+              loop_out["frame_count"] <= 64, f"实际 {loop_out['frame_count']}")
+        check("循环被检测出来并说明",
+              "循环" in loop_out["stop_reason"] or loop_out["frame_count"] < 64,
+              loop_out["stop_reason"])
+
+    # ---- ⑤ 缺 sp 必须明确报错，不能猜 ----
+    from server.core.dwarf import CfiUnavailable
+
+    w3 = CfiUnwinder(read_mem=lambda a, n: b"")
+    w3.add_module(0x7A00000000, 0x40000, base_so, "libbase.so")
+    try:
+        w3.unwind(0x7A00000000 + parsed["fdes"][0]["pc_begin"], {"x0": 1}, limit=4)
+        check("缺 sp 时要报错", False, "没有 sp 却成功返回了，这是编造")
+    except CfiUnavailable as exc:
+        check("缺 sp 时报 NO_SP", exc.code == "NO_SP", f"实际 code={exc.code}")
+
+    # ---- ⑥ CFI 被剥离的样本必须如实说"不可信" ----
+    ss = root / "samples" / "sscronet.so"
+    if not ss.exists():
+        ss = Path("/tmp/sscronet.so")
+    if ss.exists():
+        sso = Session().add(str(ss))
+        sp2 = parse_eh_frame(sso)
+        cov2 = sp2["coverage"]
+        check("sscronet 的 CFI 被判为不足", cov2["enough"] is False,
+              f"enough={cov2['enough']}——这会让调用方信假结果")
+        check("sscronet 给出不可信警告", bool(cov2.get("warning")), "")
+        check("sscronet 覆盖率极低（<1%）",
+              cov2["coverage_ratio"] < 0.01,
+              f"实际 {cov2['coverage_ratio']}")
+        # 真的展开一次：必须只出 1 帧且说明原因，不能伪造后续帧
+        pc0 = sp2["fdes"][0]["pc_begin"] + 4
+        w4 = CfiUnwinder(read_mem=lambda a, n: bytes(n))
+        w4.add_module(0x7A00000000, 0x500000, sso, "sscronet.so")
+        r4 = w4.unwind(0x7A00000000 + pc0, {"sp": 0x7000000000}, limit=32)
+        check("CFI 不足时拿不到多帧", r4["frame_count"] <= 2,
+              f"实际 {r4['frame_count']} 帧——CFI 都没有还能展开这么深就是编的")
+        check("展开停止原因说清楚了", bool(r4.get("stop_reason")), "")
+        check("返回里带 cfi_coverage.enough=False",
+              r4["cfi_coverage"].get("enough") is False, "")
+
+
+
+def test_r101_cfi_against_objdump():
+    """R101 DWARF CFI 规则与 llvm-objdump 的**真值**逐条对比。
+
+    (1) 第一次修改（2026-11-16）：
+        为什么需要这条：R99 里对 CFA 只断言"形状是三元组"，
+        **形状对但值全错它也能通过**——这正是 CFI 实现最容易出的错。
+        唯一能证明对的办法是拿第三方工具的真值做全量对照。
+
+        对照方法（踩过一次坑，写清楚免得重蹈）：
+          · **不能用 FDE 起始 PC 比**——函数序言还没执行完，此刻
+            CFA 是 sp+0 是正确的；用起始 PC 比会把 81 条全判成错。
+          · 应该用 FDE 末尾附近的 PC（prologue 全部执行完），
+            取 objdump 里**最后一条** def_cfa 作为最终状态。
+
+    环境没装 llvm-objdump 时**跳过**（但仍算通过），
+    有则必须零差异。
+    """
+    import re as _re
+    import shutil
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    sys.path.insert(0, str(root))
+
+    # 找 llvm-objdump：NDK 优先，其次 PATH
+    cands = []
+    ndk_base = Path.home() / "Library" / "Android" / "sdk" / "ndk"
+    if ndk_base.is_dir():
+        for nd in sorted(ndk_base.iterdir(), reverse=True):
+            for host in ("darwin-x86_64", "linux-x86_64"):
+                p2 = (nd / "toolchains" / "llvm" / "prebuilt" / host
+                      / "bin" / "llvm-objdump")
+                if p2.is_file():
+                    cands.append(str(p2))
+                    break
+            if cands:
+                break
+    got = shutil.which("llvm-objdump")
+    if got:
+        cands.append(got)
+    if not cands:
+        check("有 llvm-objdump 可做真值对照（缺失则跳过）", True,
+              "未安装，本项跳过（不影响其他断言）")
+        return
+
+    objdump = cands[0]
+
+    from server.core.dwarf import _as_internal_fde, _rules_at, parse_eh_frame
+    from server.core.session import Session
+
+    for so_name in ("liblog.so", "libbase.so"):
+        sample = root / "samples" / so_name
+        if not sample.exists():
+            continue
+        try:
+            out = subprocess.run([objdump, "--dwarf=frames", str(sample)],
+                                 capture_output=True, text=True, timeout=120)
+        except Exception:                                 # noqa: BLE001
+            continue
+        text = out.stdout or ""
+        if not text:
+            continue
+
+        # 解析 objdump：{ (pc_begin, pc_end): [ (reg, off), ... ] }
+        truth: dict = {}
+        cur = None
+        for line in text.splitlines():
+            m = _re.search(r"FDE cie=\S* pc=([0-9a-f]+)\.\.\.([0-9a-f]+)", line)
+            if m:
+                cur = (int(m.group(1), 16), int(m.group(2), 16))
+                truth[cur] = []
+                continue
+            if cur is None:
+                continue
+            m2 = _re.search(r"DW_CFA_def_cfa:\s*reg(\d+)\s*([+-]\d+)", line)
+            if m2:
+                truth[cur].append((int(m2.group(1)), int(m2.group(2))))
+
+        ses = Session()
+        so = ses.add(str(sample))
+        parsed = parse_eh_frame(so)
+
+        ok = bad = 0
+        first_bad = ""
+        for f in parsed["fdes"]:
+            key = (f["pc_begin"], f["pc_end"])
+            if key not in truth or not truth[key]:
+                continue
+            fe = _as_internal_fde(f)
+            if fe is None:
+                bad += 1
+                continue
+            # 用 FDE 末尾附近（prologue 已执行完），取真值里**最后一条**规则
+            st = _rules_at(fe, f["pc_end"] - 4, set())
+            if st is None or not st.cfa_known:
+                bad += 1
+                continue
+            want_reg, want_off = truth[key][-1]
+            want_name = "sp" if want_reg == 31 else "x%d" % want_reg
+            got_name = "sp" if st.cfa_reg == 31 else "x%d" % st.cfa_reg
+            if (got_name, st.cfa_off) == (want_name, want_off):
+                ok += 1
+            else:
+                bad += 1
+                if not first_bad:
+                    first_bad = ("0x%x: mda=(%s,%d) 真值=(%s,%d)"
+                                 % (f["pc_begin"], got_name, st.cfa_off,
+                                    want_name, want_off))
+
+        check("%s CFA 规则与 objdump 零差异" % so_name, bad == 0,
+              "一致 %d / 不一致 %d；首个不符：%s" % (ok, bad, first_bad))
+        check("%s 至少比对了 50 条" % so_name, ok >= 50,
+              "只比对了 %d 条，样本可能不全" % ok)
 
 
 def main() -> int:
@@ -5116,8 +5453,14 @@ def main() -> int:
     print("== R79 C++ 符号还原 ==")
     test_r79_cpp_demangle()
 
+    print("== R101 CFI 与 objdump 对照 ==")
+    test_r101_cfi_against_objdump()
+
     print("== R99 内存观察栈 ==")
     test_r99_memory_observation_stack()
+
+    print("== R100 DWARF CFI 栈回溯 ==")
+    test_r100_dwarf_cfi_unwind()
 
     print("== R98 断点别名去重 ==")
     test_r98_breakpoint_alias_dedup()

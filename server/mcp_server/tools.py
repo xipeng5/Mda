@@ -384,11 +384,19 @@ def plugin_run(name: str, args: str = "{}") -> str:
 
 @server.tool()
 @logged()
-def load_so(path: str) -> str:
+def load_so(path: str, auto_discover: bool = False) -> str:
     """加载一个 so 文件到分析会话。path 为绝对路径。
 
     加载成功后广播 UI 同步事件：GUI 的模块树/函数表/Output
     立即显示新模块，与 AI 看到的一致。
+
+    ## 函数表可能不完整（重要）
+
+    刚加载时函数表只有 FDE / dynsym 的初扫结果。加固样本实测只有 1 个，
+    补全后能到 5476 个。**函数数 < 100 时返回里会带 warning**，
+    并给出补全方式——请务必先补全再下「没有某个符号」这类否定结论。
+
+    auto_discover=True 会在加载后立即补全（大样本约 40 秒）。
     """
     # 幂等：同一路径已加载就直接复用，避免 liblog_2/_3 这样的副本堆积
     import os as _os
@@ -403,11 +411,31 @@ def load_so(path: str) -> str:
             })
 
     so = _session.add(path)
+
+    # (135) 加载后函数表可能只有 FDE/dynsym 初扫结果（实测某个加固样本只有 1 个），
+    #       而真正可用要 build_xrefs 后发现 bl 目标。不提示会导致后续结论全错。
+    if auto_discover:
+        try:
+            _session.discover_functions(so.name)
+        except Exception:                                 # noqa: BLE001
+            pass
+
     get_plugins().emit("after_load", {"so_name": so.name})
     _notify_ui({"type": "so_loaded", "so_name": so.name, "functions": len(so.functions), "path": path})
     out = {"loaded": so.name, "functions": len(so.functions)}
     if getattr(so, "renamed_from", None):
         out["renamed_from"] = so.renamed_from  # BUG-14：同名自动改名提示
+
+    # 函数数为 0 或极少时必须警告——这是"看着加载成功、实际没法用"的陷阱
+    if len(so.functions) < 100:
+        out["warning"] = (
+            f"函数表只有 {len(so.functions)} 个，**很可能不完整**。"
+            "基于它得出的『没有某个符号/函数』这类否定结论不可信——"
+            "先补全再下结论。")
+        out["next_step"] = (
+            "① 调 build_xrefs（大样本约 40 秒，会补出 bl 目标与跳转表入口）；"
+            "② 或重新 load_so(auto_discover=true)；"
+            "③ 或 search_insn(discover=true)")
     return _j(out)
 
 
@@ -1751,11 +1779,23 @@ def runtime_modules(serial: str, pid: int, keyword: str = "") -> str:
 
 @server.tool()
 @logged()
-def set_breakpoint(serial: str, pid: int, so_name: str, static_addr: int, hold: bool = False) -> str:
+def set_breakpoint(serial: str, pid: int, so_name: str, static_addr: int,
+                   hold: bool = False,
+                   auto_resume_after_ms: int = 0) -> str:
     """在目标进程的某 so 静态地址上下断点。
 
     hold=False 命中即继续（只记录）；hold=True 挂起等待，
     调用 wait_hits 拿到命中后分析，再调 resume 放行。
+
+    ## auto_resume_after_ms（强烈建议：hold=True 时设上）
+
+    **忘记 resume 的后果是目标进程被 ANR 杀掉。** 设了这个值后：
+    命中 → 抓现场 → 到点自动 resume，即使调用方忘了放行也不会卡死进程。
+
+        set_breakpoint(..., hold=True, auto_resume_after_ms=2000)
+
+    返回里会标 `auto_resume_ms`；真正触发自动放行时，
+    事件流里会有一条 `auto_resumed`，**不是静默发生**。
     """
     # (1) 第一次修改
     # bug 原因：原实现既不保存 dbg 也不 detach，函数一返回脚本就被回收，
@@ -1765,10 +1805,63 @@ def set_breakpoint(serial: str, pid: int, so_name: str, static_addr: int, hold: 
     from server.dyn.service import get_dyn
 
     bp = get_dyn().set_breakpoint(serial, pid, so_name, static_addr, hold=hold)
-    # 把地址的两种写法 + 它落在哪个函数一并返回：
-    # 调用方不用再手算，也能立刻看出"我是不是传错位置了"
-    return _j({"set": True, "persistent": True, **bp,
-               "addr_facts": _addr_facts(so_name, static_addr)})
+    out = {"set": True, "persistent": True, **bp,
+           "addr_facts": _addr_facts(so_name, static_addr)}
+
+    # (136) 自动放行：命中后 N 毫秒自动 resume，防「忘了 resume → 目标被 ANR 杀掉」
+    try:
+        delay = int(auto_resume_after_ms or 0)
+    except (TypeError, ValueError):
+        delay = 0
+    if delay > 0 and hold:
+        out["auto_resume_ms"] = delay
+        _start_auto_resume(serial, int(pid), delay)
+    elif delay > 0 and not hold:
+        out["auto_resume_note"] = ("hold=False 时命中即刻继续，"
+                                   "auto_resume_after_ms 不起作用（也不需要）")
+    return _j(out)
+
+
+# 自动放行的守护定时器（按键去重：同一目标只保留最新一个）
+_AUTO_RESUME: dict = {}
+_AUTO_RESUME_LOCK = __import__("threading").Lock()
+
+
+def _start_auto_resume(serial: str, pid: int, delay_ms: int) -> None:
+    """起一个守护线程，到点对目标做一次 resume。
+
+    重复调用会取消上一个（只保留最新），避免多个定时器叠加。
+    """
+    import threading
+
+    key = f"{serial}:{pid}"
+    with _AUTO_RESUME_LOCK:
+        old = _AUTO_RESUME.get(key)
+        if old is not None:
+            try:
+                old.set()
+            except Exception:                             # noqa: BLE001
+                pass
+        cancel = threading.Event()
+        _AUTO_RESUME[key] = cancel
+
+    def _worker() -> None:
+        if cancel.wait(max(0.05, delay_ms / 1000.0)):
+            return                                        # 被新的请求取消
+        try:
+            from server.dyn.service import get_dyn
+
+            got = get_dyn().resume(serial, pid)
+            # 明确记录这次是**自动**放行，不是用户主动调的
+            _activity("auto_resume", {"serial": serial, "pid": pid},
+                      f"auto_resumed after {delay_ms}ms", 0.0)
+            _notify_ui({"type": "auto_resumed", "serial": serial,
+                        "pid": pid, "delay_ms": delay_ms,
+                        "result": got})
+        except Exception:                                 # noqa: BLE001
+            pass
+
+    threading.Thread(target=_worker, daemon=True).start()
 
 
 @server.tool()
@@ -2334,6 +2427,246 @@ def list_threads(serial: str, pid: int) -> str:
     })
 
 
+def _dwarf_reg_source(svc, serial: str, pid: int, tid: int) -> tuple[dict, dict]:
+    """取 DWARF 展开所需的"真实现场"：寄存器快照 + 来源说明。
+
+    (135) 第一百三十五次修改（2026-11-16）：新增本函数。
+        bug 原因：dwarf 展开需要 pc / sp / x0..x30 + 各帧的栈内存，
+                  而"这些值从哪来"原先散在工具函数里，且只取 hits() 的
+                  最后一条——多线程交替命中时可能取到**别的线程**的现场，
+                  展开出来的调用栈属于另一条线程，使用者完全察觉不到。
+        解决方案：① 优先按 thread_id 精确匹配命中记录（同一线程才是同一条栈）；
+                  ② 没有该线程的命中时退回最近一条，并在返回里标明
+                     `regs_source` 说明取的是谁的现场；
+                  ③ 断点没命中过就明确报错（不给空栈冒充"栈就这么浅"）。
+
+    返回 (regs, meta)。regs 已把 "0x..." 形态的寄存器值转成 int。
+    """
+    regs: dict = {}
+    meta: dict = {"source": "", "hit_seq": None, "hit_thread": None}
+
+    got: list = []
+    try:
+        got = svc.hits(serial, int(pid)) or []
+    except Exception as exc:                              # noqa: BLE001
+        meta["error"] = f"{type(exc).__name__}: {exc}"
+        return regs, meta
+    if not got:
+        return regs, meta
+
+    chosen = None
+    if tid:
+        for h in reversed(got):        # 从最近往前找，优先最近的同线程命中
+            if int(h.get("thread_id") or 0) == int(tid):
+                chosen = h
+                meta["source"] = "hit:same_thread"
+                break
+    if chosen is None:
+        chosen = got[-1]
+        meta["source"] = "hit:latest"
+        meta["thread_mismatch"] = (
+            f"线程 {tid} 没有命中记录，退回最近一次命中（线程 "
+            f"{chosen.get('thread_id')}）的现场；这条栈属于那个线程")
+
+    meta["hit_seq"] = chosen.get("seq")
+    meta["hit_thread"] = chosen.get("thread_id")
+    for k, v in (chosen.get("context") or {}).items():
+        iv = _as_int_addr(v)
+        if iv is not None:
+            regs[str(k)] = iv
+    return regs, meta
+
+
+def _callstack_dwarf(serial: str, pid: int, tgt, tid: int, limit: int,
+                     so_name: str) -> str:
+    """method="dwarf"：用 .eh_frame 的 DWARF CFI 规则逐帧展开调用栈。
+
+    (135) 第一百三十五次修改（2026-11-16）：新增。
+
+    为什么要有这一条路：frida 的 ACCURATE 回溯在 PAC + 无帧指针的 so 上
+    实测只有 2 帧（同一个地址重复）。这条路**完全不经过 frida 的 unwind**，
+    而是纯静态解析 .eh_frame + Python 逐帧执行 CFA 规则（libunwind 的原理）。
+
+    数据来源：
+        寄存器  最近一次断点命中的 context（36 个寄存器，真实现场）
+        栈内存  service.read_runtime（adb /proc/<pid>/mem 优先，
+                hold 把线程挂住时照样能读）
+        CFI     目标 so 的 .eh_frame（load_so 进来的那个文件）
+
+    结果可信度：返回里一定带 cfi_coverage。CFI 被剥离的样本
+    （实测 sscronet.so 只有 392 字节 / 13 条 FDE / 覆盖 0.04%）
+    会带 enough=false + warning，**绝不假装成功**。
+    """
+    from server.core.dwarf import CfiUnavailable, CfiUnwinder
+
+    regs, meta = _dwarf_reg_source(_dyn_service(), serial, pid, tid)
+
+    if not regs:
+        return _j({
+            "error": "dwarf 回溯需要断点现场的寄存器（pc/sp/x0..x30），"
+                     "但该进程还没有任何断点命中记录",
+            "code": "NO_CONTEXT",
+            "method": "dwarf",
+            "hint": ("① set_breakpoint(hold=True) 让目标命中一次；"
+                     "② 再调 get_callstack(method='dwarf')；"
+                     "③ 不想下断点就用 method='scan'（启发式扫栈，不需要现场）"),
+        })
+    pc = regs.get("pc")
+    sp = regs.get("sp")
+    if not pc or not sp:
+        missing = [n for n in ("pc", "sp") if not regs.get(n)]
+        return _j({
+            "error": f"断点现场缺少 {missing}，无法确定展开起点",
+            "code": "NO_PC_OR_SP",
+            "method": "dwarf",
+            "context_keys": sorted(regs)[:40],
+        })
+
+    # ---- 组装模块表：展开可能跨 so，每个模块都用它自己的 .eh_frame ----
+    try:
+        mods = tgt.rb.refresh_modules()
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"刷新运行时模块失败：{exc}", "method": "dwarf"})
+
+    want = str(so_name or "").strip()
+    reader = _MakeReadMem(_dyn_service(), serial, pid)
+    w = CfiUnwinder(read_mem=reader)
+    registered: list[str] = []
+    skipped: list[str] = []
+    for m in mods:
+        so = _pick_so_by_name(_session, m.name)
+        w.add_module(m.base, m.size, so, m.name)
+        if so is not None:
+            registered.append(m.name)
+        elif want and _core_match_name(want, [m.name])[0]:
+            skipped.append(m.name)
+
+    # 起点 pc 所属模块若没载入 so，明确说出来（否则只会得到"无 FDE 覆盖"）
+    start_mod = None
+    for m in mods:
+        if m.base <= pc < m.base + m.size:
+            start_mod = m
+            break
+    if start_mod is None:
+        return _j({
+            "error": f"起点 pc {pc:#x} 不在任何已加载模块范围内"
+                     "（frida trampoline / JIT / 已卸载的 so 都会这样）",
+            "code": "PC_NOT_IN_MODULE", "method": "dwarf",
+            "pc": hex(pc), "sp": hex(sp),
+            "hint": "换一个落在目标 so 内的断点地址再试",
+        })
+    start_so = _pick_so_by_name(_session, start_mod.name)
+    if start_so is None:
+        return _j({
+            "error": f"起点所在的 {start_mod.name} 没有在 mda 中加载，"
+                     "拿不到它的 .eh_frame",
+            "code": "SO_NOT_LOADED", "method": "dwarf",
+            "so": start_mod.name,
+            "hint": f"先 load_so 载入 {start_mod.name} 后重试",
+        })
+
+    try:
+        out = w.unwind(pc, regs, limit=int(limit))
+    except CfiUnavailable as exc:
+        return _j({
+            "error": exc.message, "code": exc.code, "method": "dwarf",
+            "cfi_coverage": exc.coverage,
+            "frames": [], "frame_count": 0,
+            "hint": ("这个 so 的 CFI 不可用。改用 method='scan'（启发式扫栈）"
+                     "或 method='accurate'（frida），并注意它们同样可能不完整"),
+        })
+
+    # ---- 符号化：与 accurate/scan 走同一套静态模型 ----
+    frames = out["frames"]
+    for fr in frames:
+        fr["runtime_addr"] = hex(fr["pc"])
+        fr["function"] = None
+        fr["offset"] = None
+        fr["via_plt"] = False
+        fr.setdefault("in_gap", True)
+        fr["static_addr"] = (hex(fr["static_addr"])
+                             if isinstance(fr.get("static_addr"), int) else None)
+        so = _pick_so_by_name(_session, fr.get("so") or "")
+        if so is None or not fr.get("static_addr"):
+            continue
+        static = int(fr["static_addr"], 16)
+        fn = so.function_at(static)
+        if fn is not None:
+            fr["function"] = fn.name or f"sub_{fn.addr:x}"
+            fr["offset"] = static - fn.addr
+            fr["in_gap"] = False
+        else:
+            plt = so.plt_name(static)
+            if plt:
+                fr["function"] = plt
+                fr["offset"] = 0
+                fr["via_plt"] = True
+                fr["in_gap"] = False
+
+    symbolized = sum(1 for f in frames if f.get("function"))
+    out.update({
+        "thread_id": tid,
+        "frame_count": len(frames),
+        "symbolized": symbolized,
+        "unresolved": len(frames) - symbolized,
+        "regs_source": meta,
+        "so": start_mod.name,
+        "start": {"pc": hex(pc), "sp": hex(sp)},
+        "note": ("DWARF CFI 展开（纯静态解析 .eh_frame + Python 逐帧执行 CFA 规则，"
+                 "不经过 frida 的 unwind）；符号化与 accurate/scan 同源于 mda 静态模型"),
+    })
+    if out.get("cfi_coverage", {}).get("enough") is False:
+        out["verdict"] = ("CFI 覆盖不足，这条栈**不可信**——见 cfi_coverage.warning。"
+                          "它只能说明起点那个函数被 CFI 覆盖，再往上就断了")
+    return _j(out)
+
+
+def _dyn_service():
+    """取动态服务单例（延迟导入，避免 tools 顶层依赖 dyn）。"""
+    from server.dyn.service import get_dyn
+
+    return get_dyn()
+
+
+class _MakeReadMem:
+    """把 service.read_runtime 包成 read_mem(addr, size) -> bytes 回调。
+
+    (135) 第一百三十五次修改（2026-11-16）：新增。
+        为什么需要适配层：CfiUnwinder 每帧要在 CFA 附近预取一小段栈，
+                  而 service.read_runtime 单次上限 4096 字节且会走
+                  "adb /proc/<pid>/mem → frida"两级降级。这里统一裁到
+                  4096 以内，读失败返回空字节（展开器据此判定"该栈地址
+                  读不到"，而不是把它当 0 继续往下走——那会造出假帧）。
+    """
+    _MAX = 4096
+
+    def __init__(self, svc, serial: str, pid: int) -> None:
+        self._svc = svc
+        self._serial = serial
+        self._pid = int(pid)
+        self.failures = 0
+
+    def __call__(self, addr: int, size: int) -> bytes:
+        try:
+            size = max(1, min(int(size), self._MAX))
+        except (TypeError, ValueError):
+            return b""
+        try:
+            got = self._svc.read_runtime(self._serial, self._pid, int(addr), size)
+        except Exception:                                 # noqa: BLE001
+            self.failures += 1
+            return b""
+        raw = got.get("hex") if isinstance(got, dict) else None
+        if not raw:
+            self.failures += 1
+            return b""
+        try:
+            return bytes.fromhex(raw)
+        except ValueError:
+            self.failures += 1
+            return b""
+
+
 @server.tool()
 @logged()
 def get_callstack(serial: str, pid: int, thread_id: int = 0, limit: int = 32,
@@ -2352,6 +2685,39 @@ def get_callstack(serial: str, pid: int, thread_id: int = 0, limit: int = 32,
     thread_id=0 表示自动：优先用最近一次断点命中的线程，否则用枚举里的第一个。
     落在模块外（frida trampoline / JIT）或函数空洞里的帧标 in_gap=true、
     function 给 null——这是正常结果，不是错误。via_plt=true 表示该帧是 PLT 桩。
+
+    ## method：三种取栈方式（帧指针链断了就换一种）
+
+        accurate  frida 的 Thread.backtrace(ACCURATE)。默认值。
+                  **依赖帧指针链或 frida 自己的 DWARF 展开**；开了 PAC 且
+                  省略帧指针的 so 上实测只有 2 帧且是同一个地址重复。
+        scan      启发式扫栈：把栈上"落在模块内 + 前一条指令是 bl/blr"的值
+                  当候选帧。不需要断点现场，但结果只是候选、不保证顺序完整。
+        dwarf     **DWARF CFI 展开**（本项）。用目标 so 自己的 .eh_frame 规则
+                  逐帧执行 CFA 规则，原理同 libunwind，**完全不经过 frida 的
+                  unwind**。fp 链断了也能展开，是 accurate 拿不到更多帧时的替代。
+                  需要先有断点命中提供起点 pc/sp（方法见 method='dwarf' 的报错提示）。
+
+    ## 怎么选
+
+        先 accurate（快、无需断点）→ 帧数明显不对（如只有 2 帧且同址重复）
+        → 改用 dwarf（不需要帧指针，但依赖 .eh_frame 完整）
+        → 连 .eh_frame 都被剥离的样本 → 只剩 scan 兜底。
+
+    ## method="dwarf" 的返回字段（其它 method 没有）
+
+        cfi_coverage      **必须读**。含 enough / coverage_ratio / warning。
+                          enough=false 表示这个 so 的 CFI 不足以支撑完整栈，
+                          结果不可信——加固样本常把 .eh_frame 剥掉。
+        unsupported_ops   遇到的未支持 CFI 指令（十六进制），说明为什么展不开
+        decisive_frames   真正算出 CFA 的帧数
+        stop_reason       为什么停（栈顶 / 无 FDE 覆盖 / 循环 / 栈地址读不到 / 缺 sp）
+        regs_source       寄存器取自哪条命中（hit:same_thread / hit:latest）
+        mem_reads         实际读目标栈内存的次数
+
+    注意 dwarf 的 covered_pc 与 enough 是两个独立判断：
+    covered_pc=true 只说"起点那个函数有 CFI"，enough=false 才是
+    "整个样本的 CFI 不够，这条栈别全信"。
     """
     from server.dyn.service import get_dyn
 
@@ -2371,59 +2737,23 @@ def get_callstack(serial: str, pid: int, thread_id: int = 0, limit: int = 32,
     # thread_id=0：优先最近命中的线程，实在没有就由 frida 端取第一个线程
     tid = int(thread_id or 0) or _recent_thread_id(tgt)
     if method not in ("accurate", "scan", "dwarf"):
-        return _j({"error": f"method 只能是 'accurate' 或 'scan'，收到 {method!r}"})
-    # (134) dwarf：不经过 frida 取栈，而是拿最近一次断点命中的
-    #        现场寄存器，用 so 的 .eh_frame 规则逐帧展开。
+        return _j({"error": f"method 只能是 'accurate' / 'scan' / 'dwarf'，"
+                            f"收到 {method!r}"})
+    # (135) 第一百三十五次修改（2026-11-16）：dwarf 回溯走**纯静态 CFI 展开**。
+    #
+    #     bug 原因：frida 的 Thread.backtrace(ACCURATE) 依赖帧指针链或它自己的
+    #               DWARF 展开；PAC + 省略帧指针的 so 上实测只有 2 帧（同一地址
+    #               重复），fp 链断开后完全无法继续，这是本次要解决的核心问题。
+    #
+    #     解决方案：不经过 frida 取栈，而是
+    #               ① 从最近一次断点命中的 context 里拿 pc/sp/x0..x30（真实现场）
+    #               ② 用目标 so 自己的 .eh_frame 规则逐帧展开（libunwind 原理）
+    #               ③ 栈内存通过 service.read_runtime 读（adb /proc/<pid>/mem
+    #                  优先，hold 挂起时照样能读）
+    #               ④ cfi_coverage 如实报告覆盖度——CFI 被剥离的样本上必须让
+    #                  调用方看到"结果不可信"，绝不给假成功。
     if method == "dwarf":
-        from server.core.dwarf import CfiUnavailable, unwind_frames
-
-        # 需要一个 so：优先用参数，否则用会话里第一个已加载的
-        so = None
-        if so_name:
-            try:
-                so = _session.get(so_name)
-            except Exception:                             # noqa: BLE001
-                so = None
-        if so is None:
-            for nm in list(_session.modules):
-                so = _session.get(nm)
-                break
-        if so is None:
-            return _j({"error": "dwarf 回溯需要先 load_so（用它自己的 .eh_frame）",
-                       "code": "NO_SO"})
-
-        # 寄存器来源：最近一次断点命中现场（那里有完整 context）
-        regs: dict = {}
-        try:
-            got = svc.hits(serial, int(pid))
-            if got:
-                last = got[-1]
-                ctx = last.get("context") or {}
-                for k, v in ctx.items():
-                    regs[str(k)] = _as_int_addr(v)
-                frames_bt = last.get("backtrace") or []
-                if not regs.get("sp") and regs.get("pc"):
-                    pass
-        except Exception:                                 # noqa: BLE001
-            regs = {}
-
-        if not regs.get("pc"):
-            return _j({
-                "error": "dwarf 回溯需要一个起点 PC 与 sp——先下断点制造一次命中",
-                "code": "NO_CONTEXT",
-                "hint": ("① set_breakpoint(hold=True) → 命中；"
-                         "② 再调 get_callstack(method='dwarf')；"
-                         "③ 或用 method='scan' 走启发式（不需要现场）"),
-            })
-
-        try:
-            out = unwind_frames(so, int(regs["pc"]), regs, limit=int(limit))
-        except CfiUnavailable as exc:
-            return _j({"error": exc.message, "code": exc.code,
-                       "hint": "改用 method='scan'"})
-        out["thread_id"] = tid
-        out["so"] = so.name if hasattr(so, "name") else so_name
-        return _j(out)
+        return _callstack_dwarf(serial, pid, tgt, tid, limit, so_name)
 
     js = (_JS_CALLSTACK
           .replace("__TID__", str(tid))
@@ -3446,6 +3776,85 @@ def watch_memory(serial: str, pid: int, addr: str, size: int = 8,
 
 @server.tool()
 @logged()
+def timeline(serial: str, pid: int) -> str:
+    """把断点命中与事件流合并成**单一时间线**，按时间排序。
+
+    为什么需要它：同时 hook 好几个点时（不同 so 的不同地址），
+    事件输出是分散的，靠各自的时间戳手动对齐误差几十毫秒。
+    这个工具直接给出「谁先发生、间隔多久」。
+
+        timeline(serial, pid)
+        → events: [{t_rel_ms, kind, so, addr, tid, detail}]
+          +0.000ms  metasec+0x1f734c  (tid 24232)
+          +0.012ms  sscronet+0x2da314 (tid 24232)
+
+    ## 精度说明（如实标注）
+
+    时间戳来自 frida 侧的 `Date.now()`，是**墙钟毫秒**。
+    同一线程内相邻事件的相对顺序可信，绝对精度约 1ms；
+    跨线程比较时可能因调度有偏差。**不假装是纳秒级精确**。
+    """
+    from server.dyn.service import get_dyn
+
+    svc = get_dyn()
+    try:
+        hits = svc.hits(serial, int(pid))
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}",
+                   "code": "NOT_ATTACHED"})
+
+    if not hits:
+        return _j({"error": "还没有任何断点命中，无法生成时间线",
+                   "code": "NO_HITS",
+                   "hint": "先 set_breakpoint 下断，再触发目标执行"})
+
+    # 统一成 (ts, event) 再排序
+    rows: list[dict] = []
+    for h in hits:
+        ts = h.get("ts")
+        if ts is None:
+            continue
+        rows.append({
+            "ts": float(ts),
+            "kind": "bp",
+            "so": h.get("so") or "",
+            "addr": h.get("static_hex") or h.get("addr"),
+            "tid": h.get("tid"),
+            "held": bool(h.get("held")),
+        })
+
+    if not rows:
+        return _j({"error": "命中记录里没有可用时间戳", "code": "NO_TIMESTAMP"})
+
+    rows.sort(key=lambda r: r["ts"])
+    t0 = rows[0]["ts"]
+    out_events = []
+    prev = t0
+    for r in rows:
+        out_events.append({
+            "t_rel_ms": round((r["ts"] - t0) * 1000.0, 3),
+            "delta_ms": round((r["ts"] - prev) * 1000.0, 3),
+            "kind": r["kind"],
+            "so": r["so"],
+            "addr": r["addr"],
+            "tid": r["tid"],
+            "held": r["held"],
+        })
+        prev = r["ts"]
+
+    return _j({
+        "ok": True,
+        "count": len(out_events),
+        "span_ms": round((rows[-1]["ts"] - t0) * 1000.0, 3),
+        "events": out_events,
+        "precision_note": ("时间戳来自 frida 的 Date.now()（墙钟毫秒）。"
+                           "同线程相邻事件的相对顺序可信；"
+                           "跨线程比较可能有调度偏差"),
+    })
+
+
+@server.tool()
+@logged()
 def trace_alloc(serial: str, pid: int, tid: int = 0,
                 size_min: int = 0, size_max: int = 0,
                 funcs: list | None = None, max_records: int = 500,
@@ -4317,7 +4726,11 @@ def resolve_br(so_name: str, addr: int, lookback: int = 8,
 @logged()
 def dump_vm_state(serial: str, pid: int, ctx_ptr: str,
                   count_offset: int = 0x194, array_offset: int = 0x1a0,
-                  instr_size: int = 16, max_instr: int = 200) -> str:
+                  instr_size: int = 16, max_instr: int = 200,
+                  count_size: int = 8, count_min: int = 0,
+                  count_max: int = 0x100000,
+                  opcode_shift: int = 1, opcode_bits: int = 4,
+                  func_shift: int = 5, func_bits: int = 4) -> str:
     """按约定的 VM 上下文结构，把**字节码指令数组**一次解出来。
 
     VM 类壳把字节码存在自己管理的数组里，结构固定但没有符号。本工具
@@ -4347,10 +4760,30 @@ def dump_vm_state(serial: str, pid: int, ctx_ptr: str,
     计数 > 1048576 时**拒绝读取**并报 COUNT_SUSPICIOUS——
     偏移填错时读到的可能是个巨大的垃圾值，硬读会把进程内存读爆。
 
-    ## 已知边界
+    ## (5) 第五次修改（2026-11-16）：结构假设全部参数化
 
-    位域解析（opcode=bits[4:1]、func=bits[8:5]）是**经验规则**，
-    不同壳版本可能不同；返回里会说明规则来源。
+    上面那三个偏移虽然一直是参数，但仍有隐含假设（计数宽度、合理区间、
+    位域规则）。换一个 VM 时任意一条不成立，就会表现成"偏移不对"：
+
+        count_size      计数字段宽度 1/2/4/8（默认 8）。
+                        字段实为 u32 时，按 u64 读会把相邻字段一起读进来，
+                        得到一个巨大值 → 直接 COUNT_SUSPICIOUS
+        count_min/count_max
+                        计数的合理区间（默认 0 / 0x100000）。
+                        某个 VM 的计数从 0 开始或上万时，默认区间会挡掉它
+        instr_size      每条指令字节数（默认 16）
+        opcode_shift / opcode_bits
+                        opcode 的位域（默认 shift=1 bits=4 即 bits[4:1]）
+        func_shift / func_bits
+                        func 的位域（默认 shift=5 bits=4 即 bits[8:5]）
+
+    默认值全部等于原硬编码值，所以不传时行为与之前完全一致。
+
+    ## 返回
+
+        count / array_ptr / instructions[{idx, addr, raw_hex, opcode, func, words[]}]
+        truncated      是否因 max_instr 截断
+        layout_used    本次实际使用的布局参数（便于核对）
     """
     from server.core.addr import parse_addr
 
@@ -4365,7 +4798,14 @@ def dump_vm_state(serial: str, pid: int, ctx_ptr: str,
                                     count_offset=int(count_offset),
                                     array_offset=int(array_offset),
                                     instr_size=int(instr_size),
-                                    max_instr=int(max_instr)))
+                                    max_instr=int(max_instr),
+                                    count_size=int(count_size),
+                                    count_min=int(count_min),
+                                    count_max=int(count_max),
+                                    opcode_shift=int(opcode_shift),
+                                    opcode_bits=int(opcode_bits),
+                                    func_shift=int(func_shift),
+                                    func_bits=int(func_bits)))
     except Exception as exc:                              # noqa: BLE001
         return _j({"error": f"{type(exc).__name__}: {exc}",
                    "code": getattr(exc, "code", "DUMP_FAILED")})
@@ -4547,7 +4987,11 @@ def read_jump_table(so_name: str, table_static_addr: int, entry_size: int = 4,
 def probe_vm_from_hits(serial: str, pid: int,
                        count_offset: int = 0x194, array_offset: int = 0x1a0,
                        instr_size: int = 16, max_instr: int = 64,
-                       max_candidates: int = 40) -> str:
+                       max_candidates: int = 40,
+                       count_size: int = 8, count_min: int = 0,
+                       count_max: int = 0x100000,
+                       opcode_shift: int = 1, opcode_bits: int = 4,
+                       func_shift: int = 5, func_bits: int = 4) -> str:
     """从**已有断点命中**的寄存器里挖出 VM 上下文指针，直接解出指令数组。
 
     **这是解决「拿不到 ctx_ptr」的推荐路径**——比盲扫内存快得多也安全得多。
@@ -4591,6 +5035,21 @@ def probe_vm_from_hits(serial: str, pid: int,
         · 如果这批命中所在的函数不持有 VM 上下文，会返回空候选并说明原因，
           **不会编造一个 ctx**
         · 结构偏移（0x194 / 0x1a0）是经验值，不同壳版本可能不同，可覆盖
+
+    ## (5) 第五次修改（2026-11-16）：判定结构全部参数化
+
+    本工具的价值全在"判定候选像不像 VM 上下文"，而原实现的判定条件里有
+    三个隐含假设。任意一条不成立，**正确**的候选都会被丢弃，返回的却是
+    "没有一个寄存器值符合结构"——把排查方向彻底带偏：
+
+        count_size      计数字段宽度（默认 8）。字段实为 u32 时按 u64 读，
+                        会把相邻字段读进来 → 巨大值 → 候选被误杀
+        count_min/count_max
+                        计数合理区间（默认 0 / 0x100000）
+        opcode_shift/opcode_bits/func_shift/func_bits
+                        位域规则，解码阶段用（与 dump_vm_state 同口径下传）
+
+    默认值全部等于原硬编码值。
     """
     mod, err = _load_dyn_module("server.dyn.memread", "probe_vm_from_hits")
     if err:
@@ -4644,7 +5103,11 @@ def probe_vm_from_hits(serial: str, pid: int,
             serial, int(pid), hit_list,
             count_offset=int(count_offset), array_offset=int(array_offset),
             instr_size=int(instr_size), max_instr=int(max_instr),
-            max_candidates=int(max_candidates)))
+            max_candidates=int(max_candidates),
+            count_size=int(count_size), count_min=int(count_min),
+            count_max=int(count_max),
+            opcode_shift=int(opcode_shift), opcode_bits=int(opcode_bits),
+            func_shift=int(func_shift), func_bits=int(func_bits)))
     except Exception as exc:                              # noqa: BLE001
         return _j({"error": f"{type(exc).__name__}: {exc}",
                    "code": getattr(exc, "code", "PROBE_FAILED")})
@@ -5692,17 +6155,44 @@ def find_vm_dispatch_points(so_name: str, pattern_hex: str = "750700f9",
 @logged()
 def vm_regs_snapshot(serial: str, pid: int, so_name: str,
                      dispatch_offset: str = "0x76024",
-                     capture_regs: int = 32, wait: float = 5.0) -> str:
+                     pattern_hex: str = "750700f9",
+                     capture_regs: int = 32, wait: float = 5.0,
+                     reg_base_reg: str = "x25", reg_base_offset: int = 0,
+                     ctx_reg: str = "x27", ctx_expr: str = "",
+                     ip_mode: str = "ctx", ip_reg: str = "x21",
+                     ip_offset: int = 8, opcode_expr: str = "",
+                     vm_reg_count: int = 32) -> str:
     """在 VM 派发点抓一次快照：当前 VM pc、VM 寄存器堆、VM 栈。
 
     **用途**：还不知道要断哪条指令时，先用它看 VM 现在跑到哪些 idx。
+    它也是**验证结构配置对不对**的最快手段——改参数后先跑它。
+
+    ## (5) 第五次修改（2026-11-16）：结构布局参数化
+
+    原实现的寄存器约定全写死在函数体里，换 VM 时用户**无从告知**工具。
+    现在四个取值点都可以指定（不传即等于原行为）：
+
+        ctx_reg / ctx_expr               ctx 来源
+        ip_mode / ip_reg / ip_offset     VM pc 来源（ctx / reg / none）
+        reg_base_offset / reg_base_reg   寄存器堆来源（偏移>0 时优先）
+        opcode_expr                      opcode 来源（"sp+8" / "x8"）
+
+    例：实测 metasec_ml.so 的形态
+
+        vm_regs_snapshot(..., dispatch_offset="0x261820",
+                         ctx_reg="x20", opcode_expr="sp+8",
+                         reg_base_offset=0x6070)
 
     ## 返回
 
         vm_pc        当前 VM 指令指针（下一条要执行的）
+        ip_source    它是怎么取到的（ctx+0x8 / reg:x21 / none）
         ctx          VM 上下文指针
+        ctx_source   ctx 的来源
         reg_base     VM 寄存器堆基址
+        reg_base_source  寄存器堆来源（ctx+0x6070 / reg:x25）
         regs         {r0..r31}  ← **这就是 VM 寄存器堆**
+        opcode       按 opcode_expr 取到的值（没配就是 null）
         stack_hex    native 栈快照
 
     ## 注意
@@ -5716,7 +6206,14 @@ def vm_regs_snapshot(serial: str, pid: int, so_name: str,
     try:
         return _j(mod.vm_regs_snapshot(
             serial, int(pid), so_name, dispatch_offset=dispatch_offset,
-            capture_regs=int(capture_regs), wait=float(wait)))
+            pattern_hex=pattern_hex,
+            capture_regs=int(capture_regs), wait=float(wait),
+            reg_base_reg=(reg_base_reg or ""),
+            reg_base_offset=int(reg_base_offset),
+            ctx_reg=(ctx_reg or ""), ctx_expr=ctx_expr,
+            ip_mode=ip_mode, ip_reg=(ip_reg or ""),
+            ip_offset=int(ip_offset), opcode_expr=opcode_expr,
+            vm_reg_count=int(vm_reg_count)))
     except Exception as exc:                              # noqa: BLE001
         return _j({"error": f"{type(exc).__name__}: {exc}",
                    "code": "VM_SNAPSHOT_FAILED"})
@@ -5726,9 +6223,18 @@ def vm_regs_snapshot(serial: str, pid: int, so_name: str,
 @logged()
 def vm_breakpoint(serial: str, pid: int, so_name: str, target_idx: int = -1,
                   code_base: str = "", dispatch_offset: str = "0x76024",
+                  pattern_hex: str = "750700f9",
                   slot_size: int = 16, vm_pc_bytes: int = 64,
                   max_hits: int = 1, wait: float = 10.0,
-                  capture_regs: int = 32, stack_bytes: int = 256) -> str:
+                  capture_regs: int = 32, stack_bytes: int = 256,
+                  hold: bool = True,
+                  reg_base_reg: str = "x25", reg_base_offset: int = 0,
+                  ctx_reg: str = "x27", ctx_expr: str = "",
+                  ip_mode: str = "ctx", ip_reg: str = "x21",
+                  ip_offset: int = 8, opcode_expr: str = "",
+                  vm_reg_count: int = 32,
+                  prog_base_p1_offset: int = 0x240,
+                  prog_base_p2_offset: int = 0x1A0) -> str:
     """在**某条 VM 指令**上设断点，停下时给出 VM 寄存器堆与 VM 栈。
 
     这是「按 VM 层思考」的核心工具：不用管单个 op 的寄存器约定，
@@ -5770,10 +6276,27 @@ def vm_breakpoint(serial: str, pid: int, so_name: str, target_idx: int = -1,
         capture_regs    抓多少个 VM 寄存器
         stack_bytes     抓多少字节栈
 
+    ## (5) 第五次修改（2026-11-16）：结构布局全部参数化
+
+    下面这些参数是**每个 VM 都可能不同**的，默认值只是一类壳的实测值。
+    换目标时必须按实测填，否则会表现成"命中了但取不到值"：
+
+        ctx_reg         ctx 在哪个寄存器（默认 x27）
+        ctx_expr        更精确写法："x20" / "sp+0x10" / "x20+0x8"（覆盖 ctx_reg）
+        ip_mode         VM pc 取法：ctx（读 [ctx+ip_offset]）/ reg / none
+        ip_reg          ip_mode=reg 时用哪个寄存器
+        ip_offset       ip_mode=ctx 时 vm_pc 在 ctx 里的偏移（默认 8）
+        reg_base_offset 寄存器堆相对 **ctx** 的偏移（如 0x6070）。
+                        **非 0 时优先**于 reg_base_reg（结构体内嵌场景）
+        reg_base_reg    否则从该寄存器取寄存器堆（默认 x25）
+        opcode_expr     opcode 取法："sp+8"（栈）/ "x8"（寄存器）/
+                        "ctx+0x100"（结构体字段）；默认空 = 不取
+
     ## 返回
 
-        hits[]  {vm_idx, vm_idx_source, vm_pc, vm_pc_bytes, data_base,
-                 regs{r0..r31}, ctx, stack_hex}
+        hits[]  {vm_idx, vm_idx_source, vm_pc, ip_source, opcode,
+                 opcode_source, vm_pc_bytes, data_base, regs{r0..r31},
+                 ctx, ctx_source, reg_base, reg_base_source, stack_hex}
         verdict
 
         vm_idx_source: "code_base"（可信）/ "unavailable"（没给 code_base）
@@ -5801,12 +6324,166 @@ def vm_breakpoint(serial: str, pid: int, so_name: str, target_idx: int = -1,
             vm_pc_bytes=int(vm_pc_bytes),
             dispatch_offset=dispatch_offset, slot_size=int(slot_size),
             max_hits=int(max_hits), wait=float(wait),
-            capture_regs=int(capture_regs), stack_bytes=int(stack_bytes)))
+            pattern_hex=pattern_hex, hold=bool(hold),
+            capture_regs=int(capture_regs), stack_bytes=int(stack_bytes),
+            # (5) 第五次修改（2026-11-16）：结构布局参数下传。
+            # bug 原因：dyn 层这些参数已参数化，MCP 层不暴露的话调用方
+            #           **根本传不进来**（schema 里不存在），dyn 单测再绿也没用。
+            # 解决方案：全部透传，默认值取 dyn 层 VM_DEFAULTS 的同一组，
+            #           保证不传时行为与之前完全一致。
+            reg_base_reg=(reg_base_reg or ""),
+            reg_base_offset=int(reg_base_offset),
+            ctx_reg=(ctx_reg or ""),
+            ctx_expr=ctx_expr,
+            ip_mode=ip_mode,
+            ip_reg=(ip_reg or ""),
+            ip_offset=int(ip_offset),
+            opcode_expr=opcode_expr,
+            vm_reg_count=int(vm_reg_count),
+            prog_base_p1_offset=int(prog_base_p1_offset),
+            prog_base_p2_offset=int(prog_base_p2_offset)))
     except Exception as exc:                              # noqa: BLE001
         return _j({"error": f"{type(exc).__name__}: {exc}",
                    "code": "VM_BREAK_FAILED"})
 
 
+@server.tool()
+@logged()
+def vm_trace(serial: str, pid: int, so_name: str,
+             dispatch_offset: str = "", ctx_reg: str = "x0",
+             opcode_expr: str = "", reg_base_offset: int = 0,
+             count_offset: int = 0x194, array_offset: int = 0x1A0,
+             count_size: int = 8,
+             max_ops: int = 1000, duration: float = 10.0,
+             ip_mode: str = "ctx", ip_offset: int = 8, ip_reg: str = "",
+             reg_base_reg: str = "", ctx_expr: str = "",
+             slot_size: int = 16, code_base: str = "",
+             prog_base_p1_offset: int = 0x240,
+             prog_base_p2_offset: int = 0x1A0,
+             max_rows: int = 0, idx_from: int = 0, idx_to: int = 0,
+             record_regs: bool = False, reg_count: int = 8,
+             with_bytes: bool = False, bytes_len: int = 16,
+             pattern_hex: str = "") -> str:
+    """采集 **VM 执行轨迹**：连续记录跑过的每条 VM 指令（opcode / pc / 寄存器）。
+
+    **所有结构偏移都是参数，没有任何写死的假设。** 这是它与
+    `vm_breakpoint` / `dump_vm_state` 的根本区别：后两者就算参数齐了，
+    也仍然假设「计数 + 指令数组」那种结构；本工具改成**按表达式取值**，
+    结构再怎么变都能描述。
+
+    ## 参数（只填你实测到的那几个）
+
+    派发点（必须给一个来源）：
+        dispatch_offset   派发点静态偏移，"0x261820" 或十进制
+        pattern_hex       或者给派发段特征字节，让工具自动扫第一个匹配
+
+    上下文 / VM pc：
+        ctx_reg           ctx 在哪个寄存器（**默认 x0 只是占位**，
+                          实测目标常见 x20 / x27，务必按实际填）
+        ctx_expr          更精确写法："x20" / "sp+0x10" / "x20+0x8"
+        ip_mode           VM pc 取法：ctx（读 [ctx+ip_offset]）/ reg / none
+        ip_reg            ip_mode=reg 时的寄存器
+        ip_offset         ip_mode=ctx 时 vm_pc 在 ctx 里的偏移
+
+    opcode（**支持两种形态**）：
+        opcode_expr       "sp+8"        从栈读（opcode 在栈上的 VM）
+                          "x8"          从寄存器读
+                          "ctx+0x100"   从结构体字段读
+                          空 = 不取（返回 null，**不编造**）
+
+    VM 寄存器堆：
+        reg_base_offset   相对 **ctx** 的偏移（如 0x6070）。非 0 时优先
+        reg_base_reg      否则从该寄存器取
+
+    容量 / 过滤：
+        max_ops           最多记多少条（**默认 1000，到顶立即 detach**，
+                          不 hold、不阻塞目标）
+        max_rows          旧参数名，>0 时等价于 max_ops（向后兼容）
+        duration          采集多少秒
+        idx_from/idx_to   只看该 idx 段（要算 idx 需给 code_base）
+        code_base         字节码区基址，"0x..." 或十进制
+        prog_base_p1_offset / prog_base_p2_offset
+                          idx 的**另一种**算法：不靠 code_base，而是两跳解引用
+                          *(*(ctx+p1)+p2) 得到基址。默认 0x240/0x1A0 是**某一
+                          类壳的实测值**，换 VM 必须改；传 -1 关掉这条路径
+        record_regs       **默认关**。打开会每步读 N 个指针，是主要开销。
+        reg_count         record_regs=True 时记几个寄存器
+        with_bytes        回读 pc 处原始字节（反推 code_base 用）
+        bytes_len         回读多少字节（默认 16）
+        count_size        计数字段宽度（兼容旧接口，原样回显）
+
+    count_offset / array_offset 是**兼容旧接口**保留的形参：本工具按
+    opcode_expr 取 opcode，不再依赖「计数 + 指令数组」那种结构，这两个值
+    会原样回显在返回里，方便从 dump_vm_state 迁移的调用方对照。
+
+    ## 返回
+
+        ops[]        每条 {seq, ts, tid, opcode, opcode_source, pc,
+                          ip_source, idx, idx_source, ctx, regs?, pc_bytes?}
+        count        实际采到多少条
+        truncated    是否因 max_ops 截断
+        stop_reason  max_ops / duration / requested
+        distinct_idx / idx_distribution
+        ctx_fail / ip_fail
+                     **非 0 说明结构配置不符，不是 VM 没跑**（见下）
+
+    ## 关键：0 条结果要分清两种原因
+
+    如果派发点根本没执行 → 换个 dispatch_offset。
+    如果执行了但取不到 ctx / VM pc → `ctx_fail`/`ip_fail` 会非 0，
+    返回的 verdict 会直接指明「这是结构配置不符」并告诉你改哪个参数。
+    这两种情况在旧工具里是同一个"0 命中"，本工具把它们分开了。
+
+    ## 典型用法（实测 metasec_ml.so 的形态）
+
+        vm_trace(serial, pid, "libmetasec_ml.so",
+                 dispatch_offset="0x261820", ctx_reg="x20",
+                 opcode_expr="sp+8", reg_base_offset=0x6070,
+                 max_ops=200, duration=5)
+
+        → ops[] 里每条带 opcode 与 pc；opcode_source="sp+8" 证明取对了位置
+
+    ## 已知边界
+
+        · 只挂**一个**派发点，只能看到经过它的指令
+        · 采完才返回，不能边跑边看（边看会把目标拖死，实测过）
+        · 不知道寄存器堆在哪时先别开 record_regs：opcode + pc 通常就够用了
+    """
+    mod, err = _load_dyn_module("server.dyn.vmtrace", "vm_trace")
+    if err:
+        return _j(err)
+    try:
+        return _j(mod.vm_trace(
+            serial, int(pid), so_name,
+            dispatch_offset=dispatch_offset,
+            ctx_reg=(ctx_reg or ""),
+            opcode_expr=opcode_expr,
+            reg_base_offset=int(reg_base_offset),
+            count_offset=int(count_offset),
+            array_offset=int(array_offset),
+            count_size=int(count_size),
+            max_ops=int(max_ops),
+            duration=float(duration),
+            max_rows=int(max_rows),
+            ip_mode=ip_mode,
+            ip_offset=int(ip_offset),
+            ip_reg=(ip_reg or ""),
+            reg_base_reg=(reg_base_reg or ""),
+            ctx_expr=ctx_expr,
+            slot_size=int(slot_size),
+            code_base=(code_base or None),
+            prog_base_p1_offset=int(prog_base_p1_offset),
+            prog_base_p2_offset=int(prog_base_p2_offset),
+            idx_from=int(idx_from),
+            idx_to=int(idx_to),
+            record_regs=bool(record_regs),
+            reg_count=int(reg_count),
+            with_bytes=bool(with_bytes),
+            bytes_len=int(bytes_len),
+            pattern_hex=pattern_hex))
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}",
+                   "code": "VM_TRACE_FAILED"})
 # ---------------- 内存快照 diff ----------------
 #
 # 为什么必须用设备端 helper（实测数据）：
@@ -6345,3 +7022,27 @@ def ui_key(serial: str, key: str) -> str:
     from server.dyn.ui import ui_key as _impl
 
     return _ui_call(_impl, serial=serial, key=key)
+
+
+
+@server.tool()
+@logged()
+def uprobe_probe(serial: str) -> str:
+    """体检 **uprobe 内存分配追踪**这条路径在本设备是否可用（只读探测）。
+
+    检查项：tracefs 挂载点（`/sys/kernel/tracing` 与 `/sys/kernel/debug/tracing`
+    两个都试）、`uprobe_events` 是否可写、当前已注册了哪些探针。
+
+    探测用的临时探针会立刻删掉，**不在系统里留任何东西**。
+    本工具不改目标进程、也不启用采样，随时可以安全调用。
+
+    返回：{ok, tracefs, writable, existing_probes, tracing_on, note}
+    """
+    mod, err = _load_dyn_module("server.dyn.uprobe", "uprobe_probe")
+    if err:
+        return _j(err)
+    try:
+        return _j(mod.uprobe_probe(serial))
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}",
+                   "code": "UPROBE_PROBE_FAILED"})
