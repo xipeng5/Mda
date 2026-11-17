@@ -63,3 +63,15 @@ tests/probe_perf/perf_v5
 dyn/device/mda_memsnap
 tests/probe_*.py
 tests/_r67_block.py
+
+# ===== 设备端 helper 的编译产物（由 build.sh / build_payload.py 生成）=====
+# 只保留源码（.c/.S/build.sh/build_payload.py），二进制与中间文件不入库。
+server/dyn/device/mda_perfwatch
+server/dyn/device/mda_memsnap
+server/dyn/device/mda_memguard
+server/dyn/device/mda_memguard_inject
+server/dyn/device/mda_payload.bin
+server/dyn/device/mda_payload.elf
+server/dyn/device/mda_payload.o
+server/dyn/device/mda_payload.lds
+server/dyn/device/mda_payload_bin.c

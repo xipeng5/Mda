@@ -70,8 +70,24 @@ try:
 except Exception:
     _frida_tools_datas = []
 
+# (6) 第六次修改（2026-11-17）：把 z3 的原生库打进包。
+#     bug 原因：z3-solver 的 Python 模块只是壳，真正的求解器在
+#               z3/lib/libz3.dylib（**数据文件**，不是 .py 模块）。
+#               只把它加进 hiddenimports 拿不到 dylib，打包版里
+#               import z3 直接抛 "libz3.dylib not found"（实测）。
+#               这与 frida_tools/bridges/*.js 漏收是同一类问题。
+#     解决方案：collect_data_files 收 z3 的数据文件（含 lib/ 下的 dylib）。
+_z3_datas = []
+try:
+    from PyInstaller.utils.hooks import collect_data_files as _cdf
+
+    _z3_datas = _cdf("z3")
+except Exception:
+    _z3_datas = []
+
 datas = [
     *_frida_tools_datas,
+    *_z3_datas,
     # (5) 第五次修改（2026-11-09）：把 dyn/device/ 打进包。
     #     bug 原因：perf_watch 依赖设备端 helper（mda_perfwatch.c + build.sh），
     #              它们放在 dyn/device/ 下。PyInstaller 只收 .py 模块，
@@ -119,6 +135,12 @@ hiddenimports = (
     #     解决方案：collect_submodules 收模块 + collect_data_files 收
     #              bridges/*.js（js 是数据文件，光收模块拿不到它）。
     + collect_submodules("frida_tools")
+    # (5) 第五次修改（2026-11-17）：可选静态分析轮子。
+    #     z3/lief 显式声明；**yara 故意不打包**——
+    #     yara-python 自带 libcrypto.3.dylib，打进 app 后与系统库符号冲突
+    #     （实测 app 启动即崩）。打包版里 detect_so_crypto 会优雅报
+    #     YARA_NOT_INSTALLED，源码环境仍可用。
+    + ["z3", "lief"]
     # (1) 第一次修改（2026-10-30）：显式声明 mcp_server 子模块。
     #     bug 原因：mcp_server.link 是在工具包装器里用 `from mcp_server import link`
     #               运行期动态导入的，PyInstaller 静态分析扫不到，打包后

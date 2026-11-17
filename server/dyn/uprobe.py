@@ -110,6 +110,7 @@ ELF 解析（`server.core.elf_model.SoFile`）从**设备上真实使用的那�
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -1009,12 +1010,15 @@ def watch_memory(serial: str, pid: int, addr: str, size: int = 8,
         lines = [ln for ln in raw.splitlines() if ln.strip().startswith("{")]
         self_ok = any('"selftest":"pass"' in ln for ln in lines)
         selftest_records = []
+        parse_errors: list[str] = []
         for ln in lines:
             if '"seq"' in ln:
                 try:
                     selftest_records.append(json.loads(ln))
-                except Exception:                         # noqa: BLE001
-                    pass
+                except Exception as exc:                  # noqa: BLE001
+                    # (6) 不要 pass：解析失败必须能看到，否则"没采到数据"
+                    #     和"解析代码坏了"分不清——本轮就踩了这个坑。
+                    parse_errors.append(f"{type(exc).__name__}: {exc}")
     except Exception as exc:                              # noqa: BLE001
         return {"ok": False, "code": "SELFTEST_FAILED",
                 "error": f"{type(exc).__name__}: {exc}"}
@@ -1024,11 +1028,12 @@ def watch_memory(serial: str, pid: int, addr: str, size: int = 8,
                 "error": "mprotect+SIGSEGV 机制在本设备不可用",
                 "selftest_raw": lines[:3]}
 
-    return {
+    out = {
         "ok": True,
         "mechanism": "mprotect+SIGSEGV",
         "selftest": "pass",
         "selftest_sample": selftest_records[:1],
+        "selftest_records": len(selftest_records),
         "capability": {
             "可拿到": ["写入前内容", "写入地址", "pc", "lr", "sp", "x0", "x1"],
             "当前限制": [
@@ -1043,3 +1048,11 @@ def watch_memory(serial: str, pid: int, addr: str, size: int = 8,
                  "需要注入。当前返回的是能力验证结果，不是对 pid=%s 的实时监控。"
                  % int(pid)),
     }
+    if parse_errors:
+        # (6) 解析出错必须可见，不能静默变成"没有样例"
+        out["selftest_parse_errors"] = parse_errors[:3]
+    if not selftest_records:
+        out["selftest_note"] = (
+            "自检通过但没拿到样例记录——正常情况下自检会写一条 seq 记录。"
+            "若同时有 selftest_parse_errors，说明解析出错了。")
+    return out

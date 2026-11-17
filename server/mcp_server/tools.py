@@ -457,6 +457,18 @@ def load_so(path: str, auto_discover: bool = False) -> str:
 
     so = _session.add(path)
 
+    # (4) 恢复持久化的重命名与注释
+    try:
+        from server.core.annotations import store as _anno
+        restored = _anno.apply(so, so.name)
+        persisted = _anno.load(so.name)
+        for _addr_s, _item in persisted.items():
+            if _item.get("comment"):
+                _session.comments[(_session.key(so_name), int(_addr_s, 16))] = _item["comment"]
+    except Exception:                                     # noqa: BLE001
+        restored = 0
+        persisted = {}
+
     # (135) 加载后函数表可能只有 FDE/dynsym 初扫结果（实测某个加固样本只有 1 个），
     #       而真正可用要 build_xrefs 后发现 bl 目标。不提示会导致后续结论全错。
     discover_result = _run_auto_discover(so.name) if auto_discover else None
@@ -502,16 +514,31 @@ def list_modules() -> str:
 
 @server.tool()
 @logged()
-def list_functions(so_name: str, keyword: str = "", limit: int = 200) -> str:
-    """列出某 so 的函数。keyword 过滤函数名（大小写不敏感）。"""
+def list_functions(so_name: str, keyword: str = "", limit: int = 200,
+                   sort_by: str = "addr", min_size: int = 0) -> str:
+    """列出某 so 的函数。keyword 过滤函数名（大小写不敏感）。
+
+    sort_by: addr（默认）/ size（按函数大小降序，找核心逻辑）
+    min_size: 只列大于等于该大小的函数（找大函数）
+    """
     so = _session.get(so_name)
     fns = so.functions.values()
     kw = keyword.lower()
     items = [
-        {"addr": f.addr, "name": f.name or f"sub_{f.addr:x}", "size": f.size, "by": f.discovered_by}
+        {"addr": f.addr, "addr_hex": hex(f.addr),
+         "name": f.name or f"sub_{f.addr:x}", "size": f.size,
+         "by": f.discovered_by}
         for f in fns
-        if not kw or kw in (f.name or "").lower()
+        if (not kw or kw in (f.name or "").lower()) and f.size >= min_size
     ]
+    # (3) 第三次修改（2026-11-17）：支持按大小排序——使用者要靠"大函数=核心逻辑"
+    #     快速定位混淆分发器（实测 sub_28dcf0 有 51444 字节）。
+    if sort_by == "size":
+        items.sort(key=lambda x: -x["size"])
+    elif sort_by == "name":
+        items.sort(key=lambda x: x["name"])
+    else:
+        items.sort(key=lambda x: x["addr"])
     # (1) 第一次修改 bug 原因：无节表样本 FDE 只给初扫数（实测 3016），
     # 建引用图时还会补出 bl 目标（实测 +1356 → 4363），旧返回值看不出这个差距，
     # 容易误判"函数就这么多"。
@@ -785,6 +812,12 @@ def rename_function(so_name: str, addr: int, new_name: str) -> str:
         return _j({"error": f"{addr:#x} 不在任何函数内"})
     old = fn.name or f"sub_{fn.addr:x}"
     fn.name = new_name
+    # (4) 持久化到工作区 .dsh/mda_annotations/，重启后 load_so 自动恢复
+    try:
+        from server.core.annotations import store as _anno
+        _anno.save(so.name, fn.addr, rename=new_name)
+    except Exception:                                     # noqa: BLE001
+        pass
     _notify_ui({"type": "renamed", "so_name": so_name, "addr": fn.addr, "old": old, "new": new_name})
     # 同步导出表里的名字，使跨 so 解析立即用新名
     if old in so.exports:
@@ -815,8 +848,15 @@ def set_comment(so_name: str, addr: int, comment: str) -> str:
     #  解决方案：先换成规范键再存，读写两侧同口径。
     key = _session.key(so_name)
     _session.comments[(key, addr)] = comment
+    # (4) 持久化（comment 与 rename 存在同一个 JSON 里）
+    try:
+        from server.core.annotations import store as _anno
+        _anno.save(key, addr, comment=comment)
+    except Exception:                                     # noqa: BLE001
+        pass
     get_plugins().emit("after_comment", {"so_name": key, "addr": addr, "comment": comment})
-    return _j({"commented": hex(addr), "comment": comment, "so": key})
+    return _j({"commented": hex(addr), "comment": comment, "so": key,
+               "persisted": True})
 
 
 @server.tool()
@@ -2556,10 +2596,26 @@ def _callstack_dwarf(serial: str, pid: int, tgt, tid: int, limit: int,
         })
 
     # ---- 组装模块表：展开可能跨 so，每个模块都用它自己的 .eh_frame ----
+    # (6) refresh 需要活的会话；会话没了就退到缓存，别让整条回溯废掉。
+    mods = None
+    mods_source = "frida"
     try:
         mods = tgt.rb.refresh_modules()
     except Exception as exc:                              # noqa: BLE001
-        return _j({"error": f"刷新运行时模块失败：{exc}", "method": "dwarf"})
+        cached = getattr(tgt.rb, "_modules", None)
+        if cached:
+            mods = list(cached)
+            mods_source = "cached"
+        else:
+            return _j({
+                "error": f"拿不到模块表（会话已失效且没有缓存）：{exc}",
+                "code": "NO_MODULE_TABLE", "method": "dwarf",
+                "hint": ("① 目标可能已退出/被冻结，重新 attach 后立刻重试；"
+                         "② 或改用 method='scan'（不需要模块表）"),
+            })
+    if not mods:
+        return _j({"error": "模块表为空，无法定位帧所属 so",
+                   "code": "NO_MODULE_TABLE", "method": "dwarf"})
 
     want = str(so_name or "").strip()
     reader = _MakeReadMem(_dyn_service(), serial, pid)
@@ -2698,6 +2754,152 @@ class _MakeReadMem:
         except ValueError:
             self.failures += 1
             return b""
+
+
+@server.tool()
+@logged()
+def get_callees(so_name: str, addr: int, depth: int = 1) -> str:
+    """取某函数调用了谁 —— `call_chain` 的薄别名。
+
+    (1) 第一次修改（2026-11-17）：新增别名。
+        bug 原因：审查实测 `get_callees` 是 unknown tool，使用者以为它是
+                  标准工具，浪费了一轮。实际 mda 里对应能力叫 `call_chain`
+                  / `xrefs_from`，只是名字不同。
+        解决方案：加一个薄别名，复用 call_chain（**不重复实现**）。
+
+    等价于 call_chain(so_name, addr, depth=1)。
+    """
+    return call_chain(so_name, int(addr), depth=max(1, min(int(depth), 1)))
+
+
+@server.tool()
+@logged()
+def get_function_by_address(so_name: str, addr: int) -> str:
+    """按地址查所在函数 —— 复用 `addr_facts` + `function_at`。
+
+    (1) 第一次修改（2026-11-17）：新增工具。
+        bug 原因：审查实测 `get_function_by_address` 是 unknown tool。
+        解决方案：实现为薄封装——返回该地址的函数、入口、偏移，
+                  与 string_refs 的 function 字段口径一致。
+    """
+    facts = _addr_facts(so_name, int(addr))
+    out: dict = {"so_name": so_name, "addr": hex(int(addr)), **facts}
+    try:
+        so = _session.get(so_name)
+        fn = so.function_at(int(addr)) if hasattr(so, "function_at") else None
+        if fn is not None:
+            out["function"] = fn.name or f"sub_{fn.addr:x}"
+            out["function_entry"] = hex(fn.addr)
+            out["offset"] = hex(int(addr) - fn.addr)
+            out["is_entry"] = (int(addr) == fn.addr)
+        else:
+            out["function"] = None
+            out["note"] = "该地址不在任何已发现函数内（可能是数据或未补全的函数表）"
+    except KeyError as exc:
+        out["error"] = exc.args[0] if exc.args else str(exc)
+        out["code"] = getattr(exc, "mda_code", "SO_NOT_LOADED")
+    return _j(out)
+
+
+@server.tool()
+@logged()
+def function_info(so_name: str, addr: int) -> str:
+    """函数综合信息：大小、指令数、调用者/被调用数、引用的字符串。
+
+    (1) 第一次修改（2026-11-17）：新增。
+        使用者要看"哪个函数是核心"，需要综合信息而不是只有 size。
+        这是 Ghidra/IDA 函数视图的通用能力，不含样本特征。
+    """
+    so = _session.get(so_name)
+    fn = so.function_at(int(addr))
+    if fn is None:
+        return _j({"error": f"{hex(int(addr))} 不在任何已知函数内",
+                   "code": "NO_FUNCTION"})
+    from server.core.disasm import Disassembler
+
+    insns = Disassembler(so).disasm_range(fn.addr, max(fn.size, 4))
+    # (5) 第一次修改（2026-11-17）：thunk 识别。
+    #     thunk 特征：1~3 条指令，最后一条是 `b`/`br` 跳到别处。
+    #     用户实测 0x247538 是 8 字节 `mov x0,x21; b 0x1f8800`，
+    #     直到第 195 轮才发现是跳转桩。
+    fn_type = "normal"
+    thunk_target = None
+    if 0 < len(insns) <= 3:
+        last = (insns[-1].text or "").strip()
+        import re as _re
+        m = _re.match(r"b\s+#(0x[0-9a-f]+)", last)
+        if m:
+            fn_type = "thunk"
+            thunk_target = m.group(1)
+    callers = call_count = 0
+    strs = []
+    try:
+        xr = _session.xref(so_name)
+        refs_to = xr.xrefs_to(fn.addr) or []
+        callers = len(refs_to)
+        refs_from = xr.xrefs_from(fn.addr) or []
+        call_count = sum(1 for i in refs_from if getattr(i, "is_call", False))
+        strs = [hex(int(s)) for s in (xr.string_refs_of(fn.addr) or [])][:20]
+    except Exception:                                     # noqa: BLE001
+        pass
+    return _j({
+        "so": so.name, "addr": hex(fn.addr),
+        "name": fn.name or f"sub_{fn.addr:x}",
+        "size": fn.size, "insn_count": len(insns),
+        "type": fn_type, "thunk_target": thunk_target,
+        "callers": callers, "callees": call_count,
+        "string_refs": strs,
+        "discovered_by": getattr(fn, "discovered_by", ""),
+        "hint": "callers/callees 来自当前 xref 模型；先 build_xrefs 可提高覆盖",
+    })
+
+
+@server.tool()
+@logged()
+def discover_functions(so_name: str) -> str:
+    """递归补全函数表（FDE + bl 目标 + 序言检测）。
+
+    (6) 第一次修改（2026-11-17）：新增独立工具名。
+        使用者想调 mda.discover_functions，但之前只有 load_so(auto_discover=True)
+        和 build_xrefs 隐含做这件事，没有这个显式工具名。
+    """
+    so = _session.get(so_name)
+    before = len(so.functions)
+    try:
+        got = _session.discover_functions(so.name)
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}",
+                   "code": "DISCOVER_FAILED"})
+    return _j({"ok": True, "so": so.name,
+               "before": before, "after": len(so.functions),
+               "added": len(so.functions) - before,
+               "detail": got})
+
+
+@server.tool()
+@logged()
+def export_disasm(so_name: str, addr: int, size: int = 256,
+                  format: str = "asm") -> str:
+    """导出反汇编结果（asm / json / csv）。
+
+    (6) 第一次修改（2026-11-17）：新增。使用者想导出反汇编做外部比对。
+    """
+    so = _session.get(so_name)
+    insns = _session.xref(so.name).disasm.disasm_range(int(addr), int(size))
+    if format == "asm":
+        text = "\n".join(f"0x{i.addr:x}:  {i.text}" for i in insns)
+        return _j({"ok": True, "format": "asm", "text": text,
+                   "count": len(insns)})
+    if format == "json":
+        return _j({"ok": True, "format": "json", "count": len(insns),
+                   "insns": [{"addr": hex(i.addr), "text": i.text,
+                              "bytes": i.bytes.hex()} for i in insns]})
+    if format == "csv":
+        lines = ["addr,text,bytes"]
+        lines += [f"0x{i.addr:x},{i.text.replace(chr(44), chr(32))},{i.bytes.hex()}"
+                  for i in insns]
+        return _j({"ok": True, "format": "csv", "text": "\n".join(lines)})
+    return _j({"error": f"未知 format={format}", "code": "BAD_FORMAT"})
 
 
 @server.tool()
@@ -3060,6 +3262,87 @@ def read_runtime_string(serial: str, pid: int, runtime_addr: str,
     except Exception as exc:                              # noqa: BLE001
         return _j({"error": f"{type(exc).__name__}: {exc}",
                    "code": getattr(exc, "code", "READ_FAILED")})
+
+
+def _so_for_static_read(so_name: str):
+    """取静态 so 对象；未加载时给明确错误（不静默返回空）。
+
+    (28) 第二十八次修改（2026-11-17）：恢复丢失的定义。
+        bug 原因：557c642 重构时把本函数的**定义**弄丢了，只留下调用，
+                  导致 read_typed / read_string / read_pointer 一调用就
+                  NameError: _so_for_static_read is not defined。
+                  审查实测确认这是硬故障（与参数无关）。
+        解决方案：从 f8d6830 恢复原定义。报错带 candidates，
+                  区分 SO_AMBIGUOUS / SO_NOT_LOADED。
+    """
+    try:
+        return _session.get(so_name), None
+    except KeyError as exc:
+        return None, {
+            "error": exc.args[0] if exc.args else str(exc),
+            "code": getattr(exc, "mda_code", "SO_NOT_LOADED"),
+            "loaded": getattr(exc, "mda_loaded", list(_session.modules)),
+            "candidates": getattr(exc, "mda_candidates",
+                                  _session._near_names(so_name, list(_session.modules))),
+        }
+
+
+def _backtrace_hints(frames, tool_hint: str = "") -> list[str]:
+    """从符号化后的栈帧里找出"只有模块+偏移、没有函数名"的模块，给 AI 提示。
+
+    (19) 第十九次修改（2026-11-17）：恢复丢失的定义。
+        bug 原因：557c642 重构时把本函数定义弄丢，hits 一调用就
+                  NameError: _backtrace_hints is not defined。审查实测确认。
+        解决方案：从 f8d6830 恢复。扫描栈帧，把"有 +0x 但没有 !"的模块名
+                  收集起来，提示调用方去 load_so 载入这些 so。
+    """
+    missing: list[str] = []
+    seen: set[str] = set()
+    for f in frames or []:
+        text = str(f)
+        if "!" in text:
+            continue                      # 已经有函数名，符号化成功
+        marker = "+0x" if "+0x" in text else ("+0X" if "+0X" in text else "")
+        if not marker:
+            continue                      # 裸地址：不属于任何模块，另说
+        mod = text.split(marker)[0].strip()
+        if mod and mod not in seen:
+            seen.add(mod)
+            missing.append(mod)
+    if not missing:
+        return []
+    hint = (f"调用栈里有 {len(missing)} 个模块只解析出偏移、没有函数名：{missing}。"
+            "原因是这些 so 还没载入 mda（或载入时文件名与设备上的不一致）。"
+            "用 load_so 载入后重新取栈即可拿到函数名，例如 "
+            f"load_so(path=\"<本地路径>/{missing[0]}\")")
+    if tool_hint:
+        hint += "；" + tool_hint
+    return [hint]
+
+
+def _rb_for_runtime(serial: str, pid: int):
+    """取用于换算运行时地址的 Rebase；未 attach 时给明确错误。
+
+    (13) 第十三次修改（2026-11-17）：恢复丢失的定义。
+        bug 原因：557c642 重构时把本函数定义弄丢，read_typed/read_string/
+                  read_pointer 的 source="runtime" 分支一调用就 NameError。
+        解决方案：从 f8d6830 恢复。复用 dyn.service 的单例会话语义。
+    """
+    if not serial or not pid:
+        return None, {
+            "error": "source='runtime' 需要 serial 与 pid（指向已 attach 的目标进程）",
+            "code": "NEED_TARGET",
+        }
+    try:
+        from server.dyn.service import get_dyn
+
+        tgt = get_dyn().attach(serial, pid)
+    except Exception as exc:                              # noqa: BLE001 - DynError 带 code
+        return None, {"error": str(exc), "code": getattr(exc, "code", "ATTACH_FAILED")}
+    rb = getattr(tgt, "rb", None)
+    if rb is None:
+        return None, {"error": "该目标没有 Rebase（rb 为空）", "code": "NO_RB"}
+    return rb, None
 
 
 def _load_dyn_module(module_path: str, *names: str):
@@ -3761,6 +4044,110 @@ def hit_analysis(serial: str, pid: int, build_xrefs: bool = False,
         result.setdefault("notes", []).append(filter_note)
     result["hits_total"] = len(hits)
     return _j(result)
+
+
+@server.tool()
+@logged()
+def inject_selftest(serial: str, pid: int) -> str:
+    """**跨进程注入**能力自检——验证底层通路是否可用。
+
+    背景：使用者卡在「知道该看哪里，但总是看晚了」。
+    要抓写入前的内容，就得能在**目标进程里**执行代码/系统调用。
+    frida 侧两条路都不通（MemoryAccessMonitor 会把目标搞崩；
+    Process.setExceptionHandler 收不到 SIGSEGV），
+    所以改走 ptrace 注入。
+
+    这个工具检查三件事：
+      ① 能不能 ptrace attach 目标
+      ② 能不能跨进程读它的内存
+      ③ **远程系统调用**通不通（用 getpid 对照：返回值应等于目标 pid）
+
+    返回里的 remote_syscall 字段是重点：
+      "works" → 可以在目标里执行任意 syscall
+      "failed" → 这条路走不通
+    """
+    from server.dyn.inject import InjectError, selftest
+
+    try:
+        got = selftest(serial, int(pid))
+    except InjectError as exc:
+        return _j({"error": exc.message, "code": exc.code, "detail": exc.detail,
+                   "hint": ("① 目标是否允许 ptrace（加固 App 常禁止）"
+                             "② 设备是否 root")})
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}",
+                   "code": "SELFTEST_FAILED"})
+    return _j(got)
+
+
+@server.tool()
+@logged()
+def inject_read_memory(serial: str, pid: int, addr: str, size: int = 64) -> str:
+    """跨进程读目标进程的内存（不走 frida）。
+
+    用途：hold 断点挂起时 frida 的 session 会失效，read_runtime_memory 就用不了；
+    这条路走 adb 读 /proc/<pid>/mem，与 frida 完全无关。
+
+        inject_read_memory(serial, pid, "0x7075053140", 52)
+    """
+    from server.dyn.inject import InjectError, read_target_mem
+
+    try:
+        data = read_target_mem(serial, int(pid), _as_int_addr(addr), int(size))
+    except InjectError as exc:
+        return _j({"error": exc.message, "code": exc.code})
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}",
+                   "code": "READ_FAILED"})
+    return _j({"ok": True, "addr": hex(_as_int_addr(addr)), "size": len(data),
+               "hex": data.hex()})
+
+
+@server.tool()
+@logged()
+def inject_write_memory(serial: str, pid: int, addr: str, hex_data: str) -> str:
+    """跨进程写目标进程的内存（不走 frida）。
+
+    **注意**：设备端必须用 ptrace 的 POKEDATA 通道。
+    实测 process_vm_writev 在目标处于 ptrace stop 状态时
+    会"返回成功但根本没写进去"——典型的假成功。
+    """
+    from server.dyn.inject import InjectError, write_target_mem
+
+    raw = bytes.fromhex((hex_data or "").strip())
+    if not raw:
+        return _j({"error": "hex_data 为空", "code": "BAD_ARGS"})
+    try:
+        ok = write_target_mem(serial, int(pid), _as_int_addr(addr), raw)
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}",
+                   "code": "WRITE_FAILED"})
+    return _j({"ok": bool(ok), "addr": hex(_as_int_addr(addr)),
+               "size": len(raw)})
+
+
+@server.tool()
+@logged()
+def inject_resolve_syscall_offset(serial: str, pid: int) -> str:
+    """解析目标 libc 里 `syscall()` 的偏移（远程系统调用要用）。
+
+    为什么需要：不同 Android 版本的 bionic 里 syscall() 的偏移不同
+    （本机 Android 12 是 0x88190），**写死会让工具在别的 ROM 上直接失效**。
+
+    做法：从设备拉 libc（**必须 adb pull**，exec-out 拉的二进制符号表是坏的），
+         用 llvm-readelf 读 .dynsym 找 syscall@@LIBC。
+    """
+    from server.dyn.inject import InjectError, resolve_libc_syscall_offset
+
+    try:
+        off = resolve_libc_syscall_offset(serial, int(pid))
+    except InjectError as exc:
+        return _j({"error": exc.message, "code": exc.code})
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}",
+                   "code": "RESOLVE_FAILED"})
+    return _j({"ok": True, "syscall_offset": hex(off),
+               "note": "把这个值通过 MDA_SYSCALL_OFF 环境变量传给设备端 helper"})
 
 
 @server.tool()

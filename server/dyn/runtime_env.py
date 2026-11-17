@@ -234,7 +234,8 @@ def env_facts(serial: str, pid=None, package: str = "") -> dict:
             out["target_relation"] = "same" if same else "background"
 
         if out["target_in_foreground"] is False:
-            target = out["target_package"] or f"(pid {tpid})"
+            # (8) 只在后面拼一次 pid：target 已含 "(pid N)" 时不再重复追加
+            target = out["target_package"] or "该进程"
             out["warning"] = (
                 f"你正在操作 {target}(pid {tpid})，但当前前台是 {fg_pkg}"
                 f"(pid {fg_pid if fg_pid is not None else '?'})。"
