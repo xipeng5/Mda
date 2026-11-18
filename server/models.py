@@ -106,6 +106,20 @@ class Function:
     def end(self) -> int:
         return self.addr + self.size
 
+    @property
+    def start(self) -> int:
+        """函数入口地址（`addr` 的只读别名）。
+
+        (1) 第一次修改（2026-11-18）：新增。
+            bug 原因：使用者按 IDA/常见的「函数有 start/end」直觉写
+                      `fn.start`，实际字段叫 `addr`，直接抛 AttributeError
+                      打断脚本；而文档里也没列过字段清单，无从查证。
+            解决方案：加只读别名 `start`，与既有 `end` 对称；`addr` 仍是
+                      唯一真实字段（dataclass 不把 property 当字段），
+                      避免出现两个可写入口导致边界不一致。
+        """
+        return self.addr
+
     def contains(self, addr: int) -> bool:
         return self.addr <= addr < self.end
 

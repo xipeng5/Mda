@@ -288,7 +288,14 @@ class Session:
         self.modules: dict[str, SoFile] = {}  # so 短名 -> 模块
         self._xrefs: dict[str, Xref] = {}
         self._strings: dict[str, StringAnalyzer] = {}
-        self._discovered: set[str] = set()  # 已完成递归函数发现的模块
+        # 已完成递归函数发现的 (模块, 档位) 签名。
+        # (1) 第一次修改（2026-11-18）：从 set[str] 改为 set[tuple]。
+        #     bug 原因：只按模块名记忆，导致"先用 off 档跑过、再想换
+        #               strict 档"永远返回 skipped——使用者以为工具
+        #               不肯跑，实际是被自己的幂等记忆挡住。
+        #     解决方案：签名带上 (aggressive, strict_prologue)，
+        #               不同档位各跑一次，同档位仍幂等。
+        self._discovered: set[tuple[str, bool, bool, bool]] = set()
         self._export_index: dict[str, list[tuple[str, int]]] = {}  # 符号名 -> [(so, addr)]
         self._import_edges: dict[str, list[tuple[str, str]]] = {}  # 导入符号名 -> [(使用方so, plt名)]
         # 用户标注（AI/GUI 写入）：(so_name, addr) -> 注释文本
@@ -524,7 +531,10 @@ class Session:
         return self.xref(so_name).progress()
 
     def ensure_xrefs(self, name: str, discover: bool = True,
-                     aggressive: bool = False, progress=None) -> Xref:
+                     aggressive: bool = False, progress=None,
+                     strict_prologue: bool = True,
+                     use_rela: bool = True,
+                     use_prologue: bool | None = None) -> Xref:
         """确保引用图与字符串引用归并都完成，返回引用图（**显式全量**，昂贵）。
 
         字符串的 referenced_by 依赖引用图数据，二者必须一起构建。
@@ -547,7 +557,10 @@ class Session:
             # 是"为什么这么慢"的主要来源之一，必须让调用方看见。
             if progress:
                 progress(0, 100, "函数发现")
-            self.discover_functions(key, aggressive=aggressive)
+            self.discover_functions(key, aggressive=aggressive,
+                                    strict_prologue=strict_prologue,
+                                    use_rela=use_rela,
+                                    use_prologue=use_prologue)
             if progress:
                 progress(15, 100, "函数发现完成")
 
@@ -558,6 +571,14 @@ class Session:
             pct = 15 + (70 * done // total if total else 70)
             progress(pct, 100, f"反汇编 {done}/{total}")
 
+        # (1) 第一次修改（2026-11-18）：记录建图所用档位。
+        #     bug 原因：build_xrefs 命中 cached 分支时直接返回，完全不看
+        #               aggressive——使用者传 aggressive=True 得到 386，
+        #               以为"激进模式也没多出函数"，实际是被缓存吞了。
+        #     解决方案：把档位挂在 Xref 实例上，让上层能如实对比并提示。
+        x.discover_tier = {"aggressive": bool(aggressive),
+                          "strict_prologue": bool(strict_prologue),
+                          "use_rela": bool(use_rela)}
         x.build(progress=_bridge if progress else None)
 
         # 阶段三：字符串归并（85-100%）
@@ -569,7 +590,10 @@ class Session:
         return x
 
     def discover_functions(self, name: str, max_rounds: int = 6,
-                           aggressive: bool = False) -> dict:
+                           aggressive: bool = False,
+                           strict_prologue: bool = True,
+                           use_rela: bool = True,
+                           use_prologue: bool | None = None) -> dict:
         """递归补全函数表（bl 目标 + 跳转表入口 + 标准序言，迭代到不动点）。
 
         幂等且带记忆：已完成过一次就不再重扫（每轮要遍历全库指令，
@@ -582,16 +606,31 @@ class Session:
             解决方案：开头换成规范键，记忆与索引统一用 key。
         """
         _so, key = self.resolve(name)
-        if key in self._discovered:
+        # (1) 第一次修改（2026-11-18）：幂等签名带档位。
+        #     bug 原因：只记 key，导致换档位重跑永远 skipped。
+        #     解决方案：signature 含 (key, aggressive, strict_prologue)；
+        #              返回值里带上签名，调用方能看出这次是哪个口径。
+        # use_prologue 是 aggressive 的语义化别名：先归一再算签名，
+        # 否则 `aggressive=True` 与 `use_prologue=True` 会被当成两个档位各跑一次。
+        if use_prologue is not None:
+            aggressive = bool(use_prologue)
+        sig = (key, bool(aggressive), bool(strict_prologue), bool(use_rela))
+        if sig in self._discovered:
             return {"added": 0, "rounds": 0, "total": len(self.get(key).functions),
-                    "skipped": True}
+                    "skipped": True, "signature": {"aggressive": sig[1],
+                                                   "strict_prologue": sig[2],
+                                                   "use_rela": sig[3]}}
         so = self.get(key)
         x = self.xref(key)
         from server.core.discover import FunctionDiscoverer
 
         result = FunctionDiscoverer(so, x.disasm).discover(
-            max_rounds=max_rounds, aggressive=aggressive)
-        self._discovered.add(key)
+            max_rounds=max_rounds, aggressive=aggressive,
+            strict_prologue=strict_prologue, use_rela=use_rela,
+            use_prologue=use_prologue)
+        self._discovered.add(sig)
+        result["signature"] = {"aggressive": sig[1], "strict_prologue": sig[2],
+                               "use_rela": sig[3]}
         return result
 
     # ---------- 跨 so 符号解析 ----------
@@ -853,7 +892,9 @@ class Session:
 
         self.modules.pop(key, None)
         self._import_edges.pop(key, None)
-        self._discovered.discard(key)
+        # (1) 第一次修改（2026-11-18）：签名是元组，逐个档位清除。
+        for _sig in [t for t in self._discovered if t[0] == key]:
+            self._discovered.discard(_sig)
 
         # ③ 主动断开 SoFile 内部引用。
         #    这一步是**必须的**：不做的话 gc 回收不掉（实测只回收 0.5/14.7 MB）。

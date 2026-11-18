@@ -623,7 +623,8 @@ def java_list_methods(serial: str, pid: int, class_name: str,
 def java_find_classes(serial: str, pid: int, pattern: str = "",
                       limit: int = 200, field: str = "",
                       return_type: str = "", method_pattern: str = "",
-                      max_scan_classes: int = 0) -> dict:
+                      max_scan_classes: int = 0,
+                      all_loaders: bool = False) -> dict:
     """在**已加载的类**里搜索——支持按类名、字段名、方法返回类型三种维度。
 
     (7) 第七次修改（2026-11-06）：新增 field / return_type / method_pattern
@@ -686,6 +687,7 @@ def java_find_classes(serial: str, pid: int, pattern: str = "",
         var METHOD_PATTERN = __METHOD_PATTERN__;
         var LIMIT = __LIMIT__;
         var SCAN_CAP = __SCAN_CAP__;
+        var ALL_LOADERS = __ALL_LOADERS__;
 
         // (11) 第十一次修改（2026-11-06）：修回正则语义 + 去掉全匹配锚定。
         //     bug 原因：上一版把 pattern 走"通配符转正则"，做了两件与用户期望
@@ -754,6 +756,45 @@ def java_find_classes(serial: str, pid: int, pattern: str = "",
         catch (e) { send({kind: 'hook_error', error: '无法枚举类：' + e}); return; }
         out.total = all.length;
 
+        // (1) 多 ClassLoader：加固 App 的类由 DexClassLoader 动态加载，
+        //     enumerateLoadedClassesSync 只覆盖默认 loader，会漏。
+        var SEEN = {};
+        for (var si0 = 0; si0 < all.length; si0++) { SEEN[all[si0]] = 1; }
+        if (ALL_LOADERS) {
+            try {
+                var loaders = Java.enumerateClassLoadersSync();
+                out.loaders = loaders.length;
+                for (var li = 0; li < loaders.length; li++) {
+                    var ld = loaders[li];
+                    out.loaders_scanned = (out.loaders_scanned || 0) + 1;
+                    // 用 findClass 探测：先试 pattern 本身（若像全限定名），
+                    // 否则用已知类名列表逐个探测（成本高，受 LIMIT 限制）
+                    var probes = [];
+                    if (PATTERN && String(PATTERN).indexOf('.') >= 0) {
+                        probes.push(String(PATTERN).replace(/^[\^\$]/, ''));
+                    }
+                    // 用默认 loader 已见到的类名在这几个 loader 上试
+                    for (var pi = 0; pi < all.length && probes.length < 400; pi++) {
+                        probes.push(all[pi]);
+                    }
+                    for (var qi = 0; qi < probes.length; qi++) {
+                        var cand = probes[qi];
+                        if (SEEN[cand]) { continue; }
+                        try {
+                            if (ld.findClass(cand)) {
+                                SEEN[cand] = 1;
+                                all.push(cand);
+                                out.loader_hits = (out.loader_hits || 0) + 1;
+                            }
+                        } catch (e2) { /* 该 loader 里没有，正常 */ }
+                    }
+                }
+            } catch (e) {
+                out.loader_error = String(e);
+            }
+        }
+        for (var si = 0; si < all.length; si++) { SEEN[all[si]] = 1; }
+
         for (var i = 0; i < all.length; i++) {
             var nm = all[i];
             if (nameRe && !nameRe.test(nm)) { continue; }
@@ -812,7 +853,9 @@ def java_find_classes(serial: str, pid: int, pattern: str = "",
         "__FIELD__", _js_str(field or "")).replace(
         "__RETURN_TYPE__", _js_str(return_type or "")).replace(
         "__METHOD_PATTERN__", _js_str(method_pattern or "")).replace(
-        "__LIMIT__", str(n)).replace("__SCAN_CAP__", str(scan_cap))
+        "__LIMIT__", str(n)).replace(
+        "__SCAN_CAP__", str(scan_cap)).replace(
+        "__ALL_LOADERS__", "true" if all_loaders else "false")
 
     timeout = 90.0 if deep else 40.0
     box, err = _run_java_script(serial, pid, user_js, timeout=timeout)
@@ -1641,6 +1684,222 @@ _JS_JAVA_HOOK_MULTI = r"""Java.perform(function () {
 """
 
 
+_JS_STACKTRACE = r"""
+Java.perform(function () {
+    var DEPTH = __DEPTH__;
+    var SKIP_INTERNAL = __SKIP_INTERNAL__;
+    try {
+        // 用 Thread.currentThread().getStackTrace 取当前线程栈
+        var t = Java.use('java.lang.Thread').currentThread();
+        var st = t.getStackTrace();
+        var frames = [];
+        var internalRe = /^(java\.lang\.Thread\.getStackTrace|dalvik\.system\.VMStack|dalvik\.system\.VMDebug|java\.lang\.Throwable\.)/;
+        for (var i = 0; i < st.length && frames.length < DEPTH; i++) {
+            var fr = String(st[i].toString());
+            if (SKIP_INTERNAL && internalRe.test(fr)) { continue; }
+            // 结构化拆解：类名 / 方法 / 文件 / 行号
+            var cls = '', meth = '', file = '', line = -1;
+            try { cls = String(st[i].getClassName()); } catch (e) {}
+            try { meth = String(st[i].getMethodName()); } catch (e) {}
+            try { file = String(st[i].getFileName()); } catch (e) {}
+            try { line = st[i].getLineNumber(); } catch (e) {}
+            frames.push({
+                raw: fr,
+                class: cls,
+                method: meth,
+                file: file,
+                line: line,
+                is_native: (line === -2),   // StackTraceElement 约定：-2 = native
+                is_unknown: (line === -1)
+            });
+        }
+        send({kind: 'stacktrace', frames: frames, total: st.length});
+    } catch (e) {
+        send({kind: 'hook_error', code: 'STACK_FAILED',
+              error: String(e).slice(0, 300)});
+    }
+});
+"""
+
+
+_JS_ALL_THREADS = r"""
+Java.perform(function () {
+    var MAXT = __MAX_THREADS__;
+    var DEPTH = __DEPTH__;
+    var FILTER = __FILTER__;
+    var out = [];
+    var total = 0;
+    try {
+        // (4) 第四次修改（2026-11-18）：
+        //     bug 原因：getAllStackTraces() 返回的 Map 在 frida bridge 里
+        //               **不是可调用的 Java 对象**——连 m.getClass() 都抛
+        //               "TypeError: not a function"（实测二分定位：
+        //               拿到 map 后任何方法调用都失败）。
+        //               entrySet().toArray() / keySet().iterator() 全部同样报错。
+        //     解决方案：改用 Java.choose('java.lang.Thread') 枚举 Thread 实例，
+        //               对每个实例调 getName/getState/getStackTrace。
+        //               实测拿到 94 个线程及真实栈深（深度 5）。
+        Java.choose('java.lang.Thread', {
+            onMatch: function (inst) {
+                total++;
+                if (out.length >= MAXT) { return 'stop'; }
+                var name = '', state = '', prio = -1, daemon = false;
+                var arr = null;
+                try { name = String(inst.getName()); } catch (x) {}
+                if (FILTER && name.indexOf(FILTER) < 0) { return 'continue'; }
+                try { state = String(inst.getState()); } catch (x) {}
+                try { prio = inst.getPriority(); } catch (x) {}
+                try { daemon = inst.isDaemon(); } catch (x) {}
+                try { arr = inst.getStackTrace(); } catch (x) {}
+                var frames = [];
+                if (arr) {
+                    var n = Math.min(arr.length, DEPTH);
+                    for (var i = 0; i < n; i++) {
+                        var st = arr[i];
+                        var cls = '', meth = '', file = '', line = -1;
+                        try { cls = String(st.getClassName()); } catch (x) {}
+                        try { meth = String(st.getMethodName()); } catch (x) {}
+                        try { file = String(st.getFileName()); } catch (x) {}
+                        try { line = st.getLineNumber(); } catch (x) {}
+                        frames.push({
+                            raw: String(st.toString()),
+                            class: cls, method: meth, file: file, line: line,
+                            is_native: (line === -2),
+                            is_unknown: (line === -1)
+                        });
+                    }
+                }
+                out.push({
+                    name: name, state: state, priority: prio,
+                    daemon: daemon,
+                    depth: arr ? arr.length : 0,
+                    frames: frames
+                });
+                return 'continue';
+            },
+            onComplete: function () {}
+        });
+        send({kind: 'all_threads', threads: out, total: total});
+    } catch (e) {
+        send({kind: 'hook_error', code: 'ALL_THREADS_FAILED',
+              error: String(e).slice(0, 300)});
+    }
+});
+"""
+
+
+def stack_all_threads(serial: str, pid: int, max_threads: int = 40,
+                      depth: int = 15, name_filter: str = "") -> dict:
+    """取**全部 Java 线程**的栈快照（一次调用拿全）。
+
+    (2) 第二次修改（2026-11-18）：新增。
+        原因：java_stacktrace 用 Thread.currentThread() 在 frida 的
+              JS 线程里调用，只能拿到空栈（实测 frame_count=0）。
+              要抓业务线程必须用 getAllStackTraces()。
+        价值：死锁 / 卡顿 / 线程池水位定位——一次看清所有线程各自卡在哪儿。
+
+    ## 返回
+
+        threads[]   每个线程 {name, state, priority, daemon, depth, frames[]}
+        total       进程内 Java 线程总数
+        states      按状态聚合计数（RUNNABLE/BLOCKED/WAITING/...）
+
+    ## 怎么用它定位问题
+
+        · 多个线程 state=BLOCKED 且 frames 顶部是同一把锁 → 锁竞争
+        · 线程 state=WAITING 且栈顶是 Object.wait → 在等通知
+        · 某业务线程栈顶停在 native 帧（is_native=true）→ 卡在 so 里
+    """
+    js = (_JS_ALL_THREADS
+          .replace("__MAX_THREADS__", str(max(1, min(int(max_threads), 200))))
+          .replace("__DEPTH__", str(max(1, min(int(depth), 100))))
+          .replace("__FILTER__", _js_str(name_filter or "")))
+    box, err = _run_java_script(serial, pid, js, timeout=40.0)
+    if err:
+        return err
+    if not box or box.get("kind") != "all_threads":
+        return {"ok": False, "code": "ALL_THREADS_FAILED",
+                "error": str(box)[:200] if box else "无结果"}
+    threads = box.get("threads") or []
+    states: dict = {}
+    for t in threads:
+        states[t.get("state", "?")] = states.get(t.get("state", "?"), 0) + 1
+    return {
+        "ok": True,
+        "implemented": True,
+        "threads": threads,
+        "thread_count": len(threads),
+        "total": box.get("total"),
+        "states": states,
+        "note": ("一次调用拿全部 Java 线程栈。"
+                 "多线程 state=BLOCKED 且栈顶同一把锁 → 锁竞争；"
+                 "栈顶 is_native=true → 卡在 so 里"),
+    }
+
+
+def java_stacktrace(serial: str, pid: int, depth: int = 30,
+                    skip_internal: bool = True,
+                    thread_name: str = "") -> dict:
+    """取**当前 Java 调用栈**（结构化：类/方法/文件/行号）。
+
+    (1) 第一次修改（2026-11-18）：新增。
+        bug 原因：mda 此前**没有独立的 Java 取栈工具**。native 侧有
+                  get_callstack（accurate/scan/dwarf 三种），而 Java 侧只能
+                  从 java_hook / java_find_callers 里顺带拿到零散帧，
+                  拿不到"类名.方法(文件:行号)"这种标准结构，也没有
+                  "该帧是不是 native 方法"的信息。
+        解决方案：新增本工具，用 Thread.currentThread().getStackTrace()
+                  取栈并逐帧拆解成结构化字段。
+                  复用已有的内部帧跳过逻辑（getStackTrace 会把自己压在栈顶）。
+
+    ## 返回
+
+        frames[]    每帧 {raw, class, method, file, line, is_native, is_unknown}
+        total       栈深度（未截断前的总帧数）
+        thread      被取栈的线程名
+
+    ## 为什么需要 is_native
+
+        StackTraceElement.getLineNumber() 约定：
+            -2  → 该帧是 **native 方法**（从这里跨进 so）
+            -1  → 行号未知（混淆/无调试信息）
+            >=0 → 正常行号
+        所以 is_native 为 true 的那一帧，就是 **Java→so 的交界点**，
+        拿它的 class+method 去 java_list_methods 能查到 native 实现，
+        再去 native 侧 get_callstack 就能接上两条栈。
+
+    ## 已知边界（诚实说明）
+
+        · 取的是**调用本工具那一刻**的目标线程栈——必须在目标线程里执行。
+          本工具在 frida 的 JS 线程里跑，看到的是"哪个线程在跑这段 JS"，
+          不是业务线程。要抓业务线程的栈，请用 java_find_callers 那种
+          hook 方式（在方法被调时取栈）。
+        · 跨线程取栈需要用 Thread.getAllStackTraces()（见 stack_all_threads）。
+        · ART 在信号处理期间禁止调 Java，所以崩溃现场取不到 Java 栈。
+    """
+    js = (_JS_STACKTRACE
+          .replace("__DEPTH__", str(max(1, min(int(depth), 200))))
+          .replace("__SKIP_INTERNAL__", "true" if skip_internal else "false"))
+    box, err = _run_java_script(serial, pid, js, timeout=25.0)
+    if err:
+        return err
+    if not box or box.get("kind") != "stacktrace":
+        return {"ok": False, "code": "STACK_FAILED",
+                "error": str(box)[:200] if box else "无结果"}
+    frames = box.get("frames") or []
+    return {
+        "ok": True,
+        "implemented": True,
+        "frames": frames,
+        "frame_count": len(frames),
+        "total": box.get("total"),
+        "thread": thread_name or "(当前 JS 执行线程)",
+        "native_frames": [f for f in frames if f.get("is_native")],
+        "note": ("is_native=true 的帧是 Java→so 交界点，"
+                 "拿它的 class/method 可接 native 侧 get_callstack"),
+    }
+
+
 def java_find_callers(serial: str, pid: int, class_name: str, method: str,
                       overload: str = "", duration: float = 8.0,
                       max_samples: int = 30, stack_depth: int = 12) -> dict:
@@ -2432,6 +2691,7 @@ def java_hook_hint(serial: str, pid: int, query: str = "",
                    package: str = "", method: str = "",
                    include_network: bool = True,
                    limit: int = 30, max_scan_classes: int = 3000,
+                   all_loaders: bool = False,
                    count_seconds: float = 0.0) -> dict:
     """给模糊线索（类名片段 / 包名 / 方法名），返回**候选清单**让人/AI 自己判断。
 
@@ -2672,7 +2932,9 @@ def java_hook_hint(serial: str, pid: int, query: str = "",
     """.replace("__QUERY__", _js_str(query or "")).replace(
         "__PACKAGE__", _js_str(package or "")).replace(
         "__METHOD__", _js_str(method or "")).replace(
-        "__LIMIT__", str(n)).replace("__SCAN_CAP__", str(scan_cap))
+        "__LIMIT__", str(n)).replace(
+        "__SCAN_CAP__", str(scan_cap)).replace(
+        "__ALL_LOADERS__", "true" if all_loaders else "false")
 
     timeout = 90.0 if (method or scan_cap) else 40.0
     box, err = _run_java_script(serial, pid, user_js, timeout=timeout)

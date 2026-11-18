@@ -82,6 +82,12 @@
 #ifndef PAGE_ADDR_HI_CONST
 #define PAGE_ADDR_HI_CONST 0
 #endif
+#ifndef PAGE_ADDR_B2_CONST
+#define PAGE_ADDR_B2_CONST 0
+#endif
+#ifndef PAGE_ADDR_B3_CONST
+#define PAGE_ADDR_B3_CONST 0
+#endif
 #ifndef PAGE_LEN_CONST
 #define PAGE_LEN_CONST 4096
 #endif
@@ -90,6 +96,8 @@
 #endif
     .equ PAGE_ADDR_LO, PAGE_ADDR_LO_CONST
     .equ PAGE_ADDR_HI, PAGE_ADDR_HI_CONST
+    .equ PAGE_ADDR_B2, PAGE_ADDR_B2_CONST
+    .equ PAGE_ADDR_B3, PAGE_ADDR_B3_CONST
     .equ PAGE_LEN,    PAGE_LEN_CONST
 
     .equ UC_FAULT,   0x0b0
@@ -108,9 +116,12 @@
     .equ OFF_TARGET,    0x01c
     .equ OFF_TLEN,      0x020
     .equ OFF_ERRNO,     0x028
-    .equ OFF_RECS,      0x030
+    /* (6) 第六次修改（2026-11-17）：与 C 侧布局统一（B-8/B-9）
+     *     OFF_ARGS 必须 0x100（C 侧原为 0x200，两边不一致读到错位内容）；
+     *     记录区移到参数区之后，避免第 3 条起覆盖 OFF_ARGS/OFF_ACT。 */
     .equ OFF_ARGS,      0x100
-    .equ OFF_ACT,       0x300
+    .equ OFF_ACT,       0x200
+    .equ OFF_RECS,      0x400
     .equ REC_SIZE,      128
 
     .text
@@ -228,8 +239,11 @@ handler_entry:
      *       不从任何运行时槽读——彻底去掉那层间接。
      *       arm64 内核约定：x0=addr, x1=len, x2=prot
      */
+    /* (5) 四段 movk 覆盖完整 64 位地址 */
     mov  x0, #PAGE_ADDR_LO
     movk x0, #PAGE_ADDR_HI, lsl #16
+    movk x0, #PAGE_ADDR_B2, lsl #32
+    movk x0, #PAGE_ADDR_B3, lsl #48
     mov  x1, #PAGE_LEN
     mov  x2, #3                     /* PROT_READ|PROT_WRITE */
     mov  x8, #226

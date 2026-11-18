@@ -331,10 +331,19 @@ def _addr_facts(so_name: str, addr: int) -> dict:
 
     fn = so.function_at(addr)
     if fn is not None:
+        # (3) 第三次修改（2026-11-18）：把函数区间的四个数都吐出来。
+        #     bug 原因：反馈里使用者按 IDA 直觉取 `fn.start` 抛 AttributeError，
+        #               而 JSON 侧原本只有入口地址、没有区间大小——判断
+        #               "这个地址是不是在函数中段"还得自己减。
+        #     解决方案：Function 侧加只读别名 start；JSON 侧一并给
+        #               start/end/size，与 Function 字段同名可对照。
         out["function"] = {
             "name": fn.name or f"sub_{fn.addr:x}",
             "hex": hex(fn.addr),
             "dec": fn.addr,
+            "start": hex(fn.start),
+            "end": hex(fn.end),
+            "size": hex(fn.size),
         }
         out["offset_in_fn"] = hex(addr - fn.addr)
         out["is_function_entry"] = (addr == fn.addr)
@@ -458,16 +467,20 @@ def load_so(path: str, auto_discover: bool = False) -> str:
     so = _session.add(path)
 
     # (4) 恢复持久化的重命名与注释
+    restored, persisted, _n_comment = 0, {}, 0
     try:
         from server.core.annotations import store as _anno
         restored = _anno.apply(so, so.name)
         persisted = _anno.load(so.name)
+        # (5) 用规范名（so.name），load_so 没有 so_name 参数
+        _canon = _session.key(so.name)
+        _n_comment = 0
         for _addr_s, _item in persisted.items():
             if _item.get("comment"):
-                _session.comments[(_session.key(so_name), int(_addr_s, 16))] = _item["comment"]
+                _session.comments[(_canon, int(_addr_s, 16))] = _item["comment"]
+                _n_comment += 1
     except Exception:                                     # noqa: BLE001
-        restored = 0
-        persisted = {}
+        restored, persisted, _n_comment = 0, {}, 0
 
     # (135) 加载后函数表可能只有 FDE/dynsym 初扫结果（实测某个加固样本只有 1 个），
     #       而真正可用要 build_xrefs 后发现 bl 目标。不提示会导致后续结论全错。
@@ -553,7 +566,22 @@ def list_functions(so_name: str, keyword: str = "", limit: int = 200,
     by_fde = all(f.discovered_by == "fde" for f in so.functions.values())
     if by_fde and not so.sections:
         hint = "节表不可用，当前仅为 FDE 初扫结果；调用 build_xrefs 后会递归补全 bl 目标，函数数通常明显增加"
-    out = {"count": len(items), "functions": items[:limit]}
+    # (4) 第四次修改（2026-11-18）：显式标出"被 limit 截断"。
+    #     bug 原因：旧返回 `count` 是**过滤后总数**、`functions` 是截断后的
+    #               前 limit 条，两者不一致却不说明。使用者看到 200 条
+    #               就以为函数表只有 200 个（第 33 轮反馈里这条被误当成
+    #               "discover 有 200 硬上限"，实际是列表默认 limit=200）。
+    #     解决方案：加 returned / truncated / limit 三个字段，把
+    #               "总数"与"本次返回多少"分开写清楚。
+    shown = items[:limit]
+    out = {"count": len(items), "returned": len(shown),
+           "limit": limit, "truncated": len(items) > len(shown),
+           "functions": shown}
+    if out["truncated"]:
+        out["truncated_hint"] = (
+            f"共有 {len(items)} 个函数，本次只返回前 {len(shown)} 个"
+            f"（limit={limit}）。这**不代表函数表只有这么多个**——"
+            f"取全部请调大 limit 或用 keyword 过滤。")
     if hint:
         out["hint"] = hint
     return _j(out)
@@ -607,15 +635,46 @@ def disassemble(so_name: str, addr: int, size: int = 64) -> str:
 
 @server.tool()
 @logged()
-def decompile(so_name: str, addr: int) -> str:
-    """输出函数的结构化伪代码（非真反编译，控制流归类）。addr 为函数入口。"""
+def decompile(so_name: str, addr: int, with_addr: bool = True) -> str:
+    """输出函数的结构化伪代码（非真反编译，控制流归类）。addr 为函数入口。
+
+    ## 输出格式（每行都可对回字节码）
+
+        // so!name @ 0x1f758c (size 0x520)
+        // 309 insns, 17 bl, 292 shown, 17 skipped (frame only: ...)
+        void sub_1f758c() {
+            // 0x1f758c  stp x29, x30, ...     ← 每行前缀源地址
+            // 0x1f76e8  bl 0x243f18(...);
+            ...
+        }
+
+    ## 两个必读的头部行
+
+    - 第二行 `N insns, M bl, K shown, S skipped`：把「框架指令被省略」
+      与「代码没解到」分成两个数。S 只统计 paciasp/bti/nop/帧指针这类
+      **无语义**的指令，不代表漏了业务代码。
+    - `// WARNING 末条指令 ...`：末条不是 ret/b/br/brk 时出现，表示
+      fn.size 可能被截断（伪代码会"看起来少了几个 bl"）。按提示的地址
+      用 disassemble/export_disasm 扩范围即可，不要误判成工具吞了指令。
+
+    ## 注意：这不是真反编译
+
+    本工具**只做符号替换 + 线性输出**，没有 if/goto 结构、没有数据流
+    恢复。想看嵌套控制流用 angr 插件（plugin_run(name="angr_bridge")）。
+
+    with_addr=False 可关掉地址注释（输出体积敏感时用）。
+    """
     from server.core.pseudocode import PseudocodeGenerator
 
     so = _session.get(so_name)
     # (27) 第二十七次修改（2026-11-13）：同上，走 xref 拿反汇编器。
     d = _session.xref(so_name).disasm
     gen = PseudocodeGenerator(so, d)
-    return gen.generate(addr)
+    # (28) 第二十八次修改（2026-11-18）：透传 with_addr。
+    #      bug 原因：使用者要在扁平化状态机里把伪代码行对回字节码，
+    #                旧签名没有开关，只能改源码。
+    #      解决方案：新增 with_addr 参数（默认 True，与需求一致）。
+    return gen.generate(addr, with_addr=with_addr)
 
 
 @server.tool()
@@ -1066,7 +1125,9 @@ _XREF_LOCK = __import__("threading").Lock()
 
 @server.tool()
 @logged()
-def build_xrefs(so_name: str, aggressive: bool = False,
+def build_xrefs(so_name: str, use_prologue: bool | None = None,
+                aggressive: bool = False,
+                strict_prologue: bool = True, use_rela: bool = True,
                 wait_seconds: float = 20.0) -> str:
     """显式构建某 so 的全量引用图（首次调用较慢，之后有缓存）。
 
@@ -1074,10 +1135,27 @@ def build_xrefs(so_name: str, aggressive: bool = False,
     漏掉、但带标准序言的函数入口补进函数表。加固样本实测可补 1814 个
     （6047 → 7861）；健康 NDK 库通常为 0（FDE 完整，无误报）。
 
-    aggressive=True 时额外把「终止指令后紧跟序言」的地址也建成函数，
-    能捞到跳转表分发的 handler（如 SIGN handler 0xB9DA4），
-    但会把 switch 的 case 块一并切开（实测 libbase 386 → 557 全是误报），
-    只在明确需要细粒度 handler 时开启。
+    ## 三档（第 33 轮反馈：旧版只有"太保守"和"太激进"两档）
+
+    | 档位 | 等价调用 | 行为 |
+    |---|---|---|
+    | **bl_only**（默认） | 不传 / `use_prologue=false` | 只认 `bl` 目标。bl 是"被直接调用"的硬证据 |
+    | **strict**（推荐） | `use_prologue=true` | `bl` + 「终止指令后紧跟**完整栈帧**」 |
+    | **loose** | `use_prologue=true, strict_prologue=false` | `bl` + 任何序言（含裸 `bti`）。旧行为，会切碎 switch |
+
+    `aggressive` 是 `use_prologue` 的旧名。
+
+    为什么 strict 看"栈帧"而不是"序言"：裸 `bti c`/`paciasp` 是分支保护
+    标记，编译器给 switch 的**每个 case 块**都加了 `bti jc`。实测 libbase
+    用旧判据新增 171 个入口、**100% 是裸 bti**；严格档只收 2 个，都是
+    真函数（完整栈帧 + 前置终止指令），且**没有任何 bl 指向它们**——
+    说明它们只能经函数指针/vtable 抵达，正是间接调用分析要的目标。
+
+    ## 已建图后换档位
+
+    引用图建好后再调本工具会命中缓存直接返回。此时若传入的档位与建图时
+    不同，返回里会带 `tier_mismatch` 提示——换档位必须 unload_so 后重新
+    load，否则你看到的函数数仍是旧档位的（不是"激进模式没效果"）。
 
     同时把数据引用归并到字符串的 referenced_by，
     使 string_refs 可用——string_refs 依赖此步骤。
@@ -1093,12 +1171,30 @@ def build_xrefs(so_name: str, aggressive: bool = False,
     if prog.get("built"):
         x = _session.xref(so_name)
         so = _session.get(so_name)
-        return _j({
+        out = {
             "ok": True, "cached": True,
             "functions": len(so.functions),
             "call_edges": sum(len(v) for v in x.calls_to.values()),
             "data_refs": len(x.data_refs),
-        })
+        }
+        # (28) 第二十八次修改（2026-11-18）：cached 分支如实对比档位。
+        #      bug 原因：旧实现在 cached 分支完全不看 aggressive，使用者传
+        #                aggressive=True 却拿到 386 个函数，会误判"激进模式
+        #                也没用"——实际是被缓存短路了（第 14 轮反馈同一问题）。
+        #      解决方案：报出建图时用的档位，与本次请求不同则给 tier_mismatch
+        #                与明确下一步，而不是静默返回旧结果。
+        built_tier = getattr(x, "discover_tier", None)
+        if built_tier is not None:
+            out["built_tier"] = built_tier
+            want = {"aggressive": bool(aggressive),
+                    "strict_prologue": bool(strict_prologue),
+                    "use_rela": bool(use_rela)}
+            if built_tier != want:
+                out["tier_mismatch"] = (
+                    f"引用图是用 {built_tier} 建的，本次请求 {want}；"
+                    "cached 分支不会重建。要换档位请先 unload_so(so) 再 "
+                    "load_so(auto_discover=True)，或另起会话重跑。")
+        return _j(out)
 
     # 有正在跑的同一任务 → 直接复用，不要重复启动
     with _XREF_LOCK:
@@ -1141,7 +1237,10 @@ def build_xrefs(so_name: str, aggressive: bool = False,
 
         try:
             _session.ensure_xrefs(so_name, aggressive=aggressive,
-                                  progress=_on_progress)
+                                  progress=_on_progress,
+                                  strict_prologue=strict_prologue,
+                                  use_rela=use_rela,
+                                  use_prologue=use_prologue)
             so = _session.get(so_name)
             x = _session.xref(so_name)
             res = {
@@ -2295,6 +2394,8 @@ def _symbolize_frame(runtime_addr: int, mods: list, session) -> dict:
         "offset": None,
         "via_plt": False,
         "in_gap": True,
+        # (9) JNI 交界标记：true 表示这一帧是 Java→so 的入口
+        "jni": False,
     }
     mod = None
     for m in mods:
@@ -2334,6 +2435,14 @@ def _symbolize_frame(runtime_addr: int, mods: list, session) -> dict:
     if fn is not None:
         frame["function"] = fn.name or f"sub_{fn.addr:x}"
         frame["offset"] = static - fn.addr
+        # (9) JNI 交界识别：JNI 静态注册的函数名遵循 Java_<包>_<类>_<方法>
+        #     约定（Android 官方规范，非样本特征）。命中即标 jni=true，
+        #     提示调用方"这一帧之上就跨进 Java 层了"。
+        _fname = frame["function"] or ""
+        if _fname.startswith("Java_") or "JNI_OnLoad" in _fname:
+            frame["jni"] = True
+            frame["jni_note"] = ("JNI 入口帧：再往上是 Java 层，"
+                                 "用 java_stacktrace / stack_all_threads 接上")
         return frame
 
     # function_at 返回 None = 落在函数空洞或 PLT 桩区间里，不是错误
@@ -2790,6 +2899,9 @@ def get_function_by_address(so_name: str, addr: int) -> str:
         if fn is not None:
             out["function"] = fn.name or f"sub_{fn.addr:x}"
             out["function_entry"] = hex(fn.addr)
+            # (2) 第二次修改（2026-11-18）：补 start/end，与 Function.start 对齐
+            out["function_start"] = hex(fn.start)
+            out["function_end"] = hex(fn.end)
             out["offset"] = hex(int(addr) - fn.addr)
             out["is_entry"] = (int(addr) == fn.addr)
         else:
@@ -2856,24 +2968,64 @@ def function_info(so_name: str, addr: int) -> str:
 
 @server.tool()
 @logged()
-def discover_functions(so_name: str) -> str:
+def discover_functions(so_name: str, use_prologue: bool | None = None,
+                       aggressive: bool = False,
+                       strict_prologue: bool = True, use_rela: bool = True,
+                       max_rounds: int = 6) -> str:
     """递归补全函数表（FDE + bl 目标 + 序言检测）。
 
+    ## 三档（第 33 轮反馈：旧版只有"太保守"和"太激进"两档，中间是空的）
+
+    三个开关名：`use_prologue`（要不要用序言检测）、`strict_prologue`
+    （序言要不要严格）、`use_rela`（要不要用重定位表）。
+
+    | 档位 | 等价调用 | 行为 | 实测 libbase |
+    |---|---|---|---|
+    | **bl_only** | 不传（默认）或 `use_prologue=false` | 只认 `bl` 目标 | 386 → 386（+0） |
+    | **strict**（推荐） | `use_prologue=true` | `bl` + 「终止指令后紧跟**完整栈帧**」 | 386 → 388（+2，全真） |
+    | **loose** | `use_prologue=true, strict_prologue=false` | `bl` + 任何序言（含裸 `bti`） | 386 → 557（+171，全假） |
+
+    `aggressive` 是 `use_prologue` 的旧名，两个都给时以 `use_prologue` 为准。
+
+    严格档 +2 的那两个函数**没有任何 bl 指向它们**（只能经函数指针/vtable
+    抵达），正是"通过间接调用访问的函数永远发现不了、被外层粗 FDE 吞掉"
+    这个老问题的解法。
+
+    ## 关键返回字段
+
+    - `prologue_mode`：`off` / `strict` / `loose`，标明本次结果的口径
+    - `skipped_loose_prologue`：严格档**刻意不收**的裸 bti 候选数
+      （不是失败，是"这档不收"；需要时用 strict_prologue=False 重跑）
+    - `reached_max_rounds`：是否跑满轮次仍未到不动点 —— 看到 true 就该
+      加大 max_rounds 再跑，而不是认为已经补完了
+
+    ## 幂等
+
+    同一档位重复调用返回 `skipped: true`；**换档位会重新跑**
+    （第 33 轮修正：旧版按模块名记忆，换档位也被 skip，使用者会以为
+    工具不肯跑）。
+
     (6) 第一次修改（2026-11-17）：新增独立工具名。
-        使用者想调 mda.discover_functions，但之前只有 load_so(auto_discover=True)
-        和 build_xrefs 隐含做这件事，没有这个显式工具名。
+    (7) 第二次修改（2026-11-18）：加三档参数与上面三个自证字段。
     """
     so = _session.get(so_name)
     before = len(so.functions)
     try:
-        got = _session.discover_functions(so.name)
+        got = _session.discover_functions(
+            so.name, max_rounds=max_rounds, aggressive=aggressive,
+            strict_prologue=strict_prologue, use_rela=use_rela,
+            use_prologue=use_prologue)
     except Exception as exc:                              # noqa: BLE001
         return _j({"error": f"{type(exc).__name__}: {exc}",
                    "code": "DISCOVER_FAILED"})
-    return _j({"ok": True, "so": so.name,
-               "before": before, "after": len(so.functions),
-               "added": len(so.functions) - before,
-               "detail": got})
+    out = {"ok": True, "so": so.name,
+           "before": before, "after": len(so.functions),
+           "added": len(so.functions) - before,
+           "detail": got}
+    if got.get("skipped"):
+        out["note"] = ("该档位已经跑过，本次未重扫（换档位会重新跑）。"
+                       "若要强制重跑，先 unload_so 再 load_so。")
+    return _j(out)
 
 
 @server.tool()
@@ -2928,6 +3080,10 @@ def get_callstack(serial: str, pid: int, thread_id: int = 0, limit: int = 32,
                   省略帧指针的 so 上实测只有 2 帧且是同一个地址重复。
         scan      启发式扫栈：把栈上"落在模块内 + 前一条指令是 bl/blr"的值
                   当候选帧。不需要断点现场，但结果只是候选、不保证顺序完整。
+        auto      **自动降级链**（推荐）——按 accurate → scan → dwarf 依次试，
+                  前一档拿到 >=2 个不同函数就停。frida 的 ACCURATE 在部分
+                  Android 版本会让目标崩溃（frida#2861），auto 能自动躲开。
+
         dwarf     **DWARF CFI 展开**（本项）。用目标 so 自己的 .eh_frame 规则
                   逐帧执行 CFA 规则，原理同 libunwind，**完全不经过 frida 的
                   unwind**。fp 链断了也能展开，是 accurate 拿不到更多帧时的替代。
@@ -2971,8 +3127,40 @@ def get_callstack(serial: str, pid: int, thread_id: int = 0, limit: int = 32,
 
     # thread_id=0：优先最近命中的线程，实在没有就由 frida 端取第一个线程
     tid = int(thread_id or 0) or _recent_thread_id(tgt)
+    # (7) 第七次修改（2026-11-18）：新增 auto 模式——自动降级链。
+    #     bug 原因：frida 的 Thread.backtrace(ACCURATE) 在某些 Android 版本上
+    #               会让目标崩溃（frida#2861 有记录），或者只返回 2 帧重复地址
+    #               （PAC + 省略帧指针的 so）。此前只能靠调用方手选 method，
+    #               选错就崩溃或拿到垃圾，且看不出该换哪个。
+    #     解决方案：method="auto" 时按 accurate → scan → dwarf 依次尝试，
+    #               前一档拿到 >=2 个**不同**函数就停；全部失败时如实报各档结果。
+    if method == "auto":
+        tried = []
+        for m in ("accurate", "scan", "dwarf"):
+            try:
+                one = json.loads(get_callstack(
+                    serial, pid, thread_id, limit,
+                    method=m, scan_bytes=scan_bytes, so_name=so_name))
+            except Exception as exc:                      # noqa: BLE001
+                tried.append({m: f"{type(exc).__name__}: {exc}"})
+                continue
+            frames_n = len(one.get("frames") or [])
+            distinct = len({f.get("function") or f.get("addr")
+                            for f in (one.get("frames") or [])})
+            tried.append({m: {"frames": frames_n, "distinct": distinct,
+                              "error": one.get("error")}})
+            if frames_n >= 2 and distinct >= 2:
+                one["method_used"] = m
+                one["degrade_chain"] = tried
+                return _j(one)
+        return _j({"error": "三档取栈方式都没拿到有效栈",
+                   "code": "ALL_METHODS_FAILED",
+                   "degrade_chain": tried,
+                   "hint": ("accurate 可能崩溃或只剩重复帧；scan 依赖 bl 特征；"
+                            "dwarf 需要 CFI 覆盖。可先用 set_breakpoint 拿到"
+                            "现场后再用 method='dwarf'")})
     if method not in ("accurate", "scan", "dwarf"):
-        return _j({"error": f"method 只能是 'accurate' / 'scan' / 'dwarf'，"
+        return _j({"error": f"method 只能是 'accurate' / 'scan' / 'dwarf' / 'auto'，"
                             f"收到 {method!r}"})
     # (135) 第一百三十五次修改（2026-11-16）：dwarf 回溯走**纯静态 CFI 展开**。
     #
@@ -5892,6 +6080,324 @@ def find_dispatch_tables(so_name: str, max_tables: int = 200,
 
 
 # ---------------- Java 层分析（frida 17 需注入 bridge） ----------------
+# ---------------------------------------------------------------------------
+# RELA / vtable：静态重定位解析（第 33 轮反馈问题 5）
+#
+# 为什么需要：加固 so 里的函数经常通过 vtable / GOT **间接调用**，
+# 没有任何 bl 指向它 —— 于是函数发现漏掉它、function_at 把几个逻辑
+# 函数粘成一个，整个分析方向被带偏。重定位表里有 addend，那就是
+# "这个槽最终指向哪个地址"，是间接调用目标的唯一静态来源。
+# ---------------------------------------------------------------------------
+
+
+@server.tool()
+@logged()
+def rela_dump(so_name: str, addr_from: int = 0, addr_to: int = 0,
+              kind: str = "all", limit: int = 500) -> str:
+    """导出某 so 的重定位表（`.rela.dyn` / `.rela.plt` / `PT_DYNAMIC`）。
+
+    **纯静态，不需要设备。** 节表被抹的 dump so 也能解析（走 PT_DYNAMIC）。
+
+    ## 什么时候该用它
+
+    - 想知道 `vtable[4]` 实际指向哪个函数（配合 vtable_at）
+    - 想找**没有 bl 指向**的函数入口（`kind="code_target"`）
+    - 想确认某个地址是不是被重定位覆盖（GOT 槽 / vtable 槽）
+
+    ## 参数
+
+        addr_from / addr_to  按 r_offset 过滤（左闭右开）；都传 0 表示不限
+        kind  all          全部条目
+              code_target  只要 addend 落在**可执行段**的项
+                           —— 这些就是潜在的函数指针目标
+              relative     只要 RELATIVE / IRELATIVE
+              plt          只要 PLT 表里的项（导入符号的 GOT 槽）
+        limit <=0 表示不限制
+
+    ## 条目字段
+
+        offset / offset_hex    r_offset（槽地址）
+        rtype / rtype_name     重定位类型
+        sym_idx / sym_name     符号（无 dynsym 时 sym_name 为空，sym_resolved=false）
+        addend / addend_hex    附加值
+        addend_is_target       **true 才代表 addend 就是目标地址**
+                               （只有 RELATIVE/IRELATIVE 是；ABS64/GLOB_DAT
+                                的 addend 是附加到符号值上的偏移，别直接当地址）
+        addend_in_exec         addend 是否落在可执行段
+        target_function        addend 若在可执行段，给出所在函数名
+        source                 来自哪张表（rela.dyn/rela.plt/rel.plt/dynamic）
+
+    ## 解析失败时
+
+    返回的 `items` 为空 + `summary.error` 给出原因，**不会返回编造的占位条目**。
+    """
+    so = _session.get(so_name)
+    from server.core import rela as _rela
+
+    try:
+        items = _rela.rela_dump(so, int(addr_from), int(addr_to),
+                                kind, int(limit))
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}",
+                   "code": "RELA_DUMP_FAILED"})
+    summary = _rela.rela_summary(so)
+    out = {"ok": True, "so": so.name, "kind": kind,
+           "count": len(items), "limit": int(limit),
+           "truncated": int(limit) > 0 and len(items) >= int(limit),
+           "items": items, "summary": summary}
+    if summary.get("error"):
+        out["ok"] = False
+        out["error"] = summary["error"]
+    return _j(out)
+
+
+@server.tool()
+@logged()
+def vtable_at(so_name: str, addr: int) -> str:
+    """判断地址是否是 **vtable 项**，并解出它指向哪个函数。
+
+    **纯静态，不需要设备。**
+
+    ## 判定分三层（任一层不过都给理由，不猜）
+
+    1. addr 必须是某条 RELATIVE 重定位的 r_offset（槽地址，按指针宽度对齐）
+    2. 所在连续块至少 2 项（单槽无法与孤立指针区分）
+    3. 块内 addend 落在可执行段的比例 >= 0.5
+       —— vtable 项是函数指针；字符串表/typeinfo 这类数据指针块会被判为非 vtable
+
+    ## 典型用法：从虚表偏移追到实现函数
+
+        vtable_at(so, 0x2dc778)
+        → is_vtable: true, index: 4, target: 0x196424,
+          target_function: sub_196424, block: [0x2dc768, 0x2dc820)
+
+    拿到 `target` 之后，用 `function_at`/`disassemble` 看实现；
+    如果 `function_at` 返回的入口不是 target 本身，说明该函数**还没被
+    发现**——用 `discover_functions(aggressive=true)` 补（严格档会收
+    完整栈帧的真函数）。
+
+    ## 不是 vtable 时
+
+    返回 `is_vtable=false` + `reason`，并尽量给出该地址所在的块信息，
+    方便判断"是数据块"还是"判据太严"。
+    """
+    so = _session.get(so_name)
+    from server.core import rela as _rela
+
+    try:
+        out = _rela.vtable_at(so, int(addr))
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}",
+                   "code": "VTABLE_AT_FAILED"})
+    out["ok"] = True
+    out["so"] = so.name
+    return _j(out)
+
+
+@server.tool()
+@logged()
+def rela_summary(so_name: str) -> str:
+    """重定位解析概况与**能力边界**（解析失败时这里给原因，不是空列表）。
+
+    先看这个再决定要不要 rela_dump：
+    - `total` / `counts`：条目数与各表分布
+    - `code_targets`：addend 落在可执行段的去重地址数
+    - `vtable_blocks`：识别出的 vtable 块数
+    - `packed_android` / `relr`：遇到不支持的压缩编码/RELR 时如实标出
+    - `error` / `warnings`：失败原因与降级说明
+    """
+    so = _session.get(so_name)
+    from server.core import rela as _rela
+
+    try:
+        out = _rela.rela_summary(so)
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}",
+                   "code": "RELA_SUMMARY_FAILED"})
+    out["ok"] = not out.get("error")
+    out["so"] = so.name
+    return _j(out)
+
+
+# ---------------------------------------------------------------------------
+# DEX 静态解析（第 33 轮反馈问题 7）
+#
+# 反馈原文：「没有 dex 能力，我被迫自己写，踩了 4 个坑，每个坑都导致过
+# 看到不存在的东西（假 payload、假 native 调用、假 MessageDigest）」。
+#
+# 本组工具把 DEX 当**独立输入**（dex 文件或 apk），不进 so 分析会话——
+# Java 层没有虚拟地址概念，套用 so 的模型反而会误导。
+# 正确性由 dexdump 逐指令交叉验证（实测 36650 个方法 / 563078 条指令 100% 一致）。
+# ---------------------------------------------------------------------------
+
+
+@server.tool()
+@logged()
+def dex_classes(path: str) -> str:
+    """列出一个 dex/apk 里的**所有类**（纯静态，不解压到磁盘）。
+
+    `path` 是文件路径：可以是 `.dex`，也可以是 `.apk` / `.jar`
+    （内部多个 `classes*.dex` 会按顺序合并）。
+
+    ## 返回字段（`classes[]` 每项）
+
+        name            dex 原始描述符（`Lcom/x/Y;`）——传给 dex_methods 两种都行
+        java_name      给人看的形态 `com.x.Y`
+        access_flags / access_names   访问标志原值与逐个名字
+        superclass / interfaces       父类与接口描述符
+        method_count / field_count    方法/字段数
+        source_file     SourceFile 属性（混淆后常为空）
+        dex            来源条目（classes.dex / classes2.dex …）
+
+    若某个 dex 解析失败，**不影响其它 dex**：失败项以
+    `{error, code, dex}` 的形式出现在列表末尾，务必检查。
+
+    ## 多 dex
+
+    `dex_count` 说明合并了几个 dex。同名类出现在多个 dex 时以**先出现的**为准
+    （与 Android 的类加载顺序一致）。
+
+    ## 需要 Java 层定位时
+
+    先 `dex_classes` 找类 → `dex_methods` 看方法 → `dex_disasm` 反汇编 →
+    `dex_callers` 反查调用点。这四步对应 IDA 的类树/方法表/反汇编/交叉引用。
+    """
+    from server.core.dex import dex_classes as _dex_classes
+
+    try:
+        classes = _dex_classes(path)
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}",
+                   "code": "DEX_CLASSES_FAILED", "path": path})
+    if isinstance(classes, dict):        # 内部错误对象（如文件不存在）
+        return _j(classes)
+    return _j({"ok": True, "path": path, "count": len(classes),
+               "classes": classes})
+
+
+@server.tool()
+@logged()
+def dex_methods(path: str, class_name: str) -> str:
+    """列出某个类的**所有方法**（含 access flags、native/abstract 标记）。
+
+    class_name 接受三种写法：`com.x.Y`、`Lcom/x/Y;`、`com/x/Y`。
+
+    ## 关键字段
+
+        name / proto            方法名与原型描述符
+        return_type / params    拆开后的返回类型与参数类型（已从描述符归一）
+        access_flags / access_text
+        is_native               **native 方法**（实现不在 dex 里，要去 so 找）
+        is_abstract / is_static / is_constructor
+        code_off                code_item 文件偏移（0 表示无实现）
+        insn_count / regs_size  指令数与寄存器数
+        param_count
+
+    ## 定位 native 实现
+
+    `is_native=true` 的方法要在 so 里找对应实现：
+    - 静态注册：导出符号 `Java_<包>_<类>_<方法>`（可 `exports` 按关键字搜）
+    - 动态注册：`find_jni_registrations(so)` 拿 `JNINativeMethod` 表最可靠
+    """
+    from server.core.dex import dex_methods as _dex_methods
+
+    try:
+        out = _dex_methods(path, class_name)
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}",
+                   "code": "DEX_METHODS_FAILED"})
+    if isinstance(out, dict):
+        return _j(out)
+    return _j({"ok": True, "path": path, "class_name": class_name,
+               "count": len(out), "methods": out})
+
+
+@server.tool()
+@logged()
+def dex_disasm(path: str, class_name: str, method_name: str,
+               overload: str = "") -> str:
+    """反汇编一个 dex 方法的**字节码**（每条带 dex 字节偏移）。
+
+    重载方法用 overload 指定参数描述符，例如 `overload="(I)V"`；
+    不给时若同名方法有多个，会返回候选列表让你选（**不替你猜**）。
+
+    ## 输出每一行都带偏移
+
+        // Lcom/x/Y;->check(Ljava/lang/String;)Z @ 0x1a2b4, 42 insns
+          0000: invoke-static {p0}, Lcom/x/A;->a(Ljava/lang/String;)Ljava/lang/String;
+          0006: move-result-object v0
+          0008: invoke-virtual {v0}, Ljava/lang/String;->length()I
+          ...
+
+    偏移是 **code_item 内的 code unit 序号**，可直接与 dexdump 的输出对照。
+
+    ## 三个容易看错的地方（本实现已处理，说明给你避坑）
+
+    1. **payload 不是独立指令**：`packed-switch-payload` / `sparse-switch-payload`
+       / `fill-array-data-payload` 只有在紧跟对应 switch/fill 指令时才是数据，
+       否则 `0x0100` 只是一条 `nop`。输出里 payload 会标成 `payload:` 块。
+    2. **变长指令**：`move-wide/16`(0x06) 是 **32x = 3 code unit**（不是 2）；
+       2 unit 的是 `move-wide/from16`(0x05, 22x) 这类。数错一处后续全错位。
+    3. **增量索引**：`class_data_item` 里的 method_idx 是**增量**，不累加会把
+       整类方法解成同一个（症状：一个类里几十个同名 `<init>`）。
+
+    native / abstract 方法没有字节码，会明确说明而不是返回空。
+    """
+    from server.core.dex import dex_disasm as _dex_disasm
+
+    try:
+        out = _dex_disasm(path, class_name, method_name, overload or "")
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}",
+                   "code": "DEX_DISASM_FAILED"})
+    if isinstance(out, dict):
+        return _j(out)
+    return out
+
+
+@server.tool()
+@logged()
+def dex_callers(path: str, class_name: str, method_name: str,
+                overload: str = "") -> str:
+    """**谁调用了这个方法**（静态扫描所有 invoke-* 指令）。
+
+    ## 为什么这个在 Java 层特别好用
+
+    没有虚拟地址、没有间接跳转的不确定性：`invoke-virtual/...` 的操作数里
+    直接写着 method_idx，扫一遍全部 code_item 就能精确反查。这是 Java 层
+    相对 native 层的天然优势，别浪费。
+
+    ## 返回字段
+
+        caller_class / caller_method   调用方
+        caller_proto
+        invoke_kind                    virtual / direct / static / interface /
+                                       super / virtual-range ...
+        offset                         调用点在该方法 code_item 内的偏移
+        is_native_caller               调用方自身是否 native（此时拿不到字节码）
+
+    ## 注意：这不是完整的调用图
+
+    只覆盖**直接写在字节码里**的调用：
+    - 反射（`Class.getMethod().invoke`）看不到
+    - JNI 从 native 侧的调用看不到
+    - 混淆后的同名方法会全部列出（用 caller_class 区分）
+
+    需要反射调用分析时，用动态侧的 `java_hook` / `java_find_callers`。
+    """
+    from server.core.dex import dex_callers as _dex_callers
+
+    try:
+        out = _dex_callers(path, class_name, method_name, overload or "")
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}",
+                   "code": "DEX_CALLERS_FAILED"})
+    if isinstance(out, dict):
+        return _j(out)
+    return _j({"ok": True, "path": path, "class_name": class_name,
+               "method_name": method_name, "count": len(out), "callers": out})
+
+
 #
 # frida 17 起 Java bridge 从内核解耦，脚本里直接 `Java.use` 会报
 # ReferenceError。dyn/java_bridge.py 负责把 frida_tools 自带的 java.js
@@ -5961,7 +6467,8 @@ def java_list_methods(serial: str, pid: int, class_name: str,
 def java_find_classes(serial: str, pid: int, pattern: str = "",
                       limit: int = 200, field: str = "",
                       return_type: str = "", method_pattern: str = "",
-                      max_scan_classes: int = 0) -> str:
+                      max_scan_classes: int = 0,
+                      all_loaders: bool = False) -> str:
     """在**已加载的类**里搜索——支持类名、字段名、返回类型、方法名四种维度。
 
     加固 app 会动态加载大量类，静态看不到。本工具枚举运行时全部 Class 再筛选，
@@ -5987,6 +6494,9 @@ def java_find_classes(serial: str, pid: int, pattern: str = "",
         return_type      返回类型，如 "*Request"
         method_pattern   方法名，如 "get*"
         max_scan_classes 反射扫描上限（0=默认3000）
+        all_loaders      扫**所有 ClassLoader**（默认 false）。
+                         加固 App 的类常由 DexClassLoader 动态加载，
+                         默认只查默认 loader，会漏——表现为"类明明存在却找不到"。
 
     ## 性能提示（重要）
 
@@ -6020,7 +6530,8 @@ def java_find_classes(serial: str, pid: int, pattern: str = "",
             serial, int(pid), pattern, limit=int(limit),
             field=field, return_type=return_type,
             method_pattern=method_pattern,
-            max_scan_classes=int(max_scan_classes)))
+            max_scan_classes=int(max_scan_classes),
+            all_loaders=bool(all_loaders)))
     except Exception as exc:                              # noqa: BLE001
         return _j({"error": f"{type(exc).__name__}: {exc}",
                    "code": "JAVA_FIND_FAILED"})
@@ -6133,6 +6644,74 @@ def java_hook(serial: str, pid: int, class_name: str = "", method: str = "",
 
 @server.tool()
 @logged()
+def java_stacktrace(serial: str, pid: int, depth: int = 30,
+                    skip_internal: bool = True) -> str:
+    """取**当前 Java 调用栈**（结构化：类/方法/文件/行号）。
+
+    mda 之前没有独立的 Java 取栈工具——native 侧有 get_callstack，
+    Java 侧只能从 java_hook 里顺带拿零散帧。本工具补上这块。
+
+    ## 关键信息：is_native
+
+        line == -2  → 该帧是 **native 方法**（Java→so 的交界点）
+        line == -1  → 行号未知（混淆/无调试信息）
+        line >= 0   → 正常行号
+
+    拿到 is_native=true 的 class/method，就能接着用 native 侧的
+    get_callstack / set_breakpoint 接上两条栈。
+
+    ## 边界（重要）
+
+        取的是**执行本工具那一刻**的线程栈（frida 的 JS 线程），
+        不是业务线程。要抓业务线程的栈请用 java_find_callers
+        （在方法被调时取栈）。跨线程全量请看 stack_all_threads。
+    """
+    mod, err = _load_dyn_module("server.dyn.java_bridge", "java_stacktrace")
+    if err:
+        return _j(err)
+    try:
+        return _j(mod.java_stacktrace(serial, int(pid), depth=int(depth),
+                                      skip_internal=bool(skip_internal)))
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}",
+                   "code": "STACKTRACE_FAILED"})
+
+
+@server.tool()
+@logged()
+def stack_all_threads(serial: str, pid: int, max_threads: int = 40,
+                      depth: int = 15, name_filter: str = "") -> str:
+    """取**全部 Java 线程**的栈快照（一次调用拿全）。
+
+    与 java_stacktrace 的区别：那个取的是"执行工具那一刻的线程"（在 frida
+    的 JS 线程里通常是空栈）；本工具用 getAllStackTraces() 拿**所有业务线程**。
+
+    ## 用它定位什么
+
+        · 多个线程 state=BLOCKED 且栈顶是同一把锁 → 锁竞争
+        · 线程 state=WAITING 且栈顶 Object.wait → 在等通知
+        · 某线程栈顶 is_native=true → 卡在 so 里（接 native 侧 get_callstack）
+
+    ## 返回
+
+        threads[]  {name, state, priority, daemon, depth, frames[]}
+        states     按状态聚合计数
+    """
+    mod, err = _load_dyn_module("server.dyn.java_bridge", "stack_all_threads")
+    if err:
+        return _j(err)
+    try:
+        return _j(mod.stack_all_threads(serial, int(pid),
+                                        max_threads=int(max_threads),
+                                        depth=int(depth),
+                                        name_filter=name_filter))
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"error": f"{type(exc).__name__}: {exc}",
+                   "code": "ALL_THREADS_FAILED"})
+
+
+@server.tool()
+@logged()
 def java_find_callers(serial: str, pid: int, class_name: str, method: str,
                       overload: str = "", duration: float = 8.0,
                       max_samples: int = 30, stack_depth: int = 12) -> str:
@@ -6185,7 +6764,8 @@ def java_find_callers(serial: str, pid: int, class_name: str, method: str,
 def java_hook_hint(serial: str, pid: int, query: str = "", package: str = "",
                    method: str = "", include_network: bool = True,
                    limit: int = 30, max_scan_classes: int = 3000,
-                   count_seconds: float = 0.0) -> str:
+                   count_seconds: float = 0.0,
+                   all_loaders: bool = False) -> str:
     """**不知道该 hook 谁时的罗盘**：给模糊线索，返回排好序的候选清单。
 
     (1) 第一次修改（2026-11-13）：新增。
@@ -6264,6 +6844,7 @@ def java_hook_hint(serial: str, pid: int, query: str = "", package: str = "",
             serial, int(pid), query=query, package=package, method=method,
             include_network=bool(include_network), limit=int(limit),
             max_scan_classes=int(max_scan_classes),
+            all_loaders=bool(all_loaders),
             count_seconds=float(count_seconds)))
     except Exception as exc:                              # noqa: BLE001
         return _j({"error": f"{type(exc).__name__}: {exc}",

@@ -49,9 +49,13 @@ rule MD5_T {
     meta:
         algo = "MD5"
     strings:
-        $t1 = { 78 a4 6a 39 }      // T[7] little-endian 前4字节
-        $t2 = { d9 1c 7d 91 }      // T[8]
-        $t3 = { 91 7d 1c d9 }
+        // (4) 用 math.sin 实算校正（1-based 索引）：
+        //     T[7]=0xa8304613 -> 13 46 30 a8
+        //     T[8]=0xfd469501 -> 01 95 46 fd
+        //     T[9]=0x698098d8 -> d8 98 80 69
+        $t1 = { 13 46 30 a8 }
+        $t2 = { 01 95 46 fd }
+        $t3 = { d8 98 80 69 }
     condition:
         2 of them
 }
@@ -59,9 +63,10 @@ rule SHA1_K {
     meta:
         algo = "SHA-1"
     strings:
-        $k1 = { 99 99 82 5a }      // 0x5a827999 LE
+        // (3) 核实后的 LE 字节：K1/K3 原来写错了
+        $k1 = { 99 79 82 5a }      // 0x5a827999 LE
         $k2 = { a1 eb d9 6e }      // 0x6ed9eba1 LE
-        $k3 = { dc 1b bb 8f }      // 0x8f1bbcdc LE
+        $k3 = { dc bc 1b 8f }      // 0x8f1bbcdc LE
         $k4 = { d6 c1 62 ca }      // 0xca62c1d6 LE
     condition:
         3 of them
@@ -112,8 +117,20 @@ class Plugin(PluginBase):
         try:
             import yara
         except ImportError:
-            return {"error": "yara-python 未安装。pip install yara-python（Apache-2.0）",
-                    "code": "YARA_NOT_INSTALLED"}
+            return {
+                "error": ("yara-python 不可用。**打包版里这是预期的**——"
+                          "yara 自带的 libcrypto.3.dylib 会被 PyInstaller "
+                          "全局收集，覆盖系统 OpenSSL 导致 app 启动崩溃，"
+                          "因此刻意不打包。"),
+                "code": "YARA_NOT_INSTALLED",
+                "where_available": "源码环境（.venv）里功能完整",
+                "to_enable_in_source": "pip install yara-python",
+                "alternative": {
+                    "tool": "const_fingerprint",
+                    "why": "纯 Python、零第三方依赖、打包版可用，"
+                           "覆盖 20+ 常见算法常量（XXTEA/SHA1/SHA256/MD5/CRC32/FNV等）",
+                },
+            }
 
         so_name = args.get("so")
         if not so_name:

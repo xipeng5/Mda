@@ -50,11 +50,16 @@ page_addr = int(env.get("MDA_PAGE_ADDR", "0"), 0)
 page_len = int(env.get("MDA_PAGE_LEN", "4096"), 0)
 env["PAGE_ADDR_LO_CONST"] = str(page_addr & 0xffff)
 env["PAGE_ADDR_HI_CONST"] = str((page_addr >> 16) & 0xffff)
+# (2) 第二次修改（2026-11-17）：补 bit32/48，否则高地址只能构造到 bit31
+env["PAGE_ADDR_B2_CONST"] = str((page_addr >> 32) & 0xffff)
+env["PAGE_ADDR_B3_CONST"] = str((page_addr >> 48) & 0xffff)
 env["PAGE_LEN_CONST"] = str(page_len)
 env["SIGNO_CONST"] = env.get("MDA_SIGNO", "11")
 r = subprocess.run([str(cc), "-c",
                     f"-DPAGE_ADDR_LO_CONST={env['PAGE_ADDR_LO_CONST']}",
                     f"-DPAGE_ADDR_HI_CONST={env['PAGE_ADDR_HI_CONST']}",
+                    f"-DPAGE_ADDR_B2_CONST={env['PAGE_ADDR_B2_CONST']}",
+                    f"-DPAGE_ADDR_B3_CONST={env['PAGE_ADDR_B3_CONST']}",
                     f"-DPAGE_LEN_CONST={env['PAGE_LEN_CONST']}",
                     f"-DSIGNO_CONST={env['SIGNO_CONST']}",
                     "-o", str(obj), str(src)],

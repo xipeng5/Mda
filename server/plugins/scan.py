@@ -28,6 +28,28 @@ class Plugin(PluginBase):
     usage = ("args: {so: str, kind: 'bl_call|adrp_add|const|string_ref', "
              "target: str|int|None=None, limit: int=200}")
 
+
+    def _exec_ranges(self, so):
+        """(1) 可执行区域：优先 exec_regions()（PT_LOAD 兜底），
+        无节表/节表被抹的加固样本也能扫到。见 elf_model.exec_regions 的注释。
+
+        bug 原因：四个插件只遍历 so.sections，而加固样本的节表常被抹
+                  （is_exec 全 False），导致恒返回 0 且**无任何警告**。
+                  实测 libDexHelper_patched_full.so：5 个节全不可执行，
+                  但 exec_regions() 有 0x4ca0 字节可执行代码，
+                  四个插件全部 count=0/ok=true —— 最该分析的样本上静默失效。
+        解决方案：改用 exec_regions() 兜底。
+        """
+        out = []
+        for s in getattr(so, "sections", []):
+            if getattr(s, "is_exec", False) and getattr(s, "size", 0):
+                out.append((s.addr, s.size))
+        if not out:
+            for va, end, _off, _fl in getattr(so, "exec_regions", lambda: [])():
+                if end > va:
+                    out.append((va, end - va))
+        return out
+
     def run(self, session, args: dict):
         so_name = args.get("so")
         kind = args.get("kind", "bl_call")
@@ -50,14 +72,20 @@ class Plugin(PluginBase):
 
         results = []
         scanned = 0
-        for sec in getattr(so, "sections", []):
-            if not getattr(sec, "is_exec", False) or not sec.size:
-                continue
-            insns = dis.disasm_range(sec.addr, sec.size)
+        ranges = self._exec_ranges(so)
+        if not ranges:
+            return {"ok": False, "code": "NOTHING_SCANNED",
+                    "error": "该 so 没有可执行区域（节表与 PT_LOAD 都为空）"}
+        for _rva, _rsz in ranges:
+            insns = dis.disasm_range(_rva, _rsz)
             scanned += len(insns)
             for i in insns:
                 text = i.text or ""
                 if kind == "bl_call":
+                    # (2) 用 is_call 而非 call_target：后者对 b/cbz 等
+                    #     跳转也填值，实测放大 2.41 倍（1381 vs 573）
+                    if not getattr(i, "is_call", False):
+                        continue
                     t = getattr(i, "call_target", None)
                     if t is not None:
                         results.append({"addr": hex(i.addr), "target": hex(int(t)),

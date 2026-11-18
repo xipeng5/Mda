@@ -89,8 +89,14 @@ class Plugin(PluginBase):
             if fn:
                 return [(fn.addr, max(fn.size, 4))]
             return [(a, 4096)]
-        return [(s.addr, s.size) for s in getattr(so, "sections", [])
-                if getattr(s, "is_exec", False) and s.size]
+        # (1) 节表被抹时用 exec_regions() 兜底（加固样本主战场）
+        out = [(s.addr, s.size) for s in getattr(so, "sections", [])
+               if getattr(s, "is_exec", False) and s.size]
+        if not out:
+            for va, end, _off, _fl in getattr(so, "exec_regions", lambda: [])():
+                if end > va:
+                    out.append((va, end - va))
+        return out
 
     def _match(self, method, w, idx, texts, insns, mod_range):
         """返回命中详情或 None。w 是从当前指令开始的窗口。"""

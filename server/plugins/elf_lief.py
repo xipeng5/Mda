@@ -113,6 +113,75 @@ class Plugin(PluginBase):
             return {"ok": True, "so": so.name, "mode": mode,
                     "count": len(out), "segments": out[:limit]}
 
+        if mode == "patch":
+            # (1) 静态 patch：按 vaddr 改文件内容，另存新文件。
+            #     与运行时 patch（patch_memory 插件）互补：
+            #     本项改磁盘文件、持久；那项改内存、重启即恢复。
+            import struct as _struct
+
+            paddr = args.get("addr")
+            phex = str(args.get("hex") or "").strip().replace(" ", "")
+            out_path = args.get("out") or (str(path) + ".patched")
+            if paddr is None or not phex:
+                return {"error": "mode=patch 需要 addr 与 hex",
+                        "code": "BAD_ARGS"}
+            va = int(paddr, 16) if isinstance(paddr, str) and \
+                str(paddr).lower().startswith("0x") else int(paddr)
+            try:
+                pdata = bytes.fromhex(phex)
+            except ValueError:
+                return {"error": f"hex 不是合法十六进制：{phex[:40]}",
+                        "code": "BAD_HEX"}
+
+            # 找虚拟地址落在哪个段，换算文件偏移
+            target_seg = None
+            file_off = None
+            for seg in binary.segments:
+                lo = int(seg.virtual_address)
+                # (2) 用 physical_size：vszie 含 .bss（文件里无内容），
+                #     用它定界会算到段外去写坏别的段
+                fsize = int(seg.physical_size or 0)
+                if fsize <= 0:
+                    continue
+                if lo <= va < lo + fsize:
+                    target_seg = seg
+                    file_off = int(seg.file_offset) + (va - lo)
+                    break
+            if target_seg is None:
+                return {"error": f"0x{va:x} 不在任何 PT_LOAD 段内",
+                        "code": "ADDR_NOT_MAPPED"}
+
+            blob = bytearray(Path(path).read_bytes())
+            if file_off + len(pdata) > len(blob):
+                return {"error": "写入越界（超出文件大小）", "code": "OUT_OF_RANGE"}
+            old = bytes(blob[file_off:file_off + len(pdata)])
+            blob[file_off:file_off + len(pdata)] = pdata
+            Path(out_path).write_bytes(bytes(blob))
+            return {"ok": True, "so": so.name, "mode": "patch",
+                    "vaddr": hex(va), "file_offset": hex(file_off),
+                    "old_hex": old.hex(), "new_hex": pdata.hex(),
+                    "out_path": out_path,
+                    "note": ("改的是**磁盘文件**的副本（持久）。"
+                             "运行时 patch 请用 patch_memory 插件。")}
+
+        if mode == "dump":
+            # (1) 把某个段按文件布局导出（配合 dumpso 做「磁盘 vs 内存」对比）
+            daddr = args.get("addr")
+            if daddr is None:
+                return {"error": "mode=dump 需要 addr", "code": "BAD_ARGS"}
+            dva = int(daddr, 16) if isinstance(daddr, str) and \
+                str(daddr).lower().startswith("0x") else int(daddr)
+            for seg in binary.segments:
+                lo = int(seg.virtual_address)
+                if lo <= dva < lo + int(seg.virtual_size or seg.physical_size):
+                    content = bytes(seg.content)
+                    out_path = args.get("out") or (str(path) + f".seg_{lo:x}.bin")
+                    Path(out_path).write_bytes(content)
+                    return {"ok": True, "so": so.name, "mode": "dump",
+                            "vaddr": hex(lo), "size": len(content),
+                            "out_path": out_path}
+            return {"error": f"0x{dva:x} 不在任何段内", "code": "ADDR_NOT_MAPPED"}
+
         if mode == "resolve":
             addr = args.get("addr")
             if addr is None:

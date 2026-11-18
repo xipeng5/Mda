@@ -75,17 +75,22 @@ class Plugin(PluginBase):
         hits = []
         # 扫 .rodata / 数据段的 4字节和8字节对齐值
         seen = set()
-        for s in getattr(so, "sections", []):
-            if getattr(s, "is_exec", False) or not s.size:
-                continue
-            data = so.read(s.addr, min(s.size, 1 << 22))
+        # (1) 数据段：无节表时用 PT_LOAD 中**非可执行**段兜底
+        ranges = [(sec.addr, sec.size) for sec in getattr(so, "sections", [])
+                  if not getattr(sec, "is_exec", False) and getattr(sec, "size", 0)]
+        if not ranges:
+            for va, end, _off, fl in getattr(so, "_loads", []) or []:
+                if not (fl & 1) and end > va:
+                    ranges.append((va, end - va))
+        for _dva, _dsz in ranges:
+            data = so.read(_dva, min(_dsz, 1 << 22))
             for width in (4, 8):
                 fmt = "<I" if width == 4 else "<Q"
                 for off in range(0, len(data) - width + 1, width):
                     val = struct.unpack_from(fmt, data, off)[0]
                     if val not in FINGERPRINTS:
                         continue
-                    addr = s.addr + off
+                    addr = _dva + off
                     key = (addr, val)
                     if key in seen:
                         continue

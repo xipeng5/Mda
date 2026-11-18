@@ -109,14 +109,26 @@ def _run_helper(serial: str, args: list[str], timeout: int = 60) -> dict:
         raise InjectError("HELPER_NO_OUTPUT",
                           f"helper 没有输出（rc={r.returncode}）：{(r.stderr or '')[:200]}")
     # 取最后一行 JSON（前面可能有 [dbg] 行）
+    parsed = None
     for line in reversed(raw.splitlines()):
         line = line.strip()
         if line.startswith("{"):
             try:
-                return json.loads(line)
+                parsed = json.loads(line)
+                break
             except json.JSONDecodeError:
                 continue
-    raise InjectError("HELPER_BAD_OUTPUT", f"helper 输出不是 JSON：{raw[:200]}")
+    if parsed is None:
+        raise InjectError("HELPER_BAD_OUTPUT",
+                          f"helper 输出不是 JSON：{raw[:200]}")
+    # (2) 检查 returncode：helper 失败时仍会打印合法 JSON
+    if r.returncode not in (0, None) and parsed.get("ok") is not False:
+        parsed["ok"] = False
+        parsed.setdefault("code", "HELPER_EXIT_NONZERO")
+        parsed["helper_returncode"] = r.returncode
+        if r.stderr:
+            parsed.setdefault("stderr", (r.stderr or "")[:300])
+    return parsed
 
 
 def selftest(serial: str, pid: int) -> dict:
@@ -169,8 +181,9 @@ def write_target_mem(serial: str, pid: int, addr: int, data: bytes) -> bool:
     """
     if not data:
         return True
-    hexs = data.hex()
-    cmd = (f"printf '{hexs}' | "
+    # (1) 用 \xNN 转义输出真正的二进制，不能直接 printf 十六进制文本
+    esc = "".join(f"\\x{b:02x}" for b in data)
+    cmd = (f"printf '{esc}' | "
            f"dd of=/proc/{int(pid)}/mem bs=1 seek={int(addr)} "
            f"conv=notrunc 2>/dev/null")
     r = subprocess.run([_resolve_adb(), "-s", str(serial), "shell",

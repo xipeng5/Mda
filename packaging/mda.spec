@@ -85,9 +85,47 @@ try:
 except Exception:
     _z3_datas = []
 
+# (7) 第七次修改（2026-11-17）：收 unicorn 的原生库。
+#     unicorn 的核心是 libunicorn.dylib（C 扩展），
+#     与 z3 同类问题：只加 hiddenimports 拿不到原生库。
+_uc_datas = []
+try:
+    from PyInstaller.utils.hooks import collect_data_files as _cdf2
+
+    _uc_datas = _cdf2("unicorn")
+except Exception:
+    _uc_datas = []
+
+# (9) 第九次修改（2026-11-17）：yara 的打包方式。
+#     bug 原因：yara-python 依赖 yara_python.dylibs/libcrypto.3.dylib，
+#               靠 @loader_path 相对引用（本来不冲突）。但 PyInstaller
+#               把 libcrypto.3.dylib 当共享库收进全局 Frameworks/，
+#               与系统/其他模块的 libcrypto 名冲突 → app 启动即崩（实测）。
+#     解决方案：按**原始相对结构**把 yara*.so 与 yara_python.dylibs/ 放进
+#               Resources 根，@loader_path 仍能解析到它自己那份 libcrypto。
+#     (10) 第十次修改：路径动态探测，不硬编码 python3.11。
+_yara_datas = []
+try:
+    import glob as _glob
+    import sysconfig as _sc
+
+    _sp = _sc.get_paths().get("purelib") or _sc.get_paths().get("platlib")
+    if _sp:
+        for _so in _glob.glob(os.path.join(_sp, "yara*.so")):
+            _yara_datas.append((_so, "."))
+        _dylibs = os.path.join(_sp, "yara_python.dylibs")
+        if os.path.isdir(_dylibs):
+            _yara_datas.append((_dylibs, "yara_python.dylibs"))
+except Exception:
+    _yara_datas = []
+
 datas = [
     *_frida_tools_datas,
     *_z3_datas,
+    *_uc_datas,
+    # (11) yara 不进包：它的 libcrypto.3.dylib 会被 PyInstaller 全局收集，
+    #      覆盖系统 OpenSSL 导致 _ssl.so 符号缺失、app 启动即崩（实测）。
+    #      源码环境可用，打包版报 YARA_NOT_INSTALLED。
     # (5) 第五次修改（2026-11-09）：把 dyn/device/ 打进包。
     #     bug 原因：perf_watch 依赖设备端 helper（mda_perfwatch.c + build.sh），
     #              它们放在 dyn/device/ 下。PyInstaller 只收 .py 模块，
@@ -135,12 +173,14 @@ hiddenimports = (
     #     解决方案：collect_submodules 收模块 + collect_data_files 收
     #              bridges/*.js（js 是数据文件，光收模块拿不到它）。
     + collect_submodules("frida_tools")
-    # (5) 第五次修改（2026-11-17）：可选静态分析轮子。
-    #     z3/lief 显式声明；**yara 故意不打包**——
-    #     yara-python 自带 libcrypto.3.dylib，打进 app 后与系统库符号冲突
-    #     （实测 app 启动即崩）。打包版里 detect_so_crypto 会优雅报
-    #     YARA_NOT_INSTALLED，源码环境仍可用。
+    # (5) 第五次修改（2026-11-17）：可选静态分析轮子 z3/lief 显式声明。
+    #     yara 的 .so 与 dylibs 走 datas 按原相对结构放置（见上面的 _yara_datas），
+    #     不在此声明——放这里会被 PyInstaller 收进全局 Frameworks，
+    #     导致 libcrypto.3.dylib 名冲突使 app 启动崩溃（实测）。
     + ["z3", "lief"]
+    # (8) unicorn 是分层包，必须收全部子模块
+    #     （只加 "unicorn" 会 ModuleNotFoundError: unicorn_py3.arch.arm64）
+    + collect_submodules("unicorn")
     # (1) 第一次修改（2026-10-30）：显式声明 mcp_server 子模块。
     #     bug 原因：mcp_server.link 是在工具包装器里用 `from mcp_server import link`
     #               运行期动态导入的，PyInstaller 静态分析扫不到，打包后
@@ -155,6 +195,8 @@ hiddenimports = (
 
 # 用不到的重型依赖，排除以控制体积
 excludes = [
+    # (9) yara 的 dylib 靠 datas 显式放置，不走自动收集（会名冲突）
+    'yara_python.dylibs',
     "PySide6", "PyQt5", "PyQt6", "shiboken6",
     "mcp.cli", "typer", "tkinter", "matplotlib", "pandas", "numpy",
     "scipy", "IPython", "pytest",

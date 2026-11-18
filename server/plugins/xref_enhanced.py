@@ -32,6 +32,25 @@ class Plugin(PluginBase):
     usage = ("args: {so: str, mode: 'refs'|'check_reloc'|'all'='all', "
              "addr: int|None=None, limit: int=100}")
 
+
+    def _exec_ranges(self, so):
+        """(1) 可执行区域：优先节表，无则用 exec_regions()（PT_LOAD）兜底。
+
+        bug 原因：只遍历 so.sections，加固样本节表被抹（is_exec 全 False）时
+                  恒返回 0 且无警告。实测 libDexHelper 有 0x4ca0 可执行字节
+                  却扫出 0 条。
+        解决方案：exec_regions() 兜底。
+        """
+        out = []
+        for s in getattr(so, "sections", []):
+            if getattr(s, "is_exec", False) and getattr(s, "size", 0):
+                out.append((s.addr, s.size))
+        if not out:
+            for va, end, _off, _fl in getattr(so, "exec_regions", lambda: [])():
+                if end > va:
+                    out.append((va, end - va))
+        return out
+
     def run(self, session, args: dict):
         so_name = args.get("so")
         if not so_name:
@@ -53,13 +72,19 @@ class Plugin(PluginBase):
         # 全库线性扫（可执行段）
         refs = []
         suspicious = []
-        for sec in getattr(so, "sections", []):
-            if not getattr(sec, "is_exec", False):
-                continue
-            insns = dis.disasm_range(sec.addr, sec.size)
+        ranges = self._exec_ranges(so)
+        if not ranges:
+            return {"ok": False, "code": "NOTHING_SCANNED",
+                    "error": "该 so 没有可执行区域"}
+        for _rva, _rsz in ranges:
+            insns = dis.disasm_range(_rva, _rsz)
             for idx, insn in enumerate(insns):
                 t = getattr(insn, "ref_addr", None)
                 if t is None:
+                    continue
+                # (2) 排除调用/跳转：disasm 对 b/bl 也填 ref_addr，
+                #     不过滤会让 suspicious 里 49/50 是普通 bl（实测）
+                if getattr(insn, "is_call", False) or getattr(insn, "is_jump", False):
                     continue
                 t = int(t)
                 in_range = mod_lo <= t < mod_hi

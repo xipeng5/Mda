@@ -14,6 +14,7 @@ from elftools.elf.sections import SymbolTableSection
 from elftools.dwarf.callframe import CallFrameInfo
 from elftools.dwarf.structs import DWARFStructs
 
+from server.core import rela as rela_parser
 from server.models import Arch, Function, Relocation, Section, Symbol, SymbolKind
 
 import io
@@ -63,6 +64,8 @@ class SoFile:
         self.plt_stubs: set[int] = set()
         # (2) 第二次修改：桩地址排序缓存，供 in_plt_stub 二分查找
         self._stub_sorted: list[int] = []
+        # 重定位表惰性缓存（core/rela.py 的解析结果，含 PT_DYNAMIC 路径）
+        self._rela_table: rela_parser.RelocTable | None = None
         self._parse()
 
     # ---------- 解析 ----------
@@ -378,32 +381,45 @@ class SoFile:
                 self.exports[name] = s
 
     def _parse_relocations(self) -> None:
-        self.relocations: list[Relocation] = []
-        dynsym = self._sec_by_name(".dynsym")
-        for sec_name in (".rela.plt", ".rela.dyn", ".rel.plt", ".rel.dyn"):
-            sec = self._sec_by_name(sec_name)
-            if sec is None:
-                continue
-            # 只有 RelocationSection 才有 iter_relocations；
-            # .rela.dyn 若被标记为其他类型需跳过，避免 AttributeError
-            if not hasattr(sec, "iter_relocations"):
-                continue
-            for r in sec.iter_relocations():
-                sym_name = ""
-                if dynsym is not None:
-                    sym = dynsym.get_symbol(r["r_info_sym"])
-                    sym_name = sym.name
-                self.relocations.append(
-                    Relocation(
-                        offset=r["r_offset"],
-                        rtype=r["r_info_type"],
-                        sym_idx=r["r_info_sym"],
-                        sym_name=sym_name,
-                        # pyelftools 的 Relocation 是属性容器，非 dict；
-                        # .rel（32 位）节无 addend 字段，用 getattr 兜底
-                        addend=getattr(r, "r_addend", 0),
-                    )
-                )
+        """解析重定位表 → self.relocations（models.Relocation）。
+
+        (1) 第一次修改（2026-11-18）
+            bug 原因：本方法只走节表（`_sec_by_name(".rela.dyn")` 等），
+                      而壳处理的 dump so 节表被抹，`so.relocations` 恒为空。
+                      于是「函数只被 vtable/GOT 间接调用」时，mda 既没有
+                      bl 边也没有重定位可查——用户只能自己写 Python 读
+                      .rela.dyn 才找到 vtable[4] = 0x196424。
+                      另外解码逻辑与 dyn/jni.py 各有一份，容易漂移。
+            解决方案：委托 `core/rela.py` 的 parse()（节表不可用时自动走
+                      PT_DYNAMIC）。本方法只做 RelocEntry → Relocation 的
+                      字段适配，条目顺序沿用「.rela.plt 先、.rela.dyn 后」，
+                      因此既有样本上的 offset/rtype/sym_name 逐项不变
+                      （libbase 235 条、libc 2226 条，见 tests/test_rela.py）。
+
+        (2) 第二次修改（2026-11-18）
+            bug 原因：旧实现读 addend 用的是 `getattr(r, "r_addend", 0)`，
+                      而 pyelftools 的 Relocation 是**字典式**容器（字段走
+                      `r["r_addend"]`），属性访问一律 miss → 静默退回 0。
+                      实测 libc.so 的 `.rela.dyn` 首项真实 addend=0xfc020
+                      被读成 0：所有 RELATIVE 条目的 addend 全变 0，
+                      「vtable 槽指向哪个函数」这一核心信息在 so.relocations
+                      里根本没存在过。这种"取不到就当 0"的兜底不会报错，
+                      只会让人以为样本里没有 addend。
+            解决方案：addend 由 core/rela.py 直接按 ELF 结构体字节解
+                      （`<QQq`），拿到真值。行为变化仅此一项：addend 从
+                      恒 0 变为真值，属修复而非回退（无调用方依赖 0）。
+        """
+        table = self.rela_table
+        self.relocations: list[Relocation] = [
+            Relocation(
+                offset=e.offset,
+                rtype=e.rtype,
+                sym_idx=e.sym_idx,
+                sym_name=e.sym_name,
+                addend=e.addend,
+            )
+            for e in table.entries
+        ]
 
     def _parse_plt(self) -> None:
         """建立 PLT stub 地址 -> 导入符号名 的映射。
@@ -646,6 +662,25 @@ class SoFile:
     @property
     def sections(self) -> list[Section]:
         return self._sections
+
+    @property
+    def rela_table(self) -> rela_parser.RelocTable:
+        """重定位表（惰性解析，节表不可用时自动走 PT_DYNAMIC）。
+
+        与 `self.relocations` 的关系：后者是 models.Relocation 的**兼容视图**
+        （只有 offset/rtype/sym_idx/sym_name/addend 五个字段），条目数、
+        顺序、符号名与改动前逐项一致；唯一变化是 addend 由恒 0 修正为真值
+        （见 _parse_relocations 第 2 次修改）。本属性给出 core/rela.py 的
+        完整条目（含 rtype_name、sym_resolved、addend 语义标记、来源表名），
+        并带解析元信息（error/warnings/packed/relr），供
+        vtable_at / code_targets / rela_dump 使用。
+
+        惰性是必要的：一条重定位都不查的调用方（只取符号表、只搜字节）
+        不该为解析付钱；libc.so 有 2226 条，首次解析约 10ms。
+        """
+        if self._rela_table is None:
+            self._rela_table = rela_parser.parse(self)
+        return self._rela_table
 
     def read(self, addr: int, size: int) -> bytes:
         """按虚拟地址读取字节。

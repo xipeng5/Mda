@@ -73,9 +73,9 @@
 #define OFF_TARGET    0x01c
 #define OFF_TLEN      0x020
 #define OFF_ERRNO     0x028
-#define OFF_RECS      0x030
-#define OFF_ARGS      0x200
-#define OFF_ACT       0x300
+#define OFF_ARGS      0x100      /* (20) 与 mda_payload.S 的 OFF_ARGS 一致 */
+#define OFF_ACT       0x200
+#define OFF_RECS      0x400      /* (20) 记录区移到参数区之后，避免覆盖 */
 #define SHM_SIZE      0x2000
 
 /* syscall 号（arm64） */
@@ -235,12 +235,19 @@ static int remote_syscall(pid_t pid, int nr, uint64_t a0, uint64_t a1,
     if (ptrace(PTRACE_GETREGSET, pid, (void *)1, &iov) < 0) return -1;
     if (ret) *ret = cur.x[0];
     /*
-     * (16) **不恢复现场**。
-     *      单步执行下，目标停在 svc+4，并没有真的 ret 走。
-     *      如果这里把 pc 恢复成 svc 之前的地址再放行，
-     *      下一次调用就会重复执行 svc——反而更乱。
-     *      保持当前状态（pc=svc+4）即可，下一次调用会重新 GETREGSET。
+     * (18) 恢复调用前的现场。
+     *      只把 pc 放回 svc 之后（svc_addr + 4），其余寄存器全部还原——
+     *      这样目标会接着执行 libc syscall() 包装的后续逻辑
+     *      （返回值处理、errno、锁释放），而不是从半路继续。
      */
+    {
+        struct arm64_regs restore = saved;
+        restore.pc = svc_addr + 4;
+        iov.iov_base = &restore;
+        iov.iov_len = sizeof(restore);
+        g_stage = "restore";
+        if (ptrace(PTRACE_SETREGSET, pid, (void *)1, &iov) < 0) return -1;
+    }
     return 0;
 }
 
@@ -286,11 +293,12 @@ static int install_sigaction_via_syscall(pid_t pid, unsigned long shm,
              * (23) 不再挑 syscall —— PTRACE_SYSCALL 入口读到的 x8
              *      实测不可靠（全是 101），无法据此判断该不该搭便车。 */
             saved = regs;
+            /* (19) AAPCS64：sig=x0, act=x1, oact=x2, sigsetsize=x3 */
             regs.x[8] = 134;              /* rt_sigaction */
-            regs.x[1] = 11;               /* SIGSEGV */
-            regs.x[2] = shm + OFF_ACT;   /* act */
-            regs.x[3] = 0;                /* oldact */
-            regs.x[4] = 8;                /* sigsetsize */
+            regs.x[0] = 11;               /* SIGSEGV */
+            regs.x[1] = shm + OFF_ACT;    /* act */
+            regs.x[2] = 0;                /* oldact */
+            regs.x[3] = 8;                /* sigsetsize */
             iov.iov_base = &regs;
             iov.iov_len = sizeof(regs);
             ptrace(PTRACE_SETREGSET, pid, (void *)1, &iov);
@@ -775,10 +783,14 @@ int main(int argc, char **argv) {
         uint64_t got = 0;
         int r = svc ? remote_syscall(pid, SYS_GETPID, 0, 0, 0, 0, 0, 0, &got, svc) : -1;
         detach(pid);
-        printf("{\"ok\":true,\"svc\":\"0x%lx\",\"getpid_ret\":%llu,"
-               "\"expect_pid\":%d,\"remote_syscall\":\"%s\"}\n",
+        /* (22) ok 反映真实结果，不再恒 true */
+        int works = (r == 0 && got == (uint64_t)pid);
+        printf("{\"ok\":%s,\"svc\":\"0x%lx\",\"getpid_ret\":%llu,"
+               "\"expect_pid\":%d,\"remote_syscall\":\"%s\"%s}\n",
+               works ? "true" : "false",
                svc, (unsigned long long)got, (int)pid,
-               (r == 0 && got == (uint64_t)pid) ? "works" : "failed");
+               works ? "works" : "failed",
+               works ? "" : ",\"code\":\"REMOTE_SYSCALL_FAILED\"");
         return (r == 0 && got == (uint64_t)pid) ? 0 : 3;
     }
 
@@ -787,10 +799,11 @@ int main(int argc, char **argv) {
             printf("{\"ok\":false,\"error\":\"need: watch <pid> <addr> [len]\"}\n");
             return 1;
         }
+        /* (21) serial 从命令行取（可选），不硬编码设备号 */
         return cmd_watch((pid_t)atoi(argv[2]),
                          strtoul(argv[3], NULL, 16),
                          argc > 4 ? strtoul(argv[4], NULL, 0) : 8,
-                         "3e2ff172");
+                         argc > 5 ? argv[5] : "");
     }
 
     if (!strcmp(argv[1], "poll")) {
