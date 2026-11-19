@@ -387,20 +387,33 @@ def test_two_paths_consistency() -> None:
 
 
 def test_libbase_packed() -> None:
-    """libbase 的 .rela.dyn 是 APS2 压缩：必须如实报告，不能伪造 RELATIVE。"""
+    """libbase 的 .rela.dyn 是 APS2 压缩：必须如实报告，不能伪造 RELATIVE。
+
+    (1) 第一次修改 bug 原因：旧断言写死"RELR 未解析 → 条目 235 / RELATIVE 0 /
+        code_targets 空"，而 core/rela.py 现已在第 1 次修改里解析 RELR，
+        真实新增 15 条 RELATIVE（来自 .relr.dyn，不是从 APS2 流伪造）。
+        解决方案：断言改成新语义——APS2 流仍不解析（不伪造），但 RELR 条目
+        必须解析且来源为 relr，code_targets 非空且全部来自真实 RELR addend。
+    """
     print("== libbase.so（.rela.dyn 为 APS2 压缩）==")
     so = SoFile(str(BASE))
     try:
         t = so.rela_table
-        check("条目数 235（只有 .rela.plt）", len(t.entries) == 235, f"实际 {len(t.entries)}")
-        check("来源只有 rela.plt", t.counts == {"rela.plt": 235}, str(t.counts))
+        check("条目数 250（235 rela.plt + 15 relr）", len(t.entries) == 250, f"实际 {len(t.entries)}")
+        check("来源 rela.plt + relr", t.counts == {"rela.plt": 235, "relr": 15}, str(t.counts))
         check("标记为 APS2 压缩", t.packed is True, str(t.packed))
-        check("标记 RELR 未解析", t.relr is True, str(t.relr))
+        check("标记存在 RELR（且已解析 15 条）",
+              t.relr is True and t.counts.get("relr") == 15, str((t.relr, t.counts)))
         check("warnings 说清压缩格式", any("APS2" in w for w in t.warnings), str(t.warnings))
-        check("RELATIVE 条目为 0（不伪造）", len(t.relative_entries()) == 0,
-              f"实际 {len(t.relative_entries())}")
-        check("code_targets 为空（没有 RELATIVE 就没有代码目标）",
-              rela.code_targets(so) == [])
+        check("warnings 说明 RELR 已解析",
+              any("已解析" in w and "RELR" in w for w in t.warnings), str(t.warnings))
+        # APS2 流本身仍不解析：这 15 条 RELATIVE 全部来自 RELR，不是从 APS2 伪造
+        check("RELATIVE 15 条全部来自 RELR（不伪造 APS2）",
+              len(t.relative_entries()) == 15
+              and all(e.source == "relr" for e in t.relative_entries()),
+              str([(e.source, hex(e.offset)) for e in t.relative_entries()]))
+        check("code_targets 非空（来自真实 RELR addend）",
+              len(rela.code_targets(so)) == 6, str(rela.code_targets(so)))
         check("函数表未被破坏（386 个）", len(so.functions) == 386, f"实际 {len(so.functions)}")
 
         # 动态路径与节表路径一致
@@ -408,7 +421,8 @@ def test_libbase_packed() -> None:
         ka = [(e.offset, e.rtype, e.sym_idx, e.addend, e.sym_name) for e in t.entries]
         kb = [(e.offset, e.rtype, e.sym_idx, e.addend, e.sym_name) for e in d.entries]
         check("libbase 双路径条目全等", ka == kb, f"{len(ka)} vs {len(kb)}")
-        check("动态路径也报告 APS2", d.packed is True)
+        check("动态路径也报告 APS2 与 RELR",
+              d.packed is True and d.counts.get("relr") == 15, (d.packed, d.counts))
 
         # vtable_at 要明确说"不是 vtable"并给出原因
         r = rela.vtable_at(so, 0x3C610)          # GOT.PLT 里的 JUMP_SLOT
@@ -432,18 +446,19 @@ def test_erased_section_table() -> None:
         t = so.rela_table
         check("走的是 PT_DYNAMIC 路径", t.path == "dynamic", t.path)
         check("无解析错误", t.error == "", t.error)
-        check("条目数 235", len(t.entries) == 235, f"实际 {len(t.entries)}")
+        check("条目数 250（235 rela.plt + 15 relr）", len(t.entries) == 250, f"实际 {len(t.entries)}")
         check("符号名来自 PT_DYNAMIC", t.symtab == "PT_DYNAMIC", t.symtab)
-        check("仍然报告 APS2/RELR 边界",
-              t.packed is True and t.relr is True, f"packed={t.packed} relr={t.relr}")
+        check("仍然报告 APS2/RELR 边界（RELR 已从动态段解析）",
+              t.packed is True and t.relr is True and t.counts.get("relr") == 15,
+              f"packed={t.packed} relr={t.relr} counts={t.counts}")
         ka = [(e.offset, e.rtype, e.sym_idx, e.sym_name, e.addend, e.source) for e in t.entries]
         kb = [(e.offset, e.rtype, e.sym_idx, e.sym_name, e.addend, e.source)
               for e in so_orig.rela_table.entries]
-        check("与原文件条目逐项全等（235/235）", ka == kb, f"{len(ka)} vs {len(kb)}")
+        check("与原文件条目逐项全等（250/250）", ka == kb, f"{len(ka)} vs {len(kb)}")
         names_ok = sum(1 for e in t.entries if e.sym_name)
-        check("符号名恢复（导入名非空）", names_ok == 235, f"实际 {names_ok}")
+        check("符号名恢复（导入名非空，仅 rela.plt 有名字）", names_ok == 235, f"实际 {names_ok}")
         check("self.relocations 也拿到了（不再是空表）",
-              len(so.relocations) == 235, f"实际 {len(so.relocations)}")
+              len(so.relocations) == 250, f"实际 {len(so.relocations)}")
         show("抹节表样本条目数", len(t.entries))
         show("一致率", f"{sum(1 for x, y in zip(ka, kb) if x == y) / max(1, len(kb)) * 100:.2f}%")
     finally:
@@ -458,8 +473,8 @@ def test_no_symbol_table() -> None:
     so = SoFile(str(nostrtab))
     try:
         t = so.rela_table
-        check("条目仍然解析出来（偏移/类型不受影响）",
-              len(t.entries) == 235, f"实际 {len(t.entries)}")
+        check("条目仍然解析出来（偏移/类型不受影响，含 15 条 RELR）",
+              len(t.entries) == 250, f"实际 {len(t.entries)}")
         check("sym_name 全为空", all(e.sym_name == "" for e in t.entries),
               f"{sum(1 for e in t.entries if e.sym_name)} 条有名字")
         check("sym_resolved 全为 False",

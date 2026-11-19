@@ -92,17 +92,107 @@ def main():
         return 0
 
     if mode == "symbolic":
+        # (1) 第一次修改（2026-11-18）
+        #     bug 原因：原 symbolic 模式只做 blank_state→explore→返回 reached:bool，
+        #               无符号变量注入、无具体参数、无约束求解，无法"解出 x19"。
+        #     解决方案：注入 concrete 具体寄存器、symbolic 符号寄存器（按位宽建 BVS），
+        #               explore 加 depth_limit/avoid，到 find 后读输出、加约束求解，
+        #               用 solver.eval 解出符号变量值；失败如实返回 reason，不编造。
+        #               保留 reached 字段兼容旧调用方；不做全 so CFG（cfg 模式已超时）。
         entry = task.get("addr", 0)
         find = task.get("find")
         if find is None:
-            print(json.dumps({"ok": False, "code": "BAD_ARGS"}))
+            print(json.dumps({"ok": False, "code": "BAD_ARGS",
+                              "error": "symbolic 模式需要 find 地址"}))
             return 0
+        try:
+            import claripy
+        except ImportError as exc:
+            print(json.dumps({"ok": False, "code": "CLARIPY_NOT_INSTALLED",
+                              "error": str(exc)}))
+            return 1
+
         state = proj.factory.blank_state(addr=entry + base)
+
+        # 具体寄存器：state.regs.x0 = 0x...
+        for reg, val in (task.get("concrete") or {}).items():
+            try:
+                num = int(str(val), 16) if isinstance(val, str) and \
+                    str(val).lower().startswith("0x") else int(val)
+                setattr(state.regs, str(reg).lower(), num)
+            except (ValueError, AttributeError):
+                pass
+
+        # 符号寄存器：claripy.BVS('x19', 32/64)，按 symbolic_32/symbolic_64 定位宽
+        sym_vars: dict = {}
+        for reg, spec in (task.get("symbolic") or {}).items():
+            spec_s = str(spec).lower()
+            bits = 32 if "32" in spec_s else 64
+            var = claripy.BVS(str(reg).lower(), bits)
+            sym_vars[str(reg).lower()] = var
+            setattr(state.regs, str(reg).lower(), var)
+
         simgr = proj.factory.simgr(state)
-        simgr.explore(find=find + base)
+        max_depth = int(task.get("max_depth") or 60)
+        avoid = task.get("avoid")
+        explore_kw = {"find": find + base, "depth_limit": max_depth}
+        if avoid is not None:
+            av = (int(str(avoid), 16)
+                  if isinstance(avoid, str) and str(avoid).lower().startswith("0x")
+                  else int(avoid))
+            explore_kw["avoid"] = av + base
+        try:
+            simgr.explore(**explore_kw)
+        except Exception as exc:                          # noqa: BLE001
+            print(json.dumps({"ok": True, "reached": False, "solved": None,
+                              "reason": f"explore 异常：{type(exc).__name__}: {exc}",
+                              "find": hex(find)}))
+            return 0
+
         reached = bool(simgr.found)
-        print(json.dumps({"ok": True, "reached": reached,
-                          "find": hex(find)}))
+        if not reached:
+            print(json.dumps({"ok": True, "reached": False, "solved": None,
+                              "reason": "explore 未到达 find（深度上限/路径不可达）",
+                              "find": hex(find)}))
+            return 0
+
+        found_state = simgr.found[0]
+        constraint = task.get("constraint")
+        constraint_satisfied = False
+        solved: dict = {}
+        try:
+            if constraint:
+                # 约定：output==0x... 从 regs.x0 读；xN==0x... 从对应寄存器读
+                lhs, rhs = str(constraint).split("==", 1)
+                lhs, rhs = lhs.strip().lower(), rhs.strip()
+                num = (int(rhs, 16) if rhs.lower().startswith("0x")
+                       else int(rhs))
+                out_expr = (found_state.regs.x0 if lhs == "output"
+                            else getattr(found_state.regs, lhs))
+                found_state.solver.add(out_expr == num)
+            constraint_satisfied = bool(found_state.solver.satisfiable())
+            if constraint_satisfied and sym_vars:
+                for reg, var in sym_vars.items():
+                    solved[reg] = hex(found_state.solver.eval(var))
+        except Exception as exc:                          # noqa: BLE001
+            print(json.dumps({"ok": True, "reached": True, "solved": None,
+                              "constraint_satisfied": False,
+                              "reason": f"求解失败：{type(exc).__name__}: {exc}",
+                              "find": hex(find)}))
+            return 0
+
+        if constraint and not constraint_satisfied:
+            print(json.dumps({"ok": True, "reached": True, "solved": None,
+                              "constraint_satisfied": False,
+                              "reason": "约束不可满足", "find": hex(find)}))
+            return 0
+
+        print(json.dumps({
+            "ok": True, "reached": True,
+            "solved": solved if sym_vars else None,
+            "constraint_satisfied": constraint_satisfied if constraint else None,
+            "find": hex(find),
+        }))
         return 0
 
     print(json.dumps({"ok": False, "code": "BAD_MODE",

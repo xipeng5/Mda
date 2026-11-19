@@ -41,10 +41,16 @@ blr x8                ; 间接调用——引用图里没有任何 bl 边
 * Android 压缩重定位 `APS2`（`SHT_ANDROID_RELA` / `DT_ANDROID_RELA`）：
   只压缩了 r_info 的流式格式，本模块不硬解——按定长遍历会把压缩流
   当结构体读，产出成批假条目（这是同项目 dyn/jni.py 踩过的坑）。
-* `RELR`（`DT_RELR` / `DT_ANDROID_RELR`）：只编码写入地址、不含 addend。
 
-两者都记在 `RelocTable.packed` / `.relr` 与 `warnings` 里，
-调用方可以据此解释"为什么 RELATIVE 条目是 0"。
+## 已解析的编码：RELR 相对重定位
+
+`RELR`（`SHT_RELR` / `SHT_ANDROID_RELR`、`DT_RELR` / `DT_ANDROID_RELR`）
+用「偶数 word 给基址 + 奇数 word 给位图」压缩连续的相对重定位地址。
+(1) 第一次修改 bug 原因：此前把 RELR 标成"本工具不解析"，导致 `.data.rel.ro`
+末尾（vtable 所在）的重定位缺失，函数发现拿不到这些间接调用目标。
+解决方案：按标准位图编码逐 word 解码，转成 `source='relr'` 的 RELATIVE
+条目并入表；addend 从文件映射读出，读不到记 0 并在 warnings 如实标注。
+RELR 是否存在仍记在 `RelocTable.relr`，解析条数见 `rela_summary()['relr_entries']`。
 """
 from __future__ import annotations
 
@@ -226,7 +232,8 @@ class RelocEntry:
     sym_idx       r_info 高位的符号索引（无符号时 0）
     sym_name      符号名；符号表不可用或索引 0 时为空
     addend        见模块头表格；addend_is_target 为真时它才是目标地址
-    source        rela.dyn / rela.plt / rel.dyn / rel.plt / dynamic
+    source        rela.dyn / rela.plt / rel.dyn / rel.plt / dynamic / relr
+                  （relr = RELR 压缩相对重定位解出的条目，见 _walk_relr）
     sym_resolved  符号表是否可用且索引有效（**不是**"名字非空"）
     addend_implicit  REL（无显式 addend）时 addend 从目标位置读出
     """
@@ -271,7 +278,7 @@ class RelocTable:
     counts: dict[str, int] = field(default_factory=dict)  # source -> 条数
     symtab: str = ""                    # 符号名来源：.dynsym / PT_DYNAMIC / ""
     packed: bool = False                # 存在未解析的 Android APS2 压缩重定位
-    relr: bool = False                  # 存在未解析的 RELR
+    relr: bool = False                  # 存在 RELR 表（无论是否已解析成功）
     packed_where: list[str] = field(default_factory=list)  # 压缩表出现在哪
     arch: int = 0
     ptr_size: int = 8
@@ -604,6 +611,162 @@ def _walk_vaddr(raw: bytes, loads, vaddr: int, size: int, ent: int,
     _walk(raw, fo, size, ent, is_rela, ptr, source, names, table, loads)
 
 
+# ---------------------------------------------------------------- RELR 相对重定位
+
+
+def _relr_specs(so, raw: bytes, table: RelocTable, loads) -> list[tuple[str, int, int, int]]:
+    """找出所有 RELR 表位置 [(label, file_off, size, word_size)]。
+
+    (1) 第一次修改 bug 原因：RELR 此前只标"存在"不解析，节表与 PT_DYNAMIC
+        两条路径各写一份占位警告，位置信息没有统一出口。
+        解决方案：复用 _sht_int / _dynamic_tags / _v2o 收敛成这一处定位；
+        节表与动态段都看一遍（节表被抹时只能靠动态段），按文件偏移去重。
+    检测到 RELR 就置 table.relr=True（表示"存在"，与是否解析成功无关）。
+    """
+    specs: list[tuple[str, int, int, int]] = []
+    for sec in (getattr(so, "sections", None) or []):
+        name = getattr(sec, "name", "") or ""
+        if (_sht_int(getattr(sec, "sec_type", -1)) in (SHT_RELR, SHT_ANDROID_RELR)
+                or "relr" in name.lower()):
+            table.relr = True
+            specs.append((f"{name}(节表)", getattr(sec, "offset", 0),
+                          getattr(sec, "size", 0), table.ptr_size))
+
+    tags, _ = _dynamic_tags(raw)
+    pairs = (
+        ("DT_RELR", DT_RELR, DT_RELRSZ, DT_RELRENT),
+        ("DT_ANDROID_RELR", DT_ANDROID_RELR, DT_ANDROID_RELRSZ, DT_ANDROID_RELRENT),
+    )
+    for label, tag_v, tag_sz, tag_ent in pairs:
+        vaddr, size = tags.get(tag_v, 0), tags.get(tag_sz, 0)
+        if not vaddr or not size:
+            continue
+        table.relr = True
+        # DT_*RELRENT 是 RELR 表 word 宽度（4 或 8）；异常值退回 ELF class
+        ws = tags.get(tag_ent, 0) or table.ptr_size
+        if ws not in (4, 8):
+            ws = table.ptr_size
+        fo = _v2o(loads, vaddr)
+        if fo is None:
+            table.warnings.append(
+                f"{label} 地址 {vaddr:#x} 不在任何 PT_LOAD 内，无法定位 RELR 表"
+            )
+            continue
+        specs.append((label, fo, size, ws))
+
+    # 节表优先；同一张表被两条路径都报出来时只解一次
+    seen: set[tuple[int, int, int]] = set()
+    out: list[tuple[str, int, int, int]] = []
+    for spec in specs:
+        key = (spec[1], spec[2], spec[3])
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(spec)
+    return out
+
+
+def _walk_relr(raw: bytes, file_off: int, size: int, word_size: int,
+               label: str, table: RelocTable, loads) -> int:
+    """解码一张 RELR 表，返回新增条目数。
+
+    (1) 第一次修改 bug 原因：此前把 RELR 当"只编码地址、不含 addend"直接跳过，
+        `.data.rel.ro` 末尾 vtable 的重定位整块缺失。
+        解决方案：按标准位图解码——偶数 word 给出 where 本身就是一个地址，
+        奇数 word 的 bit1..bit(N-1) 依次表示 where + step*(bit-1)，处理完
+        where += step*(N-1)（N=word_size*8，step=word_size）。每条转成
+        source='relr' 的 RELATIVE；addend 从目标位置的文件映射读出，
+        读不到记 0 并标注（不编造目标地址）。
+    """
+    if word_size not in (4, 8) or size <= 0 or file_off < 0 or file_off >= len(raw):
+        table.warnings.append(
+            f"{label} RELR 表参数无效（off={file_off:#x} size={size:#x} ent={word_size}）"
+        )
+        return 0
+    n = size // word_size
+    if n > _MAX_ENTRIES:
+        table.warnings.append(
+            f"{label} RELR 条目数异常（{n} > {_MAX_ENTRIES}），拒绝解析"
+        )
+        return 0
+
+    bits = word_size * 8
+    where = 0
+    addrs: list[int] = []
+    for i in range(n):
+        o = file_off + i * word_size
+        if o + word_size > len(raw):
+            table.warnings.append(
+                f"{label} 被文件尾截断：声明 {n} 条，实际只读到 {i} 条"
+            )
+            break
+        w = int.from_bytes(raw[o:o + word_size], "little")
+        if w & 1 == 0:
+            where = w
+            addrs.append(where)
+        else:
+            for bit in range(1, bits):
+                if w & (1 << bit):
+                    addrs.append(where + word_size * (bit - 1))
+            where += word_size * (bits - 1)
+
+    rel_type = _RELATIVE_TYPE.get(table.arch, 1027)
+    rtype_name = _rtype_name(table.arch, rel_type) or "R_AARCH64_RELATIVE"
+    # addend 是被重定位槽里的指针值，宽度永远等于 ELF class 指针宽度，
+    # 与 RELR 表自己的 word 宽度（DT_RELRENT）无关
+    ptr = table.ptr_size or word_size
+    addend_fail = 0
+    for addr in addrs:
+        addend = 0
+        implicit = False
+        fo = _v2o(loads, addr)
+        if fo is not None and fo + ptr <= len(raw):
+            addend = int.from_bytes(raw[fo:fo + ptr], "little")
+            implicit = True
+        else:
+            addend_fail += 1
+        table.entries.append(RelocEntry(
+            offset=addr,
+            rtype=rel_type,
+            sym_idx=0,
+            sym_name="",
+            addend=addend,
+            source="relr",
+            rtype_name=rtype_name,
+            sym_resolved=False,
+            addend_implicit=implicit,
+            addend_is_target=True,
+        ))
+    if addrs:
+        table.counts["relr"] = table.counts.get("relr", 0) + len(addrs)
+    if addend_fail:
+        table.warnings.append(
+            f"{label} 有 {addend_fail}/{len(addrs)} 条 RELR 的 addend "
+            "无法从文件映射读出（已记 0，非真实目标地址）"
+        )
+    return len(addrs)
+
+
+def _parse_relr(so, raw: bytes, table: RelocTable, loads) -> None:
+    """解析 RELR 并入 table；把"未解析占位"警告换成实际解析结果。"""
+    specs = _relr_specs(so, raw, table, loads)
+    if not table.relr:
+        return
+    total = 0
+    labels: list[str] = []
+    for label, fo, size, ws in specs:
+        total += _walk_relr(raw, fo, size, ws, label, table, loads)
+        labels.append(label)
+    if labels:
+        table.warnings.append(f"已解析 {total} 条 RELR 相对重定位（{','.join(labels)}）")
+    elif not any("RELR" in w for w in table.warnings):
+        # 只探到 RELR 标记但定位不到表（异常值/地址越界）：保留原"不解析"口径
+        table.warnings.append(
+            "该 so 带 RELR 相对重定位（DT_RELR/DT_ANDROID_RELR），"
+            "但无法定位表文件偏移，本工具不解析——RELR 只编码写入地址，不含 addend"
+        )
+
+
 # ---------------------------------------------------------------- 符号名
 
 
@@ -671,15 +834,6 @@ def _parse_from_sections(so, raw: bytes, table: RelocTable) -> None:
         return
     names = _names_from_sections(so, raw, table)
     ptr = table.ptr_size
-    # RELR（相对重定位压缩表）：只编码写入地址、不含 addend，本模块不解析。
-    # 标记出来才能解释"为什么这个 so 的 RELATIVE 条目明显偏少"。
-    for sname, sec in secs.items():
-        if _sht_int(sec.sec_type) in (SHT_RELR, SHT_ANDROID_RELR) or "relr" in sname.lower():
-            table.relr = True
-            table.warnings.append(
-                f"{sname} 是 RELR 相对重定位（只编码地址、不含 addend），本工具不解析"
-            )
-            break
     for name in _SECTION_ORDER:
         sec = secs.get(name)
         if sec is None:
@@ -775,13 +929,6 @@ def _parse_from_dynamic(raw: bytes, loads, table: RelocTable) -> None:
         table.packed = True
         table.packed_where.append("DT_ANDROID_REL")
         table.warnings.append("该 so 用 Android 压缩重定位 DT_ANDROID_REL(APS2)，本工具不解析")
-    if any(tags.get(t) for t in (DT_RELR, DT_RELRSZ, DT_ANDROID_RELR, DT_ANDROID_RELRSZ)):
-        table.relr = True
-        table.warnings.append(
-            "该 so 带 RELR 相对重定位（DT_RELR/DT_ANDROID_RELR），"
-            "本工具不解析：RELR 只编码写入地址，不含 addend"
-        )
-
     if not table.entries and not table.error:
         table.error = (
             "没有可解析的标准重定位表：DT_RELA/DT_REL/DT_JMPREL 均为空"
@@ -815,6 +962,7 @@ def parse(so, path: str = "auto") -> RelocTable:
         _parse_from_sections(so, raw, table)
         table.path = "sections"
         if table.entries or path == "sections":
+            _parse_relr(so, raw, table, loads)
             return table
         table.warnings.append("节表路径没找到任何重定位节，改走 PT_DYNAMIC")
         # 节表路径的失败原因（若有）对动态路径的结果不再成立，
@@ -828,10 +976,12 @@ def parse(so, path: str = "auto") -> RelocTable:
         table.path = "sections"
         if not table.error:
             table.error = "节表中没有 .rela.dyn/.rela.plt/.rel.dyn/.rel.plt"
+        _parse_relr(so, raw, table, loads)
         return table
 
     _parse_from_dynamic(raw, loads, table)
     table.path = "dynamic"
+    _parse_relr(so, raw, table, loads)
     return table
 
 
@@ -881,19 +1031,20 @@ def rela_dump(so, addr_from: int = 0, addr_to: int = 0,
     """按 r_offset 范围与类别导出重定位条目。
 
     addr_from/addr_to  r_offset 区间，左闭右开；两者为 0 表示不限
-    kind               all            全部
+    kind               all            全部（含 source='relr' 的条目）
                        code_target    只要 addend 落在**可执行段**的项
                                       （反喂函数发现的关键入口）
-                       relative       只要 RELATIVE / IRELATIVE
+                       relative       只要 RELATIVE / IRELATIVE（含 RELR）
                        plt            只要 PLT 表里的项（rela.plt / rel.plt）
+                       relr           只要 RELR 解出的条目
     limit              <=0 表示不限制；达到上限即为截断
 
     解析失败时返回空列表——失败原因从 rela_summary() 取，
     **不返回编造的占位条目**。
     """
-    if kind not in ("all", "code_target", "relative", "plt"):
+    if kind not in ("all", "code_target", "relative", "plt", "relr"):
         raise ValueError(
-            f"未知 kind={kind!r}，支持 all/code_target/relative/plt"
+            f"未知 kind={kind!r}，支持 all/code_target/relative/plt/relr"
         )
     table = _table_of(so)
     execs = _exec_regions(so)
@@ -912,6 +1063,8 @@ def rela_dump(so, addr_from: int = 0, addr_to: int = 0,
         if kind == "relative" and not row["addend_is_target"]:
             continue
         if kind == "plt" and row["source"] not in ("rela.plt", "rel.plt"):
+            continue
+        if kind == "relr" and row["source"] != "relr":
             continue
         out.append(row)
         if limit and limit > 0 and len(out) >= limit:
@@ -1139,7 +1292,8 @@ def rela_summary(so) -> dict:
         "warnings": list(table.warnings),
         "packed_android": table.packed,
         "packed_where": list(table.packed_where),
-        "relr": table.relr,
+        "relr": table.relr,                       # 存在 RELR（无论是否解析成功）
+        "relr_entries": table.counts.get("relr", 0),  # 已解析出的 RELR 条数
         "relative": len(rel),
         "relative_exec": sum(1 for e in rel if _in_regions(execs, e.addend)),
         "vtable_blocks": vtables,

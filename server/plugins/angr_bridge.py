@@ -74,8 +74,15 @@ def _find_python() -> tuple[str | None, str]:
 class Plugin(PluginBase):
     name = "angr_bridge"
     description = "angr 深度分析：真反编译/CFG/符号执行（子进程桥接独立 Python）"
-    usage = ("args: {so: str, mode: 'project_info'|'cfg'|'decompile'|'symbolic', "
-             "addr: int|None=None, find: int|None=None, limit: int=50}")
+    usage = (
+        "args: {so: str, mode: 'project_info'|'cfg'|'decompile'|'symbolic', "
+        "addr: int|None=None, find: int|None=None, limit: int=50, "
+        "symbolic: dict={'x19':'symbolic_32'} ——符号寄存器及位宽, "
+        "concrete: dict={'x0':'0x1234'} ——具体寄存器值, "
+        "constraint: str='output==0x...' 或 'x0==0x...' ——求解约束, "
+        "max_depth: int=60 ——符号执行深度上限, "
+        "avoid: int|None=None ——避免到达的地址}"
+    )
 
     def run(self, session, args: dict):
         so_name = args.get("so")
@@ -120,6 +127,28 @@ class Plugin(PluginBase):
             task["find"] = (int(str(f), 16)
                             if isinstance(f, str) and str(f).lower().startswith("0x")
                             else int(f))
+
+        # (1) 第一次修改（2026-11-18）
+        #     bug 原因：symbolic 模式只返回 reached:bool，无法注入符号/具体寄存器、
+        #               无法给约束求解，用户要"解出 x19"却没有参数通路。
+        #     解决方案：把 symbolic/concrete/constraint/max_depth/avoid/find 透传给
+        #               worker task；其余参数兼容旧版（上面已处理 addr/find/limit）。
+        def _to_int(v):
+            if v is None:
+                return None
+            if isinstance(v, str) and v.lower().startswith("0x"):
+                return int(v, 16)
+            return int(v)
+
+        for key in ("symbolic", "concrete"):
+            if isinstance(args.get(key), dict):
+                task[key] = args[key]
+        if args.get("constraint") is not None:
+            task["constraint"] = str(args["constraint"])
+        if args.get("max_depth") is not None:
+            task["max_depth"] = int(args["max_depth"])
+        if args.get("avoid") is not None:
+            task["avoid"] = _to_int(args["avoid"])
 
         try:
             r = subprocess.run([py, str(_WORKER)],

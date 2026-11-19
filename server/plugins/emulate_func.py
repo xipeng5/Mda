@@ -30,6 +30,24 @@ plugin_run(name="emulate_func", args={
   · 需要调用方自己准备内存布局（用 buffer 参数）
   · 浮点/SIMD 只做透传，不保证精确
 
+## 内存导出（dump 参数，第 2 次修改新增）
+
+只给寄存器是不够的：解密/解码函数的**结果写在缓冲区里**，寄存器里往往
+只有一个指针。所以本插件支持跑完后导出内存：
+
+    dump: [{addr, size}, ...]   按指定范围导出（最常用）
+    dump: "writes"              只导出“运行期间被写过的区域”
+    dump: "stack"               导出当前栈上已用部分
+    dump: "all"                 导出所有已映射的可写区域（大样本慎用）
+
+`dump_max`（默认 4096）限制**单个范围**的导出字节数，超出截断并标
+`truncated`，不会因为一个 100MB 的段把返回撑爆。
+
+"writes" 靠 UC_HOOK_MEM_WRITE 记录**第一个写的字节的页**，再按页导出
+——只知道哪页被写过，不精确到字节，所以导出时会给出整页内容并要求
+调用方自己按已知结构裁。这样做是因为逐字节记录在循环里开销极大
+（实测解密循环 4 次 × 每次几十字节还行，但大循环会拖死模拟）。
+
 ## 通用性
 
 纯 Unicorn API 封装 + ELF 段加载，不含任何具体 so/函数特征。
@@ -46,8 +64,29 @@ class Plugin(PluginBase):
     description = "用 Unicorn 本地模拟执行 ARM64 函数（离线、不碰真机）"
     usage = ("args: {so: str, addr: str|int, "
              "x0..x7: str (可选参数), stack_size: int=0x10000, "
-             "buffer: {addr, hex} (可选内存初始化), "
-             "max_insns: int=100000, trace: bool=false}")
+             "buffer: {addr, hex} | [{addr, hex}, ...] (可选内存初始化), "
+             "max_insns: int=100000, trace: bool=false, "
+             "dump: [{addr, size}] | 'writes' | 'stack' | 'all', "
+             "dump_max: int=4096, trim_writes: bool=false, "
+             "stubs: 'auto'|true|dict|null, vfs: {path: hex}, "
+             "heap_base: int=0x400000, heap_size: int=0x100000}")
+        # (4) 第四次修改（2026-11-18）：外部函数桩 + buffer 参数形状兼容 + writes 裁剪。
+        #     bug 原因：
+        #       ① 用户传 buffer=[{addr,hex}]（list）时，旧的 `isinstance(buf, dict)`
+        #          直接为 False —— 整段内存初始化被静默跳过，不写、不报错，返回里
+        #          也没有任何标记，调用方误以为数据写进去了，据此推理出错误结论。
+        #          实测：dict 形状写 0x60000 读回 aabbccdd；list 形状读回文件原值。
+        #          注意：不是"只读段写不进去"——mem_map 没传 perms，默认 7=RWX。
+        #       ② bl malloc/fopen 到 PLT 后从 GOT 取到 0，跳到 0x0 崩溃，任何依赖
+        #          libc 的函数都跑不完 —— 只能验纯算法，拿不到签名函数输出。
+        #       ③ "writes" 导出整页 0x1000，尾部几千个 0 浪费返回带宽。
+        #     解决方案：
+        #       · buffer 同时接受 dict / list，逐个写入，回读校验，返回
+        #         buffer_applied + buffer_skipped 让静默失败可见；
+        #       · 引入通用 StubEngine（server/core/unicorn_stubs.py），在 PLT 入口
+        #         拦截并用 Python 语义实现 malloc/memcpy/strlen/snprintf/fopen 等，
+        #         设好返回值后把 PC 拉回 LR 跳过 GOT 链；
+        #       · writes 模式加 trim_writes，裁掉尾部连续 0。
 
     def run(self, session, args: dict):
         try:
@@ -132,19 +171,72 @@ class Plugin(PluginBase):
 
         uc.reg_write(UC_ARM64_REG_LR, sentinel)
 
-        # ---- 调用方准备的内存 ----
+        # ---- 调用方准备的内存（(4) 兼容 dict / list，写后回读校验） ----
         buf = args.get("buffer")
-        if isinstance(buf, dict) and buf.get("addr") and buf.get("hex"):
-            baddr = int(str(buf["addr"]), 16) if str(buf["addr"]).lower().startswith("0x") \
-                else int(buf["addr"])
-            bdata = bytes.fromhex(str(buf["hex"]))
-            bpage = baddr & ~0xFFF
-            need = ((baddr - bpage) + len(bdata) + 0xFFF) & ~0xFFF
+        # 归一化：None → []；dict → [dict]；list → 原样；其它 → [] 并记录原因
+        if buf is None:
+            buf_specs = []
+            buf_bad = None
+        elif isinstance(buf, dict):
+            buf_specs = [buf]
+            buf_bad = None
+        elif isinstance(buf, (list, tuple)):
+            buf_specs = list(buf)
+            buf_bad = None
+        else:
+            buf_specs = []
+            buf_bad = f"buffer 类型不支持：{type(buf).__name__}（要 dict 或 [{addr,hex},...])"
+        buffer_applied: list[dict] = []
+        buffer_skipped: list[dict] = []
+        for spec in buf_specs:
             try:
-                uc.mem_map(bpage, need)
-            except Exception:                             # noqa: BLE001
-                pass                                      # 已映射就跳过
-            uc.mem_write(baddr, bdata)
+                if not isinstance(spec, dict) or spec.get("addr") is None \
+                        or spec.get("hex") is None:
+                    buffer_skipped.append({"spec": str(spec)[:80],
+                                           "reason": "缺 addr 或 hex"})
+                    continue
+                sa = str(spec["addr"])
+                baddr = int(sa, 16) if sa.lower().startswith("0x") else int(sa)
+                bdata = bytes.fromhex(str(spec["hex"]).replace(" ", ""))
+                bpage = baddr & ~0xFFF
+                need = ((baddr - bpage) + len(bdata) + 0xFFF) & ~0xFFF
+                try:
+                    uc.mem_map(bpage, need)
+                except Exception:                         # noqa: BLE001
+                    pass                                  # 已映射就跳过
+                uc.mem_write(baddr, bdata)
+                # 回读校验：静默失败必须变成可见结果
+                readback = bytes(uc.mem_read(baddr, len(bdata)))
+                buffer_applied.append({
+                    "addr": hex(baddr), "size": len(bdata),
+                    "verified": readback == bdata,
+                    "readback_hex": readback[:16].hex(),
+                })
+            except Exception as exc:                      # noqa: BLE001
+                buffer_skipped.append({"spec": str(spec)[:80],
+                                       "reason": f"{type(exc).__name__}: {exc}"})
+        if buf_bad:
+            buffer_skipped.append({"spec": str(buf)[:80], "reason": buf_bad})
+
+        # ---- 外部函数桩（(4) 通用 libc 语义；stubs=null/false 时不启用） ----
+        stub_engine = None
+        stubs_arg = args.get("stubs")
+        if stubs_arg not in (None, False):
+            try:
+                from server.core.unicorn_stubs import StubEngine
+                stub_engine = StubEngine(
+                    uc, getattr(so, "plt_map", {}) or {}, stubs_arg,
+                    vfs=args.get("vfs"),
+                    heap_base=int(args.get("heap_base", 0x400000)),
+                    heap_size=int(args.get("heap_size", 0x100000)),
+                )
+                stub_engine.setup_heap()
+                from unicorn import UC_HOOK_CODE as _UC_HOOK_CODE
+                uc.hook_add(_UC_HOOK_CODE, stub_engine.on_code)
+            except Exception as exc:                      # noqa: BLE001
+                stub_engine = None
+                buffer_skipped.append({"spec": "stubs",
+                                       "reason": f"桩引擎初始化失败：{type(exc).__name__}: {exc}"})
 
         # ---- 参数 ----
         reg_names = [f"x{i}" for i in range(8)]
@@ -176,6 +268,27 @@ class Plugin(PluginBase):
             from unicorn import UC_HOOK_CODE
 
             uc.hook_add(UC_HOOK_CODE, hook_code)
+
+        # (2) 第二次修改（2026-11-18）：记录“哪些页被写过”。
+        #     bug 原因：反馈「emulate_func 虽然能跑，但不给我看内存（只给寄存器
+        #               和指令流）——所以拿不到输出值」。解密/解码函数的结果
+        #               全在缓冲区里，寄存器通常只留一个指针，等于白跑。
+        #     解决方案：dump 参数支持按范围导出 + "writes" 模式。
+        #               "writes" 用 UC_HOOK_MEM_WRITE 记页号（不记字节，
+        #               逐字节记录会拖死循环里的模拟），导出时给整页。
+        written_pages: set[int] = set()
+        dump_opt = args.get("dump")
+        if dump_opt:
+            try:
+                from unicorn import UC_HOOK_MEM_WRITE
+
+                def hook_write(uc_, access, address, size, value, user_data):
+                    # 只记页号：见方法注释里的取舍说明
+                    if len(written_pages) < 4096:
+                        written_pages.add(address & ~0xFFF)
+                uc.hook_add(UC_HOOK_MEM_WRITE, hook_write)
+            except Exception:                             # noqa: BLE001
+                pass
 
         stopped = {"reason": "unknown", "at": None}
         try:
@@ -248,11 +361,124 @@ class Plugin(PluginBase):
             "mapped_segments": mapped,
             "stopped": stopped,
             "registers": regs,
+            # (4) 静默失败可见化：用户传的 buffer 到底生效没有、哪条被跳过
+            "buffer_applied": buffer_applied,
+            "buffer_skipped": buffer_skipped,
             "note": ("Unicorn 离线模拟：不模拟 syscall，"
                      "遇到 svc/未映射调用会停住并回报现场。"),
         }
         if out_str:
             result["x0_string"] = out_str
+        if stub_engine is not None:
+            result["stubs"] = stub_engine.summary()
+
+        # (2) 第二次修改（2026-11-18）：导出内存（见类 docstring 的说明）。
+        if dump_opt:
+            result["memory"] = self._dump_memory(
+                uc, dump_opt, written_pages, covered, stack_base, stack_size,
+                sp, int(args.get("dump_max", 4096)),
+                trim_writes=bool(args.get("trim_writes", False)))
+
         if trace:
             result["trace"] = trace_log
         return result
+
+    # ---------- 内存导出 ----------
+
+    def _dump_memory(self, uc, dump_opt, written_pages, covered,
+                     stack_base, stack_size, sp, dump_max,
+                     trim_writes: bool = False):
+        """按 dump 参数导出内存内容。
+
+        返回 {regions: [{addr, size, hex, ascii, truncated, why}], note}。
+        任何一段读失败都单独标注，**不伪造内容**（读不到就给 error 字段，
+        绝不用零填充冒充"这块是空的"）。
+        """
+        regions: list[dict] = []
+
+        def _one(a: int, size: int, why: str) -> None:
+            if size <= 0:
+                return
+            take = min(size, dump_max)
+            item = {"addr": hex(a), "size": take, "why": why}
+            if take < size:
+                item["truncated"] = True
+                item["full_size"] = size
+            try:
+                data = bytes(uc.mem_read(a, take))
+            except Exception as exc:                      # noqa: BLE001
+                item["error"] = f"读不到：{exc}"
+                regions.append(item)
+                return
+            item["hex"] = data.hex()
+            # ASCII 视图：不可打印显示为 '.'，便于肉眼核对解出的字符串
+            item["ascii"] = "".join(
+                chr(b) if 32 <= b < 127 else "." for b in data)
+            # 顺手找 NUL 分隔的 C 字符串（解密结果几乎都是这种）
+            strs = []
+            for piece in data.split(b"\x00"):
+                if len(piece) >= 4 and all(32 <= c < 127 for c in piece):
+                    strs.append(piece.decode("ascii"))
+            if strs:
+                item["strings"] = strs[:20]
+            regions.append(item)
+
+        if isinstance(dump_opt, list):
+            # 显式范围（最常用、最精确）
+            for spec in dump_opt:
+                try:
+                    a = spec.get("addr")
+                    a = int(str(a), 16) if str(a).lower().startswith("0x") else int(a)
+                    n = int(spec.get("size", 64))
+                except Exception:                         # noqa: BLE001
+                    continue
+                _one(a, n, "explicit")
+        elif dump_opt == "stack":
+            # (3) 第三次修改（2026-11-18）
+            #     bug 原因（两层）：
+            #       ① 初版用「运行后的 sp」算已用长度 `(栈顶 - sp)`，
+            #          但函数返回后 sp 已恢复，算出来接近 0；
+            #       ② 改用「入口 sp 到栈顶」也不对——**入口 sp 本身就等于
+            #          栈顶**（`sp = stack_base + stack_size - 0x1000`），
+            #          所以 `top - entry_sp == 0`，区间恒为空。
+            #          实测 liblog 0x5020：entry_sp = top = 0x7fff0000f000。
+            #     解决方案：栈向下生长，函数用过的区域在
+            #               `[entry_sp - 已用, entry_sp)`。取
+            #               `[entry_sp - stack_size, entry_sp)` 与**运行后
+            #               sp** 的并集下界，导出这段；空的部分读出来是 0，
+            #               正好作为「这里没写」的证据。
+            top = stack_base + stack_size - 0x1000
+            low = top - stack_size            # 栈区最底
+            _one(low, top - low, "stack")
+        elif dump_opt == "all":
+            # 导出所有已映射区间。**不按 R/W 过滤**：covered 里没有 flags，
+            # 而"只导可写段"需要额外传权限信息；与其用假判据筛掉一段，
+            # 不如全给出来让调用方自己看（大样本请配小 dump_max）。
+            for a, b in covered:
+                _one(a, b - a, "all")
+        elif dump_opt == "writes":
+            for pg in sorted(written_pages):
+                if trim_writes:
+                    # (4) 裁尾部的连续 0：逐页导出时尾部几千个 0 纯属浪费。
+                    #     从页尾往前找最后一个非零字节，只导出到那里（至少 1 字节）。
+                    try:
+                        page = bytes(uc.mem_read(pg, 0x1000))
+                        nz = len(page.rstrip(b"\x00"))
+                        size = max(nz, 1)
+                    except Exception:                     # noqa: BLE001
+                        size = 0x1000
+                    _one(pg, size, "written_page_trimmed")
+                else:
+                    _one(pg, 0x1000, "written_page")
+        else:
+            return {"error": f"未知 dump={dump_opt!r}",
+                    "code": "BAD_DUMP",
+                    "hint": "支持 [{addr,size}] / 'writes' / 'stack' / 'all'"}
+
+        return {
+            "regions": regions,
+            "note": ("'writes' 模式只精确到页（逐字节记录会拖死模拟），"
+                     "导出的是整页；按你已知的结构自己裁。"
+                     "字符串列表是按 NUL 切且全可打印的片段。"),
+        }
+

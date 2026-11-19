@@ -76,8 +76,15 @@ class Plugin(PluginBase):
         if not ranges:
             return {"ok": False, "code": "NOTHING_SCANNED",
                     "error": "该 so 没有可执行区域"}
+        # (4) 第四次修改（2026-11-18）：记录扫描规模，让 0 结果能区分原因。
+        #     bug 原因：使用者反馈「xref_enhanced 返回 0 时不知道是函数里确实
+        #               没有引用，还是根本没扫到」。旧实现只有 refs.count=0，
+        #               既不说扫了多少指令，也不说覆盖了几个可执行段。
+        #     解决方案：累计 scanned_insns / scanned_ranges，放进返回结构。
+        scanned_insns = 0
         for _rva, _rsz in ranges:
             insns = dis.disasm_range(_rva, _rsz)
+            scanned_insns += len(insns)
             for idx, insn in enumerate(insns):
                 t = getattr(insn, "ref_addr", None)
                 if t is None:
@@ -116,13 +123,74 @@ class Plugin(PluginBase):
                         })
 
         out = {"ok": True, "so": so.name,
-               "module_range": [hex(mod_lo), hex(mod_hi)]}
+               "module_range": [hex(mod_lo), hex(mod_hi)],
+               # (4) 扫描规模：0 结果时据此判断"确实没有"还是"没扫到"
+               "scanned_insns": scanned_insns,
+               "scanned_ranges": len(ranges)}
         if mode in ("refs", "all"):
             out["refs"] = {"count": len(refs), "items": refs[:limit]}
         if mode in ("check_reloc", "all"):
             out["suspicious"] = {"count": len(suspicious),
                                  "items": suspicious[:limit]}
+        # (3) 第三次修改（2026-11-18）：补 vtable / 函数指针表引用。
+        #     bug 原因：使用者反馈「xref_enhanced 找不到虚调用者」。核实成立：
+        #               本插件只扫 adrp+add / adrp+ldr 的数据引用，且主动
+        #               排除 is_call/is_jump。而虚调用的目标在
+        #               `ldr x8,[x0,#8]; blr x8` 的**寄存器**里，静态无操作数
+        #               可查——实测对 vtable 目标地址查 refs 得 0。
+        #     解决方案：重定位表里 addend 落在可执行段的条目，就是
+        #               「函数指针表项」，它的 r_offset 才是**证据位置**。
+        #               单列 indirect 一节，明确说明这是"函数指针表引用"，
+        #               而不是"代码里 adrp 到它"。
+        if mode in ("refs", "all", "check_reloc"):
+            out["indirect"] = self._vtable_refs(so, addr_filter, limit)
         return out
+
+    def _vtable_refs(self, so, addr_filter, limit):
+        """vtable / 函数指针表引用（证据来自重定位表，不是代码扫描）。
+
+        返回 {count, items, note}。items 每项：
+            slot            函数指针表的槽地址（r_offset）
+            target          槽里指向的函数地址
+            target_function 该地址所在函数名
+            rtype           重定位类型
+            block           [起, 止) 该槽所在的连续指针块（vtable 范围）
+        """
+        try:
+            from server.core import rela as _rela
+
+            items = []
+            for it in _rela.rela_dump(so, 0, 0, "code_target", 0):
+                tgt = int(it["addend_hex"], 16)
+                if addr_filter is not None and int(addr_filter) != tgt:
+                    continue
+                slot = int(it["offset_hex"], 16)
+                blk = _rela.vtable_at(so, slot)
+                fn = so.function_at(tgt)
+                items.append({
+                    "slot": hex(slot),
+                    "target": hex(tgt),
+                    "target_function": ((fn.name if fn and fn.name
+                                         else f"sub_{tgt:x}") if fn else None),
+                    "at_function_entry": bool(fn and fn.addr == tgt),
+                    "rtype": it.get("rtype_name", ""),
+                    "block": ([hex(blk["block_start"]), hex(blk["block_end"])]
+                              if blk.get("block_start") is not None else None),
+                    "at_function_entry_slot": blk.get("index"),
+                })
+            return {
+                "count": len(items),
+                "items": items[:limit],
+                "note": ("这些是**函数指针表引用**（证据=重定位表里的槽），"
+                         "不是代码里 adrp 到该地址。虚调用 "
+                         "`ldr x8,[x0,#n]; blr x8` 的目标在寄存器里，静态"
+                         "无法从指令操作数得到——只有表里那条记录能证明"
+                         "「这个函数被放在某张表里」。"),
+            }
+        except Exception as exc:                          # noqa: BLE001
+            return {"count": 0, "items": [],
+                    "error": f"重定位解析失败：{type(exc).__name__}: {exc}"}
+
 
     def _find_compensation(self, insns, idx):
         """在后继指令里找可能的补偿运算（add/eor/sub 带寄存器）。"""
