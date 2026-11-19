@@ -80,7 +80,7 @@ export function LeftNav({ so, activeView, onPick, onServerModules, fnCount, tick
     })();
   }, [so, tick]);
 
-  // 工具总数只取一次（102 是真实注册表大小，但不要写死）
+  // 工具总数只取一次（137 是真实注册表大小，但不要写死）
   useEffect(() => {
     void (async () => {
       const r = await api.tools();
