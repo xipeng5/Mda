@@ -119,8 +119,18 @@ class Plugin(PluginBase):
         if not isinstance(features, dict):
             return {"ok": False, "error": "save 需要 features（任意 JSON 对象）",
                     "code": "BAD_ARGS"}
+        # (2) 第二次修改（2026-11-26）
+        # bug 原因：1) save 传入不存在的 path 时未校验路径有效性，静默保存了 sha256/size 为 None 的空指纹；
+        #           2) match/save 未对 sha256 做小写归一，传入大写 SHA256 时匹配失败。
+        # 解决方案：save 传入 path 时先校验文件存在，不存在返 NO_FILE；save 与 match 均将 sha256 归一为小写。
         path = args.get("path")
-        sha = _sha256_of(path) if path else args.get("sha256")
+        if path:
+            if not os.path.isfile(path):
+                return {"ok": False, "error": f"找不到文件：{path}", "code": "NO_FILE"}
+            sha = _sha256_of(path)
+        else:
+            raw_sha = args.get("sha256")
+            sha = str(raw_sha).strip().lower() if raw_sha is not None and str(raw_sha).strip() else None
         size = args.get("module_size")
         if size is None and path:
             size = _size_of(path)
@@ -169,7 +179,15 @@ class Plugin(PluginBase):
     def _match(self, args):
         """用途：按 path/module_size/sha256 找最匹配指纹，size+sha 全同=high，仅一项同=medium，都不同给最近的=low。"""
         path = args.get("path")
-        sha = _sha256_of(path) if path else args.get("sha256")
+        if path:
+            if not os.path.isfile(path):
+                return {"ok": False, "error": f"找不到文件：{path}", "code": "NO_FILE"}
+            sha = _sha256_of(path)
+        else:
+            raw_sha = args.get("sha256")
+            sha = str(raw_sha).strip().lower() if raw_sha is not None and str(raw_sha).strip() else None
+        if sha is not None:
+            sha = sha.strip().lower()
         size = args.get("module_size")
         if size is None and path:
             size = _size_of(path)
@@ -183,7 +201,9 @@ class Plugin(PluginBase):
         cands = []
         for n, r in db["fingerprints"].items():
             size_same = size is not None and r.get("module_size") == size
-            sha_same = sha is not None and r.get("sha256") == sha
+            rec_sha = (str(r.get("sha256")).strip().lower()
+                       if r.get("sha256") is not None else None)
+            sha_same = sha is not None and rec_sha == sha
             if size_same and sha_same:
                 conf = "high"
             elif size_same or sha_same:

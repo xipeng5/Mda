@@ -1,6 +1,14 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { hex, type ModuleData, type Func } from "./lib/data";
-import { api, hasNativeDialog, pickSoFile } from "./lib/api";
+import {
+  API_BASE,
+  CLIENT_HEADERS,
+  api,
+  apiWsUrl,
+  copyText,
+  hasNativeDialog,
+  pickSoFile,
+} from "./lib/api";
 import type { ApiInsn, ApiNavStats } from "./lib/api";
 import { SphereCanvas } from "./components/SphereCanvas";
 import { LeftPanel } from "./components/LeftPanel";
@@ -60,8 +68,27 @@ export default function App() {
   const [theme, setTheme] = useState<Theme>("light");
   const themeLocked = useRef(false);
   const [code, setCode] = useState<{ open: boolean; rows: ApiInsn[]; live: boolean }>({ open: false, rows: [], live: false });
-  // 代码页内联展开：addr → 反汇编行（按需拉取后缓存）
-  const [expanded, setExpanded] = useState<Record<number, ApiInsn[]>>({});
+  // (134) 第一百三十四次修改（2026-11-26）
+  // bug 原因：① 代码页内联展开 expanded 仅以数字 addr 为键，多 so 同偏移时会互相串显反汇编；
+  //           ② appendModule 在 React 18 批处理下于 setModules updater 内写局部变量 newIndex，
+  //              导致 newIndex 恒为 0、新模块未正确选中；
+  //           ③ unloadModule 缺少 active 依赖且在 setModules updater 内嵌套调用 setActive，
+  //              同时 doSync / modules_snapshot 既会硬重置 active=0 又不支持移除后端已卸载模块；
+  //           ④ HeatBar 点击直接走精确匹配 jumpToAddr，桶边界地址几乎永远报"跳转失败"；
+  //           ⑤ /api/unload、/api/mcp-config、WS /api/events 未统一基于 API_BASE，
+  //              且 POST /api/unload 缺少 X-MDA-Client: 1 头；
+  //           ⑥ 全局 Enter 快捷键未排除 textarea/select/contentEditable 且闭包陈旧；
+  //           ⑦ frida 终端 Tab 标题和角标错误显示 aiEvents.length；
+  //           ⑧ 多个异步 useEffect 缺少取消标志 alive。
+  // 解决方案：expanded 改用 `${so}:${addr}` 复合键；用 modulesRef/activeRef/selRef 同步协调
+  //           模块增删与选中状态，绝不在 setState updater 中嵌套 setState；新增 jumpToNearestAddr
+  //           供热力条智能落到所属或最近函数；统一走 API_BASE + apiWsUrl + CLIENT_HEADERS；
+  //           修复全局快捷键排除集合与最新引用；终端 Tab 改显示活跃常驻脚本数；补齐 alive 标志。
+  const [expanded, setExpanded] = useState<Record<string, ApiInsn[]>>({});
+  const expandedRef = useRef<Record<string, ApiInsn[]>>({});
+  expandedRef.current = expanded;
+  const [liveScripts, setLiveScripts] = useState(0);
+  const aiEventSeq = useRef(0);
   // 代码页列表：以当前选中函数为中心的 60 行窗口。
   // 只渲染前 60 个的话，AI 操作靠后的函数时列表里没有它，定位就落空了。
   const codeListRef = useRef<HTMLDivElement | null>(null);
@@ -82,9 +109,11 @@ export default function App() {
   const flashSeq = useRef(0);
   const backendMods = useRef<Set<string>>(new Set());
   const wsRef = useRef<WebSocket | null>(null);
-  // 最新 state 的镜像：ws 回调里的闭包拿不到最新值，必须走 ref
+  // 最新 state 的镜像：ws 回调 / 异步回调里的闭包拿不到最新值，必须走 ref
   const modulesRef = useRef<ModuleData[]>([]);
   const modRef = useRef<ModuleData | undefined>(undefined);
+  const activeRef = useRef(0);
+  const selRef = useRef<number[]>([]);
   // 服务端有、界面还没有的 so（来自 nav_stats 这条可靠路径）
   const [pendingSo, setPendingSo] = useState("");
   const booted = useRef(false);
@@ -92,50 +121,112 @@ export default function App() {
   const mod = modules[active];
   const selected = sel[active] ?? -1;
   const f = mod && selected >= 0 ? mod.funcs[selected] : null;
+  modulesRef.current = modules;
+  modRef.current = mod;
+  activeRef.current = active;
+  selRef.current = sel;
 
   const log = useCallback((text: string, kind?: string) => {
     setLogs((prev) => [...prev.slice(-300), { time: now(), text, kind }]);
   }, []);
 
-  /** 展开/收起某个函数的反汇编（内联在代码页里，和原型一致） */
-  const toggleFn = useCallback(
-    async (soName: string, addr: number) => {
+  /** 展开/收起某个函数的反汇编（使用 so:addr 复合键，杜绝多 so 同偏移串显） */
+  const toggleFn = useCallback(async (soName: string, addr: number) => {
+    const key = `${soName}:${addr}`;
+    if (expandedRef.current[key]) {
       setExpanded((prev) => {
-        if (prev[addr]) {
-          const next = { ...prev };
-          delete next[addr];
-          return next;
-        }
-        return prev;
+        const next = { ...prev };
+        delete next[key];
+        return next;
       });
-      if (expanded[addr]) return;               // 刚才是展开态，这次是收起
-      const d = await api.disasm(soName, addr);
-      if (d?.items?.length) {
-        setExpanded((prev) => ({ ...prev, [addr]: d.items }));
-      }
-    },
-    [expanded]
-  );
+      return;
+    }
+    const d = await api.disasm(soName, addr);
+    if (d?.items?.length) {
+      setExpanded((prev) => ({ ...prev, [key]: d.items }));
+    }
+  }, []);
 
-  /** 跳到指定 so 的指定函数（引用页/图谱点击进出）
-   *  先切回模块视图，否则用户点了没反应会以为坏了 */
+  /** 跳到指定 so 的指定函数（引用页/图谱/检视器点击进出；精确找不到时自动回退到所在函数） */
   const jumpToAddr = useCallback(
     (soName: string, a: number) => {
-      const mi = modules.findIndex((m) => m.so === soName);
+      const curMods = modulesRef.current;
+      const mi = curMods.findIndex((m) => m.so === soName);
       if (mi < 0) {
         log(`跳转失败：没有模块 ${soName}`);
         return;
       }
-      const i = modules[mi].funcs.findIndex((x) => x.a === a);
+      const funcs = curMods[mi].funcs;
+      let i = funcs.findIndex((x) => x.a === a);
+      if (i < 0) {
+        i = funcs.findIndex((x) => a >= x.a && a < x.a + Math.max(4, x.s));
+      }
       if (i < 0) {
         log(`跳转失败：${soName} 里没有 0x${a.toString(16)}`);
         return;
       }
+      activeRef.current = mi;
       setActive(mi);
-      setSel((prev) => prev.map((v, k) => (k === mi ? i : v)));
+      setSel((prev) => {
+        const next = prev.slice();
+        next[mi] = i;
+        selRef.current = next;
+        return next;
+      });
       setMainView("module");
     },
-    [modules, log]
+    [log]
+  );
+
+  /** 热力条点击跳转：优先精确命中/所属函数，否则自动落到距离最近的下一个（或前一个）函数 */
+  const jumpToNearestAddr = useCallback(
+    (soName: string, a: number) => {
+      const curMods = modulesRef.current;
+      const mi = curMods.findIndex((m) => m.so === soName);
+      if (mi < 0) {
+        log(`跳转失败：没有模块 ${soName}`);
+        return;
+      }
+      const funcs = curMods[mi].funcs;
+      if (!funcs.length) {
+        log(`跳转失败：${soName} 没有可用函数`);
+        return;
+      }
+      let bestIdx = -1;
+      let bestNextDist = Infinity;
+      let bestPrevIdx = -1;
+      let bestPrevAddr = -1;
+      for (let k = 0; k < funcs.length; k++) {
+        const fn = funcs[k];
+        if (fn.a === a) {
+          bestIdx = k;
+          break;
+        }
+        if (a >= fn.a && a < fn.a + Math.max(4, fn.s)) {
+          bestIdx = k;
+          break;
+        }
+        if (fn.a > a && fn.a - a < bestNextDist) {
+          bestNextDist = fn.a - a;
+          bestIdx = k;
+        }
+        if (fn.a < a && fn.a > bestPrevAddr) {
+          bestPrevAddr = fn.a;
+          bestPrevIdx = k;
+        }
+      }
+      if (bestIdx < 0) bestIdx = bestPrevIdx >= 0 ? bestPrevIdx : 0;
+      activeRef.current = mi;
+      setActive(mi);
+      setSel((prev) => {
+        const next = prev.slice();
+        next[mi] = bestIdx;
+        selRef.current = next;
+        return next;
+      });
+      setMainView("module");
+    },
+    [log]
   );
 
   /* 代码页可见的那 60 个函数：以当前选中为中心 */
@@ -195,13 +286,73 @@ export default function App() {
     setPulseKey((k) => k + 1);
   }, [active]);
 
+  /** 同步对齐服务端模块集合（支持新增与移除已卸载模块，同时保留当前 active 与 sel） */
+  const reconcileModules = useCallback(
+    (aliveSet: Set<string> | null, added: ModuleData[], focusNew = false) => {
+      const curMods = modulesRef.current;
+      const curSel = selRef.current;
+      const curSo = curMods[activeRef.current]?.so;
+
+      let changed = false;
+      const nextMods: ModuleData[] = [];
+      const nextSel: number[] = [];
+      const removedSos: string[] = [];
+
+      curMods.forEach((m, i) => {
+        if (aliveSet && !aliveSet.has(m.so)) {
+          changed = true;
+          backendMods.current.delete(m.so);
+          removedSos.push(m.so);
+        } else {
+          nextMods.push(m);
+          nextSel.push(curSel[i] ?? 0);
+        }
+      });
+
+      let firstNewIdx = -1;
+      for (const d of added) {
+        if (nextMods.some((x) => x.so === d.so)) continue;
+        if (firstNewIdx < 0) firstNewIdx = nextMods.length;
+        const firstExp = d.funcs.findIndex((x) => x.e);
+        nextMods.push(d);
+        nextSel.push(firstExp >= 0 ? firstExp : 0);
+        backendMods.current.add(d.so);
+        changed = true;
+      }
+
+      if (!changed) return;
+
+      let nextActive = 0;
+      if (focusNew && firstNewIdx >= 0) {
+        nextActive = firstNewIdx;
+      } else if (curSo) {
+        const keptIdx = nextMods.findIndex((m) => m.so === curSo);
+        nextActive = keptIdx >= 0 ? keptIdx : 0;
+      }
+
+      modulesRef.current = nextMods;
+      selRef.current = nextSel;
+      activeRef.current = nextActive;
+      setModules(nextMods);
+      setSel(nextSel);
+      setActive(nextActive);
+
+      if (removedSos.length) {
+        setExpanded((prev) => {
+          const next = { ...prev };
+          for (const k of Object.keys(next)) {
+            if (removedSos.some((s) => k.startsWith(`${s}:`))) delete next[k];
+          }
+          return next;
+        });
+      }
+    },
+    []
+  );
+
   /** 后端已解析完成 → 拉函数表、建模块、选中第一个导出函数 */
   const appendModule = useCallback(async (so: string, path: string) => {
-    const mark = (m: string) => {
-    };
-    mark(`enter:${so}`);
     const fn = await api.functions(so, "", 200000);
-    mark(`funcs:${so}:${fn?.items?.length ?? "null"}`);
     if (!fn) throw new Error("后端没有返回函数表");
     const funcs: Func[] = fn.items.map((it) => ({
       n: it.name, a: it.addr, s: it.size, e: it.is_export ? 1 : 0, r: it.refs ?? 0,
@@ -209,28 +360,23 @@ export default function App() {
     if (!funcs.length) throw new Error("这个 so 里没有解析出任何函数");
     const data: ModuleData = { so, path, size: 0, sections: [], funcs, disasm: {}, callers: {}, callees: {} };
     backendMods.current.add(so);
-    let newIndex = 0;
-    setModules((prev) => {
-      const exists = prev.findIndex((m) => m.so === so);
-      if (exists >= 0) { newIndex = exists; return prev; }
-      newIndex = prev.length;
-      return [...prev, data];
-    });
-    setSel((prev) => {
-      const next = prev.slice();
-      next[newIndex] = funcs.findIndex((x) => x.e) >= 0 ? funcs.findIndex((x) => x.e) : 0;
-      return next;
-    });
-    setActive(newIndex);
+    const cur = modulesRef.current;
+    const exists = cur.findIndex((m) => m.so === so);
+    if (exists >= 0) {
+      activeRef.current = exists;
+      setActive(exists);
+      return;
+    }
+    reconcileModules(null, [data], true);
     log(`已打开 ${so} · ${funcs.length} 函数（后端实时解析）`, "ai");
-  }, [log]);
+  }, [log, reconcileModules]);
 
   /** 释放一个模块：只清 mda 内的解析结果，不影响设备端进程。 */
   const unloadModule = useCallback(async (so: string) => {
     try {
-      const r = await fetch(`${location.origin}/api/unload`, {
+      const r = await fetch(`${API_BASE}/api/unload`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...CLIENT_HEADERS },
         body: JSON.stringify({ so }),
       });
       const j = await r.json();
@@ -238,29 +384,15 @@ export default function App() {
         log(`释放失败：${j.error || r.statusText}`, "ai");
         return;
       }
-      // 从本地状态里移除，保持前后端一致
+      // 从本地状态里移除，保持前后端一致（绝不在 setModules updater 里嵌套调 setActive）
       backendMods.current.delete(so);
-      // (3) 第三次修改（2026-11-11）：
-      //     bug 原因：原来无条件 setActive(0)，卸载非当前模块时界面会莫名跳回第一个。
-      //     解决方案：按剩余模块重新定位——如果卸载的不是当前模块，保持当前；
-      //               否则退到第一个（没有模块时归零）。同时用"按 so 名过滤"而不是
-      //               "用旧下标过滤"，避免稀疏数组错位。
-      setModules((prev) => {
-        const kept = prev.filter((m) => m.so !== so);
-        const curSo = prev[active]?.so;
-        const newIdx = curSo === so ? 0 : kept.findIndex((m) => m.so === curSo);
-        setActive(newIdx < 0 ? 0 : newIdx);
-        return kept;
-      });
-      setSel((prev) => {
-        const kept = prev.filter((_, i) => modules[i]?.so !== so);
-        return kept;
-      });
+      const aliveSet = new Set(modulesRef.current.map((m) => m.so).filter((name) => name !== so));
+      reconcileModules(aliveSet, [], false);
       log(`已释放 ${so}（约 ${j.freed_estimate_mb ?? "?"} MB），设备端进程不受影响`, "ai");
     } catch (e) {
       log(`释放出错：${String(e)}`, "ai");
     }
-  }, [log, modules]);
+  }, [log, reconcileModules]);
 
   /** 按路径加载（原生对话框选择的结果） */
   const buildModule = useCallback(async (path: string): Promise<void> => {
@@ -378,18 +510,15 @@ export default function App() {
   const syncSeq = useRef(0);
 
   const doSync = useCallback(async (mySeq: number) => {
-    // 直接问 nav_stats（不带 so）：后端会返回 serverModules。
-    // 不再先用 /api/modules 判断"要不要查"——那一步在 WKWebView 里恒空，
-    // 会让整条链在第一环就断掉（实测：anySo="" 导致 navStats 根本不调用）。
+    // 直接问 nav_stats（不带 so）：后端会返回 serverModules（带时间戳防 WKWebView 缓存）。
     const nav = await api.navStats("");
-    const serverMods = nav?.serverModules ?? [];
-    setNavSt(nav ?? null);
-    const mods = { modules: serverMods };
-    const alive = new Set((mods?.modules ?? []).map((m) => m.so));
+    if (!nav) return;
+    const serverMods = nav.serverModules ?? [];
+    setNavSt(nav);
+    const alive = new Set(serverMods.map((m) => m.so));
 
     // ① 先把服务端有、本地没有的模块数据全部取好（异步阶段）
-    // 注意：mods 来自 nav_stats（更可靠），不是 /api/modules
-    const needLoad = (mods?.modules ?? []).filter((m) => !backendMods.current.has(m.so));
+    const needLoad = serverMods.filter((m) => !backendMods.current.has(m.so));
     const loaded: ModuleData[] = [];
     for (const m of needLoad) {
       try {
@@ -402,36 +531,17 @@ export default function App() {
           so: m.so, path: m.path, size: 0, sections: [], funcs: fns,
           disasm: {}, callers: {}, callees: {},
         });
-        backendMods.current.add(m.so);
       } catch {
       }
     }
 
     // ② 只有最新一次同步能落地（旧请求的结果丢弃，防覆盖）
     if (mySeq !== syncSeq.current) return;
-    // 注意：**不在这里删模块**。alive 来自 /api/modules，而它在 WKWebView
-    // 里恒返回空——拿它做过滤会把刚加进去的模块又删掉（实测就是这个原因
-    // 导致 backendMods 有值而 modules 恒空）。
-    // 删除统一由 unload / clear_modules 的 modules_changed 处理。
-    if (loaded.length) {
-      setModules((prev) => {
-        const merged = [...prev];
-        for (const d of loaded) {
-          if (!merged.some((x) => x.so === d.so)) merged.push(d);
-        }
-        return merged;
-      });
-      for (const d of loaded) log(`已打开 ${d.so} · ${d.funcs.length} 函数`, "ai");
-    }
-    if (loaded.length) {
-      setActive(0);
-      setSel((prev) => {
-        const next = prev.slice();
-        next[0] = 0;
-        return next;
-      });
-    }
-  }, [appendModule, log]);
+    // 同时支持新增与移除后端已卸载模块，并保留用户当前 active 与 sel
+    const wasEmpty = modulesRef.current.length === 0;
+    reconcileModules(Array.isArray(nav.serverModules) ? alive : null, loaded, wasEmpty);
+    for (const d of loaded) log(`已打开 ${d.so} · ${d.funcs.length} 函数`, "ai");
+  }, [log, reconcileModules]);
 
   /** 串行包装：并发调用会互相覆盖 setModules，必须互斥 */
   /** nav_stats 带回来的服务端模块列表 → 补齐本地。
@@ -488,18 +598,26 @@ export default function App() {
 
   // 顶栏计数：按当前模块查，事件到来时刷新（左栏与顶栏必须同源）
   useEffect(() => {
+    let alive = true;
     void (async () => {
       const r = await api.navStats(mod?.so ?? "");
-      if (r) setNavSt(r);
+      if (alive && r) setNavSt(r);
     })();
+    return () => {
+      alive = false;
+    };
   }, [mod?.so, aiTick]);
 
   // 工具注册表大小（顶栏「工具 N」用）。只取一次，注册表不会在运行中变。
   useEffect(() => {
+    let alive = true;
     void (async () => {
       const r = await api.tools();
-      if (r?.tools) setToolN(r.tools.length);
+      if (alive && r?.tools) setToolN(r.tools.length);
     })();
+    return () => {
+      alive = false;
+    };
   }, []);
 
   /** 轮询服务端模块列表（3 秒）。
@@ -512,14 +630,20 @@ export default function App() {
       if (stop) return;
       try {
         const r = await api.navStats("");
-        for (const m of r?.serverModules ?? []) {
+        if (stop || !r) return;
+        const list = r.serverModules ?? [];
+        if (Array.isArray(r.serverModules)) {
+          reconcileModules(new Set(list.map((m) => m.so)), [], false);
+        }
+        for (const m of list) {
+          if (stop) return;
           if (backendMods.current.has(m.so)) continue;
           try {
             await appendModule(m.so, m.path);
-          } catch (e) {
+          } catch {
           }
         }
-      } catch (e) {
+      } catch {
       }
     };
     void tick();
@@ -528,7 +652,7 @@ export default function App() {
       stop = true;
       clearInterval(id);
     };
-  }, [appendModule]);
+  }, [appendModule, reconcileModules]);
 
 
 
@@ -543,6 +667,7 @@ export default function App() {
     //       导致旧连接的 onclose 误判为"没销毁"并额外建连（StrictMode 下必现）。
     let disposed = false;
     let ws: WebSocket | null = null;
+    let retryTimer: number | null = null;
 
     // 注意：必须读 modulesRef，不能读 modules —— 这个 effect 只在挂载时跑一次，
     // 闭包里的 modules 永远是空数组（AI 定位因此一直失效，实测 hit 恒为 null）。
@@ -572,7 +697,7 @@ export default function App() {
       if (disposed) return;
       const delay = retryDelay.current;
       retryDelay.current = Math.min(delay * 2, 10_000);
-      window.setTimeout(() => { if (!disposed) connect(); }, delay);
+      retryTimer = window.setTimeout(() => { if (!disposed) connect(); }, delay);
     };
     sock.onerror = () => { setWsAlive(false); };
 
@@ -603,31 +728,25 @@ export default function App() {
         const details = (msg as {
           details?: { so: string; path: string; functions?: FnRow[] }[];
         }).details ?? [];
+        const serverSet = new Set(details.map((m) => m.so));
+        const added: ModuleData[] = [];
         for (const m of details) {
           if (backendMods.current.has(m.so)) continue;
           const rows = m.functions ?? [];
           if (!rows.length) continue;
-          // 直接用快照里的函数表建模块 —— 不走 /api/functions。
-          // 那条 HTTP GET 在 WKWebView 里会被复用成旧/空响应（实测）。
           const funcs: Func[] = rows.map((it) => ({
             n: it.name, a: it.addr, s: it.size,
             e: it.is_export ? 1 : 0, r: it.refs ?? 0,
           }));
-          const data: ModuleData = {
+          added.push({
             so: m.so, path: m.path, size: 0, sections: [],
             funcs, disasm: {}, callers: {}, callees: {},
-          };
-          backendMods.current.add(m.so);
-          setModules((prev) =>
-            prev.some((x) => x.so === m.so) ? prev : [...prev, data]
-          );
-          setActive(0);
-          setSel((prev) => {
-            const next = prev.slice();
-            next[0] = funcs.findIndex((x) => x.e) >= 0 ? funcs.findIndex((x) => x.e) : 0;
-            return next;
           });
-          log(`已打开 ${m.so} · ${funcs.length} 函数（WebSocket 快照）`, "ai");
+        }
+        const wasEmpty = modulesRef.current.length === 0;
+        reconcileModules(serverSet, added, wasEmpty);
+        for (const d of added) {
+          log(`已打开 ${d.so} · ${d.funcs.length} 函数（WebSocket 快照）`, "ai");
         }
         return;
       }
@@ -689,7 +808,8 @@ export default function App() {
         setAiEvents((prev) => {
           if (aiPausedRef.current) return prev;
           const next = [
-            { tool: msg.tool ?? "", args: msg.args as Record<string, unknown> | undefined,
+            { id: ++aiEventSeq.current,
+              tool: msg.tool ?? "", args: msg.args as Record<string, unknown> | undefined,
               summary: msg.summary, ms: msg.ms, ts: msg.ts,
               // (1) 第一次修改（2026-11-19）：透传后端给的输入/输出完整信息，
               // 控制台据此渲染两段。缺这些字段时控制台只能看到参数摘要，
@@ -734,8 +854,7 @@ export default function App() {
     /** 建一条新连接；断线后由 onclose 再次调用（指数退避） */
     const connect = () => {
       try {
-        const proto = location.protocol === "https:" ? "wss" : "ws";
-        ws = new WebSocket(`${proto}://${location.host}/api/events`);
+        ws = new WebSocket(apiWsUrl("/api/events"));
       } catch {
         return;
       }
@@ -747,12 +866,17 @@ export default function App() {
       // (133) 标记本连接已销毁（只影响它自己）
       disposed = true;
       closed.current = true;
+      if (retryTimer != null) window.clearTimeout(retryTimer);
+      if (tickTimer.current != null) {
+        window.clearTimeout(tickTimer.current);
+        tickTimer.current = null;
+      }
       wsRef.current = null;
       ws?.close();
     };
-    // 只依赖 appendModule：modules 变化不应重建连接（否则消息会丢）
+    // 只依赖稳定回调：modules 变化不应重建连接（否则消息会丢）
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [appendModule, syncModules]);
+  }, [appendModule, syncModules, reconcileModules]);
 
   // 选中变化：取真实 xrefs + 反汇编
   useEffect(() => {
@@ -778,16 +902,6 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [active, selected]);
 
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") { setCode((c) => ({ ...c, open: false })); return; }
-      if (e.key === "Enter" && !(e.target instanceof HTMLInputElement)) void openCode();
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [active, selected]);
-
   const selectFn = (mi: number, i: number) => {
     setSel((prev) => prev.map((v, k) => (k === mi ? i : v)));
     if (mi !== active) setActive(mi);
@@ -795,17 +909,42 @@ export default function App() {
   };
 
   const openCode = async () => {
-    if (!mod || !f) return;
+    const curMod = modRef.current;
+    const curSel = selRef.current[activeRef.current] ?? -1;
+    const curFn = curMod && curSel >= 0 ? curMod.funcs[curSel] : null;
+    if (!curMod || !curFn) return;
     setCode({ open: true, rows: [], live: false });
-    const d = await api.disasm(mod.so, f.a);
+    const d = await api.disasm(curMod.so, curFn.a);
     if (d) {
       setCode({ open: true, rows: d.items, live: true });
-      log(`反汇编 ${f.n} · ${d.items.length} 条（后端实时解码）`, "ai");
+      log(`反汇编 ${curFn.n} · ${d.items.length} 条（后端实时解码）`, "ai");
     } else {
       setCode({ open: true, rows: [], live: false });
-      log(`反汇编失败：后端没有返回 ${f.n} 的指令`, "ai");
+      log(`反汇编失败：后端没有返回 ${curFn.n} 的指令`, "ai");
     }
   };
+  const openCodeRef = useRef(openCode);
+  openCodeRef.current = openCode;
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") { setCode((c) => ({ ...c, open: false })); return; }
+      if (e.key !== "Enter") return;
+      const target = e.target as HTMLElement | null;
+      if (
+        target instanceof HTMLInputElement ||
+        target instanceof HTMLTextAreaElement ||
+        target instanceof HTMLSelectElement ||
+        target instanceof HTMLButtonElement ||
+        target?.isContentEditable
+      ) {
+        return;
+      }
+      void openCodeRef.current();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
 
   const buildXrefs = async () => {
     if (!mod) return;
@@ -816,13 +955,14 @@ export default function App() {
     clearInterval(t0);
     setProgress({ percent: 100 });
     setTimeout(() => setProgress(null), 700);
+    if (r) setAiTick((v) => v + 1);
     log(r ? "引用图构建完成" : "引用图构建失败", "ai");
   };
 
   /** 复制 MCP 配置：HTTP 与 stdio 两种都写进同一个 mcpServers，粘过去删掉不用的那条即可 */
   const copyMcpConfig = useCallback(async () => {
     try {
-      const cfg = await (await fetch(`${location.origin}/api/mcp-config`)).json();
+      const cfg = await (await fetch(`${API_BASE}/api/mcp-config`)).json();
       const text = JSON.stringify(
         {
           mcpServers: {
@@ -833,29 +973,7 @@ export default function App() {
         null,
         2
       );
-      // 优先级：pywebview 原生剪贴板 > 浏览器 clipboard > execCommand
-      // (1) 第一次修改：WKWebView 里前两种都可能失败（用户实测"复制失败"），
-      //     所以先走原生 NSPasteboard，后面的只作兜底。
-      let ok = false;
-      const bridge = (window as unknown as {
-        pywebview?: { api?: { copy_text?: (t: string) => Promise<boolean> | boolean } };
-      }).pywebview;
-      if (bridge?.api?.copy_text) {
-        try { ok = !!(await bridge.api.copy_text(text)); } catch { ok = false; }
-      }
-      if (!ok) {
-        try { await navigator.clipboard.writeText(text); ok = true; } catch { ok = false; }
-      }
-      if (!ok) {
-        const ta = document.createElement("textarea");
-        ta.value = text;
-        ta.style.position = "fixed";
-        ta.style.opacity = "0";
-        document.body.appendChild(ta);
-        ta.select();
-        ok = document.execCommand("copy");
-        ta.remove();
-      }
+      const ok = await copyText(text);
       log(ok ? "已复制 MCP 配置（含 HTTP 与 stdio 两种写法）" : "复制失败：请检查剪贴板权限", "ai");
     } catch (e) {
       log(`读取 MCP 配置失败：${e}`);
@@ -1032,9 +1150,9 @@ export default function App() {
             <button
               className={"vtab" + (mainView === "console" ? " on" : "")}
               onClick={() => setMainView("console")}
-              title="控制台：看 AI 每次调用的完整输入/输出，也可以手动执行 frida 脚本"
+              title="frida 终端：手动执行一次性或常驻 frida 脚本，实时查看 console.log / send 输出"
             >
-              控制台{aiEvents.length ? ` ${aiEvents.length}` : ""}
+              frida 终端{liveScripts > 0 ? ` ${liveScripts}` : ""}
             </button>
             <span className="grow" />
             <ArmedBar />
@@ -1042,7 +1160,11 @@ export default function App() {
 
           {/* 引用密度：全局背景信息，不属于任何一个视图（原型同位置） */}
           {!empty && mod && (
-            <HeatBar so={mod.so} onPickAddr={(a) => jumpToAddr(mod.so, a)} />
+            <HeatBar
+              so={mod.so}
+              xrefBuilt={navSt?.xref_built}
+              onPickAddr={(a) => jumpToNearestAddr(mod.so, a)}
+            />
           )}
 
           {/* 「实时」页永远渲染监控台：动态操作不依赖 so 文件。
@@ -1110,7 +1232,7 @@ export default function App() {
               为什么无条件渲染而不加 empty 判断：控制台看的是 AI 调了哪些工具、
               手动跑 frida 的结果，这些都与是否加载了 so 无关——
               加上 empty 守卫会退化成"没 so 就白屏"（R83 那种坑）。 */}
-          <ConsoleOverlay open={mainView === "console"} />
+          <ConsoleOverlay open={mainView === "console"} onScriptsChange={setLiveScripts} />
 
           {mainView === "processes" && (
             <ProcessesView />
@@ -1125,8 +1247,11 @@ export default function App() {
             <div className="stage-canvas">
               {/* 反汇编列表：热力条下面的主体（原型代码页） */}
               <div className="code-listing" ref={codeListRef}>
-                {codeWindow.map((fn) => (
-                  <div key={fn.a}>
+                {codeWindow.map((fn) => {
+                  const expKey = `${mod.so}:${fn.a}`;
+                  const expRows = expanded[expKey];
+                  return (
+                  <div key={expKey}>
                     <div
                       className={"fnrow" + (f && f.a === fn.a ? " sel" : "")}
                       data-i={mod.funcs.findIndex((x) => x.a === fn.a)}
@@ -1138,19 +1263,19 @@ export default function App() {
                           setActive(modules.findIndex((m) => m.so === mod.so));
                           selectFn(modules.findIndex((m) => m.so === mod.so), idx);
                         }
-                        toggleFn(mod.so, fn.a);
+                        void toggleFn(mod.so, fn.a);
                       }}
                     >
                       <span className="fn-t">
-                        {expanded[fn.a] ? "▾" : "▸"}
+                        {expRows ? "▾" : "▸"}
                       </span>
                       <span className="fn-n">{fn.n}</span>
                       {fn.e && <span className="fn-tag">导出</span>}
                       <span className="fn-a">0x{fn.a.toString(16)}</span>
                     </div>
-                    {expanded[fn.a] && (
+                    {expRows && (
                       <div className="ins-list">
-                        {(expanded[fn.a] ?? []).map((ins) => (
+                        {expRows.map((ins) => (
                           <div className="ins-row" key={ins.addr}>
                             <span className="ins-a">
                               0x{ins.addr.toString(16)}
@@ -1181,7 +1306,8 @@ export default function App() {
                       </div>
                     )}
                   </div>
-                ))}
+                  );
+                })}
                 <div className="fn-more">
                   … 其余 {Math.max(0, mod.funcs.length - 60)} 个函数
                 </div>

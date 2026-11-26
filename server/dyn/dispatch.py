@@ -273,7 +273,12 @@ def _match_pointer_table(insns, idx: int, so):
         ins = insns[j]
         if ins.mnemonic not in ("ldr", "ldrsw", "ldrsh"):
             continue
-        dst = B._ti_norm(B._ti_reg_name(ins.op_str))
+        # (8) 第八次修改（2026-11-26）
+        # bug 原因：dst 经 B._ti_norm 把 wN 归一成了 xN，导致 dst.startswith("x") 恒为 True、
+        #           entry_size 恒为 8，要求 shift in (0, 3)，把所有 4 字节跳表（ldr w, lsl #2）全拒掉。
+        # 解决方案：在 _ti_norm 之前保留原始目标寄存器 raw_dst 判断位宽（wN -> 4，xN -> 8）。
+        raw_dst = B._ti_reg_name(ins.op_str)
+        dst = B._ti_norm(raw_dst)
         if dst != br_reg:
             continue
         # ldrsw 是"读 4 字节有符号值"，属偏移表（模式 A），不在这里解
@@ -283,7 +288,9 @@ def _match_pointer_table(insns, idx: int, so):
         if not idx_reg:
             return None                     # 无索引寄存器 → 不是索引表
         shift = _mem_shift(ins.op_str)
-        entry_size = 8 if dst.startswith("x") else 4
+        entry_size = B._ti_reg_width(raw_dst) if hasattr(B, "_ti_reg_width") else (
+            4 if raw_dst.strip().lower().startswith("w") else 8
+        )
         # 表项宽度必须与索引移位自洽：移位 0 或与 entry_size 匹配才算索引表
         if shift not in (0, 3 if entry_size == 8 else 2):
             return None
@@ -694,15 +701,17 @@ def _scan_functions(B, so, disasm, fns, ranges, so_name,
             all_targets = _read_table_targets(B, so_name, so, parsed)
             if not all_targets:
                 continue                      # 读不出就不进结果，不编造
-            if not all_targets:
-                continue
 
             in_exec = [t for t in all_targets if _in_exec(ranges, t)]
             # 目标一个都不在可执行段 → 表地址算错了，宁可丢掉也不报假表
             if not in_exec:
                 continue
 
-            conf = _confidence(in_exec, ranges, min_entries, parsed["certain"])
+            # (9) 第九次修改（2026-11-26）
+            # bug 原因：原先把已过滤的 in_exec 传给 _confidence，导致 ok/len(targets) 恒为 1.0，
+            #           永远产不出 medium/low 置信度，失去误报区分能力。
+            # 解决方案：把未过滤的原始表项列表 all_targets 传给 _confidence 计算真实可执行比例。
+            conf = _confidence(all_targets, ranges, min_entries, parsed["certain"])
             entry = {
                 "table_addr": hex(int(parsed["table_addr"])),
                 "found_at_br": hex(int(_br.addr)),

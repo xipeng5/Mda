@@ -43,15 +43,23 @@ export function ToolsView({ counts }: Props) {
   const prevCounts = useRef<Record<string, number>>({});
   const listRef = useRef<HTMLDivElement | null>(null);
 
+  // (1) 第一次修改（2026-11-26）
+  // bug 原因：异步拉取工具清单缺少取消标志。
+  // 解决方案：补齐 alive 取消标志。
   useEffect(() => {
+    let alive = true;
     void (async () => {
       const r = await api.tools();
+      if (!alive) return;
       if (!r) {
         setErr("读不到工具清单：后端未连接");
         return;
       }
       setTools(r.tools ?? []);
     })();
+    return () => {
+      alive = false;
+    };
   }, []);
 
   // 计数变了说明刚被调用过 → 那一行脉冲，并自动定位到可视区

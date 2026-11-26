@@ -12,11 +12,18 @@ export function ArmedBar() {
   const [items, setItems] = useState<ApiArmed[]>([]);
   const [open, setOpen] = useState(false);
 
+  // (1) 第一次修改（2026-11-26）
+  // bug 原因：首屏异步拉取 armed 缺少取消标志。
+  // 解决方案：增加 alive 标志防止组件卸载后 setState。
   useEffect(() => {
+    let alive = true;
     void (async () => {
       const r = await api.armed();
-      if (r) setItems(r.items ?? []);
+      if (alive && r) setItems(r.items ?? []);
     })();
+    return () => {
+      alive = false;
+    };
   }, []);
 
   /* WebSocket 推来的变化由 App 处理；这里只负责首屏 */

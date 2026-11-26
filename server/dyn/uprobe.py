@@ -113,6 +113,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -191,7 +192,38 @@ def _adb(serial: str, *args: str, timeout: int = 60) -> subprocess.CompletedProc
 
 def _shquote(s: str) -> str:
     """把任意文本安全地包成一个 shell 单词。"""
-    return "'" + s.replace("'", "'\\''") + "'"
+    return shlex.quote(str(s))
+
+
+_SAFE_FUNC_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _validate_funcs(funcs: list) -> list[str]:
+    """校验待追踪函数名列表，仅允许合法 C 标识符，阻断 shell/uprobe 注入。"""
+    out: list[str] = []
+    for raw in funcs:
+        name = str(raw or "").strip()
+        if not _SAFE_FUNC_RE.match(name):
+            raise UprobeError(
+                "BAD_FUNC_NAME",
+                f"非法函数名 {raw!r}：仅允许匹配 ^[A-Za-z_][A-Za-z0-9_]*$ 的 C 标识符",
+            )
+        if name not in out:
+            out.append(name)
+    if not out:
+        raise UprobeError("BAD_FUNC_NAME", "funcs 列表不能为空")
+    return out
+
+
+def _uprobe_args_for(func: str) -> str:
+    """按 ARM64 AAPCS64 调用约定生成各内存分配函数的 uprobe 取参字段。"""
+    if func == "realloc":
+        return "ptr=%x0 sz=%x1 lr=%lr"
+    if func == "calloc":
+        return "nmemb=%x0 sz=%x1 lr=%lr"
+    if func == "free":
+        return "ptr=%x0 lr=%lr"
+    return "sz=%x0 lr=%lr"
 
 
 def _su(serial: str, script: str, timeout: int = 60) -> subprocess.CompletedProcess:
@@ -445,27 +477,36 @@ def _cleanup(serial: str, root: str, attempts: int = 3) -> dict:
       ② 再逐个 `enable = 0` —— **有事件 enable 时 uprobe_events 是 EBUSY**
       ③ 用 `-:GROUP/NAME` 逐条删事件（不能靠清 filter，见模块文档⑤）
     """
+    # (7) 第七次修改（2026-11-26）
+    # bug 原因：L468 和 L485 用 `grep -c '^mda_alloc/'` 统计残留探针，但内核
+    #           uprobe_events 每行都以 `p:` 或 `r:` 开头（如 `p:mda_alloc/malloc`），
+    #           导致正则恒匹配 0 条，即便探针未清掉也假报清理成功。
+    # 解决方案：统一改为 `^[pr]:{_EVENT_GROUP}/`（与 L453 提取正则一致），并对路径加 shlex.quote。
     if not root:
         return {"ok": False, "reason": "no tracefs"}
     inst = f"{root}/instances/{_INSTANCE}"
+    q_root = _shquote(root)
+    q_inst = _shquote(inst)
+    q_events = _shquote(f"{root}/uprobe_events")
     # 事件名 = "p:mda_alloc/NAME" 里 NAME 那段。
     # 用 grep -o + cut 取，不用 sed 反向引用（见上面 bug 原因②）。
     pattern = f"^[pr]:{_EVENT_GROUP}/[A-Za-z0-9_]*"
+    check_pattern = f"^[pr]:{_EVENT_GROUP}/"
     script = " ; ".join([
-        f"echo 0 > {inst}/tracing_on 2>/dev/null",
-        f"MINE=$(grep -o '{pattern}' {root}/uprobe_events 2>/dev/null "
+        f"echo 0 > {q_inst}/tracing_on 2>/dev/null",
+        f"MINE=$(grep -o {_shquote(pattern)} {q_events} 2>/dev/null "
         f"| cut -d/ -f2 | sort -u)",
-        f"for n in $MINE; do echo 0 > {inst}/events/{_EVENT_GROUP}/$n/enable 2>/dev/null"
-        f" ; echo 0 > {root}/events/{_EVENT_GROUP}/$n/enable 2>/dev/null ; done",
+        f"for n in $MINE; do echo 0 > {q_inst}/events/{_EVENT_GROUP}/$n/enable 2>/dev/null"
+        f" ; echo 0 > {q_root}/events/{_EVENT_GROUP}/$n/enable 2>/dev/null ; done",
         # 必须用双引号：$n 要由 shell 展开；单引号会让它变成字面量 $n
-        f'for n in $MINE; do echo "-:{_EVENT_GROUP}/$n" >> {root}/uprobe_events '
+        f'for n in $MINE; do echo "-:{_EVENT_GROUP}/$n" >> {q_events} '
         f'2>/dev/null ; done',
-        f"echo > {inst}/trace 2>/dev/null",
+        f"echo > {q_inst}/trace 2>/dev/null",
         # 数剩余条数。**Android 的 sh 不支持 ${var:-default}**（实测 bad
         # substitution），所以直接把 grep -c 的输出接出来：它无匹配时会打印
         # 0（rc=1 但输出有效），不要 `|| echo 0`（会变成 "0 0" 带偏解析）。
         "echo LEFT_BEGIN",
-        f"grep -c '^{_EVENT_GROUP}/' {root}/uprobe_events 2>/dev/null",
+        f"grep -c {_shquote(check_pattern)} {q_events} 2>/dev/null",
         "echo LEFT_END",
         f"echo MINE=[$MINE]",
     ])
@@ -482,7 +523,7 @@ def _cleanup(serial: str, root: str, attempts: int = 3) -> dict:
             return {"ok": True, "uprobes_left": [], "instance": inst,
                     "attempts": i + 1, "removed": mine}
         time.sleep(0.3)
-    left_out = _run(serial, f"grep '^{_EVENT_GROUP}/' {root}/uprobe_events 2>/dev/null",
+    left_out = _run(serial, f"grep {_shquote(check_pattern)} {q_events} 2>/dev/null",
                     timeout=30)
     # 设备失联（adb 把错误打到 stdout）时要与"确实没清掉"区分开：
     # 前者是无法确认，后者是确定性残留。混为一谈会让人去排查根本不存在的问题。
@@ -590,9 +631,18 @@ def _parse_trace(text: str, funcs: list[str], tids: set[int],
             ts = 0.0
 
         rest = m.group("rest")
+        # (7) 第七次修改（2026-11-26）：按函数真实参数解析 size 与 ptr
+        # bug 原因：原实现所有函数都用 sz=%x0，realloc 错把旧指针当 size，calloc 错把
+        #           nmemb 当字节数，free 拿不到指针。
+        # 解决方案：calloc 读取 nmemb * sz，realloc 读 sz=%x1 且保留 ptr，free 读 ptr=%x0 且 size=None。
         size = _hexval(rest, "sz")
         if size is None:
             size = _hexval(rest, "size")
+        if event == "calloc":
+            nmemb = _hexval(rest, "nmemb")
+            if nmemb is not None and size is not None:
+                size = nmemb * size
+        ptr_val = _hexval(rest, "ptr")
         # free 的参数是待释放指针，不是大小 —— 不能当 size 报出去
         if event == "free":
             size = None
@@ -615,7 +665,7 @@ def _parse_trace(text: str, funcs: list[str], tids: set[int],
             "pid": tid,          # 兼容字段：uprobe 侧只有 tid
             "tid": tid,
             "func": event,
-            "addr": None,        # malloc 入口拿不到返回值（见模块文档）
+            "addr": hex(ptr_val) if ptr_val is not None else None,
             "size": size,
             "caller_off": caller_off,
             "caller_mod": caller_mod,
@@ -638,20 +688,34 @@ def uprobe_probe(serial: str) -> dict:
         out.update({"code": exc.code, "error": exc.message})
         return out
     try:
-        existing = _run(serial, f"cat {root}/uprobe_events 2>/dev/null", timeout=20)
+        q_root = _shquote(root)
+        q_events = _shquote(f"{root}/uprobe_events")
+        q_ton = _shquote(f"{root}/tracing_on")
+        existing = _run(serial, f"cat {q_events} 2>/dev/null", timeout=20)
         out["existing_probes"] = [x.strip() for x in existing.splitlines() if x.strip()]
-        out["tracing_on"] = _run(serial, f"cat {root}/tracing_on 2>/dev/null",
-                                timeout=20).strip()
-        # 写一条无害探针，立刻删掉，验证可写性
-        probe = _run(
-            serial,
-            f"echo 0 > {root}/tracing_on 2>/dev/null\n"
-            f"printf '%s\\n' 'p:mda_selftest/t {root}/uprobe_events:0' "
-            f"> {root}/uprobe_events 2>&1\n"
-            f"echo RC=$?\n"
-            f"echo '-:mda_selftest/t' >> {root}/uprobe_events 2>/dev/null\n"
-            f"echo LEFT=[$(cat {root}/uprobe_events 2>/dev/null | tr '\\n' '|')]",
-            timeout=40)
+        orig_tracing_on = _run(serial, f"cat {q_ton} 2>/dev/null", timeout=20).strip()
+        out["tracing_on"] = orig_tracing_on
+        # (7) 第七次修改（2026-11-26）
+        # bug 原因：原自检使用 `> uprobe_events` 截断清空整个系统探针表（误删第三方/perfetto 探针），
+        #           且写 `echo 0 > tracing_on` 后未恢复原值，违背“只读探测不留痕迹”的承诺。
+        # 解决方案：先清理遗留 mda_selftest/t，改用 `>>` 追加注册并随即移除，
+        #           最后将 tracing_on 恢复为探测前保存的原始值。
+        probe_spec = f"p:mda_selftest/t {root}/uprobe_events:0"
+        restore_line = (
+            f"echo {_shquote(orig_tracing_on)} > {q_ton} 2>/dev/null"
+            if orig_tracing_on in ("0", "1") else ""
+        )
+        probe_lines = [
+            f"echo 0 > {q_root}/events/mda_selftest/t/enable 2>/dev/null",
+            f"echo '-:mda_selftest/t' >> {q_events} 2>/dev/null",
+            f"printf '%s\\n' {_shquote(probe_spec)} >> {q_events} 2>&1",
+            "echo RC=$?",
+            f"echo '-:mda_selftest/t' >> {q_events} 2>/dev/null",
+            f"echo LEFT=[$(cat {q_events} 2>/dev/null | tr '\\n' '|')]",
+        ]
+        if restore_line:
+            probe_lines.append(restore_line)
+        probe = _run(serial, "\n".join(probe_lines), timeout=40)
         out["writable"] = "RC=0" in probe
         out["ok"] = bool(out["writable"])
         if not out["ok"]:
@@ -701,7 +765,14 @@ def trace_alloc(serial: str, pid: int, tid: int = 0, size_min: int = 0,
         · 拿不到完整调用栈：uprobe 不做栈展开，本机 `$stack` 语法不被支持。
         · 记录里 `pid` 字段实际是线程 id（内核 `common_pid` 的语义）。
     """
-    funcs = list(funcs) if funcs else list(DEFAULT_ALLOC_FUNCS)
+    # (7) 第七次修改（2026-11-26）
+    # bug 原因：① funcs 未做标识符校验，直接拼入 shell 命令存在命令注入风险；
+    #           ② 注册第一条探针时用 `> {root}/uprobe_events` 清空了全系统 uprobe 表；
+    #           ③ realloc/calloc/free 全部写死 sz=%x0，参数寄存器错误。
+    # 解决方案：① 入口校验 funcs 仅匹配 ^[A-Za-z_][A-Za-z0-9_]*$，所有 shell 参数经 shlex.quote；
+    #           ② _cleanup 已先清理旧的 mda_alloc/* 探针，注册全程改用 >> 追加，绝不截断全表；
+    #           ③ 通过 _uprobe_args_for 按 AAPCS64 为 malloc/realloc/calloc/free 生成正确取参。
+    raw_funcs = list(funcs) if funcs else list(DEFAULT_ALLOC_FUNCS)
     pid = int(pid)
     tid = int(tid or 0)
     duration = max(0.5, min(float(duration), _MAX_DURATION))
@@ -711,8 +782,14 @@ def trace_alloc(serial: str, pid: int, tid: int = 0, size_min: int = 0,
 
     result: dict = {
         "ok": False, "mechanism": "uprobe", "records": [], "dropped": 0,
-        "pid": pid, "tid": tid, "duration": duration, "funcs": funcs,
+        "pid": pid, "tid": tid, "duration": duration, "funcs": raw_funcs,
     }
+    try:
+        funcs = _validate_funcs(raw_funcs)
+        result["funcs"] = funcs
+    except UprobeError as exc:
+        result.update({"code": exc.code, "error": exc.message})
+        return result
     root = ""
     tmpdir = ""
     registered = False
@@ -750,18 +827,17 @@ def trace_alloc(serial: str, pid: int, tid: int = 0, size_min: int = 0,
         _cleanup(serial, root)
 
         # ---- ⑤ 注册探针 ----
-        # 语法依据（本机实测）：%x0 = 第 1 个参数，%lr = 调用者返回地址。
-        # 第一条用 > 清场，其余用 >> 追加（uprobe_events 是追加语义，
-        # 全部用 > 会互相覆盖）。注意不能整表清空——会误删别人的探针。
+        # 绝不用 `> uprobe_events` 清空全系统表：前面 _cleanup 已先清掉旧的 mda_alloc/*，
+        # 这里全程用 `>>` 追加，并按各函数真实参数寄存器构造探针。
+        q_events = _shquote(f"{root}/uprobe_events")
+        q_inst = _shquote(inst)
         lines = []
-        first = True
         for func, off in offsets.items():
-            redir = ">" if first else ">>"
-            first = False
+            args_expr = _uprobe_args_for(func)
+            probe_def = f"p:{_EVENT_GROUP}/{func} {libc_path}:0x{off:x} {args_expr}"
             lines.append(
-                f"printf '%s\\n' 'p:{_EVENT_GROUP}/{func} {libc_path}:0x{off:x} "
-                f"sz=%x0 lr=%lr' {redir} {root}/uprobe_events")
-        lines.append(f"echo REGISTERED=[$(cat {root}/uprobe_events | tr '\\n' '|')]")
+                f"printf '%s\\n' {_shquote(probe_def)} >> {q_events}")
+        lines.append(f"echo REGISTERED=[$(cat {q_events} | tr '\\n' '|')]")
         reg_out = _run(serial, "\n".join(lines), timeout=90)
         if f"{_EVENT_GROUP}/" not in reg_out:
             result.update({
@@ -785,16 +861,17 @@ def trace_alloc(serial: str, pid: int, tid: int = 0, size_min: int = 0,
         en = []
         for func in offsets:
             # 写 filter 并**立刻**在同一行取 $?（跨行会被下一个命令覆盖）
-            en.append(f"printf '%s' {_shquote(filt)} > "
-                      f"{inst}/events/{_EVENT_GROUP}/{func}/filter; "
+            ev_dir = _shquote(f"{inst}/events/{_EVENT_GROUP}/{func}")
+            en.append(f"printf '%s' {_shquote(filt)} > {ev_dir}/filter; "
                       f"echo FRC_{func}=$?")
-            en.append(f"echo 1 > {inst}/events/{_EVENT_GROUP}/{func}/enable")
+            en.append(f"echo 1 > {ev_dir}/enable")
         first_func = next(iter(offsets))
+        first_filter = _shquote(f"{inst}/events/{_EVENT_GROUP}/{first_func}/filter")
         en += [
-            f"echo > {inst}/trace",
-            f"echo 1 > {inst}/tracing_on",
-            f"echo ON=[$(cat {inst}/tracing_on)]",
-            f"echo FILT=[$(cat {inst}/events/{_EVENT_GROUP}/{first_func}/filter)]",
+            f"echo > {q_inst}/trace",
+            f"echo 1 > {q_inst}/tracing_on",
+            f"echo ON=[$(cat {q_inst}/tracing_on)]",
+            f"echo FILT=[$(cat {first_filter})]",
         ]
         on_out = _run(serial, "\n".join(en), timeout=90)
         bad_filter = [ln for ln in on_out.splitlines()
@@ -852,9 +929,9 @@ def trace_alloc(serial: str, pid: int, tid: int = 0, size_min: int = 0,
         result["window_ms"] = int((time.time() - t_on) * 1000)
 
         # ---- ⑧ 收窗：先关 tracing_on，再关 enable ----
-        off = [f"echo 0 > {inst}/tracing_on"]
+        off = [f"echo 0 > {q_inst}/tracing_on"]
         for func in offsets:
-            off.append(f"echo 0 > {inst}/events/{_EVENT_GROUP}/{func}/enable")
+            off.append(f"echo 0 > {_shquote(f'{inst}/events/{_EVENT_GROUP}/{func}/enable')}")
         _run(serial, "\n".join(off), timeout=60)
 
         raw = _read_trace(serial, inst)

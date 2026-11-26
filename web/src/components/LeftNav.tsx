@@ -68,24 +68,37 @@ export function LeftNav({ so, activeView, onPick, onServerModules, fnCount, tick
   const cbRef = useRef(onServerModules);
   cbRef.current = onServerModules;
 
+  // (1) 第一次修改（2026-11-26）
+  // bug 原因：两个异步 useEffect 均缺少取消标志，切换 so 或卸载后过期响应会覆写左栏计数。
+  // 解决方案：为 navStats 与 tools 的 useEffect 均补齐 alive 取消标志。
   useEffect(() => {
     // 即使 so 为空也查一次：此时服务端会返回"有哪些模块"，
     // 前端据此决定要加载谁（否则启动时永远不知道该查哪个 so）。
+    let alive = true;
     void (async () => {
       const r = await api.navStats(so);
+      if (!alive) return;
       if (r) {
         setSt(r);
         if (r.serverModules?.length) cbRef.current?.(r.serverModules);
       }
     })();
+    return () => {
+      alive = false;
+    };
   }, [so, tick]);
 
   // 工具总数只取一次（137 是真实注册表大小，但不要写死）
   useEffect(() => {
+    let alive = true;
     void (async () => {
       const r = await api.tools();
+      if (!alive) return;
       if (r?.tools) setToolCount(r.tools.length);
     })();
+    return () => {
+      alive = false;
+    };
   }, []);
 
   const n = (v: number | undefined | null) => (v == null ? "—" : v);

@@ -108,6 +108,30 @@ static int collect_segs(pid_t pid, struct seg *out, int max, uint64_t min_sz) {
     return n;
 }
 
+// (8) 第八次修改（2026-11-26）
+// bug 原因：① 快照名未校验，允许 ".." 与 "/" 导致路径穿越读写/删除任意文件；
+//           ② cmd_snap/cmd_diff 缺少 malloc 判空及错误路径资源释放；
+//           ③ 新段样本输出未按 pread 实际读取字节数，可能泄漏未初始化缓冲；
+//           ④ diff 结束位置 `end = (gap > 16) ? (i - gap) : i` 存在差 1 偏移（孤立单字节
+//              改动算出 sz=0 被丢弃，块尾还会多带最多 16 字节未改动数据）。
+// 解决方案：① 增加 valid_snap_name 严格白名单校验，拒绝 ".." 和 "/"；
+//           ② 补齐 malloc 判空与全部错误路径 free/fclose/close；
+//           ③ 新段样本严格按 pread 返回值截断输出；
+//           ④ 记录最后改动下标 last_diff，结束位置改为 end = last_diff + 1。
+static int valid_snap_name(const char *name) {
+    if (!name || !name[0] || name[0] == '.') return 0;
+    if (strstr(name, "..") != NULL) return 0;
+    size_t len = 0;
+    for (const char *p = name; *p; p++, len++) {
+        if (len >= 64) return 0;
+        unsigned char c = (unsigned char)*p;
+        int ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                 (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.';
+        if (!ok) return 0;
+    }
+    return 1;
+}
+
 static void snap_path(char *buf, size_t n, const char *name) {
     snprintf(buf, n, SNAP_DIR "/mda_snap_%s.bin", name);
 }
@@ -123,7 +147,7 @@ static int cmd_snap(pid_t pid, const char *name, uint64_t max_bytes) {
     struct seg *segs = calloc(MAX_SEGS, sizeof(*segs));
     if (!segs) return 1;
     int n = collect_segs(pid, segs, MAX_SEGS, 4096);
-    if (n < 0) { printf("{\"ok\":false,\"code\":\"NO_MAPS\"}\n"); return 2; }
+    if (n < 0) { free(segs); printf("{\"ok\":false,\"code\":\"NO_MAPS\"}\n"); return 2; }
 
     // (4) 第四次修改（2026-11-09）：排序方向反过来——**小段优先**。
     //     bug 原因：原来按大小降序（大段优先），实测进程里有 1GB / 256MB
@@ -171,13 +195,23 @@ static int cmd_snap(pid_t pid, const char *name, uint64_t max_bytes) {
     segs = chosen;
 
     int fd = fd_mem(pid);
-    if (fd < 0) { printf("{\"ok\":false,\"code\":\"NO_MEM\"}\n"); return 3; }
+    if (fd < 0) { free(segs); printf("{\"ok\":false,\"code\":\"NO_MEM\"}\n"); return 3; }
 
     char path[256], tmp[288];
     snap_path(path, sizeof(path), name);
     snprintf(tmp, sizeof(tmp), "%s.tmp", path);
     FILE *out = fopen(tmp, "wb");
-    if (!out) { printf("{\"ok\":false,\"code\":\"NO_WRITE\"}\n"); return 4; }
+    if (!out) { close(fd); free(segs); printf("{\"ok\":false,\"code\":\"NO_WRITE\"}\n"); return 4; }
+
+    char *buf = malloc(1 << 20);             // 1MB 缓冲，减少 syscall
+    if (!buf) {
+        fclose(out);
+        unlink(tmp);
+        close(fd);
+        free(segs);
+        printf("{\"ok\":false,\"code\":\"NO_MEM_ALLOC\"}\n");
+        return 5;
+    }
 
     // 头部：magic + 段数
     uint32_t magic = 0x4D444153;             // "MDAS"
@@ -186,7 +220,6 @@ static int cmd_snap(pid_t pid, const char *name, uint64_t max_bytes) {
     fwrite(&cnt, 4, 1, out);
     fwrite(segs, sizeof(struct seg), picked, out);
 
-    char *buf = malloc(1 << 20);             // 1MB 缓冲，减少 syscall
     uint64_t total = 0;
     for (int i = 0; i < picked; i++) {
         uint64_t left = segs[i].size, off = segs[i].base;
@@ -238,16 +271,30 @@ static int cmd_diff(pid_t pid, const char *name, uint64_t min_sz,
     struct seg *segs = calloc(cnt ? cnt : 1, sizeof(*segs));
     if (!segs || fread(segs, sizeof(struct seg), cnt, bf) != cnt) {
         printf("{\"ok\":false,\"code\":\"BAD_SNAPSHOT\"}\n");
+        free(segs);
         fclose(bf);
         return 3;
     }
 
     int fd = fd_mem(pid);
-    if (fd < 0) { printf("{\"ok\":false,\"code\":\"NO_MEM\"}\n"); return 4; }
+    if (fd < 0) {
+        printf("{\"ok\":false,\"code\":\"NO_MEM\"}\n");
+        free(segs);
+        fclose(bf);
+        return 4;
+    }
 
     const size_t CH = 1 << 20;
     char *a = malloc(CH), *b = malloc(CH);
-    if (!a || !b) return 5;
+    if (!a || !b) {
+        free(a);
+        free(b);
+        free(segs);
+        fclose(bf);
+        close(fd);
+        printf("{\"ok\":false,\"code\":\"NO_MEM_ALLOC\"}\n");
+        return 5;
+    }
 
     printf("{\"ok\":true,\"mode\":\"diff\",\"changed\":[");
     int reported = 0;
@@ -277,23 +324,25 @@ static int cmd_diff(pid_t pid, const char *name, uint64_t min_sz,
                 uint64_t sz = cur[ci].size;
                 if ((uint64_t)min_sz > sz) continue;
                 if (max_sz != 0 && sz > (uint64_t)max_sz) continue;
-                // 读开头一小段作为样本（整段读没必要）
+                // 读开头一小段作为样本（整段读没必要），严格按 pread 实际读取字节数输出
                 size_t want = sz > 32 ? 32 : (size_t)sz;
-                if (pread(fd, b, want, (off_t)cur[ci].base) > 0) {
+                ssize_t got_n = pread(fd, b, want, (off_t)cur[ci].base);
+                if (got_n > 0) {
+                    size_t show_n = (size_t)got_n < want ? (size_t)got_n : want;
                     if (reported) printf(",");
                     printf("{\"addr\":\"0x%llx\",\"size\":%llu,"
                            "\"kind\":\"new_segment\",\"sample\":\"",
                            (unsigned long long)cur[ci].base,
                            (unsigned long long)sz);
-                    for (size_t k = 0; k < want; k++)
+                    for (size_t k = 0; k < show_n; k++)
                         printf("%02x", (unsigned char)b[k]);
                     printf("\"}");
                     reported++;
                     total_changed += sz;
                 }
             }
-            free(cur);
         }
+        free(cur);
     }
 
     for (uint32_t i = 0; i < cnt && reported < max_report; i++) {
@@ -324,13 +373,15 @@ static int cmd_diff(pid_t pid, const char *name, uint64_t min_sz,
                     while (i < n && a[i] == b[i]) i++;
                     if (i >= n) break;
                     size_t s0 = i;
+                    size_t last_diff = i;
                     size_t gap = 0;
                     while (i < n) {
-                        if (a[i] != b[i]) { gap = 0; }
+                        if (a[i] != b[i]) { last_diff = i; gap = 0; }
                         else { if (++gap > 16) break; }
                         i++;
                     }
-                    size_t end = (gap > 16) ? (i - gap) : i;
+                    // (8) 用 last_diff + 1 精确收尾，消除孤立单字节差 1 归零及块尾多余未改字节
+                    size_t end = last_diff + 1;
                     size_t sz = end - s0;
                     if (sz < min_sz) continue;
                     if (max_sz != 0 && sz > max_sz) continue;
@@ -385,12 +436,20 @@ int main(int argc, char **argv) {
     if (!strcmp(argv[1], "snap")) {
         // snap <pid> <name> [max_mb]
         if (argc < 4) { printf("{\"ok\":false,\"error\":\"need pid name\"}\n"); return 1; }
+        if (!valid_snap_name(argv[3])) {
+            printf("{\"ok\":false,\"code\":\"BAD_NAME\",\"error\":\"invalid snapshot name\"}\n");
+            return 1;
+        }
         uint64_t mb = (argc > 4) ? strtoull(argv[4], NULL, 10) : 64;
         return cmd_snap(atoi(argv[2]), argv[3], mb * 1024ULL * 1024ULL);
     }
     if (!strcmp(argv[1], "diff")) {
         // diff <pid> <name> [min] [max] [max_report]
         if (argc < 4) { printf("{\"ok\":false,\"error\":\"need pid name\"}\n"); return 1; }
+        if (!valid_snap_name(argv[3])) {
+            printf("{\"ok\":false,\"code\":\"BAD_NAME\",\"error\":\"invalid snapshot name\"}\n");
+            return 1;
+        }
         uint64_t mn = (argc > 4) ? strtoull(argv[4], NULL, 10) : 1;
         uint64_t mx = (argc > 5) ? strtoull(argv[5], NULL, 10) : 0;
         int rep = (argc > 6) ? atoi(argv[6]) : 200;
@@ -398,6 +457,10 @@ int main(int argc, char **argv) {
     }
     if (!strcmp(argv[1], "clear")) {
         if (argc < 3) { printf("{\"ok\":false,\"error\":\"need name\"}\n"); return 1; }
+        if (!valid_snap_name(argv[2])) {
+            printf("{\"ok\":false,\"code\":\"BAD_NAME\",\"error\":\"invalid snapshot name\"}\n");
+            return 1;
+        }
         return cmd_clear(argv[2]);
     }
     printf("{\"ok\":false,\"error\":\"unknown subcommand\"}\n");

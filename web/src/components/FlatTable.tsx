@@ -14,26 +14,57 @@ import { api, type ApiSection, type ApiString } from "../lib/api";
 
 type Props = { so: string; kind: "sections" | "strings" };
 
+// (1) 第一次修改（2026-11-26）
+// bug 原因：① 后端段权限 flags 为小写 "rwx"，r.flags.includes("W") 永不为真导致 W+X 异常高亮失效；
+//           ② 切换 so/kind 时未清空旧 err 且缺少异步取消标志，慢响应会覆写新视图；
+//           ③ 字符串搜索仅拉取无 kw 的前 500 条做前端过滤，全库靠后的字符串永远搜不到。
+// 解决方案：权限高亮改用 r.flags.toUpperCase()；拉取前清空 err 并加 alive 取消标志；
+//           字符串搜索输入经防抖后传给后端 api.strings(so, kw) 做全表检索。
 export function FlatTable({ so, kind }: Props) {
   const [sections, setSections] = useState<ApiSection[]>([]);
   const [strings, setStrings] = useState<ApiString[]>([]);
   const [kw, setKw] = useState("");
+  const [debouncedKw, setDebouncedKw] = useState("");
   const [err, setErr] = useState("");
 
   useEffect(() => {
-    if (!so) return;
+    if (!kw.trim()) {
+      setDebouncedKw("");
+      return;
+    }
+    const t = window.setTimeout(() => setDebouncedKw(kw.trim()), 250);
+    return () => window.clearTimeout(t);
+  }, [kw]);
+
+  useEffect(() => {
+    if (!so || kind !== "sections") return;
+    let alive = true;
+    setErr("");
     void (async () => {
-      if (kind === "sections") {
-        const r = await api.sections(so);
-        if (r) setSections(r.items ?? []);
-        else setErr("读不到段表");
-      } else {
-        const r = await api.strings(so, "");
-        if (r) setStrings((r.items ?? []).slice(0, 2000));
-        else setErr("读不到字符串表");
-      }
+      const r = await api.sections(so);
+      if (!alive) return;
+      if (r) setSections(r.items ?? []);
+      else setErr("读不到段表");
     })();
+    return () => {
+      alive = false;
+    };
   }, [so, kind]);
+
+  useEffect(() => {
+    if (!so || kind !== "strings") return;
+    let alive = true;
+    setErr("");
+    void (async () => {
+      const r = await api.strings(so, debouncedKw);
+      if (!alive) return;
+      if (r) setStrings(r.items ?? []);
+      else setErr("读不到字符串表");
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [so, kind, debouncedKw]);
 
   const rows = useMemo(() => {
     const q = kw.trim().toLowerCase();
@@ -82,7 +113,13 @@ export function FlatTable({ so, kind }: Props) {
                 <span className="ft-m">
                   {r.size >= 1024 ? `${(r.size / 1024).toFixed(1)}K` : r.size}
                 </span>
-                <span className={r.flags.includes("W") && r.flags.includes("X") ? "ft-warn" : "ft-m"}>
+                <span
+                  className={
+                    r.flags.toUpperCase().includes("W") && r.flags.toUpperCase().includes("X")
+                      ? "ft-warn"
+                      : "ft-m"
+                  }
+                >
                   {r.flags || "—"}
                 </span>
               </div>

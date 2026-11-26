@@ -230,6 +230,12 @@ def clear_cache() -> None:
     _CACHE.clear()
 
 
+# (2) 第二次修改（2026-11-26）
+# bug 原因：此前在非完整描述符分支里写 `if not s.startswith("L"): s = "L" + s`，
+#           导致所有以大写 L 开头的 Java 类名/包名（如 "LoginActivity"、"L"、"Local.Helper"）
+#           被误判为已带 DEX 前缀而漏加 "L"，归一化成错误的 "LoginActivity;"。
+# 解决方案：仅当字符串已同时以 "L" 开头且以 ";" 结尾（完整 DEX 描述符，长度 >= 3）时视为
+#           已有前缀；否则一律补齐前缀 "L" 与后缀 ";"。
 def _norm_class(name: str) -> str:
     """三种写法都接受，统一成描述符：
 
@@ -242,14 +248,11 @@ def _norm_class(name: str) -> str:
         return s
     if s.startswith("["):          # 数组描述符原样
         return s
-    if s.startswith("L") and s.endswith(";"):
-        return s
+    if s.startswith("L") and s.endswith(";") and len(s) >= 3:
+        return "L" + s[1:-1].replace(".", "/") + ";"
     if s.endswith(";"):
         s = s[:-1]
-    s = s.replace(".", "/")
-    if not s.startswith("L"):
-        s = "L" + s
-    return s + ";"
+    return "L" + s.replace(".", "/") + ";"
 
 
 def _err(code: str, message: str, **extra) -> dict:
@@ -395,6 +398,10 @@ def dex_methods(path: str, class_name: str) -> list[dict]:
         src = _open_source(path)
     except DexError as exc:
         return [_err(exc.code, exc.message)]
+    # (2) 第二次修改（2026-11-26）
+    # bug 原因：dex_methods 内部调用 dex.method_refs(cd) 解析 class_data/method_ids 时
+    #           可能抛出 DexError，外层未捕获，违反对外 API 不抛异常的契约。
+    # 解决方案：在主 try 块增加 except DexError 转为标准 [_err(exc.code, exc.message)]。
     try:
         found = _find_class(src, _norm_class(class_name))
         if isinstance(found, str):
@@ -425,6 +432,8 @@ def dex_methods(path: str, class_name: str) -> list[dict]:
                 "dex": dex.entry,
             })
         return out
+    except DexError as exc:
+        return [_err(exc.code, exc.message)]
     finally:
         src.close()
 
@@ -537,6 +546,13 @@ def dex_callers(path: str, class_name: str, method_name: str,
         src = _open_source(path)
     except DexError as exc:
         return [_err(exc.code, exc.message)]
+    # (2) 第二次修改（2026-11-26）
+    # bug 原因：① 多 dex 场景下若某个 dex 损坏，out 里会追加不含 call_count 的错误字典，
+    #           末尾 `out.sort(key=lambda x: -x["call_count"])` 会直接抛 KeyError 崩溃；
+    #           ② 外层 _resolve_method 以及内层 _target_method_indices / iter_method_code
+    #           抛出的 DexError 未被捕获，违反不抛异常契约。
+    # 解决方案：① 排序键改为 `(1 if "error" in x else 0, -x.get("call_count", 0))`，
+    #           错误条目排在末尾且绝不 KeyError；② 内外层完整捕获 DexError 转 _err(...)。
     try:
         found = _find_class(src, _norm_class(class_name))
         if isinstance(found, str):
@@ -554,52 +570,54 @@ def dex_callers(path: str, class_name: str, method_name: str,
         for entry in src.entries:
             try:
                 dex = _load_dex(src, entry)
-            except DexError as exc:
-                out.append(_err(exc.code, f"(解析失败: {exc.code})", dex=entry))
-                continue
-            idxs = set(_target_method_indices(dex, target_cls, target_name,
-                                              target_proto))
-            if not idxs:
-                continue
-            for cdd, mm, ci in dex.iter_method_code():
-                try:
-                    units = dex.units_of(ci)
-                except DexError:
+                idxs = set(_target_method_indices(dex, target_cls, target_name,
+                                                  target_proto))
+                if not idxs:
                     continue
-                hits: dict[int, dict] = {}
-                for unit_off, op, ref_idx in bytecode.iter_invokes(
-                        units, ci.insns_size):
-                    if ref_idx not in idxs:
+                for cdd, mm, ci in dex.iter_method_code():
+                    try:
+                        units = dex.units_of(ci)
+                    except DexError:
                         continue
-                    kind = bytecode.OPCODES[op][0]
-                    h = hits.get(ref_idx)
-                    if h is None:
-                        h = hits[ref_idx] = {"kind": kind, "sites": []}
-                    h["sites"].append({
-                        "insn_off": unit_off,
-                        "insn_byte_off": unit_off * 2,
-                        "invoke_kind": kind,
+                    hits: dict[int, dict] = {}
+                    for unit_off, op, ref_idx in bytecode.iter_invokes(
+                            units, ci.insns_size):
+                        if ref_idx not in idxs:
+                            continue
+                        kind = bytecode.OPCODES[op][0]
+                        h = hits.get(ref_idx)
+                        if h is None:
+                            h = hits[ref_idx] = {"kind": kind, "sites": []}
+                        h["sites"].append({
+                            "insn_off": unit_off,
+                            "insn_byte_off": unit_off * 2,
+                            "invoke_kind": kind,
+                        })
+                    if not hits:
+                        continue
+                    try:
+                        caller_ref = dex.tables.method(mm.method_idx)
+                    except DexError:
+                        continue
+                    sites = [s for h in hits.values() for s in h["sites"]]
+                    out.append({
+                        "caller": f"{cdd.name}->{caller_ref.name}"
+                                  f"{caller_ref.proto.descriptor}",
+                        "caller_class": cdd.name,
+                        "caller_method": caller_ref.name,
+                        "caller_proto": caller_ref.proto.descriptor,
+                        "invoke_kind": next(iter(hits.values()))["kind"],
+                        "call_count": len(sites),
+                        "sites": sites,
+                        "dex": entry,
                     })
-                if not hits:
-                    continue
-                try:
-                    caller_ref = dex.tables.method(mm.method_idx)
-                except DexError:
-                    continue
-                sites = [s for h in hits.values() for s in h["sites"]]
-                out.append({
-                    "caller": f"{cdd.name}->{caller_ref.name}"
-                              f"{caller_ref.proto.descriptor}",
-                    "caller_class": cdd.name,
-                    "caller_method": caller_ref.name,
-                    "caller_proto": caller_ref.proto.descriptor,
-                    "invoke_kind": next(iter(hits.values()))["kind"],
-                    "call_count": len(sites),
-                    "sites": sites,
-                    "dex": entry,
-                })
-        out.sort(key=lambda x: -x["call_count"])
+            except DexError as exc:
+                out.append(_err(exc.code, exc.message, dex=entry))
+                continue
+        out.sort(key=lambda x: (1 if "error" in x else 0, -x.get("call_count", 0)))
         return out
+    except DexError as exc:
+        return [_err(exc.code, exc.message)]
     finally:
         src.close()
 

@@ -1,17 +1,35 @@
 # MDA 运行期依赖（Python 3.11+）
 # 安装： python -m venv .venv && .venv/bin/pip install -r requirements.txt
+#
+# (1) 第一次修改（2026-11-26）
+# bug 原因：requirements.txt 仍残留已弃用的 PySide6==6.12.0，且缺失 Web API /
+#           pywebview / frida-tools 等当前实际运行期核心依赖。
+# 解决方案：移除 PySide6，按当前 .venv 实际运行依赖更新核心项并标注可选高级插件依赖。
 
 # --- 反汇编与 ELF 解析 ---
 capstone==5.0.9
 pyelftools==0.33
 
-# --- GUI ---
-PySide6==6.12.0
+# --- Web API 与桌面窗口壳（React 前端由本服务托管）---
+starlette==1.7.0
+uvicorn==0.54.0
+websockets==13.1
+pywebview==6.2.1
+anyio==4.15.1
 
 # --- MCP（给 AI 客户端接入）---
 mcp==2.3.0
-uvicorn>=0.30
+sse-starlette==3.5.0
 httpx2==2.13.1
+pydantic==2.14.1
 
-# --- 动态分析（adb/frida 断点与内存读取，可选）---
+# --- 动态分析（adb/frida 断点、终端脚本、Java bridge）---
 frida==17.23.3
+frida-tools==14.11.0
+
+# --- 可选高级静态/模拟/求解/打包依赖（按需取消注释安装）---
+# unicorn==2.1.4          # ARM64 函数模拟执行（emulate_func）
+# z3-solver==5.4.1.0      # 约束求解与符号边界（solve_constraint / symbolic_boundary）
+# lief==1.0.0             # 高级 ELF 解析与修补（elf_lief）
+# yara-python==4.5.4      # YARA 规则特征扫描（scan，仅源码环境）
+# pyinstaller==6.22.3     # macOS .app 打包（packaging/mda.spec）

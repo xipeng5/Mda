@@ -111,10 +111,6 @@ def gui_available(force: bool = False) -> bool:
         ok = False
     _probe_cache["ok"] = ok
     _probe_cache["at"] = now
-    if ok:
-        # 恢复了：清掉旧 session_id，强制下一条请求重新握手，
-        # 避免拿着 GUI 上个进程的失效 id 触发一次 StaleSession 往返。
-        _probe_cache.setdefault("session_epoch", 0)
     return ok
 
 
@@ -146,6 +142,17 @@ class HttpProxy:
             h["mcp-session-id"] = self.session_id
         return h
 
+    # (2) 第二次修改（2026-11-26）
+    # bug 原因：① 当客户端发送的 message 本身就是 initialize 且触发 StaleSession 时，
+    #             旧实现先调 _initialize() 再重发 message，导致二次初始化冲突；
+    #          ② _post_once 解析 SSE 遇到第一条 data: 就立即 return，若流里先推送了
+    #             无 id 的通知事件，真正的 JSON-RPC 响应会被截胡丢弃；
+    #          ③ gui_available() 中残留未使用的 session_epoch 死代码；
+    #          ④ run_proxy 异常分支调 gui_available() 未传 force=True，3 秒缓存内会
+    #             误判已退出的 GUI 仍在线。
+    # 解决方案：① initialize 触发 StaleSession 时清空 session_id 后直接重发原消息；
+    #          ② SSE 遍历全部 data: 行，优先返回含 "id" 的 JSON-RPC 响应，否则取末条；
+    #          ③ 删除无效 session_epoch 死代码；④ 异常探测改用 gui_available(force=True)。
     def post(self, message: dict) -> dict | None:
         """转发一条 JSON-RPC；会话失效时自动重新握手并重试一次。
 
@@ -160,6 +167,9 @@ class HttpProxy:
             return self._post_once(message)
         except StaleSession:
             self.session_id = None
+            # 当前消息本身就是 initialize 时直接重发，不再先 _initialize() 造成二次初始化
+            if isinstance(message, dict) and message.get("method") == "initialize":
+                return self._post_once(message)
             self._initialize()
             return self._post_once(message)
 
@@ -176,14 +186,24 @@ class HttpProxy:
         if not text:
             return None  # 通知消息无响应体
         # SSE 格式：多行 "event: message" / "data: {...}"
+        # 遍历全部 data: 行，优先取带 id 的 JSON-RPC 响应，避免被前序通知截胡
         if text.startswith("event:") or "\ndata:" in text or text.startswith("data:"):
+            id_msg = None
+            last_msg = None
             for line in text.splitlines():
                 line = line.strip()
                 if line.startswith("data:"):
                     payload = line[5:].strip()
-                    if payload:
-                        return json.loads(payload)
-            return None
+                    if not payload:
+                        continue
+                    try:
+                        parsed = json.loads(payload)
+                    except json.JSONDecodeError:
+                        continue
+                    last_msg = parsed
+                    if isinstance(parsed, dict) and "id" in parsed:
+                        id_msg = parsed
+            return id_msg if id_msg is not None else last_msg
         return json.loads(text)
 
     def _initialize(self) -> None:
@@ -215,8 +235,9 @@ def run_proxy() -> int:
         try:
             resp = proxy.post(msg)
         except Exception as e:
+            # (2) 第二次修改（2026-11-26）：强制实时探测，避免命中 3 秒旧缓存误判 GUI 仍在
             # GUI 已退出：不再重试，直接结束代理（stdin 关闭后客户端会感知）
-            if not gui_available():
+            if not gui_available(force=True):
                 print(
                     f"[mda-proxy] GUI 已关闭，代理退出：{e}",
                     file=sys.stderr, flush=True,

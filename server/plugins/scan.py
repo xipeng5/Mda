@@ -19,7 +19,23 @@ from __future__ import annotations
 
 import re
 
+from server.core.addr import parse_addr
 from server.core.plugins import PluginBase
+
+
+def _parse_target(raw):
+    """解析目标地址/常量（兼容正负十六进制与十进制），非法返回 None。"""
+    val = parse_addr(raw)
+    if val is not None:
+        return val
+    if isinstance(raw, str):
+        s = raw.strip()
+        if s.lower().startswith("-0x"):
+            try:
+                return int(s, 16)
+            except ValueError:
+                return None
+    return None
 
 
 class Plugin(PluginBase):
@@ -63,12 +79,31 @@ class Plugin(PluginBase):
 
         from server.core.disasm import Disassembler
 
-        target = args.get("target")
-        if target is not None:
-            target = int(str(target), 16) if isinstance(target, str) and \
-                     str(target).lower().startswith("0x") else int(target)
+        # (3) 第三次修改（2026-11-26）
+        # bug 原因：1) adrp_add 未过滤 is_call/is_jump，导致把 bl/b 也混进结果；
+        #           2) const 正则不支持负十六进制且仅用 re.search 只查首个立即数；
+        #           3) string_ref 缺 target 时未返回 BAD_ARGS；
+        #           4) target 解析未用 parse_addr，且未捕获非 ARM64 的 ValueError。
+        # 解决方案：提前校验 kind/target（使用 _parse_target），捕获非 ARM64 返 UNSUPPORTED_ARCH；
+        #           adrp_add 排除 is_call/is_jump；const 用 findall 匹配正负十六进制/十进制立即数。
+        if kind not in ("bl_call", "adrp_add", "const", "string_ref"):
+            return {"ok": False, "error": f"未知 kind={kind}", "code": "BAD_KIND"}
+
+        raw_target = args.get("target")
+        target = None
+        if raw_target is not None:
+            target = _parse_target(raw_target)
+            if target is None:
+                return {"ok": False, "code": "BAD_ADDR",
+                        "error": f"非法 target 参数：{raw_target!r}"}
+        if kind in ("const", "string_ref") and target is None:
+            return {"ok": False, "error": f"kind={kind} 需要 target", "code": "BAD_ARGS"}
+
         limit = int(args.get("limit", 200))
-        dis = Disassembler(so)
+        try:
+            dis = Disassembler(so)
+        except ValueError as exc:
+            return {"ok": False, "code": "UNSUPPORTED_ARCH", "error": str(exc)}
 
         results = []
         scanned = 0
@@ -84,32 +119,37 @@ class Plugin(PluginBase):
                 if kind == "bl_call":
                     # (2) 用 is_call 而非 call_target：后者对 b/cbz 等
                     #     跳转也填值，实测放大 2.41 倍（1381 vs 573）
+                    # (4) 第四次修改（2026-11-26）
+                    #     bug 原因：disasm 将间接调用 blr 正确归为 is_call=True（call_target=None）后，
+                    #               这里 if t is not None 把 blr 过滤掉，导致 bl_call 总数少于 is_call 数。
+                    #     解决方案：保留间接调用条目（target=None, indirect=True），使 scan 与 is_call 口径完全一致。
                     if not getattr(i, "is_call", False):
                         continue
                     t = getattr(i, "call_target", None)
                     if t is not None:
                         results.append({"addr": hex(i.addr), "target": hex(int(t)),
                                         "insn": text})
+                    else:
+                        results.append({"addr": hex(i.addr), "target": None,
+                                        "indirect": True, "insn": text})
                 elif kind == "adrp_add":
+                    if getattr(i, "is_call", False) or getattr(i, "is_jump", False):
+                        continue
                     r = getattr(i, "ref_addr", None)
                     if r is not None:
                         results.append({"addr": hex(i.addr),
                                         "computed": hex(int(r)), "insn": text})
                 elif kind == "const":
-                    if target is None:
-                        return {"error": "kind=const 需要 target", "code": "BAD_ARGS"}
-                    m = re.search(r"#(0x[0-9a-f]+|-?\d+)", text)
-                    if m:
-                        v = int(m.group(1), 16) if m.group(1).startswith("0x") \
-                            else int(m.group(1))
-                        if v == target:
+                    for raw_imm in re.findall(r"#(-?0x[0-9a-fA-F]+|-?\d+)", text):
+                        if int(raw_imm, 0) == target:
                             results.append({"addr": hex(i.addr), "insn": text})
+                            break
                 elif kind == "string_ref":
+                    if getattr(i, "is_call", False) or getattr(i, "is_jump", False):
+                        continue
                     r = getattr(i, "ref_addr", None)
-                    if target is not None and r is not None and int(r) == target:
+                    if r is not None and int(r) == target:
                         results.append({"addr": hex(i.addr), "insn": text})
-                else:
-                    return {"error": f"未知 kind={kind}", "code": "BAD_KIND"}
 
         return {
             "ok": True, "so": so.name, "kind": kind,

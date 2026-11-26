@@ -58,6 +58,7 @@ class SoFile:
         # 节表损坏的 dump so 靠它完成 vma↔文件换算与代码发现
         self._loads: list[tuple[int, int, int, int]] = []
         self._raw: bytes | None = None
+        self._is64: bool = True
         self._sections_usable = False  # 节表损坏时 False，全部 get_section_by_name 短路
         self.section_warning: str = ""  # 节表无效时的诊断信息（GUI/日志展示）
         # (1) 第一次修改：段表模式扫描到的 PLT 桩地址集合（不伪造符号名）
@@ -92,6 +93,58 @@ class SoFile:
         self._scan_plt_stubs_by_segment()
         self._parse_functions()
 
+    def _iter_phdrs(self) -> list[tuple[int, int, int, int, int, int]]:
+        """按 EI_CLASS 手工解析 Program Header，返回 [(p_type, p_flags, p_offset, p_vaddr, p_filesz, p_memsz)]。"""
+        raw = self._raw
+        if raw is None:
+            self._stream.seek(0)
+            raw = self._stream.read()
+            self._raw = raw
+        if len(raw) < 0x34 or raw[:4] != b"\x7fELF":
+            raise ValueError("非 ELF 文件")
+        ei_class = raw[4]
+        if ei_class == 2:
+            if len(raw) < 0x40:
+                raise ValueError("非 ELF 文件")
+            self._is64 = True
+            e_phoff, = struct.unpack_from("<Q", raw, 0x20)
+            e_phentsize, e_phnum = struct.unpack_from("<HH", raw, 0x36)
+            min_ent = 56
+        elif ei_class == 1:
+            self._is64 = False
+            e_phoff, = struct.unpack_from("<I", raw, 0x1C)
+            e_phentsize, e_phnum = struct.unpack_from("<HH", raw, 0x2A)
+            min_ent = 32
+        else:
+            raise ValueError(f"不支持的 ELF 类别: EI_CLASS={ei_class}")
+        if e_phentsize < min_ent:
+            return []
+        out: list[tuple[int, int, int, int, int, int]] = []
+        for i in range(e_phnum):
+            off = e_phoff + i * e_phentsize
+            if off + min_ent > len(raw):
+                break
+            if self._is64:
+                p_type, p_flags = struct.unpack_from("<II", raw, off)
+                p_offset, p_vaddr, _pa, p_filesz, p_memsz = struct.unpack_from("<QQQQQ", raw, off + 8)
+            else:
+                p_type, p_offset, p_vaddr, _pa, p_filesz, p_memsz, p_flags = struct.unpack_from(
+                    "<IIIIIII", raw, off
+                )
+            out.append((p_type, p_flags, p_offset, p_vaddr, p_filesz, p_memsz))
+        return out
+
+    def _v2o(self, v: int) -> int | None:
+        """根据 PT_LOAD 将虚拟地址换算为文件偏移，不在段内返回 None。"""
+        for va, end, off, _fl in self._loads:
+            if va <= v < end:
+                return off + (v - va)
+        return None
+
+    # (2) 第二次修改（2026-11-26）
+    # bug 原因：此前固定按 ELF64 偏移与 56 字节 Program Header 解包，加载 ELF32（如 ARM32）
+    #           时会把程序头读错，导致 _loads 错乱或截断。
+    # 解决方案：抽取 _iter_phdrs() 根据 EI_CLASS（1=ELF32, 2=ELF64）正确解包程序头。
     def _parse_loads(self) -> None:
         """手工解析 Program Header 取 PT_LOAD。
 
@@ -100,29 +153,12 @@ class SoFile:
         导致坏节表文件连段表都拿不到。
         解决：直接按 e_phoff/e_phentsize 读原始字节，完全不碰 section API。
         """
-        import struct
-
-        self._stream.seek(0)
-        head = self._stream.read(64)
-        if len(head) < 0x40 or head[:4] != b"\x7fELF":
-            raise ValueError("非 ELF 文件")
-        e_phoff, = struct.unpack_from("<Q", head, 0x20)
-        e_phentsize, e_phnum = struct.unpack_from("<HH", head, 0x36)
         PT_LOAD = 1
         self._loads = []
-        for i in range(e_phnum):
-            self._stream.seek(e_phoff + i * e_phentsize)
-            ph = self._stream.read(e_phentsize)
-            if len(ph) < 56:
-                break
-            p_type, p_flags = struct.unpack_from("<II", ph, 0)
-            p_offset, p_vaddr, _pa, p_filesz, _memsz = struct.unpack_from("<QQQQQ", ph, 8)
+        for p_type, p_flags, p_offset, p_vaddr, p_filesz, _memsz in self._iter_phdrs():
             if p_type == PT_LOAD and p_filesz > 0:
                 self._loads.append((p_vaddr, p_vaddr + p_filesz, p_offset, p_flags))
         self._loads.sort()
-        # 缓存全文件字节：段表模式下 read() 走这里
-        self._stream.seek(0)
-        self._raw = self._stream.read()
 
     def _parse_sections(self) -> bool:
         """按节表解析。成功返回 True；节表损坏/内容非法返回 False。
@@ -207,84 +243,137 @@ class SoFile:
             self._sections_usable = False
             return False
 
+    # (1) 第一次修改（2026-11-26）
+    # bug 原因：① 旧代码把 `st_value == 0` 的条目一律跳过，导致所有合法导入符号（st_shndx == 0
+    #           且 st_value == 0）全部丢失；② 无 DT_HASH 时盲目用 `strsz // 4` 估算符号数，
+    #           现代 Android so 多用 DT_GNU_HASH，导致越界把紧随其后的 .gnu.version/.dynstr
+    #           字节解析成上百个假导出符号；③ 硬编码 ELF64 结构，不支持 ELF32。
+    # 解决方案：① 兼容 ELF32/ELF64 动态段与符号表结构；② 符号总数优先取 DT_HASH.nchain，
+    #           其次解析 DT_GNU_HASH（最大 bucket 沿 chain 走到 bit0==1），再兜底用 symtab 到
+    #           紧邻更高虚拟地址动态表或所在 PT_LOAD 末尾的最小正差值除以 sym_ent；
+    #           ③ 跳过索引 0（STN_UNDEF）和 st_name==0，仅过滤非未定义且 st_value==0 的条目。
     def _parse_dynamic_fallback(self) -> None:
         """从 PT_DYNAMIC 手工提取 dynsym/dynstr（节表不可用时的符号来源）。"""
-        import struct as _s
-
-        # 找 PT_DYNAMIC 的 vaddr 与大小
-        self._stream.seek(0)
-        head = self._stream.read(64)
-        e_phoff, = _s.unpack_from("<Q", head, 0x20)
-        e_phentsize, e_phnum = _s.unpack_from("<HH", head, 0x36)
-        PT_DYNAMIC, DT_HASH, DT_STRTAB, DT_SYMTAB, DT_STRSZ = 2, 4, 5, 6, 10
+        PT_DYNAMIC = 2
+        DT_PLTGOT, DT_HASH, DT_STRTAB, DT_SYMTAB, DT_RELA, DT_STRSZ = 3, 4, 5, 6, 7, 10
+        DT_GNU_HASH = 0x6FFFFEF5
         dyn_v = dyn_sz = 0
-        for i in range(e_phnum):
-            self._stream.seek(e_phoff + i * e_phentsize)
-            ph = self._stream.read(e_phentsize)
-            if len(ph) < 56:
-                break
-            p_type, _fl = _s.unpack_from("<II", ph, 0)
+        for p_type, _fl, _off, p_vaddr, p_filesz, _mem in self._iter_phdrs():
             if p_type == PT_DYNAMIC:
-                _off, p_vaddr, _pa, p_filesz, _mem = _s.unpack_from("<QQQQQ", ph, 8)
                 dyn_v, dyn_sz = p_vaddr, p_filesz
                 break
         if not dyn_v:
             return
 
-        def v2o(v: int) -> int | None:
-            for va, end, off, _fl in self._loads:
-                if va <= v < end:
-                    return off + (v - va)
-            return None
-
         raw = self._raw or b""
-        do = v2o(dyn_v)
+        do = self._v2o(dyn_v)
         if do is None:
             return
+        is64 = self._is64
+        dyn_ent = 16 if is64 else 8
+        dyn_fmt = "<QQ" if is64 else "<II"
         tags: dict[int, int] = {}
-        for i in range(dyn_sz // 16):
-            if do + i * 16 + 16 > len(raw):
+        for i in range(dyn_sz // dyn_ent):
+            pos = do + i * dyn_ent
+            if pos + dyn_ent > len(raw):
                 break
-            tag, val = _s.unpack_from("<QQ", raw, do + i * 16)
+            tag, val = struct.unpack_from(dyn_fmt, raw, pos)
             if tag == 0:
                 break
-            tags[tag] = val
-        symtab, strtab, strsz = tags.get(DT_SYMTAB), tags.get(DT_STRTAB), tags.get(DT_STRSZ, 0)
-        hash_v = tags.get(DT_HASH)
-        if not (symtab and strtab):
+            tags.setdefault(tag, val)
+
+        symtab = tags.get(DT_SYMTAB, 0)
+        strtab = tags.get(DT_STRTAB, 0)
+        strsz = tags.get(DT_STRSZ, 0)
+        if not (symtab and strtab and strsz):
             return
-        so_, sto = v2o(symtab), v2o(strtab)
+        so_, sto = self._v2o(symtab), self._v2o(strtab)
         if so_ is None or sto is None:
             return
-        # 符号数：DT_HASH 的 nchain；无 hash 则按 strtab 间距估算
+
+        sym_ent = 24 if is64 else 16
+        # 确定符号表真实上界：DT_HASH -> DT_GNU_HASH -> 相邻更高表偏移
         nchain = 0
+        hash_v = tags.get(DT_HASH, 0)
         if hash_v:
-            ho = v2o(hash_v)
+            ho = self._v2o(hash_v)
             if ho is not None and ho + 8 <= len(raw):
-                nchain = _s.unpack_from("<II", raw, ho)[1]
+                nchain = struct.unpack_from("<II", raw, ho)[1]
+
         if not nchain:
-            nchain = min(strsz // 4, 65536) if strsz else 0
+            gnu_hash_v = tags.get(DT_GNU_HASH, 0)
+            if gnu_hash_v:
+                gho = self._v2o(gnu_hash_v)
+                if gho is not None and gho + 16 <= len(raw):
+                    nbuckets, symoffset, bloom_size, _bloom_shift = struct.unpack_from("<IIII", raw, gho)
+                    bloom_word = 8 if is64 else 4
+                    boff = gho + 16 + bloom_size * bloom_word
+                    coff = boff + nbuckets * 4
+                    if nbuckets <= 1_000_000 and bloom_size <= 1_000_000 and coff <= len(raw):
+                        max_sym = 0
+                        for k in range(nbuckets):
+                            b = struct.unpack_from("<I", raw, boff + k * 4)[0]
+                            if b > max_sym:
+                                max_sym = b
+                        if max_sym == 0:
+                            nchain = symoffset
+                        elif max_sym >= symoffset:
+                            idx = max_sym
+                            limit = symoffset + 1_000_000
+                            while idx < limit:
+                                c_off = coff + (idx - symoffset) * 4
+                                if c_off + 4 > len(raw):
+                                    break
+                                c_val = struct.unpack_from("<I", raw, c_off)[0]
+                                idx += 1
+                                if c_val & 1:
+                                    break
+                            nchain = idx
+
+        # 计算基于地址布局的安全字节上界（既是无 hash 时的兜底，也能防止损坏 hash 越界）
+        addr_tags = (
+            DT_PLTGOT, DT_HASH, DT_STRTAB, DT_RELA, 12, 13, 17, 23, 25, 26, 36,
+            0x6000000F, 0x60000011, 0x6FFFE000, DT_GNU_HASH,
+            0x6FFFFFF0, 0x6FFFFFFC, 0x6FFFFFFE,
+        )
+        upper_bytes = [tags[t] - symtab for t in addr_tags if tags.get(t, 0) > symtab]
+        for va, end, _off, _fl in self._loads:
+            if va <= symtab < end:
+                upper_bytes.append(end - symtab)
+                break
+        max_by_layout = (min(upper_bytes) // sym_ent) if upper_bytes else 0
+        if not nchain:
+            nchain = min(max_by_layout, 200_000)
+        elif max_by_layout > 0:
+            nchain = min(nchain, max_by_layout, 200_000)
 
         # 字典在 _parse_symbols 初始化，而本方法在其之前运行（节表坏时）
         # —— 必须自行初始化，否则 AttributeError
         self.symbols: list[Symbol] = []
         self.imports: dict[str, Symbol] = {}
         self.exports: dict[str, Symbol] = {}
-        for idx in range(nchain):
-            base = so_ + idx * 24
-            if base + 24 > len(raw):
+        str_limit = min(len(raw), sto + strsz)
+        # 索引 0 为 STN_UNDEF，固定跳过
+        for idx in range(1, nchain):
+            base = so_ + idx * sym_ent
+            if base + sym_ent > len(raw):
                 break
-            st_name, st_info, _o, st_shndx, st_value, st_size = _s.unpack_from("<IBBHQQ", raw, base)
-            if st_name >= strsz or st_value == 0:
+            if is64:
+                st_name, st_info, _o, st_shndx, st_value, st_size = struct.unpack_from("<IBBHQQ", raw, base)
+            else:
+                st_name, st_value, st_size, st_info, _o, st_shndx = struct.unpack_from("<IIIBBH", raw, base)
+            undef = st_shndx == 0
+            if st_name == 0 or st_name >= strsz:
                 continue
-            end = raw.find(b"\0", sto + st_name, sto + strsz)
+            if not undef and st_value == 0:
+                continue
+            end = raw.find(b"\0", sto + st_name, str_limit)
             if end < 0:
                 continue
             name = raw[sto + st_name : end].decode("utf-8", "replace")
             if not name:
                 continue
             is_func = (st_info & 0xF) == 2  # STT_FUNC
-            undef = st_shndx == 0
             sym = Symbol(
                 name=name, addr=st_value, size=st_size,
                 kind=(SymbolKind.IMPORT if undef else SymbolKind.EXPORT),
@@ -421,6 +510,10 @@ class SoFile:
             for e in table.entries
         ]
 
+    # (1) 第一次修改（2026-11-26）
+    # bug 原因：① `if mem.base == reg and mem.disp:` 把页对齐（mem.disp == 0）的 GOT 槽过滤掉了
+    #           （实测 libc.so 漏掉 fchmodat）；② 未校验架构，非 ARM64 样本误用 ARM64 反汇编。
+    # 解决方案：开头校验 self.arch == Arch.ARM64，并将条件放宽为 `if mem.base == reg:`。
     def _parse_plt(self) -> None:
         """建立 PLT stub 地址 -> 导入符号名 的映射。
 
@@ -433,6 +526,8 @@ class SoFile:
         capstone 的 operands[1].imm 已直接给出页基址。
         """
         self.plt_map: dict[int, str] = {}
+        if self.arch != Arch.ARM64:
+            return
         got2name = {r.offset: r.sym_name for r in self.relocations if r.sym_name}
         plt = self._sec_by_name(".plt")
         if plt is None or not got2name:
@@ -452,7 +547,7 @@ class SoFile:
             elif insn.mnemonic == "ldr" and pending is not None and len(insn.operands) == 2:
                 page, stub_addr, reg = pending
                 mem = insn.operands[1].mem
-                if mem.base == reg and mem.disp:
+                if mem.base == reg:
                     name = got2name.get(page + mem.disp)
                     if name:
                         self.plt_map[stub_addr] = name
@@ -468,7 +563,7 @@ class SoFile:
         if eh is not None:
             try:
                 # 参数顺序易错：DWARFStructs(little_endian, dwarf_format, address_size)
-                structs = DWARFStructs(True, 32, 8)
+                structs = DWARFStructs(True, 32, 8 if self._is64 else 4)
                 cfi = CallFrameInfo(
                     io.BytesIO(eh.data()), len(eh.data()), eh["sh_addr"], structs, for_eh_frame=True
                 )
@@ -557,6 +652,11 @@ class SoFile:
         """地址是否落在任一 PT_LOAD 段内（过滤数据块误识别产生的野目标）。"""
         return any(va <= addr < end for va, end, _off, _fl in self._loads)
 
+    # (1) 第一次修改（2026-11-26）
+    # bug 原因：新建函数分支固定写死 size=0，忽略调用方显式传入的非 0 size 参数；
+    #           修改已有函数 size 时未清空 instructions 缓存。
+    # 解决方案：新建分支尊重正整数 size 参数（未传或 0 时仍留 0 交由 _refresh_functions 计算）；
+    #           更新已有函数 size 时顺带清空其指令缓存。
     def add_function(
         self, addr: int, size: int | None = None,
         discovered_by: str = "manual", name: str = "",
@@ -572,89 +672,166 @@ class SoFile:
             host.instructions = []             # 边界变化 → 解码缓存失效
         fn = self.functions.get(addr)
         if fn is None:
-            # size 传 0 让 _refresh_functions 用「到下一个起点的距离」填满。
-            # （若直接给 0x10，新发现函数只会反汇编 4 条指令——实测踩过）
-            fn = Function(addr=addr, size=0, name=name,
+            # size 未传或为 0 时留 0，让 _refresh_functions 用「到下一个起点的距离」填满；
+            # 调用方显式指定正 size 时直接尊重该大小。
+            init_size = int(size) if size and size > 0 else 0
+            fn = Function(addr=addr, size=init_size, name=name,
                           discovered_by=discovered_by, so_name=self.name)
             self.functions[addr] = fn
         else:
             if name:
                 fn.name = name
-            if size:
-                fn.size = size
+            if size and size > 0:
+                fn.size = int(size)
+                fn.instructions = []
         self._refresh_functions()
         return fn
 
+    # (1) 第一次修改（2026-11-26）
+    # bug 原因：旧实现无视 .eh_frame_hdr 4 字节编码头，固定假设表项从 ho+12 开始且按
+    #           `entry + loc_off`（把文件偏移 entry 当基址）计算函数起点；而实际常见编码
+    #           table_enc=0x3b 为 DW_EH_PE_datarel(0x30)|sdata4(0x0b)，基址应为 .eh_frame_hdr
+    #           的虚拟地址 hdr_v！导致无节表样本全部函数起点错位（每条递增偏差 12+8*i）。
+    # 解决方案：按 LSB 规范完整解析头部 4 字节（version/eh_frame_ptr_enc/fde_count_enc/
+    #           table_enc）及对应 DW_EH_PE 编码，依据 table_enc 高位（0x30=datarel 基址 hdr_v，
+    #           0x10=pcrel 基址条目 VA hdr_v+(pos-ho)，0x00=绝对地址）准确还原函数起点。
     def _functions_from_eh_frame_hdr(self) -> list[tuple[int, int]]:
         """从 PT_GNU_EH_FRAME 的 binary search table 恢复函数起点表。
 
         dump so 节表被抹后，.eh_frame 节头不可用，但 PT_GNU_EH_FRAME
-        段在 PT_LOAD 内完好。表项编码 sdata4 pcrel（0x3b），值为
-        相对条目自身地址的有符号偏移。函数大小未知时用下一函数起点
-        或默认 0x200 兜底（后续 bl 目标反推可补充）。
+        段在 PT_LOAD 内完好。按头部 4 字节声明的 DW_EH_PE 编码依次读取
+        eh_frame_ptr、fde_count 与查找表项。
         """
-        import struct as _s
-
         PT_GNU_EH_FRAME = 0x6474E550
-        self._stream.seek(0)
-        head = self._stream.read(64)
-        e_phoff, = _s.unpack_from("<Q", head, 0x20)
-        e_phentsize, e_phnum = _s.unpack_from("<HH", head, 0x36)
         hdr_v = hdr_sz = 0
-        for i in range(e_phnum):
-            self._stream.seek(e_phoff + i * e_phentsize)
-            ph = self._stream.read(e_phentsize)
-            if len(ph) < 56:
-                break
-            p_type, _fl = _s.unpack_from("<II", ph, 0)
+        for p_type, _fl, _off, p_vaddr, p_filesz, _mem in self._iter_phdrs():
             if p_type == PT_GNU_EH_FRAME:
-                _off, p_vaddr, _pa, p_filesz, _mem = _s.unpack_from("<QQQQQ", ph, 8)
                 hdr_v, hdr_sz = p_vaddr, p_filesz
                 break
         if not hdr_v:
             return []
 
-        def v2o(v: int) -> int | None:
-            for va, end, off, _fl in self._loads:
-                if va <= v < end:
-                    return off + (v - va)
-            return None
-
         raw = self._raw or b""
-        ho = v2o(hdr_v)
-        if ho is None or ho + 12 > len(raw):
+        ho = self._v2o(hdr_v)
+        if ho is None or ho + 4 > len(raw):
             return []
-        # table_enc 低 nibble 0xb = sdata4 pcrel；高 nibble 3 = 有 4 字节计数头
-        count = _s.unpack_from("<I", raw, ho + 8)[0]
-        table = ho + 12
-        out: list[tuple[int, int]] = []
-        prev_start = 0
-        for i in range(count):
-            entry = table + i * 8
-            if entry + 8 > len(raw):
-                break
-            loc_off, _fde = _s.unpack_from("<ii", raw, entry)
-            start = (entry + loc_off) & 0xFFFFFFFFFFFFFFFF
-            if prev_start:
-                # 上一函数大小 = 本函数起点 - 上一函数起点
-                out.append((prev_start, start - prev_start))
-            prev_start = start
-        if prev_start:
-            out.append((prev_start, 0x200))
-        # 过滤：起点必须落在 PT_LOAD 内
-        return [
-            (pc, sz) for pc, sz in out
-            if any(va <= pc < end for va, end, _o, _fl in self._loads)
-        ]
+        version, ptr_enc, count_enc, table_enc = raw[ho], raw[ho + 1], raw[ho + 2], raw[ho + 3]
+        if version != 1 or count_enc == 0xFF or table_enc == 0xFF:
+            return []
 
+        mask = 0xFFFFFFFFFFFFFFFF if self._is64 else 0xFFFFFFFF
+        ptr_sz = 8 if self._is64 else 4
+
+        def _read_pe(pos: int, enc: int) -> tuple[int | None, int]:
+            """按 DW_EH_PE 编码从 raw[pos] 读一个值，返回 (解析后的值, 新偏移)。"""
+            if enc == 0xFF:
+                return None, pos
+            fmt = enc & 0x0F
+            app = enc & 0x70
+            field_va = hdr_v + (pos - ho)
+            n = len(raw)
+            if fmt == 0x00:
+                if pos + ptr_sz > n:
+                    return None, pos
+                val = struct.unpack_from("<Q" if self._is64 else "<I", raw, pos)[0]
+                pos += ptr_sz
+            elif fmt == 0x01:
+                val, shift = 0, 0
+                while pos < n:
+                    b = raw[pos]
+                    pos += 1
+                    val |= (b & 0x7F) << shift
+                    shift += 7
+                    if not (b & 0x80):
+                        break
+            elif fmt == 0x02:
+                if pos + 2 > n:
+                    return None, pos
+                val = struct.unpack_from("<H", raw, pos)[0]
+                pos += 2
+            elif fmt == 0x03:
+                if pos + 4 > n:
+                    return None, pos
+                val = struct.unpack_from("<I", raw, pos)[0]
+                pos += 4
+            elif fmt == 0x04:
+                if pos + 8 > n:
+                    return None, pos
+                val = struct.unpack_from("<Q", raw, pos)[0]
+                pos += 8
+            elif fmt == 0x09:
+                val, shift = 0, 0
+                while pos < n:
+                    b = raw[pos]
+                    pos += 1
+                    val |= (b & 0x7F) << shift
+                    shift += 7
+                    if not (b & 0x80):
+                        if b & 0x40:
+                            val |= -(1 << shift)
+                        break
+            elif fmt == 0x0A:
+                if pos + 2 > n:
+                    return None, pos
+                val = struct.unpack_from("<h", raw, pos)[0]
+                pos += 2
+            elif fmt == 0x0B:
+                if pos + 4 > n:
+                    return None, pos
+                val = struct.unpack_from("<i", raw, pos)[0]
+                pos += 4
+            elif fmt == 0x0C:
+                if pos + 8 > n:
+                    return None, pos
+                val = struct.unpack_from("<q", raw, pos)[0]
+                pos += 8
+            else:
+                return None, pos
+
+            if app == 0x00:
+                return val & mask, pos
+            if app == 0x10:  # DW_EH_PE_pcrel：基址是当前条目虚拟地址
+                return (field_va + val) & mask, pos
+            if app == 0x30:  # DW_EH_PE_datarel：基址是 .eh_frame_hdr 虚拟地址
+                return (hdr_v + val) & mask, pos
+            return None, pos
+
+        pos = ho + 4
+        _eh_ptr, pos = _read_pe(pos, ptr_enc)
+        count, pos = _read_pe(pos, count_enc)
+        if not count or count < 0 or count > 2_000_000:
+            return []
+
+        starts: list[int] = []
+        for _ in range(count):
+            start, next_pos = _read_pe(pos, table_enc)
+            if start is None or next_pos == pos:
+                break
+            _fde_ptr, next_pos2 = _read_pe(next_pos, table_enc)
+            if next_pos2 == next_pos:
+                break
+            pos = next_pos2
+            if self.in_load(start):
+                starts.append(start)
+
+        starts = sorted(set(starts))
+        out: list[tuple[int, int]] = []
+        for i, pc in enumerate(starts):
+            sz = (starts[i + 1] - pc) if i + 1 < len(starts) else 0x200
+            if sz > 0:
+                out.append((pc, sz))
+        return out
+
+    # (1) 第一次修改（2026-11-26）
+    # bug 原因：调用方在把 addr 放进 self.functions 之前就调用 _guess_size(addr)，
+    #           旧实现只在 `start == addr` 时计算间距，导致查不到自身而恒返回 16 字节。
+    # 解决方案：用 bisect_right 直接找大于 addr 的下一个已排序函数起点算大小并设上限 0x4000。
     def _guess_size(self, addr: int) -> int:
-        """按已排序函数区间猜测未标注大小函数的体积。"""
-        ranges = sorted((a, f.end) for a, f in self.functions.items())
-        for i, (start, end) in enumerate(ranges):
-            if start == addr:
-                if i + 1 < len(ranges):
-                    return max(16, ranges[i + 1][0] - addr)
-                return 16
+        """按已排序函数起点猜测未标注大小函数的体积。"""
+        starts = sorted(self.functions)
+        i = bisect.bisect_right(starts, addr)
+        if i < len(starts):
+            return min(starts[i] - addr, 0x4000)
         return 16
 
     # ---------- 查询 ----------
@@ -861,8 +1038,12 @@ class SoFile:
         实测 3.44s → 0.065s（53 倍），命中结果完全一致（差异 0）。
         附带收益：预筛天然只落在合法指令编码上，减少非指令边界误判。
         """
+        # (3) 第三次修改（2026-11-26）
+        # bug 原因：① 未校验架构，非 ARM64 样本误按 ARM64 指令扫描 PLT 桩；
+        #           ② 截断的 dump 文件里 `off + i * 4 + 4` 可能越过 `len(raw)` 触发 struct.error。
+        # 解决方案：开头校验 self.arch == Arch.ARM64，并在解包前检查 `pos + 4 <= len(raw)`。
         # 无节表时才需要；有节表走 _parse_plt 已有通路
-        if self._sections_usable:
+        if self._sections_usable or self.arch != Arch.ARM64:
             return
         raw = self._raw
         if not raw:
@@ -874,11 +1055,13 @@ class SoFile:
         md = Cs(CS_ARCH_ARM64, CS_MODE_LITTLE_ENDIAN)
         for va, end, off in exec_loads:
             for i in range((end - va) // 4):
+                pos = off + i * 4
+                if pos + 4 > len(raw):
+                    break
                 # 预筛：ADRP（op=1）且 Rd == x16，才值得做 4 条指令校验
-                w = struct.unpack_from("<I", raw, off + i * 4)[0]
+                w = struct.unpack_from("<I", raw, pos)[0]
                 if (w & 0x9F000000) != 0x90000000 or (w & 0x1F) != 16:
                     continue
-                pos = off + i * 4
                 code = raw[pos: pos + 16]
                 if len(code) < 16:
                     continue

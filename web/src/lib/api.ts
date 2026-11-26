@@ -26,6 +26,58 @@ const pageOrigin =
 export const API_BASE =
   pageOrigin && location.port === DEV_SERVER_PORT ? DEV_API_BASE : "";
 
+// (47) 第四十七次修改（2026-11-26）
+// bug 原因：① j() 残留调试用重复 XMLHttpRequest（每次 nav_stats 双发请求）；
+//           ② 写请求缺少自定义头 X-MDA-Client: 1，无法配合后端防跨站 CSRF 校验；
+//           ③ WebSocket / 剪贴板复制逻辑散落在组件里重复编写且未统一基于 API_BASE。
+// 解决方案：删除重复 XHR 调试块；所有非 GET 写请求自动携带 X-MDA-Client: 1；
+//           新增 apiWsUrl() 与 copyText() 供 App / RealtimeMonitor 复用。
+export const CLIENT_HEADERS: Record<string, string> = { "X-MDA-Client": "1" };
+
+/** 根据 API_BASE 构造 WebSocket 地址，统一开发代理与生产同源模式。 */
+export function apiWsUrl(path: string): string {
+  if (API_BASE) {
+    return API_BASE.replace(/^http/i, "ws") + path;
+  }
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  return `${proto}://${location.host}${path}`;
+}
+
+/** 写入系统剪贴板：优先走 pywebview 原生 NSPasteboard，其次浏览器 clipboard 与 execCommand。 */
+export async function copyText(text: string): Promise<boolean> {
+  const bridge = (window as unknown as {
+    pywebview?: { api?: { copy_text?: (t: string) => Promise<boolean> | boolean } };
+  }).pywebview;
+  if (bridge?.api?.copy_text) {
+    try {
+      if (await bridge.api.copy_text(text)) return true;
+    } catch {
+      /* 降级到浏览器 API */
+    }
+  }
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch {
+    /* 降级到 execCommand */
+  }
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand("copy");
+    ta.remove();
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
 export type ApiModule = { so: string; path: string; functions: number; exports: number; sections: number };
 export type ApiFn = {
   name: string; addr: number; size: number; is_export: boolean;
@@ -35,7 +87,7 @@ export type ApiInsn = { addr: number; bytes: string; text: string; is_call: bool
 export type ApiTool = { name: string; desc: string; params: string[]; required: string[] };
 export type ApiHeatmap = {
   so: string; lo: string; hi: string; functions: number;
-  max_refs: number; buckets: number[];
+  max_refs: number; buckets: number[]; xref_built?: boolean;
 };
 export type ApiSection = {
   name: string; addr: string; offset: string; size: number; flags: string; type?: string;
@@ -90,15 +142,13 @@ export type ApiConsoleEvent = {
   pid?: number;
   /** kind=line 时是脚本打印的原始文本行 */
   text?: string;
-  /** 有值表示这条是 AI 调工具时内部脚本的旁路输出，标注来源工具名 */
-  source?: string;
   payload?: unknown;
   error?: string;
   stack?: string;
   mode?: string;
   reason?: string;
 };
-export type ApiXrefItem = { addr: string; name: string; is_export: boolean; size: number };
+export type ApiXrefItem = { addr: string; site?: string; name: string; is_export: boolean; size: number };
 /** 函数检视器：一个函数的全部已知事实（右侧面板） */
 
 /** 动态侧状态：断点 / 命中 / 内存 / VM / 行为监控。
@@ -117,9 +167,9 @@ export type ApiDynState = {
   }[];
   memory: { name: string; size: number; mtime: number }[];
   vm: {
-    dispatch: { calls?: number; num?: number | null; ts?: string; summary?: string }[];
-    regs: { calls?: number; num?: number | null; ts?: string; summary?: string }[];
-    trace: { calls?: number; num?: number | null; ts?: string; summary?: string }[];
+    dispatch: { tool?: string; calls?: number; num?: number | null; ts?: string; summary?: string }[];
+    regs: { tool?: string; calls?: number; num?: number | null; ts?: string; summary?: string }[];
+    trace: { tool?: string; calls?: number; num?: number | null; ts?: string; summary?: string }[];
   };
   behavior: { armed: boolean; categories: string[]; off?: string[] };
   errors: string[];
@@ -136,7 +186,7 @@ export type ApiFnDetail = {
   refs_out: number;
   section: string;
   attached: boolean;
-  callers: { addr: string; name: string; is_export: boolean }[];
+  callers: { addr: string; site?: string; name: string; is_export: boolean }[];
   callees: { addr: string; name: string; is_export: boolean; plt: boolean }[];
   strings: { addr: string; value: string }[];
   breakpoint: boolean;
@@ -201,26 +251,17 @@ async function j<T>(url: string, init?: RequestInit): Promise<T | null> {
     // 连服务端 no-store 和客户端 cache:"no-store" 都不遵守。
     // 带参数的请求（如 nav_stats?so=xxx）不会被缓存——这就是为什么
     // 左栏能显示真实计数、而 /api/modules 恒返回旧空数组（实测定位）。
-    const isGet = !init || !init.method || init.method === "GET";
+    const isGet = !init || !init.method || init.method.toUpperCase() === "GET";
     const bust = isGet ? (url.includes("?") ? "&" : "?") + "_t=" + Date.now() : "";
     const finalUrl = url + bust;
-    if (url.includes("nav_stats")) {
-      try {
-        const x = new XMLHttpRequest();
-        x.open("GET", finalUrl, true);
-        x.onload = () => {
-          const w = window as unknown as { __mdaNavRaw?: string[] };
-          w.__mdaNavRaw = [...(w.__mdaNavRaw ?? []).slice(-5), x.responseText.slice(0, 160)];
-        };
-        x.send();
-      } catch { /* ignore */ }
+    // 所有写请求统一附加 X-MDA-Client: 1 头，配合服务端防跨站 CSRF 校验
+    const reqInit: RequestInit = { cache: "no-store", ...init };
+    if (!isGet) {
+      const hdrs = new Headers(init?.headers ?? {});
+      hdrs.set("X-MDA-Client", "1");
+      reqInit.headers = hdrs;
     }
-    // 诊断：把实际请求的 URL 记下来（窗口里 console 看不到，靠这个上报）
-    try {
-      const w = window as unknown as { __mdaUrls?: string[] };
-      w.__mdaUrls = [...(w.__mdaUrls ?? []).slice(-20), finalUrl];
-    } catch { /* ignore */ }
-    const r = await fetch(finalUrl, { cache: "no-store", ...init });
+    const r = await fetch(finalUrl, reqInit);
     if (!r.ok) return null;
     return (await r.json()) as T;
   } catch {
@@ -263,7 +304,10 @@ export const api = {
   armed: () => j<{ count: number; items: ApiArmed[] }>(`${API_BASE}/api/armed`),
   /** 清空待命显示（不撤设备上的断点，只清界面） */
   armedClear: () =>
-    j<{ cleared: number }>(`${API_BASE}/api/armed/clear`, { method: "POST" }),
+    j<{ cleared: number }>(`${API_BASE}/api/armed/clear`, {
+      method: "POST",
+      headers: { ...CLIENT_HEADERS },
+    }),
   /** 函数检视器（右侧面板：概况 / 调用者 / 被调用 / 引用字符串 / 动态） */
   fnDetail: (so: string, addr: number) =>
     j<ApiFnDetail>(
@@ -302,14 +346,14 @@ export const api = {
   load: (path: string) =>
     j<{ module: ApiModule }>(`${API_BASE}/api/load`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", ...CLIENT_HEADERS },
       body: JSON.stringify({ path }),
     }),
   /** 拖入的文件：字节直接上传，后端落盘后按路径解析 */
   upload: (name: string, buf: ArrayBuffer) =>
     fetch(`${API_BASE}/api/load_upload?name=${encodeURIComponent(name)}`, {
       method: "POST",
-      headers: { "content-type": "application/octet-stream" },
+      headers: { "content-type": "application/octet-stream", ...CLIENT_HEADERS },
       body: buf,
     }).then(async (r) => {
       const body = await r.json().catch(() => ({}));
@@ -331,7 +375,7 @@ export const api = {
   buildXrefs: (so: string) =>
     j<{ ok: boolean }>(`${API_BASE}/api/xrefs/build`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", ...CLIENT_HEADERS },
       body: JSON.stringify({ so }),
     }),
 
@@ -353,7 +397,7 @@ export const api = {
       `${API_BASE}/api/frida_js`,
       {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: { "content-type": "application/json", ...CLIENT_HEADERS },
         body: JSON.stringify(opts),
       }
     ),
@@ -362,7 +406,7 @@ export const api = {
       `${API_BASE}/api/frida_js/stop`,
       {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: { "content-type": "application/json", ...CLIENT_HEADERS },
         body: JSON.stringify(opts),
       }
     ),

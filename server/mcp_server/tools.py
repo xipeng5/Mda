@@ -14,6 +14,8 @@ GUI 的 Output 面板订阅显示——人工能实时看到 AI 在干什么。
 from __future__ import annotations
 
 import json
+import sys
+import threading
 import time
 from collections import deque
 
@@ -65,6 +67,11 @@ def _notify_ui(event: dict) -> None:
 #          （hits 一次 12KB/条、disassemble 可达上万行），几百条就把内存吃爆，
 #          且 get_activity_log 每次都要 list() 全量复制。
 # 解决方案：改用 deque(maxlen=300)，与前端控制台保留条数一致；超限丢最旧。
+# (136) 第136次修改（2026-11-26）
+# bug 原因：_activity_log 与 _log_listeners 在多请求并发写（_activity）和 GUI
+#          并发读（get_activity_log）时无锁保护，存在 RuntimeError / 读到撕裂状态风险。
+# 解决方案：新增 _activity_lock = threading.Lock() 保护读写，并在锁外触发回调避免死锁。
+_activity_lock = threading.Lock()
 _activity_log: deque[dict] = deque(maxlen=300)
 _log_listeners: list = []  # 回调列表，GUI 注册
 
@@ -101,7 +108,7 @@ def _result_brief(result) -> dict:
         text = result
     else:
         try:
-            text = json.dumps(result, ensure_ascii=False, indent=2, default=str)
+            text = json.dumps(_plain_json(result), ensure_ascii=False, indent=2, default=str)
         except Exception:                                  # noqa: BLE001
             text = str(result)
     total = len(text)
@@ -113,7 +120,8 @@ def _result_brief(result) -> dict:
 
 def on_activity(cb) -> None:
     """GUI 注册监听：每条 AI 活动回调 cb(entry dict)。"""
-    _log_listeners.append(cb)
+    with _activity_lock:
+        _log_listeners.append(cb)
 
 
 def _activity(tool: str, args: dict, summary: str, ms: float,
@@ -144,8 +152,10 @@ def _activity(tool: str, args: dict, summary: str, ms: float,
         "result_truncated": brief["truncated"],
         "result_bytes": brief["bytes"],
     }
-    _activity_log.append(entry)
-    for cb in _log_listeners:
+    with _activity_lock:
+        _activity_log.append(entry)
+        listeners = list(_log_listeners)
+    for cb in listeners:
         try:
             cb(entry)
         except Exception:
@@ -221,7 +231,8 @@ def get_activity_log(limit: int = 200) -> list[dict]:
     解决方案：用 itertools.islice 的等价写法。limit<=0 视为不限（返回全部），
               与调用方语义保持一致；转成 list 返回，调用方仍按列表使用。
     """
-    items = list(_activity_log)
+    with _activity_lock:
+        items = list(_activity_log)
     if limit and limit > 0:
         return items[-limit:]
     return items
@@ -236,13 +247,19 @@ def get_session() -> Session:
 _plugin_mgr = None
 
 
+# (136) 第136次修改（2026-11-26）
+# bug 原因：get_plugins 的 log 回调默认 print(..., flush=True) 输出到 stdout，
+#          在 MCP stdio 模式下会向 stdout 吐出纯文本，直接破坏 JSON-RPC 协议流。
+# 解决方案：将日志输出改为 file=sys.stderr，确保 stdout 仅供 MCP JSON-RPC 使用。
 def get_plugins():
     """插件管理器，惰性初始化。"""
     global _plugin_mgr
     if _plugin_mgr is None:
         from server.core.plugins import PluginManager
 
-        _plugin_mgr = PluginManager(_session, log=lambda t: print(t, flush=True))
+        _plugin_mgr = PluginManager(
+            _session, log=lambda t: print(t, file=sys.stderr, flush=True)
+        )
         _plugin_mgr.scan_and_load()
     return _plugin_mgr
 
@@ -383,9 +400,25 @@ def logged(tool_name: str | None = None):
     return deco
 
 
+# (138) 第一百三十八次修改（2026-11-26）
+# bug 原因：CPython 纯 Python 路径的 json.dumps(..., indent=2) 用 `if not dct:` 判空，
+#          而 dyn.service._Result(dict) 重写了 __bool__（resumed=False/removed=False 时为 False），
+#          导致所有失败的 _Result 在 _j() 与 _result_brief() 中被静默序列化成 "{}"，丢失全部字段！
+# 解决方案：序列化前递归将 dict 子类转为普通 dict（保留所有键值对、恢复按长度判空语义）。
+def _plain_json(obj):
+    """递归把自定义 dict 子类（如 _Result）还原为普通 dict，避免 indent=2 序列化变空对象。"""
+    if isinstance(obj, dict):
+        return {k: _plain_json(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_plain_json(v) for v in obj]
+    if isinstance(obj, tuple):
+        return [_plain_json(v) for v in obj]
+    return obj
+
+
 def _j(obj) -> str:
     """统一 JSON 输出，dataclass 自动转 dict。"""
-    return json.dumps(obj, ensure_ascii=False, indent=2, default=lambda o: o.__dict__)
+    return json.dumps(_plain_json(obj), ensure_ascii=False, indent=2, default=lambda o: o.__dict__)
 
 
 # ---------------- 地址换算（自动，不让人手算） ----------------
@@ -544,11 +577,15 @@ def load_so(path: str, auto_discover: bool = False) -> str:
     real = _os.path.abspath(path)
     for existing in list(_session.modules.values()):
         if _os.path.abspath(getattr(existing, "path", "") or "") == real:
+            # (136) 第136次修改（2026-11-26）
+            # bug 原因：① 复用分支在 auto_discover=True 时武断限定 functions<100 才补全，
+            #             导致初扫 >=100 个函数的样本再次调用 load_so(auto_discover=True) 被跳过；
+            #          ② 首次加载分支在 _run_auto_discover 之前就调 _anno.apply()，导致新发现
+            #             的函数无法恢复历史重命名。
+            # 解决方案：① 复用分支 auto_discover=True 时无条件触发 _run_auto_discover（底层自带幂等）；
+            #          ② 首次加载分支先执行 _run_auto_discover，再调 _anno.apply() 恢复重命名与注释。
             # (22) 复用分支也要给同样的警告——见 _so_table_warning 的说明
-            discover_result = None
-            if auto_discover and int(getattr(existing, "functions", {}) and
-                                     len(existing.functions) or 0) < 100:
-                discover_result = _run_auto_discover(existing.name)
+            discover_result = _run_auto_discover(existing.name) if auto_discover else None
             return _j({
                 "loaded": existing.name,
                 "reused": True,
@@ -557,7 +594,11 @@ def load_so(path: str, auto_discover: bool = False) -> str:
 
     so = _session.add(path)
 
-    # (4) 恢复持久化的重命名与注释
+    # (135) 加载后函数表可能只有 FDE/dynsym 初扫结果（实测某个加固样本只有 1 个），
+    #       而真正可用要 build_xrefs 后发现 bl 目标。不提示会导致后续结论全错。
+    discover_result = _run_auto_discover(so.name) if auto_discover else None
+
+    # (4) 恢复持久化的重命名与注释（放在 auto_discover 之后，确保新发现的函数也能恢复改名）
     restored, persisted, _n_comment = 0, {}, 0
     try:
         from server.core.annotations import store as _anno
@@ -572,10 +613,6 @@ def load_so(path: str, auto_discover: bool = False) -> str:
                 _n_comment += 1
     except Exception:                                     # noqa: BLE001
         restored, persisted, _n_comment = 0, {}, 0
-
-    # (135) 加载后函数表可能只有 FDE/dynsym 初扫结果（实测某个加固样本只有 1 个），
-    #       而真正可用要 build_xrefs 后发现 bl 目标。不提示会导致后续结论全错。
-    discover_result = _run_auto_discover(so.name) if auto_discover else None
 
     get_plugins().emit("after_load", {"so_name": so.name})
     out = {"loaded": so.name, **_so_table_warning(so, auto_discover, discover_result)}
@@ -776,11 +813,19 @@ def xrefs_to(so_name: str, addr: int) -> str:
     自动构建全部已加载模块的引用图（跨 so 调用藏在其他模块的
     PLT 调用里，只 build 目标模块会漏），并归并字符串引用。
     """
+    # (136) 第136次修改（2026-11-26）
+    # bug 原因：xrefs_to 与 xrefs_from 未先将别名 so_name 规范化为 so.name，跨 so
+    #          去重条件 `link.caller_so != so_name` 在传入别名时会误把本模块算作跨 so；
+    #          且 xrefs_from docstring 承诺返回数据引用但代码仅返回代码调用。
+    # 解决方案：先规范化 so_name = so.name（并保留会话键 canon）；xrefs_from 补充
+    #          x.data_refs_of_fn(fn.addr) 到返回字段 data_refs。
     for name in list(_session.modules):
         _session.ensure_xrefs(name)
-    x = _session.xref(so_name)
-    sites = x.xrefs_to(addr)
     so = _session.get(so_name)
+    canon = _session.key(so_name)
+    so_name = so.name
+    x = _session.xref(canon)
+    sites = x.xrefs_to(addr)
     out = [
         {"so": so_name, "site": s, "function": (fn.name or f"sub_{fn.addr:x}") if (fn := so.function_at(s)) else None}
         for s in sites
@@ -789,7 +834,7 @@ def xrefs_to(so_name: str, addr: int) -> str:
     fn_at = so.function_at(addr)
     if fn_at is not None and fn_at.name:
         for link in _session.callers_of(fn_at.name):
-            if link.caller_so != so_name:
+            if link.caller_so not in (so_name, canon):
                 out.append({
                     "so": link.caller_so, "site": link.caller_addr,
                     "function": f"{link.caller} (via PLT → {fn_at.name})",
@@ -802,17 +847,19 @@ def xrefs_to(so_name: str, addr: int) -> str:
 def xrefs_from(so_name: str, addr: int) -> str:
     """查询某函数发出了哪些引用（IDA 的 xrefs from）。
 
-    返回调用目标（含 PLT 解析出的跨 so 落点）与数据引用。
+    返回调用目标（含 PLT 解析出的跨 so 落点）与数据引用（data_refs）。
     """
-    _session.ensure_xrefs(so_name)
-    x = _session.xref(so_name)
     so = _session.get(so_name)
+    canon = _session.key(so_name)
+    so_name = so.name
+    _session.ensure_xrefs(canon)
+    x = _session.xref(canon)
     fn = so.function_at(addr)
     if fn is None:
         return _j({"error": f"{addr:#x} 不在任何函数内"})
     out = []
     for callee in sorted(set(x.called_by.get(fn.addr, []))):
-        link = _session.resolve_call(so_name, callee)
+        link = _session.resolve_call(canon, callee)
         if link:
             out.append({
                 "target": callee,
@@ -823,7 +870,19 @@ def xrefs_from(so_name: str, addr: int) -> str:
             })
         else:
             out.append({"target": callee, "name": hex(callee), "target_so": so_name})
-    return _j({"function": fn.name or f"sub_{fn.addr:x}", "refs": out})
+    # 补充函数发出的数据引用（与 docstring 保持一致）
+    data_addrs = (
+        x.data_refs_of_fn(fn.addr)
+        if callable(getattr(x, "data_refs_of_fn", None))
+        else list((getattr(x, "_fn_data_refs", None) or {}).get(fn.addr, []))
+    )
+    data_refs = [{"target": d, "target_hex": hex(d), "so": so_name} for d in data_addrs]
+    return _j({
+        "so": so_name,
+        "function": fn.name or f"sub_{fn.addr:x}",
+        "refs": out,
+        "data_refs": data_refs,
+    })
 
 
 @server.tool()
@@ -864,31 +923,56 @@ def segments(so_name: str) -> str:
     dump 上完全丢失。现在 program_headers 从原始 ELF 头解析，
     与 sections 并列返回；节表无效时 sections 为空数组 + warning。
     """
+    # (136) 第136次修改（2026-11-26）
+    # bug 原因：旧实现直接无锁 seek/read so._stream，多线程并发查询会互相踩文件偏移；
+    #          且硬编码 ELF64 头布局，遇到 ELF32 或截断头会抛 struct.error。
+    # 解决方案：直接从内存缓冲 so._raw 解析，校验 ELF 魔数与长度边界，兼容 ELF32/ELF64
+    #          及大小端编码。
     import struct as _s
 
     so = _session.get(so_name)
     # 手工解析 program headers（不依赖节表可用性）
     phdrs = []
-    so._stream.seek(0)
-    head = so._stream.read(64)
-    e_phoff, = _s.unpack_from("<Q", head, 0x20)
-    e_phentsize, e_phnum = _s.unpack_from("<HH", head, 0x36)
+    raw = getattr(so, "_raw", None)
+    if not isinstance(raw, (bytes, bytearray)):
+        raw = b""
     PT = {1: "PT_LOAD", 2: "PT_DYNAMIC", 3: "PT_INTERP", 4: "PT_NOTE",
           6: "PT_PHDR", 7: "PT_TLS", 0x6474E550: "PT_GNU_EH_FRAME",
           0x6474E551: "PT_GNU_STACK", 0x6474E552: "PT_GNU_RELRO"}
-    for i in range(e_phnum):
-        so._stream.seek(e_phoff + i * e_phentsize)
-        ph = so._stream.read(e_phentsize)
-        if len(ph) < 56:
-            break
-        p_type, p_flags = _s.unpack_from("<II", ph, 0)
-        p_offset, p_vaddr, _pa, p_filesz, p_memsz = _s.unpack_from("<QQQQQ", ph, 8)
-        phdrs.append({
-            "type": PT.get(p_type, hex(p_type)),
-            "vaddr": hex(p_vaddr), "filesz": hex(p_filesz), "memsz": hex(p_memsz),
-            "offset": hex(p_offset),
-            "flags": (("R" if p_flags & 4 else "") + ("W" if p_flags & 2 else "") + ("X" if p_flags & 1 else "")) or "-",
-        })
+    if len(raw) >= 52 and raw[:4] == b"\x7fELF":
+        ei_class = raw[4]  # 1=ELF32, 2=ELF64
+        endian = ">" if raw[5] == 2 else "<"
+        if ei_class == 2 and len(raw) >= 64:
+            e_phoff, = _s.unpack_from(endian + "Q", raw, 0x20)
+            e_phentsize, e_phnum = _s.unpack_from(endian + "HH", raw, 0x36)
+            min_ent = 56
+        elif ei_class == 1 and len(raw) >= 52:
+            e_phoff, = _s.unpack_from(endian + "I", raw, 0x1C)
+            e_phentsize, e_phnum = _s.unpack_from(endian + "HH", raw, 0x2A)
+            min_ent = 32
+        else:
+            e_phoff, e_phentsize, e_phnum, min_ent = 0, 0, 0, 0
+
+        if e_phentsize >= min_ent > 0 and e_phoff > 0:
+            for i in range(e_phnum):
+                off = e_phoff + i * e_phentsize
+                if off + min_ent > len(raw):
+                    break
+                if ei_class == 2:
+                    p_type, p_flags = _s.unpack_from(endian + "II", raw, off)
+                    p_offset, p_vaddr, _pa, p_filesz, p_memsz = _s.unpack_from(
+                        endian + "QQQQQ", raw, off + 8
+                    )
+                else:
+                    p_type, p_offset, p_vaddr, _pa, p_filesz, p_memsz, p_flags = (
+                        _s.unpack_from(endian + "IIIIIII", raw, off)
+                    )
+                phdrs.append({
+                    "type": PT.get(p_type, hex(p_type)),
+                    "vaddr": hex(p_vaddr), "filesz": hex(p_filesz), "memsz": hex(p_memsz),
+                    "offset": hex(p_offset),
+                    "flags": (("R" if p_flags & 4 else "") + ("W" if p_flags & 2 else "") + ("X" if p_flags & 1 else "")) or "-",
+                })
     return _j({
         "program_headers": phdrs,
         "sections": [
@@ -956,7 +1040,15 @@ def rename_function(so_name: str, addr: int, new_name: str) -> str:
 
     对齐 IDA 的 N 快捷键。重命名即时生效且持久到当前会话。
     """
+    # (136) 第136次修改（2026-11-26）
+    # bug 原因：① 旧实现更新 _export_index 时直接 `_export_index.pop(old, None)`，
+    #             会误删其他 so 的同名导出符号；② 写入了原始别名 so_name 而非规范名，
+    #             且列表推导式 `(n, a) if a != fn.addr else (n, a)` 无效并会重复追加；
+    #          ③ 未同步更新 so.exports[new_name].name。
+    # 解决方案：统一使用规范名 so.name（会话键 canon），仅从旧名列表移除本模块的
+    #          (canon, fn.addr) 条目，新名列表去重追加，并同步更新 Symbol.name。
     so = _session.get(so_name)
+    canon = _session.key(so_name)
     fn = so.function_at(addr)
     if fn is None:
         return _j({"error": f"{addr:#x} 不在任何函数内"})
@@ -968,24 +1060,34 @@ def rename_function(so_name: str, addr: int, new_name: str) -> str:
         _anno.save(so.name, fn.addr, rename=new_name)
     except Exception:                                     # noqa: BLE001
         pass
-    _notify_ui({"type": "renamed", "so_name": so_name, "addr": fn.addr, "old": old, "new": new_name})
+    _notify_ui({"type": "renamed", "so_name": so.name, "addr": fn.addr, "old": old, "new": new_name})
     # 同步导出表里的名字，使跨 so 解析立即用新名
     if old in so.exports:
+        import dataclasses as _dc
+
         renamed = so.exports.pop(old)
+        if _dc.is_dataclass(renamed):
+            renamed = _dc.replace(renamed, name=new_name)
+        elif hasattr(renamed, "name"):
+            renamed.name = new_name
         so.exports[new_name] = renamed
-        if new_name in _session._export_index:
-            _session._export_index[new_name] = [
-                (n, a) if a != fn.addr else (n, a)
-                for (n, a) in _session._export_index[new_name]
+        old_entries = _session._export_index.get(old)
+        if old_entries is not None:
+            kept = [
+                (n, a) for (n, a) in old_entries
+                if not (n in (canon, so.name) and a == fn.addr)
             ]
-            _session._export_index[new_name].append((so_name, fn.addr))
-        else:
-            _session._export_index[new_name] = [(so_name, fn.addr)]
-        _session._export_index.pop(old, None)
+            if kept:
+                _session._export_index[old] = kept
+            else:
+                _session._export_index.pop(old, None)
+        new_entries = _session._export_index.setdefault(new_name, [])
+        if (canon, fn.addr) not in new_entries:
+            new_entries.append((canon, fn.addr))
         # 旧名若与 PLT 映射名一致，跨 so 调用方按旧名解析会失效——
         # 导出符号真实改名场景极少，此处保留 PLT 名不变（导入名是对方 so 的事实）
-    get_plugins().emit("after_rename", {"so_name": so_name, "addr": fn.addr, "old": old, "new": new_name})
-    return _j({"renamed": True, "addr": hex(fn.addr), "old": old, "new": new_name})
+    get_plugins().emit("after_rename", {"so_name": so.name, "addr": fn.addr, "old": old, "new": new_name})
+    return _j({"renamed": True, "so": so.name, "addr": hex(fn.addr), "old": old, "new": new_name})
 
 
 @server.tool()
@@ -998,15 +1100,24 @@ def set_comment(so_name: str, addr: int, comment: str) -> str:
     #  解决方案：先换成规范键再存，读写两侧同口径。
     key = _session.key(so_name)
     _session.comments[(key, addr)] = comment
+    # (136) 第136次修改（2026-11-26）
+    # bug 原因：持久化失败被 except 吞掉后仍然硬编码返回 persisted=True，误导调用方。
+    # 解决方案：如实记录 saved_ok 与 persist_error，失败时返回 persisted=False 并附错误原因。
     # (4) 持久化（comment 与 rename 存在同一个 JSON 里）
+    saved_ok = False
+    persist_error = ""
     try:
         from server.core.annotations import store as _anno
         _anno.save(key, addr, comment=comment)
-    except Exception:                                     # noqa: BLE001
-        pass
+        saved_ok = True
+    except Exception as exc:                              # noqa: BLE001
+        persist_error = f"{type(exc).__name__}: {exc}"
     get_plugins().emit("after_comment", {"so_name": key, "addr": addr, "comment": comment})
-    return _j({"commented": hex(addr), "comment": comment, "so": key,
-               "persisted": True})
+    out = {"commented": hex(addr), "comment": comment, "so": key,
+           "persisted": saved_ok}
+    if not saved_ok:
+        out["persist_error"] = persist_error
+    return _j(out)
 
 
 @server.tool()
@@ -1259,6 +1370,13 @@ def build_xrefs(so_name: str, use_prologue: bool | None = None,
         prog = _session.xref_progress(so_name) or {}
     except Exception:                                     # noqa: BLE001
         prog = {}
+    # (136) 第136次修改（2026-11-26）
+    # bug 原因：① cached 分支比对档位时遗漏了 use_prologue（与 aggressive 等价的推荐参数），
+    #             传 use_prologue=True 却与旧缓存 aggressive=False 误判一致；
+    #          ② 后台任务去重按原始别名 so_name 比较，不同别名可并发启动重复建图任务。
+    # 解决方案：① eff_aggressive 综合 use_prologue 与 aggressive，want 纳入 use_prologue
+    #             并透传给 ensure_xrefs；② 先解析规范模块名 so.name 再做后台任务去重与登记。
+    eff_aggressive = bool(use_prologue) if use_prologue is not None else bool(aggressive)
     if prog.get("built"):
         x = _session.xref(so_name)
         so = _session.get(so_name)
@@ -1269,28 +1387,35 @@ def build_xrefs(so_name: str, use_prologue: bool | None = None,
             "data_refs": len(x.data_refs),
         }
         # (28) 第二十八次修改（2026-11-18）：cached 分支如实对比档位。
-        #      bug 原因：旧实现在 cached 分支完全不看 aggressive，使用者传
-        #                aggressive=True 却拿到 386 个函数，会误判"激进模式
-        #                也没用"——实际是被缓存短路了（第 14 轮反馈同一问题）。
-        #      解决方案：报出建图时用的档位，与本次请求不同则给 tier_mismatch
-        #                与明确下一步，而不是静默返回旧结果。
         built_tier = getattr(x, "discover_tier", None)
         if built_tier is not None:
             out["built_tier"] = built_tier
-            want = {"aggressive": bool(aggressive),
+            want = {"aggressive": eff_aggressive,
+                    "use_prologue": eff_aggressive,
                     "strict_prologue": bool(strict_prologue),
                     "use_rela": bool(use_rela)}
-            if built_tier != want:
+            built_norm = {
+                "aggressive": bool(built_tier.get("aggressive")),
+                "use_prologue": bool(
+                    built_tier.get("use_prologue", built_tier.get("aggressive"))
+                ),
+                "strict_prologue": bool(built_tier.get("strict_prologue")),
+                "use_rela": bool(built_tier.get("use_rela")),
+            }
+            if built_norm != want:
                 out["tier_mismatch"] = (
                     f"引用图是用 {built_tier} 建的，本次请求 {want}；"
                     "cached 分支不会重建。要换档位请先 unload_so(so) 再 "
                     "load_so(auto_discover=True)，或另起会话重跑。")
         return _j(out)
 
+    # 先按规范模块名归一，确保不同别名指向同一后台任务
+    canon_so = _session.get(so_name).name
+
     # 有正在跑的同一任务 → 直接复用，不要重复启动
     with _XREF_LOCK:
         for jid, job in _XREF_JOBS.items():
-            if job["so"] == so_name and job["state"] == "running":
+            if job["so"] == canon_so and job["state"] == "running":
                 return _j({"ok": True, "job": jid, "state": "running",
                            "message": "这个 so 的引用图正在建，用 "
                                       "build_xrefs_status(job=...) 轮询"})
@@ -1301,7 +1426,7 @@ def build_xrefs(so_name: str, use_prologue: bool | None = None,
 
         jid = _uuid.uuid4().hex[:12]
         _XREF_JOBS[jid] = {
-            "job": jid, "so": so_name, "state": "running",
+            "job": jid, "so": canon_so, "state": "running",
             "started": _t.time(), "percent": 0, "result": None, "error": None,
         }
 
@@ -1327,13 +1452,15 @@ def build_xrefs(so_name: str, use_prologue: bool | None = None,
                 job["elapsed"] = round(_t.time() - job["started"], 1)
 
         try:
-            _session.ensure_xrefs(so_name, aggressive=aggressive,
+            _session.ensure_xrefs(canon_so, aggressive=eff_aggressive,
                                   progress=_on_progress,
                                   strict_prologue=strict_prologue,
                                   use_rela=use_rela,
                                   use_prologue=use_prologue)
-            so = _session.get(so_name)
-            x = _session.xref(so_name)
+            so = _session.get(canon_so)
+            x = _session.xref(canon_so)
+            if isinstance(getattr(x, "discover_tier", None), dict):
+                x.discover_tier["use_prologue"] = eff_aggressive
             res = {
                 "functions": len(so.functions),
                 "call_edges": sum(len(v) for v in x.calls_to.values()),
@@ -1425,19 +1552,24 @@ def list_devices() -> str:
     return _j([{"serial": d.serial, "state": d.state} for d in Adb.list_devices()])
 
 
+# (136) 第136次修改（2026-11-26）
+# bug 原因：list_processes 暴露了 pid 参数但函数体内完全未过滤，传入 pid 后仍返回全量进程。
+# 解决方案：pid > 0 时按 p.pid == int(pid) 精确过滤，与 keyword 过滤协同生效。
 @server.tool()
 @logged()
 def list_processes(serial: str, keyword: str = "",
                    pid: int = 0) -> str:
-    """列出设备进程。keyword 过滤进程名。"""
+    """列出设备进程。keyword 过滤进程名；pid > 0 时仅返回指定 PID。"""
     from server.dyn.adb import Adb
 
     procs = Adb(serial).processes()
     kw = keyword.lower()
+    want_pid = int(pid or 0)
     return _j([
         {"pid": p.pid, "name": p.name, "user": p.user}
         for p in procs
-        if not kw or kw in p.name.lower()
+        if (want_pid <= 0 or p.pid == want_pid)
+        and (not kw or kw in p.name.lower())
     ][:200])
 
 
@@ -1477,10 +1609,15 @@ def start_frida(serial: str) -> str:
     return _j(Adb(serial).start_frida(expect_version=expect))
 
 
+# (136) 第136次修改（2026-11-26）
+# bug 原因：底层 ensure_server 支持 allow_unverified 参数，但 MCP 包装层未暴露，
+#          导致无官方 sha256 清单时无法由调用方显式放行。
+# 解决方案：暴露可选参数 allow_unverified: bool = False 并透传给 ensure_server。
 @server.tool()
 @logged()
 def frida_server_align(serial: str, version: str = "", dry_run: bool = True,
-                       device_path: str = "") -> str:
+                       device_path: str = "",
+                       allow_unverified: bool = False) -> str:
     """把设备端 frida-server 覆盖成**与本机客户端完全一致**的版本并启动。
 
     为什么需要：frida 客户端与设备端 server 版本必须一致才能通信，minor 不同也会报
@@ -1493,7 +1630,8 @@ def frida_server_align(serial: str, version: str = "", dry_run: bool = True,
         确认无误后传 dry_run=False 才真正执行。
         执行时：覆盖前强制备份原文件（<路径>.bak-<时间戳>），
         任一步失败自动还原备份并把回滚结果写进返回，不留半坏状态。
-        下载后按 GitHub 官方公布的 sha256 校验，不匹配立即删除并中止。
+        下载后按 GitHub 官方公布的 sha256 校验，不匹配立即删除并中止；
+        仅在确认安全且明确需要跳过无官方校验清单限制时传 allow_unverified=True。
 
     version 留空表示用本机 `frida.__version__`，这是保证匹配的正常用法。
     device_path 留空表示 /data/local/tmp/frida-server。
@@ -1511,6 +1649,7 @@ def frida_server_align(serial: str, version: str = "", dry_run: bool = True,
             version=(version or None),
             dry_run=bool(dry_run),
             device_path=(device_path or "/data/local/tmp/frida-server"),
+            allow_unverified=bool(allow_unverified),
         )
     except Exception as exc:              # noqa: BLE001 - DynError 带 code
         code = getattr(exc, "code", type(exc).__name__)
@@ -1595,6 +1734,92 @@ def remove_breakpoint(bp_id: str) -> str:
                    "code": getattr(exc, "code", "REMOVE_FAILED")})
 
 
+# (136) 第136次修改（2026-11-26）
+# bug 原因：① _reg_value / _hit_matches_filter 内部无条件用 int(x, 16) 解析字符串，
+#             纯十进制 "10" 被错当成 0x10 (16)；
+#          ② 范围过滤 min/max/gt/lt/ge/le 遇到无法解析的值时静默放行；
+#          ③ _group_hits 的 plain_fields 漏了 docstring 承诺的 "ts"；
+#          ④ hits 的 bp_id 过滤仅比对静态地址未校验模块名，多 so 同偏移会串台；
+#          ⑤ hits 过滤结果为空时引用未绑定的 total_matched 抛 UnboundLocalError；
+#          ⑥ hits 传 group_by 时先被 limit 截断再聚合导致分布失真，且样本未遵守
+#             include_context 并原地 pop 污染了原记录。
+# 解决方案：① 统一改用 server.core.addr.parse_addr 解析（十进制 "10"->10、"0x10"->16）；
+#          ② 无法解析的比较值返回不匹配（hits 入口校验并报明确错误 BAD_FILTER）；
+#          ③ plain_fields 补 "ts"；④ 提取公共 _parse_bp_id / _bp_so_matches 校验模块名；
+#          ⑤ 在 reg_filter 前记录 total_before_filter；
+#          ⑥ group_by 先对全量 filtered 聚合，样本按浅拷贝裁剪并遵守 include_context。
+def _parse_bp_id(bp_id: str) -> tuple[str, int | None]:
+    """解析 bp_id（形如 serial:pid:so:hex_addr 或 so:hex_addr 或 hex_addr）。
+
+    返回 (want_so, want_addr)；地址末段按十六进制（兼容 0x/0X 前缀与裸 hex）经
+    parse_addr 解析，避免 lstrip('0x') 在 '0x0' 等值上剥空报错。
+    """
+    from server.core.addr import parse_addr
+
+    text = str(bp_id or "").strip()
+    if not text:
+        return "", None
+    parts = text.rsplit(":", 2)
+    if len(parts) == 3:
+        want_so = parts[1].strip()
+        tail = parts[2].strip()
+    elif ":" in text:
+        left, tail = text.rsplit(":", 1)
+        want_so = left.strip()
+        tail = tail.strip()
+    else:
+        want_so = ""
+        tail = text
+    if not tail:
+        return want_so, None
+    # bp_id 末段始终是静态地址的十六进制表示（见 dyn/service.py:f"{static_addr:x}"）
+    if tail.lower().startswith("0x"):
+        want_addr = parse_addr(tail)
+    else:
+        want_addr = parse_addr("0x" + tail)
+    return want_so, want_addr
+
+
+def _bp_so_matches(want_so: str, hit_so: str) -> bool:
+    """规范化比对 bp_id 中的模块名与命中记录的 so_name，防多 so 同偏移串台。"""
+    w = str(want_so or "").strip()
+    if not w:
+        return True
+    h = str(hit_so or "").strip()
+    if not h:
+        return False
+    wb = w.rsplit("/", 1)[-1]
+    hb = h.rsplit("/", 1)[-1]
+    if wb == hb:
+        return True
+    if _core_strip_version_tag(wb) == _core_strip_version_tag(hb):
+        return True
+    return bool(_core_match_name(w, [h])[0])
+
+
+def _validate_reg_filter(flt: dict) -> str | None:
+    """校验寄存器过滤条件里的比较值是否可解析；有非法值返回中文错误说明。"""
+    from server.core.addr import parse_addr
+
+    for reg, cond in (flt or {}).items():
+        if not isinstance(cond, dict):
+            if parse_addr(cond) is None:
+                return f"filter[{reg!r}] 的值 {cond!r} 无法解析为整数或地址"
+            continue
+        for op in ("eq", "ne", "min", "max", "gt", "lt", "ge", "le"):
+            if op in cond and parse_addr(cond[op]) is None:
+                return f"filter[{reg!r}][{op!r}] 的值 {cond[op]!r} 无法解析为整数或地址"
+        for op in ("in", "not_in"):
+            if op in cond:
+                vals = cond[op]
+                if not isinstance(vals, (list, tuple, set)):
+                    return f"filter[{reg!r}][{op!r}] 必须是列表"
+                for v in vals:
+                    if parse_addr(v) is None:
+                        return f"filter[{reg!r}][{op!r}] 包含无法解析的值 {v!r}"
+    return None
+
+
 def _reg_value(context: dict, name: str):
     """从命中现场取某个寄存器的整数值；取不到返回 None。
 
@@ -1603,6 +1828,8 @@ def _reg_value(context: dict, name: str):
     为什么要这个包装：context 里的值是 "0x..." 字符串，键名大小写不定
     （有的是 fp 有的是 x29），直接比较容易踩空。这里统一成 int 再比。
     """
+    from server.core.addr import parse_addr
+
     if not isinstance(context, dict) or not name:
         return None
     key = str(name).strip().lower()
@@ -1615,10 +1842,7 @@ def _reg_value(context: dict, name: str):
             raw = context.get(alt)
     if raw is None:
         return None
-    try:
-        return int(raw, 16) if isinstance(raw, str) else int(raw)
-    except (TypeError, ValueError):
-        return None
+    return parse_addr(raw)
 
 
 def _hit_matches_filter(hit: dict, flt: dict) -> bool:
@@ -1635,9 +1859,10 @@ def _hit_matches_filter(hit: dict, flt: dict) -> bool:
         {"min": 1, "max": 10}       闭区间
         {"gt": .., "lt": .., "ge": .., "le": ..}   其它比较
 
-    寄存器取不到时**视为不匹配**（而不是放行）——否则一个写错的寄存器名
-    会悄悄把所有命中都放回来，看起来像"过滤没生效"。
+    寄存器取不到或条件值无法解析时一律**视为不匹配**（而不是静默放行）。
     """
+    from server.core.addr import parse_addr
+
     ctx = hit.get("context") or {}
     for reg, cond in (flt or {}).items():
         val = _reg_value(ctx, str(reg))
@@ -1645,55 +1870,55 @@ def _hit_matches_filter(hit: dict, flt: dict) -> bool:
             return False
         if not isinstance(cond, dict):
             # 直接给值 = 等于
-            try:
-                want = int(cond, 16) if isinstance(cond, str) else int(cond)
-            except (TypeError, ValueError):
-                return False
-            if val != want:
+            want = parse_addr(cond)
+            if want is None or val != want:
                 return False
             continue
 
         def _as_int(x):
-            try:
-                return int(x, 16) if isinstance(x, str) else int(x)
-            except (TypeError, ValueError):
-                return None
+            return parse_addr(x)
 
-        if "eq" in cond and val != _as_int(cond["eq"]):
-            return False
-        if "ne" in cond and val == _as_int(cond["ne"]):
-            return False
+        if "eq" in cond:
+            m = _as_int(cond["eq"])
+            if m is None or val != m:
+                return False
+        if "ne" in cond:
+            m = _as_int(cond["ne"])
+            if m is None or val == m:
+                return False
         if "in" in cond:
-            pool = [ _as_int(x) for x in (cond["in"] or []) ]
-            if val not in pool:
+            raw_in = cond["in"] or []
+            pool = [_as_int(x) for x in raw_in]
+            if any(x is None for x in pool) or val not in pool:
                 return False
         if "not_in" in cond:
-            pool = [ _as_int(x) for x in (cond["not_in"] or []) ]
-            if val in pool:
+            raw_not = cond["not_in"] or []
+            pool = [_as_int(x) for x in raw_not]
+            if any(x is None for x in pool) or val in pool:
                 return False
         if "min" in cond:
             m = _as_int(cond["min"])
-            if m is not None and val < m:
+            if m is None or val < m:
                 return False
         if "max" in cond:
             m = _as_int(cond["max"])
-            if m is not None and val > m:
+            if m is None or val > m:
                 return False
         if "gt" in cond:
             m = _as_int(cond["gt"])
-            if m is not None and not val > m:
+            if m is None or not val > m:
                 return False
         if "lt" in cond:
             m = _as_int(cond["lt"])
-            if m is not None and not val < m:
+            if m is None or not val < m:
                 return False
         if "ge" in cond:
             m = _as_int(cond["ge"])
-            if m is not None and not val >= m:
+            if m is None or not val >= m:
                 return False
         if "le" in cond:
             m = _as_int(cond["le"])
-            if m is not None and not val <= m:
+            if m is None or not val <= m:
                 return False
     return True
 
@@ -1716,7 +1941,7 @@ def _group_hits(items: list, field: str, top: int = 50) -> dict:
     """
     counts: dict = {}
     unparsed = 0
-    plain_fields = {"so_name", "thread_id", "seq", "static_addr",
+    plain_fields = {"so_name", "thread_id", "seq", "ts", "static_addr",
                     "runtime_addr", "tid"}
     is_plain = field in plain_fields
 
@@ -1845,37 +2070,43 @@ def hits(serial: str, pid: int, bp_id: str = "", limit: int = 0,
     #                ④ 返回里给 total_matched 与 fields_omitted，
     #                   让调用方明确知道"这次拿到的不是全部"。
     want_bp = str(bp_id or "").strip()
+    want_so, want_addr = _parse_bp_id(want_bp) if want_bp else ("", None)
     filtered: list = []
     for h in items:
         if since_seq and int(h.get("seq") or 0) <= int(since_seq):
             continue
         if want_bp:
-            h_addr = h.get("static_addr")
-            want_addr = None
-            try:
-                want_addr = int(want_bp.rsplit(":", 1)[-1], 16)
-            except (ValueError, IndexError):
-                want_addr = None
-            if want_addr is None or int(h_addr or -1) != want_addr:
-                continue
+            if h.get("bp_id") and str(h.get("bp_id")) == want_bp:
+                pass
+            else:
+                h_addr = h.get("static_addr")
+                if want_addr is None or h_addr is None or int(h_addr) != want_addr:
+                    continue
+                if want_so and not _bp_so_matches(want_so, h.get("so_name") or ""):
+                    continue
         filtered.append(h)
 
-    # (26) 第二十六次修改（2026-11-06）：加寄存器值过滤（P0）。
-    #      bug 原因：2000 条命中里想找"x2 == 5"那批，只能先取回 3 条
-    #               （受返回体积限制）再自己看，根本筛不出想要的。
-    #               寄存器是判断"这次调用是什么命令/什么分支"最直接的依据。
-    #      解决方案：filter 支持按寄存器值筛选，比较方式包含等于 /
-    #               不等 / 集合 / 区间；多条件是 AND。
-    #               在 limit 之前执行——先筛再截，否则截完再筛就漏了。
+    # (136) 第136次修改（2026-11-26）
+    # bug 原因：① reg_filter 过滤结果为空时引用了尚未赋值的 total_matched，导致 UnboundLocalError；
+    #          ② 无法解析的范围过滤值会被静默放行；
+    #          ③ group_by 在 limit 截断之后执行导致分布失真，且样本未遵守 include_context。
+    # 解决方案：① 在 reg_filter 前先记录 total_before_filter = len(filtered)；
+    #          ② 先校验 filter 值合法性，非法直接返回 BAD_FILTER；
+    #          ③ group_by 存在时先对全量 filtered 聚合，再拷贝样本并按 include_context 裁剪。
+    total_before_filter = len(filtered)
     reg_filter = filter if isinstance(filter, dict) else None
     if reg_filter:
+        flt_err = _validate_reg_filter(reg_filter)
+        if flt_err:
+            return _j({"ok": False, "error": flt_err, "code": "BAD_FILTER",
+                       "filter": reg_filter})
         filtered = [h for h in filtered if _hit_matches_filter(h, reg_filter)]
         if not filtered:
             return _j({
                 "ok": True, "count": 0, "total_matched": 0, "hits": [],
                 "filter": reg_filter,
-                "total_before_filter": total_matched,
-                "verdict": (f"共有 {total_matched} 条命中，但**没有一条**满足 "
+                "total_before_filter": total_before_filter,
+                "verdict": (f"共有 {total_before_filter} 条命中，但**没有一条**满足 "
                             f"filter={reg_filter}"),
                 "hint": ("可用 group_by 先看这个寄存器有哪些值："
                          "hits(group_by='x2') 会给出值分布，"
@@ -1884,48 +2115,50 @@ def hits(serial: str, pid: int, bp_id: str = "", limit: int = 0,
 
     total_matched = len(filtered)
 
-    if int(limit or 0) > 0:
-        filtered = filtered[-int(limit):]                 # 最近的 N 条
-
-    # 按需省略大字段
-    omitted: list[str] = []
-    trimmed: list = []
-    for h in filtered:
-        item = dict(h)
-        if not include_context:
-            item.pop("context", None)
-            if "context" not in omitted:
-                omitted.append("context")
-        if not include_backtrace:
-            item.pop("backtrace", None)
-            if "backtrace" not in omitted:
-                omitted.append("backtrace")
-        if not include_stack:
-            item.pop("stack", None)
-            item.pop("stack_hex", None)
-            if "stack" not in omitted:
-                omitted.append("stack")
-        trimmed.append(item)
-
     # (26) 第二十六次修改（2026-11-06）：加聚合统计（P1）。
-    #      为什么：调用方真正想知道的是"这个寄存器的值都是什么分布"，
-    #              而不是 2000 条原始 JSON。聚合后一次调用就能看出
-    #              哪个命令号最常见、哪个调用点最热。
-    #      设计：给了 group_by 就**不返回 hits 数组**——那正是要避免的数据量。
-    #              但仍然给少量样本（最多 3 条），便于对照聚合结果。
+    #      先对全量 filtered 聚合再截样本，不受 limit 截断干扰；样本遵守 include_context。
+    group_field = str(group_by or "").strip()
     group_result = None
-    if str(group_by or "").strip():
-        group_result = _group_hits(filtered, str(group_by).strip(),
+    omitted: list[str] = []
+    if group_field:
+        group_result = _group_hits(filtered, group_field,
                                    int(group_top or 50))
-        # 只留几条样本，不返回全量
+        # 只留几条样本，不返回全量（拷贝避免原地污染命中记录）
         trimmed = filtered[:3] if filtered else []
+        trimmed = [dict(h) for h in trimmed]
         for h in trimmed:
+            if not include_context:
+                h.pop("context", None)
+                if "context" not in omitted:
+                    omitted.append("context")
             h.pop("backtrace", None)
             h.pop("stack", None)
             h.pop("stack_hex", None)
         size_kb = None
         all_frames = []
     else:
+        if int(limit or 0) > 0:
+            filtered = filtered[-int(limit):]                 # 最近的 N 条
+
+        # 按需省略大字段
+        trimmed = []
+        for h in filtered:
+            item = dict(h)
+            if not include_context:
+                item.pop("context", None)
+                if "context" not in omitted:
+                    omitted.append("context")
+            if not include_backtrace:
+                item.pop("backtrace", None)
+                if "backtrace" not in omitted:
+                    omitted.append("backtrace")
+            if not include_stack:
+                item.pop("stack", None)
+                item.pop("stack_hex", None)
+                if "stack" not in omitted:
+                    omitted.append("stack")
+            trimmed.append(item)
+
         # 汇总所有命中的调用栈，找出没符号化的模块
         all_frames = []
         for h in trimmed:
@@ -2161,13 +2394,17 @@ def wait_hits(serial: str, pid: int, timeout: float = 10.0) -> str:
     return _j({"hits": get_dyn().wait_hits(serial, pid, timeout=timeout)})
 
 
+# (136) 第136次修改（2026-11-26）
+# bug 原因：get_dyn().resume() 已返回 {"resumed": bool, "reason": ..., "state": ...}，
+#          外层再包一层 {"resumed": ...} 产生双层嵌套 {"resumed": {"resumed": false, ...}}。
+# 解决方案：直接返回 _j(get_dyn().resume(serial, pid))。
 @server.tool()
 @logged()
 def resume(serial: str, pid: int) -> str:
     """放行 hold 策略下挂起的线程（重复调用无副作用）。"""
     from server.dyn.service import get_dyn
 
-    return _j({"resumed": get_dyn().resume(serial, pid)})
+    return _j(get_dyn().resume(serial, pid))
 
 
 # ---- 动态观测工具：事件流 / 线程列表 / 调用栈符号化 ----
@@ -2570,10 +2807,15 @@ def _target_state(svc, serial: str, pid: int) -> dict:
     return {"global_seq": st.get("seq", 0)}
 
 
+# (136) 第136次修改（2026-11-26）
+# bug 原因：poll_events 默认 after_seq=0 且仅在 seq > 0 时透传，导致调用方显式传
+#          after_seq=0 想从头重放时被静默吞掉，走成了推进游标模式。
+# 解决方案：改为 after_seq: int | None = None；None 表示推进游标取新事件，
+#          传 0 或正整数时显式透传给 svc.poll_events（0 即从头重放、不推进游标）。
 @server.tool()
 @logged()
 def poll_events(serial: str, pid: int, timeout: float = 0.0, limit: int = 200,
-                after_seq: int = 0) -> str:
+                after_seq: int | None = None) -> str:
     """非阻塞地取动态事件，并附上目标当前状态。
 
     **推荐工作流**：
@@ -2588,21 +2830,28 @@ def poll_events(serial: str, pid: int, timeout: float = 0.0, limit: int = 200,
         breakpoint_removed / breakpoint_remove_failed / resumed
     seq 单调自增，所以「有没有新事件」看 last_seq 与 global_seq 的差即可。
 
+    after_seq 三档语义：
+        None（默认）→ 推进本目标游标，只取未读新事件；
+        0           → 显式从头重放（只读，不推进游标）；
+        N（> 0）    → 仅取 seq > N 的事件（只读，不推进游标）。
+
     timeout=0（默认）立即返回；timeout>0 最多等这么久，等到就立刻回。
     返回里的 target_state 为 paused 表示线程正被 hold 断点挂住、等 resume。
     """
     from server.dyn.service import get_dyn
 
     svc = get_dyn()
-    # (14) 第十四次修改（2026-11-05）：把 after_seq 真正透传给 service。
-    #      bug 原因：service.poll_events 已实现三档游标语义（None=推进游标取新增、
-    #                0=从头/显式指定、N=取 seq>N），但 MCP 工具签名里没有该参数，
-    #                于是"增量拉取 / 显式重放"在 AI 侧根本不可达。
-    #      解决方案：加 after_seq 参数；<=0 视为"不指定"（保持原来的推进语义），
-    #                >0 时按"只取 seq 大于它的事件"且**不推进**共享游标。
-    seq = int(after_seq or 0)
     kwargs = {"timeout": timeout, "limit": limit}
-    if seq > 0:
+    seq: int | None = None
+    if after_seq is not None:
+        try:
+            seq = int(after_seq)
+        except (TypeError, ValueError):
+            return _j({"error": f"after_seq 必须是整数或 None，实际 {after_seq!r}",
+                       "code": "BAD_REQUEST"})
+        if seq < 0:
+            return _j({"error": "after_seq 不能为负数（None=推进游标，0=从头重放，N>0=取 seq>N）",
+                       "code": "BAD_REQUEST"})
         kwargs["after_seq"] = seq
     try:
         events = svc.poll_events(serial, pid, **kwargs)
@@ -2612,7 +2861,7 @@ def poll_events(serial: str, pid: int, timeout: float = 0.0, limit: int = 200,
         "has_new": bool(events),
         "count": len(events),
         "events": events,
-        "after_seq": seq if seq > 0 else None,
+        "after_seq": seq,
         **_target_state(svc, serial, pid),
     })
 
@@ -2727,6 +2976,13 @@ def _dwarf_reg_source(svc, serial: str, pid: int, tid: int) -> tuple[dict, dict]
     if not got:
         return regs, meta
 
+    # (136) 第136次修改（2026-11-26）
+    # bug 原因：① dwarf 模式默认 thread_id=0 时未指定线程，却仍写入 thread_mismatch 误报；
+    #          ② 返回的 thread_id 用传入的 tid(可能为 0) 而非真实 meta["hit_thread"]；
+    #          ③ fr.setdefault("in_gap", True) 当 unwind 返回已含 in_gap=False 时无法修正。
+    # 解决方案：① 仅在调用方显式指定了非零 tid 且未找到同线程命中时才报 thread_mismatch；
+    #          ② 输出 thread_id 优先用 meta["hit_thread"]；
+    #          ③ 每帧默认置 in_gap=True，匹配到已知函数或 PLT 桩后才置 False。
     chosen = None
     if tid:
         for h in reversed(got):        # 从最近往前找，优先最近的同线程命中
@@ -2737,9 +2993,10 @@ def _dwarf_reg_source(svc, serial: str, pid: int, tid: int) -> tuple[dict, dict]
     if chosen is None:
         chosen = got[-1]
         meta["source"] = "hit:latest"
-        meta["thread_mismatch"] = (
-            f"线程 {tid} 没有命中记录，退回最近一次命中（线程 "
-            f"{chosen.get('thread_id')}）的现场；这条栈属于那个线程")
+        if tid and int(chosen.get("thread_id") or 0) != int(tid):
+            meta["thread_mismatch"] = (
+                f"线程 {tid} 没有命中记录，退回最近一次命中（线程 "
+                f"{chosen.get('thread_id')}）的现场；这条栈属于那个线程")
 
     meta["hit_seq"] = chosen.get("seq")
     meta["hit_thread"] = chosen.get("thread_id")
@@ -2872,7 +3129,7 @@ def _callstack_dwarf(serial: str, pid: int, tgt, tid: int, limit: int,
         fr["function"] = None
         fr["offset"] = None
         fr["via_plt"] = False
-        fr.setdefault("in_gap", True)
+        fr["in_gap"] = True
         fr["static_addr"] = (hex(fr["static_addr"])
                              if isinstance(fr.get("static_addr"), int) else None)
         so = _pick_so_by_name(_session, fr.get("so") or "")
@@ -2894,7 +3151,7 @@ def _callstack_dwarf(serial: str, pid: int, tgt, tid: int, limit: int,
 
     symbolized = sum(1 for f in frames if f.get("function"))
     out.update({
-        "thread_id": tid,
+        "thread_id": meta.get("hit_thread") if meta.get("hit_thread") is not None else tid,
         "frame_count": len(frames),
         "symbolized": symbolized,
         "unresolved": len(frames) - symbolized,
@@ -2956,6 +3213,9 @@ class _MakeReadMem:
             return b""
 
 
+# (136) 第136次修改（2026-11-26）
+# bug 原因：get_callees 将 depth 上限硬编码截为 1（min(int(depth), 1)），传入多级深度无效。
+# 解决方案：将上限放宽至 8（max(1, min(int(depth), 8))），允许合法多级深度展开。
 @server.tool()
 @logged()
 def get_callees(so_name: str, addr: int, depth: int = 1) -> str:
@@ -2967,9 +3227,9 @@ def get_callees(so_name: str, addr: int, depth: int = 1) -> str:
                   / `xrefs_from`，只是名字不同。
         解决方案：加一个薄别名，复用 call_chain（**不重复实现**）。
 
-    等价于 call_chain(so_name, addr, depth=1)。
+    等价于 call_chain(so_name, addr, depth=depth)（depth 范围 1..8）。
     """
-    return call_chain(so_name, int(addr), depth=max(1, min(int(depth), 1)))
+    return call_chain(so_name, int(addr), depth=max(1, min(int(depth), 8)))
 
 
 @server.tool()
@@ -3235,9 +3495,18 @@ def get_callstack(serial: str, pid: int, thread_id: int = 0, limit: int = 32,
             except Exception as exc:                      # noqa: BLE001
                 tried.append({m: f"{type(exc).__name__}: {exc}"})
                 continue
+            # (136) 第136次修改（2026-11-26）
+            # bug 原因：① method="auto" 帧去重查不存在的键 f.get("addr")，未符号化帧全得 None，
+            #             导致多帧有效栈被误判 distinct=1 而跳过；
+            #          ② scan_bytes Python 侧写死上限 1024，与 JS 探针上限 4096 不一致。
+            # 解决方案：① 改为依次取 function / runtime_addr / static_addr / pc 去重；
+            #          ② scan_bytes 上限对齐到 4096。
             frames_n = len(one.get("frames") or [])
-            distinct = len({f.get("function") or f.get("addr")
-                            for f in (one.get("frames") or [])})
+            distinct = len({
+                key for f in (one.get("frames") or [])
+                if (key := (f.get("function") or f.get("runtime_addr")
+                            or f.get("static_addr") or f.get("pc"))) is not None
+            })
             tried.append({m: {"frames": frames_n, "distinct": distinct,
                               "error": one.get("error")}})
             if frames_n >= 2 and distinct >= 2:
@@ -3273,7 +3542,7 @@ def get_callstack(serial: str, pid: int, thread_id: int = 0, limit: int = 32,
           .replace("__TID__", str(tid))
           .replace("__LIMIT__", str(limit))
           .replace("__MODE__", str(method))
-          .replace("__SCANBYTES__", str(max(64, min(int(scan_bytes or 1024), 1024)))))
+          .replace("__SCANBYTES__", str(max(64, min(int(scan_bytes or 1024), 4096)))))
     try:
         payload = _run_frida_script(tgt.rb.session, js)
     except Exception as exc:             # noqa: BLE001 - frida 异常类型不稳定
@@ -3369,44 +3638,52 @@ def dedupe_breakpoints(serial: str = "", pid: int = 0) -> str:
     except Exception as exc:                              # noqa: BLE001
         return _j({"error": f"{type(exc).__name__}: {exc}"})
 
+    # (136) 第136次修改（2026-11-26）
+    # bug 原因：对同 runtime_addr 的重复登记 ids[1:] 调用 svc.remove_breakpoint(bid)，
+    #          而它们与 keep 共享同一个 Frida Interceptor 钩子；remove_breakpoint 会直接
+    #          detach 底层钩子，导致保留下来的 keep 变成不再命中的假断点。
+    # 解决方案：在 svc._lock 下仅从 tgt.breakpoints 字典 pop 移除重复登记项，保留 keep
+    #          对应的真实底层 Frida 钩子不动。
     removed: list[dict] = []
     kept = 0
-    for tgt in targets:
-        if serial and str(getattr(tgt, "serial", "")) != str(serial):
-            continue
-        if pid and int(getattr(tgt, "pid", 0) or 0) != int(pid):
-            continue
-        # 按运行时地址分组
-        by_rt: dict[int, list[str]] = {}
-        for bid, rec in list(getattr(tgt, "breakpoints", {}).items()):
-            rt = int(rec.get("runtime_addr") or -1)
-            if rt > 0:
-                by_rt.setdefault(rt, []).append(bid)
-        for rt, ids in by_rt.items():
-            if len(ids) <= 1:
-                kept += len(ids)
+    with svc._lock:                                       # noqa: SLF001 - 原子去重
+        for tgt in targets:
+            if serial and str(getattr(tgt, "serial", "")) != str(serial):
                 continue
-            # 保留第一条，其余真撤销
-            keep = ids[0]
-            kept += 1
-            for bid in ids[1:]:
-                try:
-                    got = svc.remove_breakpoint(bid)
-                    removed.append({"id": bid, "kept": keep,
-                                    "removed": bool(got.get("removed")),
-                                    "partial": bool(got.get("partial"))})
-                except Exception as exc:                  # noqa: BLE001
-                    removed.append({"id": bid, "kept": keep,
-                                    "removed": False,
-                                    "error": f"{type(exc).__name__}: {exc}"})
+            if pid and int(getattr(tgt, "pid", 0) or 0) != int(pid):
+                continue
+            bps = getattr(tgt, "breakpoints", None)
+            if not isinstance(bps, dict):
+                continue
+            # 按运行时地址分组
+            by_rt: dict[int, list[str]] = {}
+            for bid, rec in list(bps.items()):
+                rt = int(rec.get("runtime_addr") or -1)
+                if rt > 0:
+                    by_rt.setdefault(rt, []).append(bid)
+            for rt, ids in by_rt.items():
+                if len(ids) <= 1:
+                    kept += len(ids)
+                    continue
+                # 保留第一条及其底层 Frida 钩子，其余仅删除重复登记项
+                keep = ids[0]
+                kept += 1
+                for bid in ids[1:]:
+                    popped = bps.pop(bid, None)
+                    removed.append({
+                        "id": bid,
+                        "kept": keep,
+                        "removed": popped is not None,
+                        "hook_preserved": True,
+                    })
 
     return _j({
         "ok": True,
         "kept": kept,
         "removed_count": len(removed),
         "removed": removed,
-        "note": ("按运行时地址去重，与模块名写法无关；"
-                 "保留最早的一条，其余真撤销"),
+        "note": ("按运行时地址去重，与模块名写法无关；保留最早的一条及共享的底层 "
+                 "Frida 钩子，仅清理重复登记项，不误摘有效钩子"),
     })
 
 
@@ -3835,19 +4112,64 @@ def read_pointer(so_name: str, addr: int, depth: int = 1, offset: int = 0,
     return _j(result)
 
 
+# (136) 第136次修改（2026-11-26）
+# bug 原因：plan_step 硬编码传 None 给 plan_step_out/plan_step_over，无法利用已附着
+#          目标的基址换算运行时 LR，且无条件返回 execute_available=True（即使
+#          resolvable=False 或 ok=False）。
+# 解决方案：① 新增只读辅助 _find_active_debugger(serial, pid)，按指定或唯一活跃目标
+#             获取 dbg 传入 planner（无活跃目标时才传 None）；
+#          ② 新增可选参数 serial/pid（保持后向兼容默认值）；
+#          ③ 根据 bool(plan.get("ok")) and bool(plan.get("resolvable")) 如实设置
+#             execute_available 与 execute_note。
+def _find_active_debugger(serial: str = "", pid: int = 0):
+    """只读查找对应或唯一活跃附着目标的 debugger（不主动 attach，找不到返回 None）。"""
+    try:
+        from server.dyn.service import STATE_DETACHED, get_dyn
+
+        svc = get_dyn()
+        lock = getattr(svc, "_lock", None)
+        if lock is not None:
+            lock.acquire()
+        try:
+            targets = list((getattr(svc, "_targets", None) or {}).values())
+        finally:
+            if lock is not None:
+                lock.release()
+
+        active = [t for t in targets if getattr(t, "state", None) != STATE_DETACHED]
+        if not active:
+            return None
+        want_serial = str(serial or "").strip()
+        want_pid = int(pid or 0)
+        if want_serial and want_pid > 0:
+            for t in active:
+                if str(getattr(t, "serial", "")) == want_serial and int(getattr(t, "pid", 0) or 0) == want_pid:
+                    return getattr(t, "dbg", None)
+            return None
+        if want_serial:
+            matched = [t for t in active if str(getattr(t, "serial", "")) == want_serial]
+            return getattr(matched[0], "dbg", None) if len(matched) == 1 else None
+        if want_pid > 0:
+            matched = [t for t in active if int(getattr(t, "pid", 0) or 0) == want_pid]
+            return getattr(matched[0], "dbg", None) if len(matched) == 1 else None
+        return getattr(active[0], "dbg", None) if len(active) == 1 else None
+    except Exception:                                     # noqa: BLE001
+        return None
+
+
 @server.tool()
 @logged()
 def plan_step(so_name: str, static_addr: int | str, mode: str = "over", count: int = 1,
               so_context: str | None = None, lr: int | str | None = None,
-              mnemonic: str = "", max_insns: int = 500) -> str:
+              mnemonic: str = "", max_insns: int = 500,
+              serial: str = "", pid: int = 0) -> str:
     """规划一次单步：**只算临时断点该下在哪，不执行**。
 
-    ⚠ 执行本身当前**未实现**（execute_step 需真机 frida 临时断点模拟）。
-    本工具是纯静态规划：告诉你"下一个该停的地址"，你可以自己在设备可用时
-    用 set_breakpoint 把 plan 的 temp_breakpoint_addr 下成断点。
     本工具只规划、**不动目标**。要真正单步请调 execute_step（它会下临时断点、
     放行、停在落点）。返回里 execute_available=true 表示落点可解析、可以交给
     execute_step；resolvable=false 时 execute_step 会拒绝执行。
+    若提供了 serial/pid（或当前动态会话恰好有一个活跃目标），会自动只读复用其
+    debugger 基址以支持运行时 LR 换算（如 mode='out'）。
 
     mode 四选一：
         over            跨过当前指令（遇到 bl 不进入，断点放下一条）
@@ -3865,6 +4187,7 @@ def plan_step(so_name: str, static_addr: int | str, mode: str = "over", count: i
         lr         运行时 LR 值，mode="out" 必填；mode="over" 遇到 ret 也要它
         mnemonic   mode="until_mnemonic" 必填，如 "bl" / "ret" / "br"
         so_context 若 so_name 为空，可作为 so 名回退（stepper 本身不消费该参数）
+        serial/pid 可选，指定已附着目标以只读获取模块运行时基址（默认自动复用唯一活跃目标）
 
     怎么读结果：
         ok=true 且 resolvable=true  → 地址确定，可以下断点
@@ -3913,9 +4236,10 @@ def plan_step(so_name: str, static_addr: int | str, mode: str = "over", count: i
     except (TypeError, ValueError):
         return _j({"error": "count / max_insns 必须是整数", "code": "BAD_REQUEST"})
 
+    dbg = _find_active_debugger(serial=serial, pid=pid)
     try:
         if mode_n == "over":
-            plan = mod.plan_step_over(None, name, addr, lr=lr_val)
+            plan = mod.plan_step_over(dbg, name, addr, lr=lr_val)
         elif mode_n == "out":
             if lr is None:
                 return _j({
@@ -3923,7 +4247,7 @@ def plan_step(so_name: str, static_addr: int | str, mode: str = "over", count: i
                              "取法：hit.context['lr']",
                     "code": "RET_NEEDS_LR",
                 })
-            plan = mod.plan_step_out(None, lr=lr_val, so_name=name,
+            plan = mod.plan_step_out(dbg, lr=lr_val, so_name=name,
                                      static_addr=addr)
         elif mode_n == "into":
             try:
@@ -3931,9 +4255,9 @@ def plan_step(so_name: str, static_addr: int | str, mode: str = "over", count: i
             except (TypeError, ValueError):
                 return _j({"error": f"count 必须是整数，实际 {count!r}",
                            "code": "BAD_COUNT"})
-            plan = mod.plan_step_into(None, name, addr, count=n)
+            plan = mod.plan_step_into(dbg, name, addr, count=n)
         elif mode_n in ("until_mnemonic", "until", "mnemonic"):
-            plan = mod.plan_step_until_mnemonic(None, name, addr, mnemonic,
+            plan = mod.plan_step_until_mnemonic(dbg, name, addr, mnemonic,
                                                 max_insns=max_insns)
         else:
             return _j({
@@ -3946,8 +4270,13 @@ def plan_step(so_name: str, static_addr: int | str, mode: str = "over", count: i
     out = dict(plan)
     out["mode"] = mode_n
     out["so_name"] = name
-    out["execute_available"] = True
-    out["execute_note"] = "落点已算出；要真正单步请调 execute_step（会放行并停在落点）"
+    exec_ok = bool(plan.get("ok")) and bool(plan.get("resolvable"))
+    out["execute_available"] = exec_ok
+    if exec_ok:
+        out["execute_note"] = "落点已算出；要真正单步请调 execute_step（会放行并停在落点）"
+    else:
+        why = plan.get("reason") or plan.get("error") or "落点无法静态解析"
+        out["execute_note"] = f"当前落点不可执行（{why}），execute_step 会拒绝执行"
     return _j(out)
 
 
@@ -4036,6 +4365,103 @@ def execute_step(serial: str, pid: int, so_name: str, static_addr: int | str,
     result["plan"] = {k: plan.get(k) for k in
                       ("ok", "resolvable", "strategy", "temp_breakpoint_addr", "reason")}
     return _j(result)
+
+
+# (136) 第136次修改（2026-11-26）
+# bug 原因：trace_aggregate 与 trace_timeline 在 events=None 时均调用 _snapshot_service_events()，
+#          该函数定义丢失，导致无参调用直接 NameError。
+# 解决方案：补回只读辅助函数 _snapshot_service_events() -> tuple[list, str]，优先调
+#          svc.snapshot_events()（若存在），否则在 svc._lock 下读取活跃目标事件缓冲副本，
+#          绝不推进 poll 游标；无已附加目标或无事件时返回 ([], 明确中文提示)。
+def _snapshot_service_events() -> tuple[list, str]:
+    """从动态服务取当前已附着目标的事件缓冲只读快照（不推进 poll 游标）。"""
+    try:
+        from server.dyn.service import STATE_DETACHED, get_dyn
+
+        svc = get_dyn()
+    except Exception as exc:                                # noqa: BLE001
+        return [], f"动态服务不可用：{type(exc).__name__}: {exc}"
+
+    snap_fn = getattr(svc, "snapshot_events", None)
+    if callable(snap_fn):
+        try:
+            evs = list(snap_fn() or [])
+        except Exception as exc:                            # noqa: BLE001
+            return [], f"读取动态服务事件快照失败：{type(exc).__name__}: {exc}"
+        if not evs:
+            return [], "动态服务当前尚无已记录的事件；请先触发断点命中或用 events 参数传入"
+        return [dict(e) if isinstance(e, dict) else e for e in evs], ""
+
+    lock = getattr(svc, "_lock", None)
+    if lock is not None:
+        lock.acquire()
+    active_info: list[tuple[str, str, int, object]] = []
+    collected: list = []
+    try:
+        targets = list((getattr(svc, "_targets", None) or {}).values())
+        active = [t for t in targets if getattr(t, "state", None) != STATE_DETACHED]
+        if not active:
+            return [], "当前没有已附加的目标进程，无法自动获取事件快照；请先 attach 并触发命中，或用 events 参数传入"
+        active_keys = {
+            getattr(t, "key", f"{getattr(t, 'serial', '')}:{getattr(t, 'pid', 0)}")
+            for t in active
+        }
+        # 优先兼容直接挂在 target 上的 events 列表
+        for tgt in active:
+            t_evs = getattr(tgt, "events", None)
+            if t_evs:
+                collected.extend(dict(e) if isinstance(e, dict) else e for e in list(t_evs))
+            active_info.append((
+                getattr(tgt, "key", ""),
+                str(getattr(tgt, "serial", "")),
+                int(getattr(tgt, "pid", 0) or 0),
+                getattr(tgt, "dbg", None),
+            ))
+        # DynamicService 的真实事件缓冲为服务级 _events，按活跃目标 key 过滤
+        if not collected:
+            svc_evs = getattr(svc, "_events", None)
+            if svc_evs:
+                collected = [
+                    dict(e) if isinstance(e, dict) else e
+                    for e in list(svc_evs)
+                    if not isinstance(e, dict) or e.get("key") in active_keys
+                ]
+    finally:
+        if lock is not None:
+            lock.release()
+
+    # 若事件队列仍空，释放 svc._lock 后再只读拷贝 dbg._hits（遵守锁序防死锁，不推游标）
+    if not collected:
+        for tkey, tserial, tpid, dbg in active_info:
+            if dbg is None:
+                continue
+            dlock = getattr(dbg, "_lock", None)
+            if dlock is not None:
+                dlock.acquire()
+            try:
+                raw_hits = list(getattr(dbg, "_hits", None) or [])
+            finally:
+                if dlock is not None:
+                    dlock.release()
+            for h in raw_hits:
+                if isinstance(h, dict):
+                    collected.append(dict(h))
+                else:
+                    collected.append({
+                        "type": "breakpoint_hit",
+                        "key": tkey,
+                        "serial": tserial,
+                        "pid": tpid,
+                        "so_name": getattr(h, "so_name", None),
+                        "static_addr": getattr(h, "static_addr", None),
+                        "runtime_addr": getattr(h, "runtime_addr", None),
+                        "thread_id": getattr(h, "thread_id", None),
+                        "ts": getattr(h, "ts", None),
+                    })
+
+    if not collected:
+        return [], "当前已附加目标尚无事件记录；请先下断点并触发命中，或用 events 参数显式传入"
+    return collected, ""
 
 
 @server.tool()
@@ -4165,6 +4591,10 @@ def trace_aggregate(events: list | None = None,
     return _j(out)
 
 
+# (136) 第136次修改（2026-11-26）
+# bug 原因：locate_runtime_addr docstring 中误粘贴了 get_callstack 的 method 三选一段落，
+#          与本工具实际参数（serial/pid/runtime_addr）不符。
+# 解决方案：删除误粘贴的 method 段落，使文档与参数及 locate_static 真实返回字段一致。
 @server.tool()
 @logged()
 def locate_runtime_addr(serial: str, pid: int, runtime_addr: int | str) -> str:
@@ -4178,16 +4608,6 @@ def locate_runtime_addr(serial: str, pid: int, runtime_addr: int | str) -> str:
         → locate_runtime_addr 拿 static_addr_int 与 function
         → 用 static_addr_int 调 disassemble / xrefs_to（这两个接口要 int）。
 
-    ## method 三选一
-
-    accurate  frida 的 Backtracer.ACCURATE（默认）。依赖帧指针或 DWARF CFI，
-              **PAC + 无帧指针的加固 so 上通常只有 2 帧**
-    scan      启发式扫栈：找"落在模块内 + 前一条指令是 bl"的值当候选帧。
-              不需要现场，但结果是**候选**不是精确调用栈
-    dwarf     用 so 的 .eh_frame 规则逐帧展开（编译器生成的权威信息）。
-              需要一次断点命中提供现场 PC/SP；so_name 指定用哪个 so 的 CFI。
-              **CFI 被剥离的样本会明告 warning**，不会假装成功
-
     runtime_addr 支持十进制整数或 "0x..." 字符串（调用栈输出就是 hex 串）。
 
     会 attach 目标（幂等，已附加则复用同一会话），本工具**需要设备**。
@@ -4199,7 +4619,8 @@ def locate_runtime_addr(serial: str, pid: int, runtime_addr: int | str) -> str:
         loaded_in_mda=false   mda 没加载该 so：so/static_addr 仍有效，但没有函数名，
                               先 load_so 再查一次才有符号
         module_match          名字怎么对上的（exact/renamed/normalized/stem/suffix）
-    hex 字段都配了同名 *_int 字段，喂接 int 的接口请用 *_int 版。
+    hex 字段都配了同名 *_int 字段（static_addr_int / function_addr_int / offset_int），
+    喂接 int 的接口请用 *_int 版。
     """
     mod, err = _load_dyn_module("server.dyn.bridge", "locate_static")
     if err:
@@ -4261,20 +4682,34 @@ def hit_analysis(serial: str, pid: int, build_xrefs: bool = False,
     except Exception as exc:            # noqa: BLE001 - DynError 带 code
         return _j({"error": f"{type(exc).__name__}: {exc}", "code": "NOT_ATTACHED"})
 
+    # (136) 第136次修改（2026-11-26）
+    # bug 原因：原实现用 lstrip("0x") 剥前缀，遇到 "0x0" 或大写 "0X..." 会解析失败，
+    #          且未校验 bp_id 中的模块名，多 so 同偏移时会串台。
+    # 解决方案：复用 _parse_bp_id（底层走 parse_addr）和 _bp_so_matches，同时校验地址与模块名。
     # (120) 按 bp_id 过滤：bp_id 形如 "serial:pid:so:2d8a48"，
     #       末段是十六进制静态地址。删掉旧断点后，旧命中仍在队列里，
     #       不过滤就会取到旧记录（用户实测过这个坑）。
     filter_note = ""
     if bp_id:
-        try:
-            want = int(str(bp_id).rsplit(":", 1)[-1].lstrip("0x"), 16)
-        except Exception:                                 # noqa: BLE001
+        want_so, want = _parse_bp_id(bp_id)
+        if want is None:
             return _j({"error": f"bp_id 格式不对：{bp_id!r}（应形如 "
                                 f"'serial:pid:so:2d8a48'）",
                        "code": "BAD_BP_ID"})
         before = len(hits)
-        hits = [h for h in hits
-                if int(h.get("static_addr", h.get("static", -1)) or -1) == want]
+        want_bp_text = str(bp_id).strip()
+        filtered_hits = []
+        for h in hits:
+            if h.get("bp_id") and str(h.get("bp_id")) == want_bp_text:
+                filtered_hits.append(h)
+                continue
+            h_addr = h.get("static_addr", h.get("static", None))
+            if h_addr is None or int(h_addr) != want:
+                continue
+            if want_so and not _bp_so_matches(want_so, h.get("so_name") or ""):
+                continue
+            filtered_hits.append(h)
+        hits = filtered_hits
         filter_note = (f"已按 bp_id 过滤到 {len(hits)} 条"
                        f"（过滤前 {before} 条）")
         if not hits:
@@ -4382,6 +4817,11 @@ def inject_read_memory(serial: str, pid: int, addr: str, size: int = 64) -> str:
                "hex": data.hex()})
 
 
+# (136) 第136次修改（2026-11-26）
+# bug 原因：inject_write_memory 未校验 _as_int_addr(addr) 为 None，bytes.fromhex 不在
+#          try/except 中遇到非法 hex 直接裸抛 ValueError，且未单独捕获 InjectError 保留错误码。
+# 解决方案：校验 addr_val 非空、把 bytes.fromhex 纳入 try/except 返回 BAD_HEX、
+#          捕获 InjectError 返回可读错误 JSON 与原始 code。
 @server.tool()
 @logged()
 def inject_write_memory(serial: str, pid: int, addr: str, hex_data: str) -> str:
@@ -4393,15 +4833,26 @@ def inject_write_memory(serial: str, pid: int, addr: str, hex_data: str) -> str:
     """
     from server.dyn.inject import InjectError, write_target_mem
 
-    raw = bytes.fromhex((hex_data or "").strip())
+    addr_val = _as_int_addr(addr)
+    if addr_val is None:
+        return _j({"error": f"addr 无法解析为有效地址：{addr!r}",
+                   "code": "BAD_ADDR"})
+    try:
+        raw = bytes.fromhex((hex_data or "").strip())
+    except ValueError as exc:
+        return _j({"error": f"hex_data 不是合法十六进制：{exc}",
+                   "code": "BAD_HEX"})
     if not raw:
         return _j({"error": "hex_data 为空", "code": "BAD_ARGS"})
     try:
-        ok = write_target_mem(serial, int(pid), _as_int_addr(addr), raw)
+        ok = write_target_mem(serial, int(pid), addr_val, raw)
+    except InjectError as exc:
+        return _j({"error": exc.message, "code": exc.code,
+                   "detail": getattr(exc, "detail", "")})
     except Exception as exc:                              # noqa: BLE001
         return _j({"error": f"{type(exc).__name__}: {exc}",
                    "code": "WRITE_FAILED"})
-    return _j({"ok": bool(ok), "addr": hex(_as_int_addr(addr)),
+    return _j({"ok": bool(ok), "addr": hex(addr_val),
                "size": len(raw)})
 
 
@@ -4612,6 +5063,16 @@ def trace_alloc(serial: str, pid: int, tid: int = 0,
                    "code": "TRACE_ALLOC_FAILED"})
 
 
+# (136) 第136次修改（2026-11-26）
+# bug 原因：① clear_hits 直接调 dbg.resume() 绕过了 svc.resume(serial, pid)，导致
+#             tgt.state 停留在 paused、自动放行定时器未取消，状态机不同步；
+#          ② 清理 dbg._hits / dbg._events 未加 dbg._lock 保护；
+#          ③ 未清理 service 侧事件缓冲里的旧命中事件，也未重置 tgt.hit_cursor，
+#             导致 poll_events 仍会翻出已清理的旧命中，且新命中同步游标错位。
+# 解决方案：① 放行挂起线程统一走 svc.resume(serial, pid) 保持状态机一致；
+#          ② 在 dbg._lock 下清理 dbg._hits 与 dbg._events（绝不清空 _pending_tokens）；
+#          ③ 在 svc._lock 下清理 svc._events（及 tgt.events 若存在）里该目标的命中事件，
+#             并重置 tgt.hit_cursor = 0（及 tgt.last_synced_seq = 0 若存在）。
 @server.tool()
 @logged()
 def clear_hits(serial: str, pid: int) -> str:
@@ -4627,7 +5088,7 @@ def clear_hits(serial: str, pid: int) -> str:
 
     注意：只清**命中记录**，断点本身还在；要撤断点用 remove_breakpoint。
     """
-    from server.dyn.service import get_dyn
+    from server.dyn.service import STATE_DETACHED, STATE_PAUSED, get_dyn
 
     svc = get_dyn()
     try:
@@ -4637,34 +5098,96 @@ def clear_hits(serial: str, pid: int) -> str:
 
     dbg = getattr(tgt, "dbg", None)
 
-    # (127) 先放行所有挂起的线程，再清记录。
-    #       _pending_tokens 是**放行凭据**：直接清掉会让 resume() 找不到 token，
-    #       被 recv().wait() 卡住的线程永远醒不过来 → 只能杀进程。
+    # (127) 先经 svc.resume 放行所有挂起的线程，保持 service 状态机与定时器同步。
+    #       _pending_tokens 是放行凭据，绝不在此处清空，由 resume() 自行维护。
     resumed = None
     try:
-        pend = getattr(dbg, "_pending_tokens", None)
-        if pend:
-            resumed = dbg.resume()                        # 全放行
+        need_resume = getattr(tgt, "state", None) == STATE_PAUSED
+        if not need_resume and dbg is not None:
+            dlock = getattr(dbg, "_lock", None)
+            if dlock is not None:
+                dlock.acquire()
+            try:
+                has_pend = bool(getattr(dbg, "_pending_tokens", None))
+            finally:
+                if dlock is not None:
+                    dlock.release()
+            if has_pend:
+                with svc._lock:                           # noqa: SLF001
+                    if getattr(tgt, "state", None) != STATE_DETACHED:
+                        tgt.state = STATE_PAUSED
+                need_resume = True
+        if need_resume:
+            resumed = svc.resume(serial, pid)
+            if isinstance(resumed, dict) and not resumed.get("resumed") and resumed.get("reason") != "not_paused":
+                return _j({
+                    "error": f"清理前放行挂起线程未完全成功：{resumed.get('reason') or resumed}",
+                    "code": "CLEAR_ABORTED",
+                    "resume_result": resumed,
+                    "hint": "未做任何清理，避免把线程留在永久挂起状态",
+                })
     except Exception as exc:                              # noqa: BLE001
         return _j({"error": f"清理前放行挂起线程失败：{exc}",
                    "code": "CLEAR_ABORTED",
                    "hint": "未做任何清理，避免把线程留在永久挂起状态"})
 
     cleared = 0
+    events_cleared = 0
     try:
-        hits = getattr(dbg, "_hits", None)
-        if hits is not None:
-            cleared = len(hits)
-            hits.clear()
-        # 事件流里的旧命中同样清掉，避免 poll_events 又翻出来
-        ev = getattr(dbg, "_events", None)
-        if ev is not None:
-            ev.clear()
-        # 注意：**不清** _pending_tokens —— 它由 resume() 自己维护
+        # 1) 在 dbg._lock 下清理 debugger 侧命中缓冲（不动 _pending_tokens）
+        if dbg is not None:
+            dlock = getattr(dbg, "_lock", None)
+            if dlock is not None:
+                dlock.acquire()
+            try:
+                hits_buf = getattr(dbg, "_hits", None)
+                if hits_buf is not None:
+                    cleared = len(hits_buf)
+                    hits_buf.clear()
+                ev_buf = getattr(dbg, "_events", None)
+                if ev_buf is not None:
+                    ev_buf.clear()
+            finally:
+                if dlock is not None:
+                    dlock.release()
+
+        # 2) 在 svc._lock 下清理 service 侧该目标的命中事件并重置同步游标
+        slock = getattr(svc, "_lock", None)
+        if slock is not None:
+            slock.acquire()
+        try:
+            tgt_key = getattr(tgt, "key", f"{serial}:{pid}")
+            svc_evs = getattr(svc, "_events", None)
+            if svc_evs is not None:
+                kept = [
+                    e for e in svc_evs
+                    if not (isinstance(e, dict)
+                            and e.get("key") == tgt_key
+                            and e.get("type") == "breakpoint_hit")
+                ]
+                events_cleared += len(svc_evs) - len(kept)
+                svc_evs.clear()
+                svc_evs.extend(kept)
+            tgt_evs = getattr(tgt, "events", None)
+            if tgt_evs is not None:
+                kept_t = [
+                    e for e in tgt_evs
+                    if not (isinstance(e, dict) and e.get("type") == "breakpoint_hit")
+                ]
+                events_cleared += len(tgt_evs) - len(kept_t)
+                tgt_evs.clear()
+                tgt_evs.extend(kept_t)
+            if hasattr(tgt, "hit_cursor"):
+                tgt.hit_cursor = 0
+            if hasattr(tgt, "last_synced_seq"):
+                tgt.last_synced_seq = 0
+        finally:
+            if slock is not None:
+                slock.release()
     except Exception as exc:                              # noqa: BLE001
         return _j({"error": f"{type(exc).__name__}: {exc}",
                    "code": "CLEAR_FAILED"})
-    out = {"ok": True, "cleared": cleared,
+    out = {"ok": True, "cleared": cleared, "events_cleared": events_cleared,
            "note": "只清命中记录，断点仍然有效"}
     if resumed is not None:
         out["resumed_before_clear"] = resumed
@@ -4917,7 +5440,8 @@ def trace_app_startup(serial: str, package: str, symbols: list | None = None,
     ## 已知限制（如实标注）
 
         · spawn 需要 app 允许调试；加固样本可能失败（返回 SPAWN_FAILED）
-        · 只 hook 导出符号；内部函数需先拿静态地址再走 set_breakpoint
+        · symbols 仅支持导出符号；内部无导出函数请通过 breakpoints 参数传静态地址
+          （支持 dlopen 后自动延迟补下），或采集后用 set_breakpoint
         · 加载与调用**分类限额**（默认每个符号最多 max_events/符号数/2 条），
           避免 malloc 这类高频函数把加载事件挤出队列——这是实测踩到的坑：
           原来共用总上限时，启动阶段 malloc 几万次会把 module_load 挤到 0 条
@@ -4983,18 +5507,25 @@ def trace_app_startup(serial: str, package: str, symbols: list | None = None,
                 unsymbolized_frames += 1
                 if info.get("so"):
                     missing_sos.add(str(info["so"]))
+            # (136) 第136次修改（2026-11-26）
+            # bug 原因：未加载 so 的栈帧里残留死代码 `if False`，导致 static_addr 被丢弃、
+            #          symbol 只剩 "so (无函数名)"，无法直接定位偏移。
+            # 解决方案：取 _symbolize_frame 算出的 static_addr，既保留在 frames[].static_addr
+            #          字段，也在 symbol 中展示为 "{so_name}+{static_addr}"。
             fn_name = info.get("function")
             so_name = info.get("so")
             off = info.get("offset")
+            static_addr = info.get("static_addr")
             if fn_name and so_name:
                 symbol = f"{so_name}!{fn_name}" + (
                     f"+{hex(off)}" if isinstance(off, int) else "")
             elif so_name:
-                symbol = f"{so_name}+{hex(addr - 0)}" if False else f"{so_name} (无函数名)"
+                symbol = f"{so_name}+{static_addr}" if static_addr else f"{so_name} (无函数名)"
             else:
                 symbol = hex(addr)
             frames.append({
                 "runtime_addr": hex(addr),
+                "static_addr": static_addr,
                 "so": so_name,
                 "function": fn_name,
                 "offset": off,
@@ -5199,6 +5730,9 @@ def run_script(code: str) -> str:
     return run_in_session(_session, code)
 
 
+# (136) 第136次修改（2026-11-26）
+# bug 原因：run_idc / run_idc_file 即使执行报错（result 含 error）仍广播 data_changed 刷新 GUI。
+# 解决方案：仅在执行结果不含 error 时触发 _notify_ui("data_changed")。
 @server.tool()
 @logged()
 def run_idc(so_name: str, source: str) -> str:
@@ -5212,9 +5746,10 @@ def run_idc(so_name: str, source: str) -> str:
     from server.scripting.idc import run_idc as _run
 
     result = _run(_session, so_name, source)
-    # IDC 批量改名/建函数后立即刷新 GUI（否则界面还是旧名字/旧函数表）
-    _notify_ui({"type": "data_changed", "so_name": so_name,
-                "why": f"run_idc（{len(result.get('messages', []))} 条消息）"})
+    # 仅在执行无 error 时刷新 GUI
+    if isinstance(result, dict) and not result.get("error"):
+        _notify_ui({"type": "data_changed", "so_name": so_name,
+                    "why": f"run_idc（{len(result.get('messages', []))} 条消息）"})
     return _j(result)
 
 
@@ -5230,9 +5765,10 @@ def run_idc_file(so_name: str, path: str) -> str:
     if not p.is_file():
         return _j({"error": f"文件不存在: {path}"})
     result = _run(_session, so_name, p.read_text(encoding="utf-8", errors="replace"))
-    # 同 run_idc：IDC 批量操作后刷新 GUI
-    _notify_ui({"type": "data_changed", "so_name": so_name,
-                "why": f"run_idc_file({p.name})"})
+    # 同 run_idc：仅在执行无 error 时刷新 GUI
+    if isinstance(result, dict) and not result.get("error"):
+        _notify_ui({"type": "data_changed", "so_name": so_name,
+                    "why": f"run_idc_file({p.name})"})
     return _j({"file": str(p), **result})
 
 
@@ -5323,11 +5859,15 @@ def watch_module(serial: str, pid: int, so_name: str, duration: float = 5.0,
     mod, err = _load_dyn_module("server.dyn.tracer", "watch_module")
     if err:
         return _j(err)
+    # (136) 第136次修改（2026-11-26）
+    # bug 原因：watch_module 声明了 batch_interval_ms 参数但未透传给 mod.watch_module，导致参数失效。
+    # 解决方案：显式透传 batch_interval_ms=int(batch_interval_ms)。
     try:
         return _j(mod.watch_module(serial, int(pid), so_name,
                                    duration=float(duration),
                                    max_points=int(max_points),
                                    batch=int(batch),
+                                   batch_interval_ms=int(batch_interval_ms),
                                    offset_range=offset_range))
     except Exception as exc:                              # noqa: BLE001
         return _j({"error": f"{type(exc).__name__}: {exc}",
@@ -5619,6 +6159,10 @@ def probe_hits(serial: str, pid: int, so_name: str, static_addr: int,
                    "code": getattr(exc, "code", "PROBE_FAILED")})
 
 
+# (136) 第136次修改（2026-11-26）
+# bug 原因：read_jump_table docstring 开头称"纯静态，不需要设备"与下方 serial/pid 运行时模式矛盾，
+#          且返回字段列表遗漏 ok/implemented/so_name/table_addr/entry_size/count/code_base。
+# 解决方案：修正 docstring 说明支持静态（默认，不连设备）与运行时（传 serial+pid）双模式，并补全真实返回字段。
 @server.tool()
 @logged()
 def read_jump_table(so_name: str, table_static_addr: int, entry_size: int = 4,
@@ -5626,7 +6170,8 @@ def read_jump_table(so_name: str, table_static_addr: int, entry_size: int = 4,
                     serial: str = "", pid: int = 0) -> str:
     """读一张**跳转表**，把表项解析成目标地址（解决表驱动的 br）。
 
-    **纯静态，不需要设备。**
+    **支持双模式**：不传 serial/pid 时纯静态读本地 so 文件（不需要设备）；
+    传入 serial + pid 时优先从目标进程运行时内存读取。
 
     VM 分发器的常见形态：
 
@@ -5662,6 +6207,7 @@ def read_jump_table(so_name: str, table_static_addr: int, entry_size: int = 4,
 
     ## 返回
 
+        ok / implemented / so_name / table_addr / entry_size / count / code_base
         source      "runtime"（从进程内存读）或 "static"（读文件）
         raw / offsets[] / targets[] / note
 
@@ -6181,11 +6727,16 @@ def find_dispatch_tables(so_name: str, max_tables: int = 200,
 # ---------------------------------------------------------------------------
 
 
+# (136) 第136次修改（2026-11-26）
+# bug 原因：rela_dump / vtable_at docstring 中多处字段名与底层 core/rela.py 真实返回不符
+#          （如 addend_in_exec 实为 addend_exec、无 target_function；vtable_at 实为
+#          function / block_start / block_end / block_slots，并引用了不存在的 MCP 工具名）。
+# 解决方案：按 core/rela.py 真实输出结构与真实 MCP 工具名校正两处 docstring。
 @server.tool()
 @logged()
 def rela_dump(so_name: str, addr_from: int = 0, addr_to: int = 0,
               kind: str = "all", limit: int = 500) -> str:
-    """导出某 so 的重定位表（`.rela.dyn` / `.rela.plt` / `PT_DYNAMIC`）。
+    """导出某 so 的重定位表（`.rela.dyn` / `.rela.plt` / `RELR` / `PT_DYNAMIC`）。
 
     **纯静态，不需要设备。** 节表被抹的 dump so 也能解析（走 PT_DYNAMIC）。
 
@@ -6198,25 +6749,27 @@ def rela_dump(so_name: str, addr_from: int = 0, addr_to: int = 0,
     ## 参数
 
         addr_from / addr_to  按 r_offset 过滤（左闭右开）；都传 0 表示不限
-        kind  all          全部条目
+        kind  all          全部条目（含 source='relr'）
               code_target  只要 addend 落在**可执行段**的项
                            —— 这些就是潜在的函数指针目标
-              relative     只要 RELATIVE / IRELATIVE
-              plt          只要 PLT 表里的项（导入符号的 GOT 槽）
+              relative     只要 RELATIVE / IRELATIVE（含 RELR）
+              plt          只要 PLT 表里的项（rela.plt / rel.plt）
+              relr         只要 RELR 解出的条目
         limit <=0 表示不限制
 
-    ## 条目字段
+    ## 条目字段（`items[]` 每项）
 
         offset / offset_hex    r_offset（槽地址）
         rtype / rtype_name     重定位类型
-        sym_idx / sym_name     符号（无 dynsym 时 sym_name 为空，sym_resolved=false）
+        sym_idx / sym_name / sym_resolved  符号（无 dynsym 时 sym_name 为空，sym_resolved=false）
         addend / addend_hex    附加值
         addend_is_target       **true 才代表 addend 就是目标地址**
                                （只有 RELATIVE/IRELATIVE 是；ABS64/GLOB_DAT
                                 的 addend 是附加到符号值上的偏移，别直接当地址）
-        addend_in_exec         addend 是否落在可执行段
-        target_function        addend 若在可执行段，给出所在函数名
-        source                 来自哪张表（rela.dyn/rela.plt/rel.plt/dynamic）
+        addend_implicit        是否隐式 addend（REL/RELR）
+        addend_exec            addend 是否落在可执行段
+        addend_in_image        addend 是否落在镜像 PT_LOAD 范围内
+        source                 来自哪张表（rela.dyn/rela.plt/rel.plt/relr/dynamic）
 
     ## 解析失败时
 
@@ -6256,21 +6809,25 @@ def vtable_at(so_name: str, addr: int) -> str:
     3. 块内 addend 落在可执行段的比例 >= 0.5
        —— vtable 项是函数指针；字符串表/typeinfo 这类数据指针块会被判为非 vtable
 
-    ## 典型用法：从虚表偏移追到实现函数
+    ## 典型用法与真实返回字段
 
         vtable_at(so, 0x2dc778)
-        → is_vtable: true, index: 4, target: 0x196424,
-          target_function: sub_196424, block: [0x2dc768, 0x2dc820)
+        → is_vtable: true, index: 4, slot_addr: 0x2dc778,
+          target: 0x196424, target_hex: "0x196424",
+          target_exec: true, target_in_image: true,
+          function: "sub_196424", function_addr: 0x196424,
+          at_function_entry: true, function_offset: 0,
+          block_start: 0x2dc768, block_end: 0x2dc820, block_slots: 23,
+          block_exec_targets: 23, block_exec_ratio: 1.0
 
-    拿到 `target` 之后，用 `function_at`/`disassemble` 看实现；
-    如果 `function_at` 返回的入口不是 target 本身，说明该函数**还没被
-    发现**——用 `discover_functions(aggressive=true)` 补（严格档会收
-    完整栈帧的真函数）。
+    拿到 `target` 之后，用 `get_function_by_address` / `disassemble` 看实现；
+    如果 `at_function_entry=false`，说明该函数**还没被发现**——用
+    `build_xrefs(so_name, use_prologue=True)` 补全函数表。
 
     ## 不是 vtable 时
 
-    返回 `is_vtable=false` + `reason`，并尽量给出该地址所在的块信息，
-    方便判断"是数据块"还是"判据太严"。
+    返回 `is_vtable=false` + `reason` + `detail`，并尽量给出该地址所在的块信息
+    （`block_start` / `block_end` / `block_slots`），方便判断"是数据块"还是"判据太严"。
     """
     so = _session.get(so_name)
     from server.core import rela as _rela
@@ -6322,6 +6879,15 @@ def rela_summary(so_name: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+# (136) 第136次修改（2026-11-26）
+# bug 原因：① core/dex/api.py 的 dex_classes / dex_methods / dex_callers 在文件不存在、
+#             类不存在或方法不存在时返回单元素错误列表 [{"error": ..., "code": ...}]，
+#             旧代码仅判断 isinstance(out, dict)，把错误列表包装成了假成功
+#             {"ok": True, "count": 1, ...}；
+#          ② 三个工具的 docstring 字段列表与真实返回字段存在多处不一致。
+# 解决方案：① 统一检测单元素错误列表 `isinstance(out, list) and len(out) == 1 and
+#             isinstance(out[0], dict) and "error" in out[0]`，返回 {"ok": False, **out[0]}；
+#          ② 同步校正三个工具的 docstring 字段说明。
 @server.tool()
 @logged()
 def dex_classes(path: str) -> str:
@@ -6330,23 +6896,26 @@ def dex_classes(path: str) -> str:
     `path` 是文件路径：可以是 `.dex`，也可以是 `.apk` / `.jar`
     （内部多个 `classes*.dex` 会按顺序合并）。
 
-    ## 返回字段（`classes[]` 每项）
+    ## 返回字段
 
+        ok / path / count / classes[]
+
+    `classes[]` 每项字段：
         name            dex 原始描述符（`Lcom/x/Y;`）——传给 dex_methods 两种都行
-        java_name      给人看的形态 `com.x.Y`
+        java_name       给人看的形态 `com.x.Y`
         access_flags / access_names   访问标志原值与逐个名字
         superclass / interfaces       父类与接口描述符
         method_count / field_count    方法/字段数
         source_file     SourceFile 属性（混淆后常为空）
-        dex            来源条目（classes.dex / classes2.dex …）
+        dex             来源条目（classes.dex / classes2.dex …）
 
     若某个 dex 解析失败，**不影响其它 dex**：失败项以
     `{error, code, dex}` 的形式出现在列表末尾，务必检查。
 
     ## 多 dex
 
-    `dex_count` 说明合并了几个 dex。同名类出现在多个 dex 时以**先出现的**为准
-    （与 Android 的类加载顺序一致）。
+    多个 `classes*.dex` 按顺序合并，每条记录的 `dex` 字段标明来源条目。
+    同名类出现在多个 dex 时以**先出现的**为准（与 Android 的类加载顺序一致）。
 
     ## 需要 Java 层定位时
 
@@ -6362,6 +6931,9 @@ def dex_classes(path: str) -> str:
                    "code": "DEX_CLASSES_FAILED", "path": path})
     if isinstance(classes, dict):        # 内部错误对象（如文件不存在）
         return _j(classes)
+    if (isinstance(classes, list) and len(classes) == 1
+            and isinstance(classes[0], dict) and "error" in classes[0]):
+        return _j({"ok": False, **classes[0]})
     return _j({"ok": True, "path": path, "count": len(classes),
                "classes": classes})
 
@@ -6373,16 +6945,15 @@ def dex_methods(path: str, class_name: str) -> str:
 
     class_name 接受三种写法：`com.x.Y`、`Lcom/x/Y;`、`com/x/Y`。
 
-    ## 关键字段
+    ## 关键字段（`methods[]` 每项）
 
-        name / proto            方法名与原型描述符
-        return_type / params    拆开后的返回类型与参数类型（已从描述符归一）
-        access_flags / access_text
+        name / proto / shorty   方法名、原型描述符与短描述符
+        access_flags / access_names   访问标志原值与逐个名字
         is_native               **native 方法**（实现不在 dex 里，要去 so 找）
-        is_abstract / is_static / is_constructor
+        is_abstract / is_direct 是否抽象 / 是否来自 direct_methods（含 static/private/<init>）
         code_off                code_item 文件偏移（0 表示无实现）
-        insn_count / regs_size  指令数与寄存器数
-        param_count
+        insn_count              指令 code unit 数（等价 dexdump 的 insns size）
+        param_count / ins_size / registers_size  参数数（不含 this）、入参寄存器数（含 this）、总寄存器数
 
     ## 定位 native 实现
 
@@ -6399,6 +6970,9 @@ def dex_methods(path: str, class_name: str) -> str:
                    "code": "DEX_METHODS_FAILED"})
     if isinstance(out, dict):
         return _j(out)
+    if (isinstance(out, list) and len(out) == 1
+            and isinstance(out[0], dict) and "error" in out[0]):
+        return _j({"ok": False, **out[0]})
     return _j({"ok": True, "path": path, "class_name": class_name,
                "count": len(out), "methods": out})
 
@@ -6458,14 +7032,15 @@ def dex_callers(path: str, class_name: str, method_name: str,
     直接写着 method_idx，扫一遍全部 code_item 就能精确反查。这是 Java 层
     相对 native 层的天然优势，别浪费。
 
-    ## 返回字段
+    ## 返回字段（`callers[]` 每项）
 
-        caller_class / caller_method   调用方
-        caller_proto
-        invoke_kind                    virtual / direct / static / interface /
-                                       super / virtual-range ...
-        offset                         调用点在该方法 code_item 内的偏移
-        is_native_caller               调用方自身是否 native（此时拿不到字节码）
+        caller                         完整签名（如 `Lcom/x/Y;->foo(I)V`）
+        caller_class / caller_method / caller_proto  调用方类、方法名与原型
+        invoke_kind                    invoke-virtual / invoke-direct / invoke-static /
+                                       invoke-interface / invoke-super 等
+        call_count                     该调用者中命中次数
+        sites                          调用点列表 `[{insn_off, insn_byte_off}]`
+        dex                            调用者所在的 dex 条目
 
     ## 注意：这不是完整的调用图
 
@@ -6485,6 +7060,9 @@ def dex_callers(path: str, class_name: str, method_name: str,
                    "code": "DEX_CALLERS_FAILED"})
     if isinstance(out, dict):
         return _j(out)
+    if (isinstance(out, list) and len(out) == 1
+            and isinstance(out[0], dict) and "error" in out[0]):
+        return _j({"ok": False, **out[0]})
     return _j({"ok": True, "path": path, "class_name": class_name,
                "method_name": method_name, "count": len(out), "callers": out})
 
@@ -7174,6 +7752,10 @@ def perf_watch_poll(serial: str, slot: int = 0, limit: int = 200) -> str:
                    "code": "PERF_POLL_FAILED"})
 
 
+# (136) 第136次修改（2026-11-26）
+# bug 原因：perf_watch_stop 停止观察点后未调用 mod.forget_slot_pid(serial, slot)，
+#          导致过期的槽位-PID 映射残留。
+# 解决方案：停止完成后安全调用 mod.forget_slot_pid(serial, int(slot)) 清理映射。
 @server.tool()
 @logged()
 def perf_watch_stop(serial: str, slot: int = 0) -> str:
@@ -7182,7 +7764,13 @@ def perf_watch_stop(serial: str, slot: int = 0) -> str:
     if err:
         return _j(err)
     try:
-        return _j(mod.perf_watch_stop(serial, slot=int(slot)))
+        res = mod.perf_watch_stop(serial, slot=int(slot))
+        try:
+            if callable(getattr(mod, "forget_slot_pid", None)):
+                mod.forget_slot_pid(serial, int(slot))
+        except Exception:                                 # noqa: BLE001
+            pass
+        return _j(res)
     except Exception as exc:                              # noqa: BLE001
         return _j({"error": f"{type(exc).__name__}: {exc}",
                    "code": "PERF_STOP_FAILED"})
@@ -7686,16 +8274,36 @@ def mem_diff(serial: str, pid: int, key: str = "default", min_size: int = 1,
                    "code": "MEM_DIFF_FAILED"})
 
 
+# (136) 第136次修改（2026-11-26）
+# bug 原因：① mem_snapshot_clear 声明了 pid 参数但未在文档或返回中说明其不参与快照过滤；
+#          ② unload_so / clear_modules 卸载模块后未发 _notify_ui 通知前端刷新模块列表；
+#          ③ clear_modules(keep=...) 直接传原始别名给 Session.clear()，未按 _session
+#             别名规则归一化到规范模块名，传入别名会导致该模块未被保留而被误清空。
+# 解决方案：① mem_snapshot_clear 明确说明 pid 仅用于运行环境上下文（快照按 key 清理），
+#             pid!=0 时在结果中附注提示；
+#          ② unload_so / clear_modules 成功时广播 modules_changed UI 同步事件；
+#          ③ clear_modules 先将 keep 中字符串按 _session 归一化为规范模块名再传入 clear()。
 @server.tool()
 @logged()
 def mem_snapshot_clear(serial: str, key: str = "default",
                        pid: int = 0) -> str:
-    """删掉设备上的快照文件，释放空间。"""
+    """删掉设备上的快照文件，释放空间。
+
+    注意：设备上的快照按 `key` 命名和清理（不按 `pid` 隔离）；`pid` 仅用于
+    运行时环境上下文检测（例如确认目标进程是否在前台），不参与快照过滤。
+    """
     mod, err = _load_dyn_module("server.dyn.memdiff", "mem_snapshot_clear")
     if err:
         return _j(err)
     try:
-        return _j(mod.mem_snapshot_clear(serial, key=key))
+        res = mod.mem_snapshot_clear(serial, key=key)
+        if int(pid or 0) != 0 and isinstance(res, dict):
+            res = dict(res)
+            res.setdefault(
+                "pid_note",
+                "设备端快照按 key 标识并清理；pid 参数仅用于运行时环境上下文，不参与快照过滤",
+            )
+        return _j(res)
     except Exception as exc:                              # noqa: BLE001
         return _j({"error": f"{type(exc).__name__}: {exc}",
                    "code": "MEM_CLEAR_FAILED"})
@@ -7730,7 +8338,14 @@ def unload_so(so_name: str) -> str:
     from server.mcp_server.tools import get_session
 
     try:
-        return _j(get_session().unload(so_name))
+        res = get_session().unload(so_name)
+        if isinstance(res, dict) and res.get("ok"):
+            _notify_ui({
+                "type": "modules_changed",
+                "action": "unload",
+                "so_name": res.get("so") or so_name,
+            })
+        return _j(res)
     except Exception as exc:                              # noqa: BLE001
         return _j({"error": f"{type(exc).__name__}: {exc}",
                    "code": "UNLOAD_FAILED"})
@@ -7750,8 +8365,29 @@ def clear_modules(keep: list | None = None) -> str:
     """
     from server.mcp_server.tools import get_session
 
+    sess = get_session()
+    norm_keep = keep
+    if isinstance(keep, str):
+        resolved = sess._resolve_key(keep)                # noqa: SLF001
+        norm_keep = [resolved or keep]
+    elif isinstance(keep, (list, tuple, set)):
+        norm_keep = []
+        for item in keep:
+            if isinstance(item, str):
+                resolved = sess._resolve_key(item)        # noqa: SLF001
+                norm_keep.append(resolved or item)
+            else:
+                norm_keep.append(item)
     try:
-        return _j(get_session().clear(keep=keep))
+        res = sess.clear(keep=norm_keep)
+        if isinstance(res, dict) and res.get("ok"):
+            _notify_ui({
+                "type": "modules_changed",
+                "action": "clear",
+                "so_name": "",
+                "freed": res.get("freed") or [],
+            })
+        return _j(res)
     except Exception as exc:                              # noqa: BLE001
         return _j({"error": f"{type(exc).__name__}: {exc}",
                    "code": "CLEAR_FAILED"})
@@ -8037,11 +8673,16 @@ def ui_find(serial: str, text: str = "", resource_id: str = "",
                     clickable_only=clickable_only, limit=limit)
 
 
+# (137) 第一百三十七次修改（2026-11-26）
+# bug 原因：ui_click / ui_input 默认 index=0，与 dyn/ui.py 修复后的
+#          `index is not None` 语义冲突——未传 index 时会被当成显式选中第 0 项，
+#          跳过多候选 AMBIGUOUS 检测。
+# 解决方案：默认改为 index: int | None = None，传 0 时精准选第 0 个，不传时按歧义规则处理。
 @server.tool()
 @logged()
 def ui_click(serial: str, x: int | None = None, y: int | None = None,
              text: str = "", resource_id: str = "", content_desc: str = "",
-             cls: str = "", exact: bool = False, index: int = 0,
+             cls: str = "", exact: bool = False, index: int | None = None,
              wait: float = 0.0) -> str:
     """点击界面。给坐标，或给查找条件（内部先找再点中心）。
 
@@ -8070,7 +8711,7 @@ def ui_click(serial: str, x: int | None = None, y: int | None = None,
 @logged()
 def ui_input(serial: str, content: str, text: str = "",
              resource_id: str = "", content_desc: str = "", cls: str = "",
-             exact: bool = False, index: int = 0,
+             exact: bool = False, index: int | None = None,
              clear_first: bool = True) -> str:
     """向输入框输入文本。
 

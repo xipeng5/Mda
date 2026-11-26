@@ -31,6 +31,7 @@
 """
 from __future__ import annotations
 
+from server.core.addr import parse_addr
 from server.core.plugins import PluginBase
 
 _JS_PATCH = r"""
@@ -107,10 +108,47 @@ class Plugin(PluginBase):
             return {"error": f"hex 不是合法十六进制：{hexs[:40]}",
                     "code": "BAD_HEX"}
 
-        a = int(str(addr), 16) if isinstance(addr, str) and \
-            str(addr).lower().startswith("0x") else int(addr)
+        # (8) 第八次修改（2026-11-26）
+        # bug 原因：1) 未统一使用 parse_addr 解析 addr，非法输入抛 ValueError；
+        #           2) usage 声明了 so 参数但未实现通过 Rebase 把静态偏移换算为运行时地址；
+        #           3) try 与 finally 中重复调用了两次 _detach_async(sess)；
+        #           4) restore=True 未检查 write_target_mem() 的布尔返回值，写回失败仍假报 restored=True，
+        #              且未明确标注恢复发生在读回校验之后。
+        # 解决方案：使用 parse_addr（非法返 BAD_ADDR）；传 so 且地址为偏移时通过 Rebase 换算运行时地址；
+        #           删除重复的 _detach_async；restore=True 仅在写入与读回校验后执行并严格检查返回值。
+        a = parse_addr(addr)
+        if a is None:
+            return {"ok": False, "code": "BAD_ADDR",
+                    "error": f"非法地址参数 addr={addr!r}"}
 
-        # (7) restore=true 时：先读旧字节 → 写入 → 再由 Python 写回旧值
+        so_name = args.get("so")
+        rebased_info: dict = {}
+        if so_name:
+            rb = None
+            try:
+                from server.dyn.rebase import Rebase
+
+                rb = Rebase.attach(str(serial), int(pid))
+                mod = rb.find_module(str(so_name))
+                if mod is None:
+                    return {"ok": False, "code": "MODULE_NOT_FOUND",
+                            "error": f"目标进程未加载模块：{so_name}"}
+                if not (mod.base <= a < mod.base + mod.size):
+                    orig = a
+                    a = rb.to_runtime(orig, mod)
+                    rebased_info = {
+                        "so": mod.name,
+                        "module_base": hex(mod.base),
+                        "static_offset": hex(orig),
+                    }
+            except Exception as exc:                      # noqa: BLE001
+                return {"ok": False, "code": "REBASE_FAILED",
+                        "error": f"模块地址换算失败：{exc}"}
+            finally:
+                if rb is not None:
+                    rb.detach()
+
+        # (7) restore=true 时：先读旧字节 → 写入 → 读回验证 → 再由 Python 写回旧值
         old_bytes = b""
         if args.get("restore"):
             try:
@@ -159,17 +197,10 @@ class Plugin(PluginBase):
                 if box:
                     break
                 time.sleep(0.05)
-            # (7) 用 tracer 的异步卸载：同步 unload 在 frida 17 会永久阻塞
-            try:
-                from server.dyn.tracer import _detach_async
-
-                _detach_async(sess)
-            except Exception:                             # noqa: BLE001
-                pass
         except Exception as exc:                          # noqa: BLE001
             return {"error": f"执行失败：{exc}", "code": "PATCH_FAILED"}
         finally:
-            # (7) 同上：detach 也走异步，避免 MCP 调用永不返回
+            # (7) detach 统一在 finally 中走异步，避免 MCP 调用永不返回
             try:
                 from server.dyn.tracer import _detach_async
 
@@ -182,6 +213,8 @@ class Plugin(PluginBase):
         box["ok"] = bool(box.get("ok"))
         box["addr"] = hex(a)
         box["size"] = len(data)
+        if rebased_info:
+            box.update(rebased_info)
         # (6) 外部读回校验（同步可靠）
         if box.get("ok") and args.get("verify", True):
             try:
@@ -198,14 +231,23 @@ class Plugin(PluginBase):
                 box["verify_error"] = f"{type(exc).__name__}: {exc}"
         box["note"] = ("改的是运行时内存，不落盘——重启 App 即恢复。"
                        "加固 App 若有 CRC 自校验，改完可能崩溃。")
-        # (7) restore=true：把原字节记下来并写回（真正的恢复）
-        if args.get("restore") and old_bytes:
-            try:
-                from server.dyn.inject import write_target_mem
+        # (7)(8) restore=true：仅在写入并读回验证后执行恢复，并严格检查 write_target_mem 返回值
+        if args.get("restore") and box.get("ok"):
+            if not old_bytes:
+                box["restored"] = False
+                box["restore_error"] = "patch 前未能读到原字节，无法自动恢复"
+            else:
+                try:
+                    from server.dyn.inject import write_target_mem
 
-                write_target_mem(str(serial), int(pid), a, old_bytes)
-                box["restored"] = True
-                box["restored_hex"] = old_bytes.hex()
-            except Exception as exc:                      # noqa: BLE001
-                box["restore_error"] = f"{type(exc).__name__}: {exc}"
+                    restored_ok = bool(write_target_mem(str(serial), int(pid), a, old_bytes))
+                    box["restored"] = restored_ok
+                    if restored_ok:
+                        box["restored_hex"] = old_bytes.hex()
+                        box["restore_note"] = "已在读回验证后恢复为 patch 前原字节"
+                    else:
+                        box["restore_error"] = "write_target_mem 返回 False，未能恢复原字节"
+                except Exception as exc:                  # noqa: BLE001
+                    box["restored"] = False
+                    box["restore_error"] = f"{type(exc).__name__}: {exc}"
         return box

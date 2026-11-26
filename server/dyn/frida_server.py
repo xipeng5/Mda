@@ -36,6 +36,7 @@ import io
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import time
@@ -267,10 +268,14 @@ def _port_listening(adb: Adb, port: int) -> bool:
     (5) 第五次修改（2026-11-03）：新增本函数。用 grep -h 拿原始行回本地解析，
         避免了 awk 的 $ 被多层 shell 展开的问题（实测 awk 版本恒返回空）。
     """
+    # (11) 第十一次修改（2026-11-26）
+    # bug 原因：adb._cmd("shell", "su", "-c", "<复合命令>") 会被 adb 空格拼接后交由外层
+    #           非 root sh 解析，导致 || / && / | / ; 及重定向脱离 su -c 权限。
+    # 解决方案：全模块统一改用 adb.su_shell(...)（内部以 shlex.quote 保护整段命令）。
     hex_port = f"{port:04X}"
-    raw = adb._cmd("shell", "su", "-c",
-                   f"grep -h -i :{hex_port} /proc/net/tcp /proc/net/tcp6 2>/dev/null || true",
-                   check=False)
+    raw = adb.su_shell(
+        f"grep -h -i :{hex_port} /proc/net/tcp /proc/net/tcp6 2>/dev/null || true",
+        check=False)
     for line in (raw or "").splitlines():
         parts = line.split()
         # 字段布局：sl local_address rem_address st ... inode(第10列)
@@ -457,9 +462,18 @@ def prepare_server(version: str, abi: str, dry_run: bool = True,
             "BAD_BINARY",
             f"解压出的 frida-server 未通过健全性检查（{why}）；已删除",
         )
+    # (11) 第十一次修改（2026-11-26）
+    # bug 原因：当 GitHub release 的 sha256(digest) 为空时，前面第 444 行已将
+    #           out["verified"] 置为 False，但第 462 行又无条件覆写为 True，
+    #           导致未做哈希校验的二进制被放行，违背“校验不可跳过”的安全约定。
+    # 解决方案：仅在真实完成官方 sha256 校验（info["sha256"] 非空）时才置 verified=True。
     out["actual_size"] = os.path.getsize(bin_path)
-    out["verify_method"] = "xz(sha256) + binary(ELF/大小)"
-    out["verified"] = True
+    if info["sha256"]:
+        out["verify_method"] = "xz(sha256) + binary(ELF/大小)"
+        out["verified"] = True
+    else:
+        out["verify_method"] = "binary(ELF/大小，缺少官方 sha256)"
+        out["verified"] = False
     try:
         os.chmod(bin_path, 0o755)
     except OSError:
@@ -510,9 +524,9 @@ def _device_abi(adb: Adb) -> str:
 
 def _device_stat(adb: Adb, path: str) -> dict:
     """返回 {exists, size}；用 stat 而不是 ls 解析，避免格式差异。"""
-    out = adb._cmd("shell", "su", "-c",
-                   f"stat -c '%s' {path} 2>/dev/null || echo MISSING",
-                   check=False)
+    out = adb.su_shell(
+        f"stat -c '%s' {shlex.quote(path)} 2>/dev/null || echo MISSING",
+        check=False)
     text = (out or "").strip()
     if not text or "MISSING" in text:
         return {"exists": False, "size": 0}
@@ -567,8 +581,8 @@ def build_plan(serial: str, version: str | None = None,
     #               实测一次列出 20+ 项，真正有威胁的两个（frida-server、
     #               frida_16019）被淹没，等于没提醒。
     #     解决方案：只保留「可执行 + 名字含 frida + 不是 gadget」的文件。
-    listing = adb._cmd("shell", "su", "-c",
-                       f"ls -la {DEVICE_DIR}/ | grep -i frida || echo NONE", check=False)
+    listing = adb.su_shell(
+        f"ls -la {shlex.quote(DEVICE_DIR)}/ | grep -i frida || echo NONE", check=False)
     others = []
     for ln in (listing or "").splitlines():
         parts = ln.split()
@@ -636,27 +650,29 @@ def _install(adb: Adb, local_bin: str, device_path: str) -> dict:
     tmp = f"{DEVICE_DIR}/.mda-frida-server.new"
     result = {"tmp_path": tmp, "backup_path": "", "backed_up": False}
 
+    q_tmp = shlex.quote(tmp)
+    q_dev = shlex.quote(device_path)
     # push：/data/local/tmp 一般允许 shell 写；失败再走 su 中转
     try:
         adb._cmd("push", local_bin, tmp, timeout=180)
     except DynError:
         stage = f"{DEVICE_DIR}/.mda-stage"
+        q_stage = shlex.quote(stage)
         adb._cmd("push", local_bin, stage, timeout=180)
-        adb._cmd("shell", "su", "-c", f"cp {stage} {tmp} && rm -f {stage}", timeout=60)
+        adb.su_shell(f"cp {q_stage} {q_tmp} && rm -f {q_stage}", timeout=60)
 
-    adb._cmd("shell", "su", "-c", f"chmod 755 {tmp}", timeout=30)
+    adb.su_shell(f"chmod 755 {q_tmp}", timeout=30)
 
     # 备份原文件（带时间戳，保留可回滚点）
     stat = _device_stat(adb, device_path)
     if stat["exists"]:
         stamp = time.strftime("%Y%m%d-%H%M%S")
         backup = f"{device_path}.bak-{stamp}"
-        adb._cmd("shell", "su", "-c", f"cp -p {device_path} {backup}", timeout=60)
+        adb.su_shell(f"cp -p {q_dev} {shlex.quote(backup)}", timeout=60)
         result["backup_path"] = backup
         result["backed_up"] = True
 
-    adb._cmd("shell", "su", "-c", f"mv -f {tmp} {device_path} && chmod 755 {device_path}",
-             timeout=60)
+    adb.su_shell(f"mv -f {q_tmp} {q_dev} && chmod 755 {q_dev}", timeout=60)
     return result
 
 
@@ -665,9 +681,9 @@ def _restore(adb: Adb, backup_path: str, device_path: str) -> bool:
     if not backup_path:
         return False
     try:
-        adb._cmd("shell", "su", "-c",
-                 f"cp -p {backup_path} {device_path} && chmod 755 {device_path}",
-                 timeout=60)
+        q_bak = shlex.quote(backup_path)
+        q_dev = shlex.quote(device_path)
+        adb.su_shell(f"cp -p {q_bak} {q_dev} && chmod 755 {q_dev}", timeout=60)
         return True
     except Exception:                                     # noqa: BLE001
         return False
@@ -690,9 +706,9 @@ def _rollback(adb: Adb, installed: dict, device_path: str,
                     "port_listening": False}
     # 1) 停掉当前持有者（新起的那个）
     for pid, name in adb.listening_pids(27042):
-        adb._cmd("shell", "su", "-c",
-                 f"kill {pid} 2>/dev/null; sleep 0.3; kill -9 {pid} 2>/dev/null",
-                 check=False)
+        adb.su_shell(
+            f"kill {int(pid)} 2>/dev/null; sleep 0.3; kill -9 {int(pid)} 2>/dev/null",
+            check=False)
         result["stopped_new"].append({"pid": pid, "name": name})
     for _ in range(20):
         if not adb.listening_port(27042):
@@ -707,8 +723,8 @@ def _rollback(adb: Adb, installed: dict, device_path: str,
 
     # 3) 把还原后的旧二进制重新起来
     try:
-        adb._cmd("shell", "su", "-c",
-                 f"nohup {device_path} >/dev/null 2>&1 &", timeout=20)
+        adb.su_shell(f"nohup {shlex.quote(device_path)} >/dev/null 2>&1 &",
+                     timeout=20)
         time.sleep(2.0)
         result["port_listening"] = adb.listening_port(27042)
         result["restarted"] = result["port_listening"]
@@ -789,9 +805,9 @@ def ensure_server(serial: str, version: str | None = None, dry_run: bool = True,
         stopped = []
         victims = adb.listening_pids(27042)
         for pid, name in victims:
-            adb._cmd("shell", "su", "-c",
-                     f"kill {pid} 2>/dev/null; sleep 0.3; kill -9 {pid} 2>/dev/null",
-                     check=False)
+            adb.su_shell(
+                f"kill {int(pid)} 2>/dev/null; sleep 0.3; kill -9 {int(pid)} 2>/dev/null",
+                check=False)
             stopped.append(f"{name}（pid {pid}）")
         out["stopped_processes"] = stopped
         out["stopped_count"] = len(victims)
@@ -818,10 +834,21 @@ def ensure_server(serial: str, version: str | None = None, dry_run: bool = True,
         out["port_free"] = not _port_listening(adb, 27042)
 
         # 启动并等待端口
-        adb._cmd("shell", "su", "-c",
-                 f"nohup {device_path} >/dev/null 2>&1 &", timeout=20)
+        adb.su_shell(f"nohup {shlex.quote(device_path)} >/dev/null 2>&1 &",
+                     timeout=20)
         time.sleep(2.0)
+        # (11) 第十一次修改（2026-11-26）
+        # bug 原因：原实现仅查 adb._running_name()（固定匹配 frida-server / frida-server-17），
+        #           自定义 device_path（如 /data/local/tmp/fs_custom）启动成功后被误判未运行并触发回滚。
+        # 解决方案：同时匹配自定义 device_path 的 basename（pidof）以及 27042 端口监听状态。
         running = adb._running_name()
+        if not running:
+            custom_name = os.path.basename(device_path)
+            if custom_name and adb._cmd("shell", "pidof", custom_name, check=False).strip():
+                running = custom_name
+            elif _port_listening(adb, 27042):
+                holders_now = adb.listening_pids(27042)
+                running = holders_now[0][1] if holders_now else custom_name
         out["started_process"] = running
         if not running:
             raise DynError("START_FAILED", "启动命令已执行，但设备上找不到 frida 进程")

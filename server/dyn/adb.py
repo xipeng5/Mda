@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 import shutil
 import subprocess
 import time
@@ -98,6 +99,16 @@ class Adb:
             raise DynError("ADB_COMMAND_FAILED", f"adb {' '.join(args)} 失败: {r.stderr.strip()}")
         return r.stdout
 
+    # (11) 第十一次修改（2026-11-26）
+    # bug 原因：直接调用 `self._cmd("shell", "su", "-c", "<复合命令>")` 时，adb shell 会把所有参数
+    #           用空格拼成一条命令交由设备外层 sh 解析，导致 `;`、`&&`、`|`、`||` 和重定向被拆出
+    #           `su -c` 之外并在非 root shell 中执行，造成权限不足、静默失败或误杀。
+    # 解决方案：新增 su_shell 统一封装，使用 shlex.quote(cmd) 把整段复合命令保护为单个参数传给 su -c。
+    def su_shell(self, cmd: str, *, timeout: int = 30, check: bool = True) -> str:
+        """以 root 身份执行完整 shell 命令串（整段受 shlex.quote 保护，不被外层 sh 拆分）。"""
+        return self._cmd("shell", "su", "-c", shlex.quote(cmd),
+                         timeout=timeout, check=check)
+
     # ---------- 设备 ----------
 
     @staticmethod
@@ -119,7 +130,7 @@ class Adb:
     def is_root(self) -> bool:
         """探测设备能否用 su 拿到 root（给 preflight 提供准确降级原因）。"""
         try:
-            out = self._cmd("shell", "su", "-c", "id", check=False, timeout=8)
+            out = self.su_shell("id", check=False, timeout=8)
         except Exception:                      # noqa: BLE001 - 探测失败即视为无 root
             return False
         return "uid=0" in out
@@ -185,8 +196,8 @@ class Adb:
                 target = self.resolve_server_path()
             except DynError:
                 return ""
-        out = self._cmd("shell", "su", "-c", f"{target} --version 2>&1",
-                        check=False, timeout=25)
+        out = self.su_shell(f"{shlex.quote(target)} --version 2>&1",
+                            check=False, timeout=25)
         text = (out or "").strip().splitlines()[0].strip() if (out or "").strip() else ""
         # 只认形如 17.23.3 / 16.0.19 的版本串，避免把报错信息当版本
         import re as _re
@@ -208,9 +219,9 @@ class Adb:
         实现：grep 原始行回本地解析，避免设备端 awk 的 $ 被多层 shell 提前展开
               （实测 awk 版本恒返回空）。
         """
-        raw = self._cmd("shell", "su", "-c",
-                        f"grep -h -i :{self._port_hex(port)} /proc/net/tcp "
-                        f"/proc/net/tcp6 2>/dev/null || true", check=False)
+        raw = self.su_shell(
+            f"grep -h -i :{self._port_hex(port)} /proc/net/tcp "
+            f"/proc/net/tcp6 2>/dev/null || true", check=False)
         for line in (raw or "").splitlines():
             parts = line.split()
             # 字段：sl local_address rem_address st ... （st=0A 表示 LISTEN）
@@ -234,9 +245,9 @@ class Adb:
                       命中数 > 0 即判定为该端口的持有者。候选通常只有 1-3 个，
                       成本可接受且不依赖 ls 的跨目录输出格式。
         """
-        raw = self._cmd("shell", "su", "-c",
-                        f"grep -h -i :{self._port_hex(port)} /proc/net/tcp "
-                        f"/proc/net/tcp6 2>/dev/null || true", check=False)
+        raw = self.su_shell(
+            f"grep -h -i :{self._port_hex(port)} /proc/net/tcp "
+            f"/proc/net/tcp6 2>/dev/null || true", check=False)
         inode = ""
         for line in (raw or "").splitlines():
             parts = line.split()
@@ -261,8 +272,7 @@ class Adb:
 
         holders: list[tuple[int, str]] = []
         for pid, name in candidates:
-            out = self._cmd(
-                "shell", "su", "-c",
+            out = self.su_shell(
                 # 必须用 -F：socket:[123] 里的方括号是**字面量**，不用 -F 时
                 # grep 会把它当字符类（匹配 "socket:" 后跟一个数字），而实际文本
                 # 里方括号是真实字符，导致恒匹配不到（实测全返回 0）。
@@ -388,7 +398,7 @@ class Adb:
                 "path": path,
             }
 
-        self._cmd("shell", "su", "-c", f"nohup {path} >/dev/null 2>&1 &", timeout=15)
+        self.su_shell(f"nohup {shlex.quote(path)} >/dev/null 2>&1 &", timeout=15)
         time.sleep(wait)
         ok = self.listening_port(port) or self.frida_running()
         return {
@@ -417,9 +427,9 @@ class Adb:
             return {"stopped": [], "ok": True, "message": "端口 27042 没有监听者"}
         stopped: list[dict] = []
         for pid, name in holders:
-            self._cmd("shell", "su", "-c",
-                      f"kill {pid} 2>/dev/null; sleep 0.3; kill -9 {pid} 2>/dev/null",
-                      check=False)
+            self.su_shell(
+                f"kill {pid} 2>/dev/null; sleep 0.3; kill -9 {pid} 2>/dev/null",
+                check=False)
             stopped.append({"pid": pid, "name": name})
         time.sleep(0.5)
         return {
@@ -516,9 +526,9 @@ class Adb:
             冻结/解冻不能只看"命令执行成功"，必须能读到真实状态，
             否则会出现"以为冻住了其实没有"的假成功。
         """
-        out = self._cmd("shell", "su", "-c",
-                        f"cat /proc/{pid}/stat 2>/dev/null || echo MISSING",
-                        check=False)
+        out = self.su_shell(
+            f"cat /proc/{int(pid)}/stat 2>/dev/null || echo MISSING",
+            check=False)
         text = (out or "").strip()
         if not text or "MISSING" in text:
             return ""
@@ -554,7 +564,7 @@ class Adb:
                     "message": f"读不到 pid {pid} 的 /proc 状态，可能已退出",
                     "status_before": "", "status_after": ""}
 
-        self._cmd("shell", "su", "-c", f"kill -STOP {pid} 2>/dev/null", check=False)
+        self.su_shell(f"kill -STOP {int(pid)} 2>/dev/null", check=False)
         time.sleep(wait)
         after = self.process_status(pid)
         ok = after in ("T", "t")
@@ -578,7 +588,7 @@ class Adb:
                     "message": f"读不到 pid {pid} 的 /proc 状态",
                     "status_before": "", "status_after": ""}
 
-        self._cmd("shell", "su", "-c", f"kill -CONT {pid} 2>/dev/null", check=False)
+        self.su_shell(f"kill -CONT {int(pid)} 2>/dev/null", check=False)
         time.sleep(wait)
         after = self.process_status(pid)
         ok = after not in ("T", "t", "")
@@ -645,9 +655,9 @@ class Adb:
 
         # ① /proc/<pid> 是否存在 + ② 状态字符
         try:
-            out = self._cmd("shell", "su", "-c",
-                            f"cat /proc/{int(pid)}/stat 2>/dev/null || echo MISSING",
-                            check=False)
+            out = self.su_shell(
+                f"cat /proc/{int(pid)}/stat 2>/dev/null || echo MISSING",
+                check=False)
             text = (out or "").strip()
         except Exception:                                 # noqa: BLE001
             text = ""

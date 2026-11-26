@@ -75,8 +75,8 @@ _DELTA = 0x9E3779B9
 
 # 全部 transformer 名字集中登记，便于文档化与解析器识别
 _TRANSFORM_NAMES = (
-    "raw", "hexbytes", "md5hex", "sha1hex", "sha256hex",
-    "le", "upper", "lower",
+    "raw", "hexbytes", "md5", "md5hex", "sha1", "sha1hex",
+    "sha256", "sha256hex", "le", "upper", "lower",
 )
 
 
@@ -154,11 +154,20 @@ def _t_lower(v):
     return _to_str(v).lower()
 
 
+# (1) 第一次修改（2026-11-26）
+# bug 原因：1) 文档示例使用了 md5(url)，但 _TRANSFORMS 未注册 md5 别名；
+#           2) _eval_segment 把所有未知 word(...) 均替换为空串，破坏普通模板文本；
+#           3) _render_template 用 latin-1 编码会毁坏中文字符。
+# 解决方案：在 _TRANSFORMS 注册 md5/sha1/sha256 别名；仅替换已注册的变换函数，
+#           未知 word(...) 原样保留；_render_template 改用 UTF-8 编码。
 _TRANSFORMS = {
     "raw": _t_raw,
     "hexbytes": _t_hexbytes,
+    "md5": _t_md5hex,
     "md5hex": _t_md5hex,
+    "sha1": _t_sha1hex,
     "sha1hex": _t_sha1hex,
+    "sha256": _t_sha256hex,
     "sha256hex": _t_sha256hex,
     "le": _t_le,
     "upper": _t_upper,
@@ -197,7 +206,7 @@ def _eval_arg(arg, fields):
     if len(a) >= 2 and a[0] == a[-1] and a[0] in "\"'":
         return a[1:-1]
     m = re.fullmatch(r"([A-Za-z_]\w*)\((.*)\)", a)
-    if m:
+    if m and m.group(1) in _TRANSFORMS:
         return _call_transform(m.group(1), m.group(2), fields)
     if a in fields:
         return fields[a]
@@ -207,7 +216,7 @@ def _eval_arg(arg, fields):
 def _call_transform(name, args_str, fields):
     """用途：解析 func(arg,...) 形式的 Transformer 调用，参数求值后应用对应变换。"""
     if name not in _TRANSFORMS:
-        return ""
+        return f"{name}({args_str})"
     parts = [p for p in _split_top(args_str, ",")]
     if not parts or not parts[0].strip():
         return _TRANSFORMS[name]("")
@@ -218,9 +227,9 @@ def _call_transform(name, args_str, fields):
 def _eval_expr(expr, fields):
     """用途：求值花括号内表达式——支持 field、field|t1|t2 管道、func(arg) 调用、field_le 后缀。"""
     e = expr.strip()
-    # 函数调用：md5hex(url)
+    # 函数调用：md5hex(url)（仅匹配已注册变换，未知调用原样保留）
     m = re.fullmatch(r"([A-Za-z_]\w*)\((.*)\)", e)
-    if m:
+    if m and m.group(1) in _TRANSFORMS:
         return _to_str(_call_transform(m.group(1), m.group(2), fields))
     # 管道：url|md5hex|upper
     if "|" in e:
@@ -229,7 +238,7 @@ def _eval_expr(expr, fields):
         for p in parts[1:]:
             p = p.strip()
             pm = re.fullmatch(r"([A-Za-z_]\w*)\((.*)\)", p)
-            if pm:
+            if pm and pm.group(1) in _TRANSFORMS:
                 val = _call_transform(pm.group(1), pm.group(2), fields)
             else:
                 val = _apply_transform(p, val)
@@ -244,12 +253,14 @@ def _eval_expr(expr, fields):
 
 
 def _eval_segment(seg, fields, pipe_input=None):
-    """用途：求值模板顶层段——展开花括号、求值裸函数调用；整段是 transformer 名时应用到管道输入。"""
+    """用途：求值模板顶层段——展开花括号、求值已注册裸函数调用；整段是 transformer 名时应用到管道输入。"""
     def brace_repl(m):
         return _to_str(_eval_expr(m.group(1), fields))
     text = re.sub(r"\{([^{}]+)\}", brace_repl, seg)
 
     def call_repl(m):
+        if m.group(1) not in _TRANSFORMS:
+            return m.group(0)
         return _to_str(_call_transform(m.group(1), m.group(2), fields))
     text = re.sub(r"\b([A-Za-z_]\w*)\(([^()]*)\)", call_repl, text)
 
@@ -260,14 +271,14 @@ def _eval_segment(seg, fields, pipe_input=None):
 
 
 def _render_template(template, fields):
-    """用途：渲染模板为明文 bytes——按顶层 | 管道切段，逐段求值，左段结果作为右段输入。"""
+    """用途：渲染模板为明文 bytes（UTF-8 编码保留中文）——按顶层 | 管道切段逐段求值。"""
     segs = _split_top(template, "|")
     if len(segs) == 1:
-        return _eval_segment(segs[0], fields).encode("latin-1", "replace")
+        return _eval_segment(segs[0], fields).encode("utf-8", "replace")
     val = _eval_segment(segs[0], fields)
     for seg in segs[1:]:
         val = _eval_segment(seg, fields, pipe_input=val)
-    return val.encode("latin-1", "replace")
+    return val.encode("utf-8", "replace")
 
 
 def _resolve_key(expr, fields):
@@ -276,7 +287,7 @@ def _resolve_key(expr, fields):
     if e.startswith("literal:"):
         return e[len("literal:"):]
     m = re.fullmatch(r"([A-Za-z_]\w*)\((.*)\)", e)
-    if m:
+    if m and m.group(1) in _TRANSFORMS:
         return _to_str(_call_transform(m.group(1), m.group(2), fields))
     for suffix, tname in (("_le", "le"), ("_raw", "hexbytes")):
         if e.endswith(suffix) and e[:-len(suffix)] in fields:
@@ -385,18 +396,33 @@ class Plugin(PluginBase):
         templates = args.get("templates") or []
         algos = [str(a).lower() for a in (args.get("algos") or [])]
         keys = args.get("keys") or ["none"]
-        target_hex = args.get("target")
-        if not isinstance(target_hex, str) or not target_hex.strip():
-            return {"ok": False, "error": "需要 target（hex 字符串）", "code": "BAD_ARGS"}
+        # (2) 第二次修改（2026-11-26）
+        # bug 原因：1) encoding="base64" 时仍对 target 调 bytes.fromhex，导致合法 base64 目标报错且比对必败；
+        #           2) algos 为空时完全跳过隐式明文比对；
+        #           3) 隐式明文检查放在 (algo, key) 内层循环，会给每个无关 algo/key 刷出重复假匹配。
+        # 解决方案：encoding="base64" 时直接校验并接受 base64 目标串（兼容 urlsafe），按 base64 字节比对；
+        #           将隐式明文比对移出 (algo, key) 内层循环，每条模板仅比对一次，algos 为空也能命中明文。
+        target_str = args.get("target")
+        if not isinstance(target_str, str) or not target_str.strip():
+            return {"ok": False, "error": "需要 target（hex 或 base64 字符串）", "code": "BAD_ARGS"}
         target_len = int(args.get("target_len", 0))
         max_combos = int(args.get("max_combos", 200000))
         encoding = str(args.get("encoding", "hex")).lower()
         timeout_ms = int(args.get("timeout_ms", 30000))
-        try:
-            target = bytes.fromhex(target_hex.replace(" ", ""))
-        except ValueError as exc:
-            return {"ok": False, "error": "target 不是合法 hex: %s" % exc,
-                    "code": "BAD_TARGET"}
+        t_clean = target_str.strip()
+        if encoding == "base64":
+            if not re.fullmatch(r"[A-Za-z0-9+/=_-]+", t_clean):
+                return {"ok": False, "error": f"target 不是合法 base64：{t_clean[:40]}",
+                        "code": "BAD_TARGET"}
+            target = t_clean.encode("ascii")
+        elif encoding in ("raw", "utf-8", "utf8"):
+            target = t_clean.encode("utf-8")
+        else:
+            try:
+                target = bytes.fromhex(t_clean.replace(" ", ""))
+            except ValueError as exc:
+                return {"ok": False, "error": "target 不是合法 hex: %s" % exc,
+                        "code": "BAD_TARGET"}
 
         resolved_keys = [(k, _key_bytes(_resolve_key(k, fields))) for k in keys]
         default_key_name = str(keys[0]) if keys else "n/a"
@@ -414,6 +440,21 @@ class Plugin(PluginBase):
             except Exception as exc:                         # noqa: BLE001
                 return {"ok": False, "error": "模板解析失败 %r: %s" % (tpl, exc),
                         "code": "BAD_TEMPLATE"}
+
+            # 隐式明文候选：每条模板仅检查一次（移出 algo/key 内层循环，algos 为空时同样生效）
+            if tried >= max_combos:
+                truncated, stop_reason = True, "max_combos"
+                break
+            if (time.time() - start) * 1000 >= timeout_ms:
+                truncated, stop_reason = True, "timeout_ms"
+                break
+            if not algos:
+                tried += 1
+            for ic, via in self._implicit_candidates(plain):
+                if self._equal(ic, target, target_len, encoding):
+                    self._add_match(matches, seen, self._mk_match(
+                        tpl, "none", "n/a", fields, ic, plain, via=via))
+
             for algo in algos:
                 # hash 类算法不需要 key：只用一个哨兵键，避免无意义地重复组合
                 need_key = algo in ("rc4", "xxtea", "aes256", "hmac_sha1")
@@ -431,11 +472,6 @@ class Plugin(PluginBase):
                     if out is not None and self._equal(out, target, target_len, encoding):
                         self._add_match(matches, seen, self._mk_match(
                             tpl, algo, key_name, fields, out, plain))
-                    # 隐式候选：模板明文本身（含 hex 解码版本）
-                    for ic, via in self._implicit_candidates(plain):
-                        if self._equal(ic, target, target_len, encoding):
-                            self._add_match(matches, seen, self._mk_match(
-                                tpl, algo, key_name, fields, ic, plain, via=via))
                 if truncated:
                     break
             if truncated:
@@ -482,8 +518,11 @@ class Plugin(PluginBase):
         """用途：按 encoding 处理结果字节，并按 target_len 只比前 N 字节。"""
         rb = result
         if encoding == "base64":
-            rb = base64.b64encode(result)
-        elif encoding not in ("hex", "raw", "latin1", ""):
+            if b"-" in target or b"_" in target:
+                rb = base64.urlsafe_b64encode(result)
+            else:
+                rb = base64.b64encode(result)
+        elif encoding not in ("hex", "raw", "latin1", "utf-8", "utf8", ""):
             rb = result
         if target_len and target_len > 0:
             return rb[:target_len] == target[:target_len]
@@ -494,7 +533,7 @@ class Plugin(PluginBase):
         """用途：生成"模板明文本身即结果"的隐式候选（hex 字符串额外给 bytes.fromhex 版本）。"""
         out = [(plain, "plain")]
         try:
-            s = plain.decode("latin-1").strip()
+            s = plain.decode("utf-8").strip()
             if s and len(s) % 2 == 0 and all(c in "0123456789abcdefABCDEF" for c in s):
                 out.append((bytes.fromhex(s), "plain_hex_decoded"))
         except Exception:                                    # noqa: BLE001
@@ -517,7 +556,7 @@ class Plugin(PluginBase):
             "algo": algo,
             "key": key_name,
             "fields": dict(fields),
-            "plaintext": plain.decode("latin-1", "replace"),
+            "plaintext": plain.decode("utf-8", "replace"),
             "plaintext_hex": plain.hex(),
             "result_hex": out.hex(),
         }

@@ -39,6 +39,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
+from server.core.addr import parse_addr
 from server.core.plugins import PluginBase
 
 _WORKER = Path(__file__).resolve().parent / "angr_worker" / "worker.py"
@@ -52,22 +53,49 @@ _CANDIDATES = [
     "/usr/local/bin/python3.12",
 ]
 
+# 模块级缓存：按 MDA_ANGR_PYTHON 值缓存已验证可用的 (解释器路径, 说明)
+_PYTHON_CACHE: dict[str, tuple[str, str]] = {}
 
+
+def _probe_angr_python(py_path: str) -> str | None:
+    """校验给定解释器是否可导入 angr，成功返回版本号，否则返回 None。"""
+    if not py_path or not os.path.isfile(py_path):
+        return None
+    try:
+        r = subprocess.run([py_path, "-c", "import angr;print(angr.__version__)"],
+                           capture_output=True, text=True, timeout=60)
+        if r.returncode == 0:
+            return r.stdout.strip() or "unknown"
+    except Exception:                                     # noqa: BLE001
+        return None
+    return None
+
+
+# (2) 第二次修改（2026-11-26）
+# bug 原因：1) MDA_ANGR_PYTHON 仅判断文件存在，未校验能否 import angr；
+#           2) 每次调用都反复起子进程探测候选解释器，造成额外开销。
+# 解决方案：统一通过 _probe_angr_python 校验 MDA_ANGR_PYTHON 与候选路径，
+#           并对已找到的解释器做模块级缓存。
 def _find_python() -> tuple[str | None, str]:
     """找一个装了 angr 的解释器。返回 (路径, 说明)。"""
-    env = os.environ.get("MDA_ANGR_PYTHON")
-    if env and os.path.isfile(env):
-        return env, "来自 MDA_ANGR_PYTHON"
+    env = os.environ.get("MDA_ANGR_PYTHON") or ""
+    cached = _PYTHON_CACHE.get(env)
+    if cached and os.path.isfile(cached[0]):
+        return cached
+
+    if env:
+        ver = _probe_angr_python(env)
+        if ver is not None:
+            res = (env, f"来自 MDA_ANGR_PYTHON（angr {ver}）")
+            _PYTHON_CACHE[env] = res
+            return res
+
     for cand in _CANDIDATES:
-        if not os.path.isfile(cand):
-            continue
-        try:
-            r = subprocess.run([cand, "-c", "import angr;print(angr.__version__)"],
-                               capture_output=True, text=True, timeout=60)
-            if r.returncode == 0:
-                return cand, f"自动探测（angr {r.stdout.strip()}）"
-        except Exception:                                 # noqa: BLE001
-            continue
+        ver = _probe_angr_python(cand)
+        if ver is not None:
+            res = (cand, f"自动探测（angr {ver}）")
+            _PYTHON_CACHE[env] = res
+            return res
     return None, ""
 
 
@@ -117,29 +145,22 @@ class Plugin(PluginBase):
         mode = args.get("mode", "project_info")
         task = {"mode": mode, "path": str(path),
                 "limit": int(args.get("limit", 50))}
-        if args.get("addr") is not None:
-            a = args["addr"]
-            task["addr"] = (int(str(a), 16)
-                            if isinstance(a, str) and str(a).lower().startswith("0x")
-                            else int(a))
-        if args.get("find") is not None:
-            f = args["find"]
-            task["find"] = (int(str(f), 16)
-                            if isinstance(f, str) and str(f).lower().startswith("0x")
-                            else int(f))
+        # (3) 第三次修改（2026-11-26）
+        # bug 原因：addr/find/avoid 直接用 int() 解析，非法字符串会抛出未捕获 ValueError。
+        # 解决方案：统一通过 parse_addr 解析地址参数，非法值返回 BAD_ADDR 错误。
+        for addr_key in ("addr", "find", "avoid"):
+            if args.get(addr_key) is not None:
+                parsed = parse_addr(args[addr_key])
+                if parsed is None:
+                    return {"ok": False, "code": "BAD_ADDR",
+                            "error": f"非法地址参数 {addr_key}={args[addr_key]!r}"}
+                task[addr_key] = parsed
 
         # (1) 第一次修改（2026-11-18）
         #     bug 原因：symbolic 模式只返回 reached:bool，无法注入符号/具体寄存器、
         #               无法给约束求解，用户要"解出 x19"却没有参数通路。
         #     解决方案：把 symbolic/concrete/constraint/max_depth/avoid/find 透传给
         #               worker task；其余参数兼容旧版（上面已处理 addr/find/limit）。
-        def _to_int(v):
-            if v is None:
-                return None
-            if isinstance(v, str) and v.lower().startswith("0x"):
-                return int(v, 16)
-            return int(v)
-
         for key in ("symbolic", "concrete"):
             if isinstance(args.get(key), dict):
                 task[key] = args[key]
@@ -147,8 +168,6 @@ class Plugin(PluginBase):
             task["constraint"] = str(args["constraint"])
         if args.get("max_depth") is not None:
             task["max_depth"] = int(args["max_depth"])
-        if args.get("avoid") is not None:
-            task["avoid"] = _to_int(args["avoid"])
 
         try:
             r = subprocess.run([py, str(_WORKER)],

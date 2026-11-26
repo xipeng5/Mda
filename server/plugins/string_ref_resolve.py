@@ -26,6 +26,7 @@ source_addr 就是模式一要的 cipher_addr，只是把这条路径自动化�
 """
 from __future__ import annotations
 
+from server.core.addr import parse_addr
 from server.core.plugins import PluginBase
 
 
@@ -37,12 +38,10 @@ class Plugin(PluginBase):
 
     def _parse_int(self, value):
         """用途：兼容 '0x...' 字符串与 int 的地址入参，失败抛 ValueError。"""
-        if isinstance(value, int):
-            return value
-        s = str(value).strip()
-        if s.lower().startswith("0x"):
-            return int(s, 16)
-        return int(s, 10)
+        parsed = parse_addr(value)
+        if parsed is None:
+            raise ValueError(f"非法地址：{value!r}")
+        return parsed
 
     def _parse_cipher_hex(self, text):
         """用途：把调用方给的十六进制字节串解析成 bytes，容忍空格与 '0x' 前缀。
@@ -97,18 +96,23 @@ class Plugin(PluginBase):
             vaddrs.update(self._file_off_to_vaddr(so, off))
         return sorted(vaddrs), len(raw), offs
 
+    # (1) 第一次修改（2026-11-26）
+    # bug 原因：1) _refs_of 直接调 xr.xrefs_to(addr) 未先调用 xr.build()，未手动 build_xrefs 时恒返回空引用；
+    #           2) hint 写错字段名 source_addr（string_crack 实际字段为 addr）；
+    #           3) cipher_addr 解析失败返 BAD_ARGS 而非统一 BAD_ADDR，且未捕获非 ARM64 的 ValueError。
+    # 解决方案：在 _refs_of 中先确保 xr.build() 并使用规范名 so.name；修正 hint 为 addr；
+    #           cipher_addr 非法返 BAD_ADDR；捕获非 ARM64 返 UNSUPPORTED_ARCH。
     def _refs_of(self, session, so, so_name, addr, limit):
-        """用途：查一个密文地址的静态引用者，折回所在函数（模式一/二共用）。
-
-        走 session.xref(so_name).xrefs_to(addr)。xrefs_to 返回的是**调用点/
-        数据引用点指令地址**；再用 so.function_at 折回函数名。
-        insn 字段：xref 模型若能从指令缓存拿到原指令文本就填，拿不到只给地址，
-        **不编造指令文本**。
-        """
+        """用途：查一个密文地址的静态引用者，折回所在函数（模式一/二共用）。"""
         out = []
         try:
-            xr = session.xref(so_name)
+            xr = session.xref(so.name)
+            if hasattr(xr, "build"):
+                xr.build()
             sites = xr.xrefs_to(addr) or []
+        except ValueError as exc:
+            return {"ok": False, "code": "UNSUPPORTED_ARCH",
+                    "addr": hex(addr), "refs": [], "error": str(exc)}
         except Exception as exc:                          # noqa: BLE001
             return {"addr": hex(addr), "refs": [], "error": f"xref 查询失败：{exc}"}
         for site in sites[:limit]:
@@ -158,7 +162,7 @@ class Plugin(PluginBase):
                 "error": ("仅给 plaintext 无法反查静态引用（静态 xref 指向"
                           "密文地址，不是解密结果）。请给 cipher_addr 或 cipher_hex。"),
                 "code": "NEED_CIPHER_LOC",
-                "hint": "string_crack 的结果里应有 source_addr",
+                "hint": "string_crack 的结果里应有 addr",
                 "so": so.name,
                 "plaintext": plaintext,
                 "note": note,
@@ -166,11 +170,13 @@ class Plugin(PluginBase):
 
         # 模式一：调用方给了密文地址，直接查引用者。
         if cipher_addr is not None:
-            try:
-                addr = self._parse_int(cipher_addr)
-            except (ValueError, TypeError) as exc:
-                return {"error": f"cipher_addr 解析失败：{exc}", "code": "BAD_ARGS"}
-            res = self._refs_of(session, so, so_name, addr, limit)
+            addr = parse_addr(cipher_addr)
+            if addr is None:
+                return {"ok": False, "error": f"cipher_addr 解析失败：{cipher_addr!r}",
+                        "code": "BAD_ADDR"}
+            res = self._refs_of(session, so, so.name, addr, limit)
+            if res.get("code") == "UNSUPPORTED_ARCH":
+                return res
             res.update({
                 "ok": True,
                 "mode": "cipher_addr",
@@ -191,7 +197,10 @@ class Plugin(PluginBase):
         vaddrs, scanned_bytes, file_offs = self._search_cipher_vaddrs(so, needle)
         refs = []
         for va in vaddrs[:limit]:
-            refs.extend(self._refs_of(session, so, so_name, va, limit)["refs"])
+            one = self._refs_of(session, so, so.name, va, limit)
+            if one.get("code") == "UNSUPPORTED_ARCH":
+                return one
+            refs.extend(one["refs"])
         return {
             "ok": True,
             "mode": "search_cipher",

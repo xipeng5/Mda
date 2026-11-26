@@ -271,16 +271,23 @@ class FunctionDiscoverer:
         # 显式给 use_prologue 时以它为准；否则沿用 aggressive，保证老调用不变。
         if use_prologue is not None:
             aggressive = bool(use_prologue)
+        # (2) 第二次修改（2026-11-26）
+        # bug 原因：旧代码仅靠 `rounds >= max_rounds` 判定 reached_max_rounds，若在最后一轮
+        #           （如 max_rounds=1 且首轮即 not found）刚好收敛退出，会误报 reached_max_rounds=True。
+        # 解决方案：显式记录是否因 not found 收敛（converged=True），仅当未收敛且跑满 max_rounds
+        #           时才置 reached_max_rounds=True。
         added = 0
         rounds = 0
         by_reason: dict[str, int] = {}
         skipped_loose = 0
+        converged = False
         for rounds in range(1, max_rounds + 1):
             found, skipped = self._scan_round(aggressive=aggressive,
                                               strict_prologue=strict_prologue,
                                               use_rela=use_rela)
             skipped_loose += skipped
             if not found:
+                converged = True
                 break
             for addr, reason in sorted(found.items()):
                 self.so.add_function(addr, discovered_by=reason)
@@ -298,8 +305,8 @@ class FunctionDiscoverer:
                 "use_rela": bool(use_rela),
                 "rela_targets": len(self.rela_targets()) if use_rela else 0,
                 "skipped_loose_prologue": skipped_loose,
-                # 跑满轮次说明没到不动点（最后一轮仍有新增）
-                "reached_max_rounds": rounds >= max_rounds,
+                # 跑满轮次且未提前收敛说明没到不动点（最后一轮仍有新增）
+                "reached_max_rounds": (not converged) and max_rounds > 0 and rounds >= max_rounds,
                 "max_rounds": max_rounds}
 
     def _scan_round(self, aggressive: bool = False,

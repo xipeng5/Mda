@@ -25,6 +25,7 @@ bug 原因：本模块原来只有"断点表 + 命中计数"两种状态：
 """
 from __future__ import annotations
 
+import inspect
 import threading
 import time
 from collections import deque
@@ -55,7 +56,12 @@ _HIT_FIELDS = ("so_name", "static_addr", "runtime_addr", "thread_id",
 #     解决方案：held/token 作为可选字段一并透出，_sync_hits 以 debugger 的
 #               真实状态为准（bp.hold 仅作兜底）。token 属内部实现细节，
 #               不放进对 AI 暴露的事件里，仍由 resume() 统一放行。
-_HIT_OPTIONAL_FIELDS = ("held", "token")
+# (23) 第二十三次修改（2026-11-26）
+# bug 原因：_HIT_OPTIONAL_FIELDS 未包含 "seq"，导致 _hit_dict() 丢弃 BreakpointHit.seq，
+#           上层 tools.py:hits(since_seq=...) 与 group_by="seq" 均拿不到命中序号；
+#           同时不能无条件补 0，否则会破坏无 seq 字段的旧单测断言。
+# 解决方案：将 "seq" 加入可选字段表，仅在命中对象/字典真实带有 seq 时原样保留。
+_HIT_OPTIONAL_FIELDS = ("held", "token", "seq")
 
 # (13) 第十三次修改（2026-11-06）：断点机制名，供 set_breakpoint 如实回报。
 #     目前 dyn/debugger.py 的 set_breakpoint 只走 frida 的 Interceptor.attach
@@ -79,7 +85,8 @@ class Target:
     # ---- 以下字段是 (1) 第一次修改新增的会话状态 ----
     state: str = STATE_ATTACHED   # attached / paused / detached
     polled_seq: int = 0           # 该目标已被取走事件的最大 seq（poll 游标）
-    hit_cursor: int = 0           # dbg.hits 里已转成事件的下标（避免重复入队）
+    hit_cursor: int = 0           # dbg.hits 里已转成事件的下标（兼容无 seq 的假 debugger）
+    last_synced_seq: int = 0      # 已同步进事件流的最大命中单调序号（2000 满队列不失效）
 
     @property
     def key(self) -> str:
@@ -124,9 +131,17 @@ class DynamicService:
                 rb = Rebase.attach(serial, pid)
             except Exception as exc:                      # noqa: BLE001 - frida 异常类型不稳定
                 raise DynError("ATTACH_FAILED", _explain(exc)) from exc
+            # (24) 第二十四次修改（2026-11-26）
+            # bug 原因：attach 创建 Debugger 后未注册主动命中回调，调用方不 poll 时
+            #           tgt.state 不会即时进入 paused，auto_resume 定时器也不会触发。
+            # 解决方案：通过 dbg.set_on_hit 注册 _on_debugger_hit，在命中到达瞬间
+            #           即时同步 paused 状态并调度 auto_resume。
+            dbg = Debugger(rb)
             # polled_seq 从当前 seq 起算：新会话只看新事件，不翻旧账
-            tgt = Target(serial=serial, pid=pid, rb=rb, dbg=Debugger(rb),
+            tgt = Target(serial=serial, pid=pid, rb=rb, dbg=dbg,
                          polled_seq=self._seq)
+            if hasattr(dbg, "set_on_hit"):
+                dbg.set_on_hit(lambda hit, _t=tgt: self._on_debugger_hit(_t, hit))
             self._targets[key] = tgt
             self._emit(tgt, "attached")
             return tgt
@@ -160,10 +175,14 @@ class DynamicService:
             pass
         return True
 
+    # (25) 第二十五次修改（2026-11-26）
+    # bug 原因：Wi-Fi ADB 设备 serial 形如 "192.168.1.2:5555"，key 为 "ip:port:pid"，
+    #           用 partition(":") 会从第一个冒号切分导致 pid 解析成 "5555:1234" 失败。
+    # 解决方案：改用 rpartition(":") 从右侧最后一个冒号切分 serial 与 pid。
     def close_all(self) -> None:
         """退出时清理，避免留下 hook 或占用设备。"""
         for key in list(self._targets):
-            serial, _, pid = key.partition(":")
+            serial, _, pid = key.rpartition(":")
             try:
                 self.detach(serial, int(pid))
             except Exception:                              # noqa: BLE001
@@ -324,6 +343,11 @@ class DynamicService:
         #          值不同则继续往下走，重新向 debugger 下发 policy，成功后才把新
         #          hold 写回记录并返回，返回的 hold 恒为最终生效值。
         #          下发失败时抛 BREAKPOINT_FAILED，记录保持旧值，不装成功。
+        # (26) 第二十六次修改（2026-11-26）
+        # bug 原因：按运行时地址复用旧别名断点并改策略写入新规范 bp_id 时，未删除旧别名键，
+        #           导致 tgt.breakpoints 中同时残留旧别名与新规范名两条重复记录。
+        # 解决方案：复用旧记录时记下 old_bid，落库新 bp_id 时一并 pop(old_bid, None)。
+        old_bid: str | None = None
         with self._lock:
             rec = tgt.breakpoints.get(bp_id)
             # (20) 别名防护：bp_id 用规范名后，正常情况不会再有同址多条记录。
@@ -333,6 +357,7 @@ class DynamicService:
                 for _bid, _rec in tgt.breakpoints.items():
                     if int(_rec.get("runtime_addr") or -1) == int(_runtime):
                         rec = _rec
+                        old_bid = _bid
                         break
         if rec is not None and bool(rec.get("hold")) == bool(hold):
             # (21) 第二十一次修改（2026-11-16）：幂等早退也要处理自动放行---
@@ -406,6 +431,8 @@ class DynamicService:
             "auto_resume_ms": auto_ms,
         }
         with self._lock:
+            if old_bid is not None and old_bid != bp_id:
+                tgt.breakpoints.pop(old_bid, None)
             tgt.breakpoints[bp_id] = bp
         # 已有断点只是改策略时，事件类型仍是 breakpoint_set（钩子与记录都还在），
         # 但带上 policy_changed=True，让事件流能区分"新下断"与"改了 hold"。
@@ -461,16 +488,23 @@ class DynamicService:
             return _result("removed", {"id": bp_id, "removed": False,
                                        "partial": False, "reason": "not_found",
                                        "message": f"断点 {bp_id} 不存在"})
+        # (27) 第二十七次修改（2026-11-26）
+        # bug 原因：按别名反查命中后，删除记录仍用传入的别名 bp_id 而非实际存储键 bp["id"]，
+        #           导致真实记录留在 tgt.breakpoints 中删不掉。
+        # 解决方案：统一按实际键 real_id = bp.get("id") or bp_id 删除（若与别名不同则两者一并清理）。
         tgt, bp = hit
+        real_id = str(bp.get("id") or bp_id)
         fn = getattr(tgt.dbg, "remove_breakpoint", None)
         if not callable(fn):
             # 降级：脚本侧无法单点撤销，只能删记录（等重建会话时才真正消失）
             with self._lock:
-                tgt.breakpoints.pop(bp_id, None)
-            self._emit(tgt, "breakpoint_removed", bp_id=bp_id,
+                tgt.breakpoints.pop(real_id, None)
+                if real_id != bp_id:
+                    tgt.breakpoints.pop(bp_id, None)
+            self._emit(tgt, "breakpoint_removed", bp_id=real_id,
                        partial=True, reason="debugger_no_unhook")
             return _result("removed", {
-                "id": bp_id,
+                "id": real_id,
                 "removed": True,
                 "partial": True,
                 "reason": "debugger_no_unhook",
@@ -490,20 +524,22 @@ class DynamicService:
             ok = True if raw is None else bool(raw)
         if not ok:
             # 记录保留：hook 还在，删了记录就等于骗人
-            self._emit(tgt, "breakpoint_remove_failed", bp_id=bp_id,
+            self._emit(tgt, "breakpoint_remove_failed", bp_id=real_id,
                        reason="debugger_rejected")
             return _result("removed", {
-                "id": bp_id,
+                "id": real_id,
                 "removed": False,
                 "partial": False,
                 "reason": "debugger_rejected",
                 "message": "debugger 拒绝撤销，断点记录已保留（hook 仍生效）",
             })
         with self._lock:
-            tgt.breakpoints.pop(bp_id, None)
-        self._emit(tgt, "breakpoint_removed", bp_id=bp_id,
+            tgt.breakpoints.pop(real_id, None)
+            if real_id != bp_id:
+                tgt.breakpoints.pop(bp_id, None)
+        self._emit(tgt, "breakpoint_removed", bp_id=real_id,
                    partial=False, reason="")
-        return _result("removed", {"id": bp_id, "removed": True,
+        return _result("removed", {"id": real_id, "removed": True,
                                    "partial": False, "reason": ""})
 
     # ---------- 事件 / 命中 ----------
@@ -570,6 +606,99 @@ class DynamicService:
     def hits(self, serial: str, pid: int) -> list[dict]:
         tgt = self._target(serial, pid)
         return [_hit_dict(h) for h in _dbg_hits(tgt.dbg)]
+
+    # (28) 第二十八次修改（2026-11-26）
+    # bug 原因：上层 MCP 工具直接读取私有字段 svc._events / dbg._hits / dbg._events
+    #           缺少线程锁保护且容易破坏内部状态（如游标或挂起 token）。
+    # 解决方案：提供线程安全的只读快照 snapshot_events() 与安全清理 clear_target_hits()，
+    #           不推进 poll 游标且清理前按需先放行挂起线程。
+    def snapshot_events(self, serial: str = "", pid: int = 0) -> list[dict]:
+        """线程安全地返回事件队列只读快照（不推进任何目标的 poll 游标）。"""
+        want_serial = str(serial or "").strip()
+        want_pid = int(pid or 0)
+        want_key = f"{want_serial}:{want_pid}" if (want_serial and want_pid) else ""
+        with self._lock:
+            targets_to_sync = []
+            for tgt in self._targets.values():
+                if tgt.state == STATE_DETACHED:
+                    continue
+                if want_key and tgt.key != want_key:
+                    continue
+                if want_serial and not want_pid and tgt.serial != want_serial:
+                    continue
+                if want_pid and not want_serial and tgt.pid != want_pid:
+                    continue
+                targets_to_sync.append(tgt)
+        for tgt in targets_to_sync:
+            self._sync_hits(tgt)
+        with self._lock:
+            out: list[dict] = []
+            for ev in self._events:
+                if want_key and ev.get("key") != want_key:
+                    continue
+                if want_serial and not want_pid and ev.get("serial") != want_serial:
+                    continue
+                if want_pid and not want_serial and ev.get("pid") != want_pid:
+                    continue
+                out.append(dict(ev))
+            return out
+
+    def clear_target_hits(self, serial: str, pid: int,
+                          release_held: bool = True) -> dict:
+        """线程安全地清空指定目标的命中缓存（不影响已下断点与单调序号）。"""
+        tgt = self._target(serial, pid)
+        dbg = getattr(tgt, "dbg", None)
+        resumed = None
+        if release_held:
+            need_resume = (tgt.state == STATE_PAUSED
+                           or _dbg_state(dbg) == STATE_PAUSED
+                           or bool(getattr(dbg, "_pending_tokens", None)))
+            if need_resume:
+                resumed = self.resume(serial, pid)
+        cleared = 0
+        clear_fn = getattr(dbg, "clear_hits", None)
+        if callable(clear_fn):
+            cleared = int(clear_fn() or 0)
+        else:
+            dbg_lock = getattr(dbg, "_lock", None)
+            if dbg_lock is not None:
+                with dbg_lock:
+                    hits_obj = getattr(dbg, "_hits", None)
+                    if hits_obj is not None and hasattr(hits_obj, "clear"):
+                        cleared = len(hits_obj)
+                        hits_obj.clear()
+                    ev_obj = getattr(dbg, "_events", None)
+                    if ev_obj is not None and hasattr(ev_obj, "clear"):
+                        ev_obj.clear()
+            else:
+                hits_obj = getattr(dbg, "_hits", None)
+                if hits_obj is None:
+                    raw_hits = getattr(dbg, "hits", None)
+                    if isinstance(raw_hits, list):
+                        hits_obj = raw_hits
+                if hits_obj is not None and hasattr(hits_obj, "clear"):
+                    cleared = len(hits_obj)
+                    hits_obj.clear()
+                ev_obj = getattr(dbg, "_events", None)
+                if ev_obj is not None and hasattr(ev_obj, "clear"):
+                    ev_obj.clear()
+        with self._lock:
+            tgt.hit_cursor = 0
+            # 移除该目标旧的 breakpoint_hit 事件，避免 poll_events(after_seq=0) 或 timeline 翻出旧命中
+            kept = deque(
+                (ev for ev in self._events
+                 if not (ev.get("key") == tgt.key and ev.get("type") == "breakpoint_hit")),
+                maxlen=self._events.maxlen,
+            )
+            self._events = kept
+        out: dict = {
+            "ok": True,
+            "cleared": cleared,
+            "note": "只清命中记录，断点仍然有效",
+        }
+        if resumed is not None:
+            out["resumed_before_clear"] = dict(resumed) if isinstance(resumed, dict) else resumed
+        return out
 
     def timeline(self, serial: str, pid: int, duration: float = 10.0,
                  limit: int = 500) -> dict:
@@ -714,7 +843,16 @@ class DynamicService:
 
     # ---------- 放行 ----------
 
-    def resume(self, serial: str, pid: int) -> dict:
+    # (29) 第二十九次修改（2026-11-26）
+    # bug 原因：① 原实现未先同步命中/核对 debugger 真实状态，若调用方未先 poll 便直接
+    #             resume，即使目标已 paused 也会误报 not_paused 拒绝放行；
+    #           ② L771 误写 getattr(dbg, "state", "") 触发 NameError（应为 tgt.dbg）；
+    #           ③ 自动放行触发时无条件全量放行，可能越权唤醒其他无关断点的挂起线程。
+    # 解决方案：① 检查 paused 前先同步 _sync_hits 并核对 _dbg_state(tgt.dbg)；
+    #           ② 修正 tgt.dbg 引用；
+    #           ③ 支持可选 token 参数，优先走 dbg.resume_token(token) 或 dbg.resume(token=token)
+    #              精准放行单个挂起线程，其余挂起线程仍保持 paused 与各自定时器。
+    def resume(self, serial: str, pid: int, token: str | None = None) -> dict:
         """放行 paused 的目标；未 paused 时如实回 not_paused。
 
         (1) 第一次修改
@@ -724,12 +862,18 @@ class DynamicService:
                   {"resumed": False, "reason": "not_paused"}，不装成功。
         """
         tgt = self._target(serial, pid)
+        if tgt.state != STATE_PAUSED:
+            self._sync_hits(tgt)
         with self._lock:
             if tgt.state != STATE_PAUSED:
-                return _result("resumed", {"resumed": False, "reason": "not_paused",
-                                           "state": tgt.state})
+                if tgt.state != STATE_DETACHED and _dbg_state(tgt.dbg) == STATE_PAUSED:
+                    tgt.state = STATE_PAUSED
+                else:
+                    return _result("resumed", {"resumed": False, "reason": "not_paused",
+                                               "state": tgt.state})
         fn = getattr(tgt.dbg, "resume", None)
-        if not callable(fn):
+        fn_token = getattr(tgt.dbg, "resume_token", None) if token else None
+        if not callable(fn) and not callable(fn_token):
             raise DynError("NOT_IMPLEMENTED", "当前 debugger 未提供 resume()")
         # (3) 第三次修改（2026-11-02）：必须尊重 debugger 的放行结果。
         #     bug 原因：旧实现 fn() 之后无条件写 {"resumed": True}，把 debugger
@@ -739,8 +883,16 @@ class DynamicService:
         #               这正是本文件头注释第 ④ 条要消灭的行为。
         #     解决方案：把 fn() 的返回值当作事实来源，支持 bool / dict 两种形态；
         #               明确拒绝时保持 paused 状态并原样上报原因，不谎报成功。
+        single_token = False
         try:
-            raw = fn()
+            if token and callable(fn_token):
+                single_token = True
+                raw = fn_token(token)
+            elif token and callable(fn) and _accepts_token_arg(fn):
+                single_token = True
+                raw = fn(token=token)
+            else:
+                raw = fn()
         except Exception as exc:                          # noqa: BLE001 - frida 异常类型不稳定
             raise DynError("RESUME_FAILED", f"放行 {tgt.key} 失败：{exc}") from exc
 
@@ -763,12 +915,49 @@ class DynamicService:
         #               状态保持 paused，返回 resumed=False 并透出剩余数量，
         #               调用方可再次 resume 或据此排查。
         facts = _resume_facts(raw)
+        if single_token:
+            # 单 token 精准放行：仅当 failed>0 才算部分失败；
+            # 若 state 仍为 paused（其他无关线程仍挂起），则保持 paused 但本次 token 放行成功。
+            if facts.get("failed", 0) > 0:
+                with self._lock:
+                    cur = tgt.state
+                if cur != STATE_PAUSED and str(getattr(tgt.dbg, "state", "")) == "paused":
+                    cur = STATE_PAUSED
+                    with self._lock:
+                        tgt.state = STATE_PAUSED
+                self._emit(tgt, "resume_partial", reason="token_resume_failed")
+                return _result("resumed", {
+                    "resumed": False,
+                    "reason": "partial_resume",
+                    "state": cur,
+                    "failed": facts.get("failed", 0),
+                    "woken": facts.get("woken", 0),
+                    "pending": facts.get("pending"),
+                })
+            still_held = (facts.get("state") == "paused")
+            with self._lock:
+                if tgt.state != STATE_DETACHED:
+                    tgt.state = STATE_PAUSED if still_held else STATE_ATTACHED
+                state_after = tgt.state
+                item = self._auto_resume.pop((tgt.key, str(token)), None)
+            if item is not None:
+                try:
+                    item["timer"].cancel()
+                except Exception:                         # noqa: BLE001
+                    pass
+            self._emit(tgt, "resumed", token=str(token), woken=facts.get("woken"))
+            out = {"resumed": True, "reason": "", "state": state_after,
+                   "woken": facts.get("woken"), "token": str(token)}
+            if still_held:
+                out["other_threads_paused"] = True
+            return _result("resumed", out)
+
         still_paused = (facts.get("state") == "paused"
                         or facts.get("failed", 0) > 0)
         if still_paused:
             with self._lock:
                 cur = tgt.state
-            if cur != STATE_PAUSED and str(getattr(dbg, "state", "")) == "paused":
+            if cur != STATE_PAUSED and str(getattr(tgt.dbg, "state", "")) == "paused":
                 cur = STATE_PAUSED
                 with self._lock:
                     tgt.state = STATE_PAUSED
@@ -853,10 +1042,15 @@ class DynamicService:
           · 放行本身失败（partial_resume 等）→ 事件记 auto_resume_failed，
             并把 reason 透出；**不重试**（重试会在目标卡死时无限 post）。
         """
+        # (30) 第三十次修改（2026-11-26）
+        # bug 原因：① target_key.partition(":") 遇到 Wi-Fi ADB "ip:port:pid" 切分失败，
+        #             int(pid_text) 抛 ValueError 静默退出，自动放行彻底失效；
+        #           ② self.resume(serial, pid) 未传 token，会越权放行其他无关断点的挂起线程。
+        # 解决方案：改用 rpartition(":") 正确切分 serial/pid，并透传 token=token 做单 token 精准放行。
         key = (target_key, token)
         with self._lock:
             self._auto_resume.pop(key, None)
-        serial, _, pid_text = target_key.partition(":")
+        serial, _, pid_text = target_key.rpartition(":")
         try:
             pid = int(pid_text)
         except (TypeError, ValueError):
@@ -864,7 +1058,7 @@ class DynamicService:
         if tgt.state == STATE_DETACHED:
             return
         try:
-            res = self.resume(serial, pid)
+            res = self.resume(serial, pid, token=token)
         except Exception as exc:                          # noqa: BLE001 - 定时器线程不能炸
             self._emit(tgt, "auto_resume_failed", token=token,
                        reason=f"{type(exc).__name__}: {exc}")
@@ -997,9 +1191,14 @@ class DynamicService:
         if addr <= 0:
             raise DynError("BAD_ADDRESS", f"运行时地址必须为正：{runtime_addr!r}")
         tgt = self.attach(serial, pid)
+        # (31) 第三十一次修改（2026-11-26）
+        # bug 原因：原循环读满 limit 且未遇到 \x00 正常结束时，truncated 保持 False，
+        #           返回 terminated=True, truncated=False，谎报字符串已正确终止。
+        # 解决方案：单独记录 found_nul，循环结束仍未见 \x00 时将 truncated 置 True、terminated 置 False。
         chunk = 64
         buf = bytearray()
         truncated = False
+        found_nul = False
         readable_until = 0
         while len(buf) < limit:
             want = min(chunk, limit - len(buf))
@@ -1018,12 +1217,15 @@ class DynamicService:
             if nul >= 0:
                 buf.extend(data[:nul])
                 readable_until = addr + len(buf)
+                found_nul = True
                 break
             buf.extend(data)
             readable_until = addr + len(buf)
             if len(data) < want:
                 truncated = True
                 break
+        if not found_nul:
+            truncated = True
         raw = bytes(buf)
         try:
             text = raw.decode("utf-8")
@@ -1034,7 +1236,7 @@ class DynamicService:
             "string": text,
             "length": len(raw),
             "raw_hex": raw.hex(),
-            "terminated": not truncated,
+            "terminated": found_nul,
             "truncated": truncated,
             "end_addr": readable_until,
         }
@@ -1136,7 +1338,11 @@ class DynamicService:
             if not mods:
                 return None
 
-            addrs = [int(m.base) + off0 for m in mods]
+            # (32) 第三十二次修改（2026-11-26）
+            # bug 原因：64 位地址以整数序列化给 JS ptr(...) 会受 float64 53 位精度限制，
+            #           导致 ARM64 TBI 高位地址（0xb4...）被截断读歪。
+            # 解决方案：统一转为 hex(int(...)) 字符串传给 JS ptr(...) 无损解析。
+            addrs = [hex(int(m.base) + off0) for m in mods]
             js = (
                 "var A = " + _json.dumps(addrs) + ";"
                 "var out = [];"
@@ -1163,61 +1369,72 @@ class DynamicService:
         except Exception:                                 # noqa: BLE001
             return None
 
+    # (33) 第三十三次修改（2026-11-26）
+    # bug 原因：① _sync_hits 仅按列表下标 hit_cursor 切片，当 dbg._hits 环形缓冲满 2000 条后
+    #             len(hits) 恒为 2000，hits[2000:] 永远为空，后续所有命中被静默丢失；
+    #           ② 缺少主动命中回调入口，不 poll 时 hold 命中无法即时迁移 paused 和调度 auto_resume；
+    #           ③ _hit_dict 保留 "seq" 后若直接 **payload 传给 _emit，会覆盖全局事件 seq。
+    # 解决方案：拆出单条入队逻辑 _ingest_hit_locked 与主动回调 _on_debugger_hit；
+    #           真实带单调 seq 的命中按 seq > tgt.last_synced_seq 增量同步，无 seq 的假 debugger
+    #           兼容回退到 hit_cursor；入队事件时剥离 "seq"（另存 hit_seq）保护全局事件序号。
+    def _on_debugger_hit(self, tgt: Target, hit) -> None:
+        """Debugger 主动推送的单条命中回调：即时同步状态并调度自动放行。"""
+        with self._lock:
+            if tgt.state == STATE_DETACHED:
+                return
+            self._ingest_hit_locked(tgt, hit)
+
+    def _ingest_hit_locked(self, tgt: Target, hit) -> bool:
+        """在持有 self._lock 的前提下把单条命中写入事件流并更新目标状态（幂等去重）。"""
+        seq = _hit_seq(hit)
+        last_seq = int(getattr(tgt, "last_synced_seq", 0) or 0)
+        if seq > 0:
+            if seq <= last_seq:
+                return False
+            tgt.last_synced_seq = seq
+        d = _hit_dict(hit)
+        bp = _match_bp(tgt, d.get("so_name"), d.get("static_addr"))
+        held = _resolve_held(d, bp)
+        # (4) 第四次修改（2026-11-02）：墓碑状态不可被迟到的命中消息复活。
+        if held and tgt.state != STATE_DETACHED:
+            tgt.state = STATE_PAUSED
+        # token 属内部实现，不进对 AI 暴露的事件；
+        # seq 若透传进 **payload 会覆盖 _emit 生成的全局事件 seq，因此剥离后另存 hit_seq。
+        payload = {k: v for k, v in d.items()
+                   if k not in ("ts", "token", "held", "seq")}
+        if "seq" in d:
+            payload["hit_seq"] = d["seq"]
+        self._emit(tgt, "breakpoint_hit", ts=d.get("ts"), hold=held,
+                   held=held, bp_id=(bp or {}).get("id"), **payload)
+        # (21) 第二十一次修改（2026-11-16）：hold 命中且断点记录要求自动放行时起守护定时器。
+        if held and bp is not None and int(bp.get("auto_resume_ms") or 0) > 0:
+            self._schedule_auto_resume(tgt, bp, d.get("token"),
+                                       int(bp.get("auto_resume_ms") or 0))
+        return True
+
     def _sync_hits(self, tgt: Target) -> int:
         """把 dbg.hits 里尚未转成事件的新命中补成 breakpoint_hit 事件。
 
         hold 断点命中即把目标标记为 paused（线程在等 resume）。返回本次新增事件数。
-
-        (2) 第二次修改（2026-11-02）：paused 的判定依据改为 debugger 的真实状态。
-            bug 原因：原实现 `held = bool(bp and bp.get("hold"))` 只认断点记录，
-                      而 debugger 的 held/token 才是线程是否真被挂住的事实。
-                      两者不一致时（绕过登记的 hold、同址重复登记、policy
-                      中途改过），service 判定「在跑」→ resume() 拒绝放行 →
-                      线程永久阻塞，且无任何 API 能救。
-            解决方案：优先级改为
-                      ① 命中自带 held=True（debugger 亲口说挂住了）→ paused
-                      ② 命中显式 held=False（debugger 说没挂）→ 不信 bp.hold
-                      ③ 命中没给 held（老 debugger）→ 退回 bp.hold 兜底
-                      这样「明确没挂」不会被误判为挂起，「没说明」才靠记录猜。
         """
         # (13) 第十三次修改（2026-11-06）：改走 _dbg_hits，兼容 hits 为
         #      property / 方法 / 裸 list 三种形态（debugger 正被重写）。
         hits = _dbg_hits(tgt.dbg)
         with self._lock:
-            # debugger 若清空过 hits，游标要跟着回退，否则会漏事件
-            start = tgt.hit_cursor if tgt.hit_cursor <= len(hits) else 0
-            fresh = hits[start:]
+            last_seq = int(getattr(tgt, "last_synced_seq", 0) or 0)
+            has_seq = bool(hits) and _hit_seq(hits[-1]) > 0
+            if has_seq:
+                fresh = [h for h in hits if _hit_seq(h) > last_seq]
+            else:
+                # 兼容未带 seq 的单元测试假 debugger：按旧下标游标切片
+                start = tgt.hit_cursor if tgt.hit_cursor <= len(hits) else 0
+                fresh = hits[start:]
+            added = 0
             for hit in fresh:
-                d = _hit_dict(hit)
-                bp = _match_bp(tgt, d.get("so_name"), d.get("static_addr"))
-                held = _resolve_held(d, bp)
-                # (4) 第四次修改（2026-11-02）：墓碑状态不可被迟到的命中消息复活。
-                #     bug 原因：detach 之后若仍有命中消息在途（frida 侧 send 已发出、
-                #               脚本尚未卸载完），这里会把 state 从 detached 改回
-                #               paused。实测确实出现 detached → paused，于是墓碑
-                #               守卫（_target 里拒绝已 detach 的目标）失效，后续
-                #               resume 会去操作一个已关闭的会话。
-                #     解决方案：detached 是终态，任何事件都不再改变它；事件本身
-                #               照常记录，仅不迁移状态。
-                if held and tgt.state != STATE_DETACHED:
-                    tgt.state = STATE_PAUSED
-                # token 属内部实现，不进对 AI 暴露的事件；
-                # held 也可能已在 payload 里（来自 _hit_dict），故从 payload 剔除后
-                # 再由参数显式传入，避免 "got multiple values for 'held'"。
-                payload = {k: v for k, v in d.items()
-                           if k not in ("ts", "token", "held")}
-                self._emit(tgt, "breakpoint_hit", ts=d.get("ts"), hold=held,
-                           held=held, bp_id=(bp or {}).get("id"), **payload)
-                # (21) 第二十一次修改（2026-11-16）：hold 命中且断点记录要求自动
-                #      放行时，为该 token 起一个守护定时器。
-                #      必须在**锁内**登记（_schedule_auto_resume 自己也拿锁，
-                #      这里是 RLock 可重入），避免"命中已发生、定时器还没登记"
-                #      期间用户手动 resume 导致定时器事后又 post 一次的竞态。
-                if held and bp is not None and int(bp.get("auto_resume_ms") or 0) > 0:
-                    self._schedule_auto_resume(tgt, bp, d.get("token"),
-                                               int(bp.get("auto_resume_ms") or 0))
+                if self._ingest_hit_locked(tgt, hit):
+                    added += 1
             tgt.hit_cursor = len(hits)
-            return len(fresh)
+            return added
 
     def _collect(self, tgt: Target, floor: int, limit: int,
                  advance: bool = True) -> list[dict]:
@@ -1549,6 +1766,28 @@ def _match_bp(tgt: Target, so_name, static_addr) -> dict | None:
         if bp.get("so_name") == so_name and bp.get("static_addr") == static_addr:
             return bp
     return None
+
+
+def _hit_seq(hit) -> int:
+    """提取命中记录的单调序号（无 seq 或非正整数返回 0）。"""
+    raw = hit.get("seq") if isinstance(hit, dict) else getattr(hit, "seq", None)
+    try:
+        val = int(raw) if raw is not None else 0
+    except (TypeError, ValueError):
+        val = 0
+    return val if val > 0 else 0
+
+
+def _accepts_token_arg(fn) -> bool:
+    """判断 debugger.resume() 是否接受 token 关键字参数。"""
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return False
+    for name, param in sig.parameters.items():
+        if name == "token" or param.kind == inspect.Parameter.VAR_KEYWORD:
+            return True
+    return False
 
 
 def _hit_dict(hit) -> dict:

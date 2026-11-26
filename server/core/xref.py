@@ -47,6 +47,8 @@ class Xref:
         # 避免同一批 Instruction 被复制两份（6110 个函数约 86 万条，重复会多占数百 MB）
         self._insn_cache: dict[int, list[Instruction]] = {}
         self._built = False
+        # 记录建图时的函数表快照 [(addr, size), ...]，供 ensure_xrefs 判断边界是否变化
+        self._built_fn_sig: tuple[tuple[int, int], ...] | None = None
         # 线性扫描补了多少个新目标（供诊断/进度报告）
         self._linear_scan_added = 0
 
@@ -125,6 +127,20 @@ class Xref:
         # 线性扫描补充：按函数收集会漏掉 FDE/dynsym 之外的代码
         self._merge_linear_scan()
         self._built = True
+        self._built_fn_sig = tuple(sorted((a, f.size) for a, f in self.so.functions.items()))
+
+    def reset(self) -> None:
+        """清空全部引用索引与指令缓存，供函数表扩展或边界切分后完整重建。"""
+        self._calls_to.clear()
+        self._called_by.clear()
+        self._data_refs.clear()
+        self._plt_calls.clear()
+        self._fn_data_refs.clear()
+        self._insn_cache.clear()
+        self._built = False
+        self._built_fn_sig = None
+        self._linear_scan_added = 0
+        self.disasm.invalidate_cache()
 
     def ensure_function(self, fn_addr: int) -> None:
         """只确保单个函数的引用已收集（惰性、快速）。
@@ -184,22 +200,46 @@ class Xref:
                 imm -= (1 << 21)
             adrps[off] = ((insn & 0x1F), (pc & ~0xFFF) + (imm << 12))
 
-        # 第二步：向后找配对的 add（同一 rd），边找边判失效
+        # (2) 第二次修改（2026-11-26）
+        # bug 原因：① 旧 ADD 掩码 `(insn & 0x7F800000) == 0x11000000` 未校验 64 位 sf=1（误配 32 位 add w），
+        #           且忽略了 bit22 的 sh（LSL #12）移位；② 未在 add rd, rd 覆写自身、遇 ret/bl/blr 或
+        #           新 adrp 覆写 rd 时中断（旧条件 `(insn & 0x7C000000) != 0x10000000` 恰好放过了新 adrp），
+        #           导致新旧 adrp 串页产生假引用；③ 追加 _data_refs[tgt] 未去重，重复记录同一 site。
+        # 解决方案：改用精确 64 位 ADD(imm) 掩码 0xFF800000 == 0x91000000 并处理 sh 移位；
+        #           遇 ret/bl/blr、新 adrp 或 add rd, rd 覆写自身时中断配对；追加前按集合 O(1) 去重。
+        # 第二步：向后找配对的 64 位 add（同一 rd），边找边判失效
+        seen_sites: dict[int, set[int]] = {
+            tgt: set(sites) for tgt, sites in self._data_refs.items()
+        }
         for off, (rd, page) in adrps.items():
             for delta in range(4, 4 * 64, 4):
                 p = off + delta
                 if p + 4 > n:
                     break
                 insn = int.from_bytes(data[p:p + 4], "little", signed=False)
-                if (insn & 0x7F800000) == 0x11000000 and ((insn >> 5) & 0x1F) == rd:
-                    tgt = page + ((insn >> 10) & 0xFFF)
+                # 遇函数返回或调用（ret/retaa/retab/bl/blr）中断配对
+                if ((insn & 0xFFFFFC1F) == 0xD65F0000
+                        or insn in (0xD65F0BFF, 0xD65F0FFF)
+                        or (insn & 0xFC000000) == 0x94000000
+                        or (insn & 0xFFFFFC1F) == 0xD63F0000):
+                    break
+                # 64 位 ADD (immediate): sf=1, op=0, S=0, 100010, sh(bit22), imm12
+                if (insn & 0xFF800000) == 0x91000000 and ((insn >> 5) & 0x1F) == rd:
+                    sh = (insn >> 22) & 1
+                    imm = ((insn >> 10) & 0xFFF) << (12 if sh else 0)
+                    tgt = (page + imm) & 0xFFFFFFFFFFFFFFFF
                     if so.in_load(tgt):
                         site = text.addr + p
-                        self._data_refs[tgt].append(site)
-                    # 不 break：同一 rd 后续可能还有 add（地址表遍历常见）
+                        bucket = seen_sites.setdefault(tgt, set())
+                        if site not in bucket:
+                            bucket.add(site)
+                            self._data_refs[tgt].append(site)
+                    # add rd, rd, #imm 覆写了 rd 自身 → 页基址已失效，中断
+                    if (insn & 0x1F) == rd:
+                        break
                     continue
-                # rd 被其它写指令覆盖 → adrp 的页基址失效，停止配对
-                if (insn & 0x1F) == rd and (insn & 0x7C000000) != 0x10000000:
+                # 新 adrp 或其它写指令覆盖 rd → 旧页基址失效，停止配对
+                if (insn & 0x1F) == rd:
                     break
 
     def _merge_linear_scan(self) -> None:
@@ -296,11 +336,17 @@ class Xref:
             if ins.is_call or ins.ref_addr is not None
         ]
 
+    # (2) 第二次修改（2026-11-26）
+    # bug 原因：传入函数体内偏移地址而非函数起点时，直接用原始 fn_addr 查 _fn_data_refs
+    #           会 miss（_collect_function 已按 fn.addr 归一入表），导致返回空列表。
+    # 解决方案：与其他查询入口一致，先经 self.so.function_at(fn_addr) 归一化到 fn.addr。
     def string_refs_of(self, fn_addr: int) -> list[int]:
         """某函数引用的字符串地址（BUG-3 修复后的正确入口）。"""
-        if fn_addr not in self._fn_data_refs:
-            self._collect_function(fn_addr)
-        return [a for a in self._fn_data_refs.get(fn_addr, []) if self._is_string(a)]
+        fn = self.so.function_at(fn_addr)
+        key = fn.addr if fn is not None else fn_addr
+        if key not in self._fn_data_refs:
+            self._collect_function(key)
+        return [a for a in self._fn_data_refs.get(key, []) if self._is_string(a)]
 
     # ---------- 符号解析 ----------
 

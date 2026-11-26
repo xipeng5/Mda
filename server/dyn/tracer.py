@@ -254,23 +254,18 @@ class TraceBuffer:
         返回的是缓冲内的事件对象引用，**调用方不要原地修改**；
         要序列化请用 ``event.to_dict()``。
         """
-        floor = self._poll_cursor if after_seq is None else max(_to_int(after_seq), 0)
+        # (27) 第二十七次修改（2026-11-26）
+        # bug 原因：原实现在 with self._lock 之外读取 self._poll_cursor，多线程并发 poll 时
+        #           可能读到陈旧游标导致重复消费或游标竞态。
+        # 解决方案：把 self._poll_cursor 读取与推进全部放入同一把 self._lock 内保证原子性。
         limit = _to_int(limit, 200)
         if limit <= 0:
             raise ValueError("limit 必须是正整数")
         kinds = _kind_set(kind)
-        # (4) 第四次修改（2026-11-05）：只有"取全部且未指定游标"时才推进共享游标。
-        #     bug 原因：原实现无论是否传 after_seq、无论有没有 kind 过滤，只要取到
-        #               结果就把 _poll_cursor 推到最大 seq。于是——
-        #               · 带 kind 过滤取走 read 事件时，被过滤掉的 code 事件
-        #                 位置也被跳过了，下次按游标取就**永久丢失**；
-        #               · 显式传 after_seq 做"重放/回看"时，也会污染共享游标，
-        #                 影响其他按默认游标取事件的调用方。
-        #               这与 service._collect 第五次修改的正确做法相反。
-        #     解决方案：advance = (after_seq is None and kinds is None)，
-        #               只有"完整的顺序消费"才推进游标；其余一律只读不推进。
         advance = (after_seq is None and kinds is None)
+        explicit_floor = None if after_seq is None else max(_to_int(after_seq), 0)
         with self._lock:
+            floor = self._poll_cursor if explicit_floor is None else explicit_floor
             # deque 内的插入顺序就是 seq 升序，无需再排序
             picked = [
                 ev for ev in self._items
@@ -808,21 +803,9 @@ _DEPENDS_ON = {
 }
 
 
-def _find_loaded_so(session, name: str):
-    """在 mda 会话里按名字找已加载的 SoFile（复用 MCP 层的多级别名匹配）。
-
-    找不到返回 None。这里做一层薄封装，是为了让 dyn 层不必重复实现
-    "设备名 ↔ 本地名"的匹配规则（那套规则在 mcp_server.tools._pick_so_by_name）。
-    """
-    try:
-        from server.mcp_server.tools import _pick_so_by_name
-
-        return _pick_so_by_name(session, name)
-    except Exception:                                     # noqa: BLE001
-        mods = getattr(session, "modules", {}) or {}
-        return mods.get(name)
-
-
+# (28) 第二十八次修改（2026-11-26）
+# bug 原因：本文件在 L811 与 L891 重复定义了两份完全相同的 _find_loaded_so，属于冗余死定义。
+# 解决方案：删除此处重复的第一份定义，统一保留下方唯一定义。
 _DETACH_PENDING: set = set()
 _DETACH_LOCK = __import__("threading").Lock()
 
@@ -903,39 +886,47 @@ def _find_loaded_so(session, name: str):
         return mods.get(name)
 
 
+# (29) 第二十九次修改（2026-11-26）
+# bug 原因：原实现检查不存在的 so.read_bytes 和 so._segments 后落入 fh.seek(offset)，
+#           当虚拟地址 != 文件偏移（非首段 PT_LOAD）时会读错字节，导致指纹/校验失真。
+# 解决方案：优先调用 SoFile 真实存在的 so.read(int(offset), int(size))；回退时兼容
+#           so._loads 四元组 (va, end, file_off, flags) 精确换算文件偏移。
 def _read_static_bytes(so, offset: int, size: int) -> bytes:
-    """从已加载的 SoFile 读原始文件字节（用于生成指纹 / 校验断点是否被 patch）。
-
-    (15) 第十五次修改（2026-11-06）：新增。
-        为什么需要：① 模块名对不上时要靠字节指纹反查；
-                  ② 断点自检要把"内存里的字节"与"文件里的原始字节"对比，
-                     才能判断这个地址到底有没有被 patch。
-    """
-    # SoFile 可能提供 read_bytes；没有就退回直接读文件
-    fn = getattr(so, "read_bytes", None)
-    if callable(fn):
-        try:
-            data = fn(int(offset), int(size))
-            if data:
-                return bytes(data)
-        except Exception:                                 # noqa: BLE001
-            pass
+    """从已加载的 SoFile 读原始文件字节（用于生成指纹 / 校验断点是否被 patch）。"""
+    off_i = int(offset)
+    sz_i = int(size)
+    if sz_i <= 0:
+        return b""
+    for attr in ("read", "read_bytes"):
+        fn = getattr(so, attr, None)
+        if callable(fn):
+            try:
+                data = fn(off_i, sz_i)
+                if data:
+                    return bytes(data)
+            except Exception:                             # noqa: BLE001
+                pass
     path = getattr(so, "path", "") or getattr(so, "_path", "")
     if not path:
         return b""
     try:
         with open(path, "rb") as fh:
-            # 偏移是虚拟地址，需要按段换算成文件偏移
+            for item in (getattr(so, "_loads", None) or []):
+                if isinstance(item, (tuple, list)) and len(item) >= 3:
+                    va, end, file_off = int(item[0]), int(item[1]), int(item[2])
+                    if va <= off_i < end:
+                        fh.seek(file_off + (off_i - va))
+                        return fh.read(sz_i)
             segs = getattr(so, "_segments", None) or []
             for seg in segs:
                 va = int(getattr(seg, "vaddr", 0) or 0)
                 memsz = int(getattr(seg, "memsz", 0) or 0)
-                if va <= offset < va + max(memsz, 1):
-                    file_off = int(getattr(seg, "offset", 0) or 0) + (offset - va)
+                if va <= off_i < va + max(memsz, 1):
+                    file_off = int(getattr(seg, "offset", 0) or 0) + (off_i - va)
                     fh.seek(file_off)
-                    return fh.read(int(size))
-            fh.seek(int(offset))
-            return fh.read(int(size))
+                    return fh.read(sz_i)
+            fh.seek(off_i)
+            return fh.read(sz_i)
     except Exception:                                     # noqa: BLE001
         return b""
 
@@ -1291,6 +1282,12 @@ _MEM_FUNCS = (
     ("__memset_chk", -1, 0, 2),
 )
 
+# (30) 第三十次修改（2026-11-26）
+# bug 原因：① inRange 使用闭区间 p.compare(END) <= 0，会多匹配到紧邻区间尾部的 1 个字节；
+#           ② onEnter 未按 KIND 过滤，trace_read 会把 memcpy 的写目标(wIdx)也当读命中，
+#             trace_write 会把源地址(rIdx)也当写命中。
+# 解决方案：区间改为半开 [START, END)（p.compare(END) < 0）；KIND === 'read' 只查 rIdx
+#           与 memcmp 的 args[1]，KIND === 'write' 只查 wIdx。
 _JS_MEM_TRACE = r"""
 (function () {
     var START = ptr('__START__');
@@ -1301,7 +1298,7 @@ _JS_MEM_TRACE = r"""
 
     function inRange(p) {
         if (p === null) { return false; }
-        try { return p.compare(START) >= 0 && p.compare(END) <= 0; }
+        try { return p.compare(START) >= 0 && p.compare(END) < 0; }
         catch (e) { return false; }
     }
 
@@ -1318,10 +1315,17 @@ _JS_MEM_TRACE = r"""
                     if (count >= MAX) { return; }
                     var hit = false;
                     var off = -1;
-                    if (rIdx >= 0 && inRange(args[rIdx])) { hit = true; off = rIdx; }
-                    // memcmp 两个参数都读，单独判
-                    if (!hit && name === 'memcmp' && inRange(args[1])) { hit = true; off = 1; }
-                    if (!hit && wIdx >= 0 && inRange(args[wIdx])) { hit = true; off = wIdx; }
+                    if (KIND === 'read') {
+                        if (rIdx >= 0 && inRange(args[rIdx])) { hit = true; off = rIdx; }
+                        // memcmp 两个参数都读，单独判
+                        if (!hit && name === 'memcmp' && inRange(args[1])) { hit = true; off = 1; }
+                    } else if (KIND === 'write') {
+                        if (wIdx >= 0 && inRange(args[wIdx])) { hit = true; off = wIdx; }
+                    } else {
+                        if (rIdx >= 0 && inRange(args[rIdx])) { hit = true; off = rIdx; }
+                        if (!hit && name === 'memcmp' && inRange(args[1])) { hit = true; off = 1; }
+                        if (!hit && wIdx >= 0 && inRange(args[wIdx])) { hit = true; off = wIdx; }
+                    }
                     if (!hit) { return; }
                     count++;
                     var bt = [];
@@ -2159,19 +2163,25 @@ def trace_app_startup(
             "label": label or f"{so_name}+{addr:#x}",
         })
 
-    # 每个符号的单独特额：总预算的 1/4 分给每个符号，至少 50 条，
-    # 保证热门函数不会独吞名额（加载事件另算，永不被挤）
+    # (31) 第三十一次修改（2026-11-26）
+    # bug 原因：① 用 repr(syms).replace("'", '"') 与 json.dumps(sbps).replace("'", '"')
+    #             注入 JS，遇到含单引号或反斜杠的字符串会产生语法错误/JS 注入风险；
+    #           ② symbols=[] 时 box["hooked"] 与 box["failed"] 均为空，就位等待空转满 5 秒；
+    #           ③ 超时或异常提前返回时若 keep_alive=True 且尚未 resume，spawn 出来的进程会永久卡死。
+    # 解决方案：直接用 json.dumps 安全序列化；新增 hooked_done 标记且 syms 为空时 ready 即放行；
+    #           finally 中追踪 resumed_ok，未放行且 keep_alive 时确保 dev.resume(pid) 恢复目标。
     per_sym = max(50, int(max_events) // max(len(syms), 1) // 2) if syms else 0
     js = (_JS_APP_STARTUP
-          .replace("__SYMS__", repr(syms).replace("'", '"'))
+          .replace("__SYMS__", json.dumps(syms))
           .replace("__PER_SYM__", str(per_sym))
-          .replace("__SBPS__", json.dumps(sbps).replace("'", '"'))
+          .replace("__SBPS__", json.dumps(sbps))
           .replace("__BT_DEPTH__", str(max(0, min(int(backtrace_depth), 32))))
           .replace("__BT_LIMIT__", str(max(0, int(backtrace_limit)))))
 
     events: list[dict] = []
     mods: list = []
-    box: dict = {"ready": False, "hooked": [], "failed": [], "stopped": False,
+    box: dict = {"ready": False, "hooked_done": False,
+                 "hooked": [], "failed": [], "stopped": False,
                  "modules": [],
                  "baseline": 0, "t0": 0.0,
                  # 分类计数：加载与调用各自限额，避免互相挤占
@@ -2181,6 +2191,7 @@ def trace_app_startup(
     dev = None
     pid = 0
     sess = None
+    resumed_ok = False
     try:
         dev = frida.get_device(serial, timeout=15)
         try:
@@ -2203,6 +2214,7 @@ def trace_app_startup(
                 box["t0"] = float(payload.get("t0") or 0) / 1000.0
                 return
             if kind == "hooked":
+                box["hooked_done"] = True
                 box["hooked"] = payload.get("hooked") or []
                 box["failed"] = payload.get("failed") or []
                 return
@@ -2252,7 +2264,8 @@ def trace_app_startup(
         script.load()
 
         t_ready = _time.time()
-        while not (box["ready"] and (box["hooked"] or box["failed"]) 
+        while not (box["ready"]
+                   and (not syms or box["hooked_done"] or box["hooked"] or box["failed"])
                    or _time.time() - t_ready > 5.0):
             _time.sleep(0.02)
         if not box["ready"]:
@@ -2286,11 +2299,18 @@ def trace_app_startup(
                 "error": f"{type(exc).__name__}: {exc}", "package": pkg, "pid": pid}
     finally:
         _detach_async(sess)
-        if not keep_alive and pid:
-            try:
-                dev.kill(pid)
-            except Exception:                             # noqa: BLE001
-                pass
+        if pid and dev is not None:
+            if not keep_alive:
+                try:
+                    dev.kill(pid)
+                except Exception:                         # noqa: BLE001
+                    pass
+            elif not resumed_ok:
+                # 提前超时/异常退出且要求保活时必须放行，防止 spawned 进程永久冻结
+                try:
+                    dev.resume(pid)
+                except Exception:                         # noqa: BLE001
+                    pass
 
     # ---- 过滤系统模块 + 排序 + 算间隔 ----
     def _is_system(p) -> bool:
@@ -2947,17 +2967,33 @@ def watch_module(
     #               ③ 一个**安全上限估计**（按密度和失败率推算）；
     #               ④ 明确的下一步建议（缩小 range / 增大 max_points / 保持）。
     #                AI 拿着这些数就能自己决定下一次的 max_points。
-    # 密度：分母优先用 offset_range 宽度，其次用 so.size；两者都没有就给 None
+    # (32) 第三十二次修改（2026-11-26）
+    # bug 原因：① SoFile 没有 size 属性，getattr(so, "size", 0) 恒为 0 导致 span_kb=1e-9、
+    #             density 变成天文数字；
+    #           ② density 为 None 时 round(density, 2) 直接抛 TypeError。
+    # 解决方案：按 so._loads / so.sections 计算真实跨度，且对 density is None 做安全判空。
     span_kb = None
     if offset_range and len(offset_range) == 2:
         span_kb = max(1e-9, (int(offset_range[1]) - int(offset_range[0])) / 1024.0)
     elif so is not None:
-        span_kb = max(1e-9, int(getattr(so, "size", 0) or 0) / 1024.0)
+        span_bytes = 0
+        for item in (getattr(so, "_loads", None) or []):
+            if isinstance(item, (tuple, list)) and len(item) >= 2:
+                span_bytes += max(0, int(item[1]) - int(item[0]))
+        if span_bytes <= 0:
+            secs = getattr(so, "sections", None) or {}
+            svals = secs.values() if isinstance(secs, dict) else list(secs)
+            for sec in svals:
+                span_bytes += max(0, int(getattr(sec, "size", 0) or 0))
+        if span_bytes <= 0:
+            span_bytes = int(getattr(so, "size", 0) or 0)
+        if span_bytes > 0:
+            span_kb = max(1e-9, span_bytes / 1024.0)
     density = (total_fns / span_kb) if span_kb else None
     fail_rate = (box["failed"] / float(box["placed"] + box["failed"])
                  if (box["placed"] + box["failed"]) else 0.0)
     rec: dict = {
-        "function_density_per_kb": round(density, 2),
+        "function_density_per_kb": round(density, 2) if density is not None else None,
         "fail_rate": round(fail_rate, 3),
         "placed": box["placed"],
         "failed": box["failed"],
@@ -2986,9 +3022,13 @@ def watch_module(
     return out
 
 
+# (33) 第三十三次修改（2026-11-26）
+# bug 原因：ptr(__RUNTIME__) 与指纹批量读取的 addrs 均以裸数字传给 JS，64 位 ARM64 TBI
+#           地址会被 JS float64 截断。
+# 解决方案：统一改为字符串形式 ptr('__RUNTIME__') 与 hex(int(...)) 列表传入。
 _JS_VERIFY_BP = r"""
 (function () {
-    var RUNTIME = ptr(__RUNTIME__);
+    var RUNTIME = ptr('__RUNTIME__');
     var out = {};
     // 1) 当前内存字节
     try {
@@ -3217,7 +3257,7 @@ def verify_breakpoint(serial: str, pid: int, so_name: str, static_addr: int,
                         addrs = []
                         for _m, b in probes:
                             for o, _h in fps:
-                                addrs.append(b + o)
+                                addrs.append(hex(int(b + o)))
                         sc2 = sess.create_script(
                             "var A = " + json.dumps(addrs) + ";"
                             "var out = [];"
@@ -3259,7 +3299,12 @@ def verify_breakpoint(serial: str, pid: int, so_name: str, static_addr: int,
         result["module_base"] = hex(m_base)
         result["runtime_addr"] = hex(runtime)
 
-        js = _JS_VERIFY_BP.replace("__RUNTIME__", str(runtime))
+        # (34) 第三十四次修改（2026-11-26）
+        # bug 原因：① __RUNTIME__ 传十进制整数会被 JS float64 截断；
+        #           ② 拷贝结果键漏掉 "attachable"，导致后续 result.get("attachable") is False 永不触发；
+        #           ③ 未传 bp_id 时仅比对 static_addr 未校验 so_name，不同模块同偏移会误判 installed=True。
+        # 解决方案：__RUNTIME__ 改传 hex(int(runtime))；补拷 "attachable"；按地址反查时校验模块名。
+        js = _JS_VERIFY_BP.replace("__RUNTIME__", hex(int(runtime)))
         box: dict = {}
         script = sess.create_script(js)
         script.on("message", lambda m, d: box.update(m.get("payload") or {}))
@@ -3268,7 +3313,7 @@ def verify_breakpoint(serial: str, pid: int, so_name: str, static_addr: int,
         while not box and _time.time() - t0 < 10.0:
             _time.sleep(0.02)
         for key in ("current_hex", "read_error", "already_hooked",
-                    "attach_error", "probe_ok"):
+                    "attachable", "attach_error", "probe_ok"):
             if key in box:
                 result[key] = box[key]
     except Exception as exc:                              # noqa: BLE001
@@ -3336,9 +3381,22 @@ def verify_breakpoint(serial: str, pid: int, so_name: str, static_addr: int,
             if bp:
                 installed = True
             else:
-                # 没给 bp_id 时，看这个静态地址上有没有任何断点
+                # 没给 bp_id 时，按 (so_name, static_addr) 同时校验，避免跨模块同偏移误判
+                want_names = set(_module_name_candidates(so_name))
+                for extra_nm in (so_name, result.get("module_name"), result.get("mda_key")):
+                    if extra_nm:
+                        s_nm = str(extra_nm)
+                        want_names.add(s_nm)
+                        want_names.add(s_nm.rsplit("/", 1)[-1])
                 installed = any(
                     int(v.get("static_addr", -1)) == int(static_addr)
+                    and (
+                        not want_names
+                        or str(v.get("so_name") or "") in want_names
+                        or str(v.get("so_name") or "").rsplit("/", 1)[-1] in want_names
+                        or str(v.get("original_name") or "") in want_names
+                        or str(v.get("original_name") or "").rsplit("/", 1)[-1] in want_names
+                    )
                     for v in (_tgt.breakpoints or {}).values()
                 )
     except Exception:                                     # noqa: BLE001
@@ -3427,8 +3485,14 @@ _JS_PROBE_HITS = r"""
     var MAX_SAMPLES = __MAXSAMPLES__;
     var samples = [];
     var seenKeys = {};
-    function capOne(ctx) {
-        var one = { tid: this.threadId, n: 0 };
+    // (35) 第三十五次修改（2026-11-26）
+    // bug 原因：① capOne 作为普通函数调用，内部 this.threadId 恒为 undefined；
+    //           ② samples.length >= MAX_SAMPLES 写在 seenKeys 去重累加之前，
+    //             采满后已见过的组合不再累加命中计数 n。
+    // 解决方案：显式传入 tid（capOne(this.context, this.threadId)），
+    //           先做 seenKeys 去重计数累加，仅在新增样本前判断 MAX_SAMPLES 上限。
+    function capOne(ctx, tid) {
+        var one = { tid: tid, n: 0 };
         for (var i = 0; i < CAP_REGS.length; i++) {
             var rn = CAP_REGS[i];
             var v = null;
@@ -3444,9 +3508,8 @@ _JS_PROBE_HITS = r"""
                 if (firstTs === null) { firstTs = Date.now() / 1000; }
                 threads[this.threadId] = (threads[this.threadId] || 0) + 1;
                 if (CAP_REGS.length === 0) { return; }
-                if (samples.length >= MAX_SAMPLES) { return; }
                 try {
-                    var one = capOne(this.context);
+                    var one = capOne(this.context, this.threadId);
                     // 按寄存器值去重：同一个值反复命中只留一条 + 计数，
                     // 高频函数下能把采样压到可控规模
                     var key = CAP_REGS.map(function (r) { return one[r] || '-'; }).join('|');
@@ -3454,6 +3517,7 @@ _JS_PROBE_HITS = r"""
                         samples[seenKeys[key]].n++;
                         return;
                     }
+                    if (samples.length >= MAX_SAMPLES) { return; }
                     one.n = 1;
                     seenKeys[key] = samples.length;
                     samples.push(one);
@@ -3745,18 +3809,20 @@ _JS_CALL_TREE = r"""
         return;
     }
     var base = mod.base;
+    var modSize = mod.size;
+    var modEnd = base.add(modSize);
     var ROOTS = __ROOTS__;          // 要追踪的入口偏移
     var MAXN = __MAXN__;
-    var edges = {};                 // "from->to" -> count
+    var edges = {};                 // "in:<off>-><to>" 或 "out:<rt>-><to>" -> count
     var entryHits = {};
     var placed = 0, failed = [];
 
-    // (20) 第二十次修改（2026-11-06）：调用链追踪。
-    //      为什么需要：反复出现"某个函数断点不命中，但不知道是上层没调它、
-    //      还是地址找错了"。只看单点命中是 0 分不清；看它被谁调用、
-    //      调用了几次，才能判断这条路径到底走没走。
-    //      做法：在给定入口挂 Interceptor，onEnter 里取返回地址（lr）作为"调用者"，
-    //            记录 调用者lr -> 本函数 的边与次数。开销远小于 Stalker。
+    // (36) 第三十六次修改（2026-11-26）
+    // bug 原因：① caller.sub(base).toInt32() 对 64 位地址差做 32 位有符号截断，跨模块调用
+    //             会被回绕伪造成模块内偏移；
+    //           ② stop 时未调用 Interceptor.detachAll()，导致所有探针残留于目标进程。
+    // 解决方案：改用无截断 64 位比较 caller.compare(base) >= 0 && caller.compare(base.add(modSize)) < 0
+    //           区分模块内（in:）与跨模块（out:）调用者；stop 时先 Interceptor.detachAll() 摘钩。
     function place(off) {
         try {
             Interceptor.attach(base.add(off), {
@@ -3765,12 +3831,14 @@ _JS_CALL_TREE = r"""
                     try {
                         var caller = this.returnAddress;
                         if (caller !== null) {
-                            var c = caller.sub(base).toInt32();
-                            if (c >= 0) {
-                                var key = c + '->' + off;
-                                if (Object.keys(edges).length < MAXN) {
-                                    edges[key] = (edges[key] || 0) + 1;
-                                }
+                            var inMod = caller.compare(base) >= 0 && caller.compare(modEnd) < 0;
+                            var key = inMod
+                                ? ('in:' + caller.sub(base).toString() + '->' + off)
+                                : ('out:' + caller.toString() + '->' + off);
+                            if (edges[key] !== undefined) {
+                                edges[key] = edges[key] + 1;
+                            } else if (Object.keys(edges).length < MAXN) {
+                                edges[key] = 1;
                             }
                         }
                     } catch (e) {}
@@ -3788,6 +3856,7 @@ _JS_CALL_TREE = r"""
     send({ kind: 'ready', module: mod.name, base: base.toString(),
            placed: placed, failed: failed, total: ROOTS.length });
     recv('stop', function () {
+        try { Interceptor.detachAll(); } catch (e) {}
         send({ kind: 'stopped', entry_hits: entryHits, edges: edges });
     });
 })();
@@ -3960,10 +4029,26 @@ def trace_call_tree(serial: str, pid: int, so_name: str,
     edges = []
     for k, v in (box["edges"] or {}).items():
         try:
-            caller_s, callee_s = str(k).split("->")
-            edges.append({"caller_static": hex(int(caller_s)),
-                          "callee_static": hex(int(callee_s)),
-                          "count": int(v)})
+            raw_k = str(k)
+            in_mod = True
+            if raw_k.startswith("in:"):
+                raw_k = raw_k[3:]
+                in_mod = True
+            elif raw_k.startswith("out:"):
+                raw_k = raw_k[4:]
+                in_mod = False
+            caller_s, callee_s = raw_k.split("->")
+            caller_int = int(caller_s, 16) if caller_s.lower().startswith("0x") else int(caller_s)
+            callee_int = int(callee_s, 16) if callee_s.lower().startswith("0x") else int(callee_s)
+            edge = {
+                "caller_static": hex(caller_int) if in_mod else None,
+                "caller_in_module": in_mod,
+                "callee_static": hex(callee_int),
+                "count": int(v),
+            }
+            if not in_mod:
+                edge["caller_runtime"] = hex(caller_int)
+            edges.append(edge)
         except (TypeError, ValueError):
             continue
     edges.sort(key=lambda e: -e["count"])

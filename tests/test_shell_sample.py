@@ -44,8 +44,15 @@ def check(name: str, cond: bool, detail: str = "") -> None:
 
 
 def main() -> int:
-    if not SAMPLE.exists():
-        print(f"样本不存在，跳过：{SAMPLE}")
+    # (1) 第一次修改（2026-11-26）
+    # bug 原因：SAMPLE 指向仓库外绝对路径，在受限沙箱或他机上调用 SAMPLE.exists() 会抛 PermissionError 崩溃。
+    # 解决方案：捕获 OSError，无法访问时安全跳过并返回 0。
+    try:
+        has_sample = SAMPLE.exists()
+    except OSError:
+        has_sample = False
+    if not has_sample:
+        print(f"样本不存在或无权限访问，跳过：{SAMPLE}")
         return 0
 
     print("== 壳样本加载 ==")

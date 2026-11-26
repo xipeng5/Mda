@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, type ApiHooks } from "../lib/api";
+import { api, copyText, type ApiHooks } from "../lib/api";
 
 /**
  * 实时监控台 —— AI 的每次 MCP 工具调用都在这里上流。
@@ -17,7 +17,19 @@ import { api, type ApiHooks } from "../lib/api";
  *   · 冻结脉冲 —— 断点命中时目标短暂失活
  */
 
+// (2) 第二次修改（2026-11-26）
+// bug 原因：① AiEvent 缺少稳定唯一 id，选中行按数组下标保存，新事件头插后详情面板跳变；
+//           ② 分类筛选 CATS 中把 "mem" 误拼成 "memo"，导致 mem_* 事件无法被筛选；
+//           ③ 自动滚动依赖 events.length，满 500 条截断后失效；
+//           ④ 详情面板只展示了 60 字 summary，未展示 detail.result（含截断标注），
+//              且"复制原始返回"只复制 summary 并直调 navigator.clipboard（WKWebView 下失败）。
+// 解决方案：为 AiEvent 增加单调递增 id 字段并按 id 定位选中与触发滚动；
+//           修正 "memo" → "mem"；详情面板展示完整 detail.result（标明截断），
+//           复制按钮优先经 copyText（pywebview.api.copy_text → clipboard → execCommand）
+//           复制 detail.result || detail.summary；补齐异步 useEffect 取消标志。
 export type AiEvent = {
+  /** 单调递增唯一 ID，避免新事件头插导致选中项错位及满 500 条后滚动失效 */
+  id?: number;
   tool: string;
   args?: Record<string, unknown>;
   summary?: string;
@@ -122,7 +134,7 @@ const CATS: { k: string; label: string; types: string[] | null }[] = [
   { k: "static", label: "静态", types: ["static"] },
   { k: "runtime", label: "运行时", types: ["runtime", "java"] },
   { k: "vm", label: "VM", types: ["vm"] },
-  { k: "behavior", label: "行为", types: ["behavior", "memo", "watch", "bp"] },
+  { k: "behavior", label: "行为", types: ["behavior", "mem", "watch", "bp"] },
   { k: "proc", label: "进程", types: ["proc", "trace"] },
 ];
 
@@ -174,6 +186,7 @@ function Procs({ onMain }: { onMain?: (n: number | null) => void }) {
   // 「AI 正在盯着」的待命条数：复用服务端已广播的 mda:armed（ArmedBar 同源）
   const [armed, setArmed] = useState(0);
   useEffect(() => {
+    let alive = true;
     const on = (e: Event) => {
       const items = (e as CustomEvent).detail;
       setArmed(Array.isArray(items) ? items.length : 0);
@@ -182,15 +195,20 @@ function Procs({ onMain }: { onMain?: (n: number | null) => void }) {
     // 首屏主动拉一次：事件只在变化时广播，刚打开页面时还没有事件
     void (async () => {
       const r = await api.armed();
-      if (r?.count != null) setArmed(r.count);
+      if (alive && r?.count != null) setArmed(r.count);
     })();
-    return () => window.removeEventListener("mda:armed", on as EventListener);
+    return () => {
+      alive = false;
+      window.removeEventListener("mda:armed", on as EventListener);
+    };
   }, []);
 
   useEffect(() => {
+    let alive = true;
     void (async () => {
       // ① 先问设备：前台是哪个 App
       const fg = await api.foreground();
+      if (!alive) return;
       if (!fg || !fg.package) {
         setNote(fg?.error ? String(fg.error).slice(0, 46) : "读不到前台 App（设备未连接？）");
         return;
@@ -199,6 +217,7 @@ function Procs({ onMain }: { onMain?: (n: number | null) => void }) {
 
       // ② 再查它的全部进程
       const r = await api.appProcesses({ package: fg.package });
+      if (!alive) return;
       if (!r || r.ok === false) {
         setNote(r?.error ? String(r.error).slice(0, 46) : "这个 App 没有可取到的进程");
         return;
@@ -214,6 +233,9 @@ function Procs({ onMain }: { onMain?: (n: number | null) => void }) {
       onMain?.(main?.loaded_so_count ?? null);
       setNote("");
     })();
+    return () => {
+      alive = false;
+    };
   }, [onMain]);
 
   if (!procs.length) {
@@ -353,16 +375,23 @@ function Lanes({ events }: { events: AiEvent[] }) {
 }
 
 export function RealtimeMonitor({ events, paused, onTogglePause, onClear, mods, hooksProp }: Props) {
-  const [sel, setSel] = useState<number | null>(null);
+  const [selId, setSelId] = useState<number | null>(null);
   const listRef = useRef<HTMLDivElement | null>(null);
   const [autoScroll, setAutoScroll] = useState(true);
+  const scrollSeqRef = useRef(0);
+  const prevTopRef = useRef<AiEvent | undefined>(undefined);
+  if (events[0] !== prevTopRef.current) {
+    prevTopRef.current = events[0];
+    scrollSeqRef.current += 1;
+  }
+  const latestSeq = events[0]?.id ?? scrollSeqRef.current;
 
-  /* 新事件进来时，若开着自动滚动就滚到顶部（最新的在最上面） */
+  /* 新事件进来时，若开着自动滚动就滚到顶部（依赖单调递增序号，满 500 条仍生效） */
   useEffect(() => {
     if (autoScroll && listRef.current) listRef.current.scrollTop = 0;
-  }, [events.length, autoScroll]);
+  }, [latestSeq, events.length, autoScroll]);
 
-  const detail = sel != null ? events[sel] : null;
+  const detail = selId != null ? events.find((e) => e.id === selId) ?? null : null;
   const toolCalls = events.length;
 
   /* 分类筛选 + 折叠（原型事件流表头那两个能力） */
@@ -373,10 +402,14 @@ export function RealtimeMonitor({ events, paused, onTogglePause, onClear, mods, 
      第一次进来查一次即可——前台应用变化是低频的，不需要跟着每条事件重查。 */
   const [fgPkg, setFgPkg] = useState("");
   useEffect(() => {
+    let alive = true;
     void (async () => {
       const r = await api.foreground();
-      if (r?.package) setFgPkg(r.package);
+      if (alive && r?.package) setFgPkg(r.package);
     })();
+    return () => {
+      alive = false;
+    };
   }, []);
 
   /* 监控目标 = AI 最近一次操作过的包/进程（从真实 args 里取） */
@@ -432,7 +465,7 @@ export function RealtimeMonitor({ events, paused, onTogglePause, onClear, mods, 
   useEffect(() => {
     const ev = events[0];
     if (!ev) return;
-    const sig = `${ev.ts}|${ev.tool}|${events.length}`;
+    const sig = ev.id != null ? `id:${ev.id}` : `${ev.ts}|${ev.tool}|${events.length}`;
     if (sig === lastRef.current) return;      // 同一条不重复触发
     lastRef.current = sig;
 
@@ -605,15 +638,16 @@ export function RealtimeMonitor({ events, paused, onTogglePause, onClear, mods, 
             })
             .map(({ ev, i }) => {
             const r = renderCall(ev);
+            const isSel = selId != null && ev.id != null && selId === ev.id;
             return (
               <div
-                key={i}
+                key={ev.id ?? i}
                 className={
-                  "sr " + r.type + (sel === i ? " sel" : "") +
+                  "sr " + r.type + (isSel ? " sel" : "") +
                   (r.kind ? " from-" + r.kind : "") +
                   (i === 0 ? " fresh" : "")
                 }
-                onClick={() => setSel(i)}
+                onClick={() => setSelId(ev.id ?? null)}
                 title={`${ev.tool}  ${r.meta}`}
               >
                 <span className="sr-t">{clock(ev.ts)}</span>
@@ -660,22 +694,35 @@ export function RealtimeMonitor({ events, paused, onTogglePause, onClear, mods, 
                   <pre className="det-json">{detail.summary}</pre>
                 </>
               )}
+              {detail.result && (
+                <>
+                  <div className="det-sec">
+                    原始返回
+                    {detail.result_truncated && (
+                      <span style={{ marginLeft: 6, color: "var(--attention)", fontWeight: 400 }}>
+                        已截断（原长 {detail.result_bytes || detail.result.length} 字符）
+                      </span>
+                    )}
+                  </div>
+                  <pre className="det-json">{detail.result}</pre>
+                </>
+              )}
               <div className="det-sec">在界面上能做的</div>
               <div className="det-acts">
                 <button
                   className="det-act"
                   onClick={() => {
                     const txt = JSON.stringify(detail.args ?? {}, null, 1);
-                    void navigator.clipboard?.writeText(txt);
+                    void copyText(txt);
                   }}
                 >
                   复制为提问
                 </button>
                 <button
                   className="det-act"
-                  disabled={!detail.summary}
+                  disabled={!detail.result && !detail.summary}
                   onClick={() => {
-                    void navigator.clipboard?.writeText(detail.summary ?? "");
+                    void copyText(detail.result || detail.summary || "");
                   }}
                 >
                   复制原始返回

@@ -224,7 +224,7 @@ __SPEC_HELPERS__
             // 硬读只会得到垃圾并算出一个看起来合理的假 idx）。
             var idx = null;
             var idxSrc = 'unavailable';
-            if (vmPc !== null && CODE_BASE !== null) {
+            if (vmPc !== null && CODE_BASE !== null && CODE_BASE !== 0 && CODE_BASE !== '') {
                 try {
                     var big = BigInt(vmPc.toString()) - BigInt(ptr(CODE_BASE).toString());
                     idx = Number(big / BigInt(SLOT_SIZE));
@@ -244,14 +244,19 @@ __SPEC_HELPERS__
                 if (IDX_TO > 0 && idx > IDX_TO) { return; }
             }
 
-            // opcode：按表达式取（"sp+8" / "x8" / "ctx+0x100"），取不到就 null
+            // (6) 第六次修改（2026-11-26）
+            // bug 原因：OPCODE_SPEC.kind === 'reg' 时对寄存器里的标量数值调了 readScalar()
+            //           （p.readU64() 解引用内存），触发访问违例导致 opcode 恒为空。
+            // 解决方案：kind === 'reg' 直接用 scalarFromReg(opRes.ptr) 取寄存器数值，
+            //           仅在内存表达式（sp/ctx/regoff）时才解引用读取。
             var opcodeVal = null;
             var opcodeSrc = 'none';
             if (OPCODE_SPEC.kind !== 'none') {
                 var opRes = resolveValue(c, OPCODE_SPEC, ctxp);
                 opcodeSrc = opRes.src;
                 if (opRes.ptr !== null) {
-                    var sv = readScalar(opRes.ptr);
+                    var sv = (OPCODE_SPEC.kind === 'reg')
+                        ? scalarFromReg(opRes.ptr) : readScalar(opRes.ptr);
                     opcodeVal = (sv.n !== null) ? sv.n : sv.s;
                 }
             }
@@ -477,13 +482,19 @@ def vm_trace(serial: str, pid: int, so_name: str,
     else:
         reg_base_spec = {"kind": "none"}
 
-    # 派发点：给了就用，没给按 pattern 扫（两者都没有 -> 明确报缺失）
+    # (6) 第六次修改（2026-11-26）
+    # bug 原因：自动扫描派发点时未传入已加载的 SoFile，传短模块名会读不到字节，
+    #           且未把文件偏移按 so._loads 换算为虚拟地址。
+    # 解决方案：先通过 _lookup_loaded_so 从全局 Session 查找 SoFile 并传给 find_dispatch_points。
     disp = _parse_dispatch_offset(dispatch_offset)
     if disp is None:
         if pattern_hex:
-            from server.dyn.vmbreak import find_dispatch_points
+            from server.dyn.vmbreak import (_lookup_loaded_so,
+                                            find_dispatch_points)
 
-            scan = find_dispatch_points(so_name, pattern_hex=pattern_hex, limit=1)
+            loaded_so = _lookup_loaded_so(so_name)
+            scan = find_dispatch_points(so_name, so=loaded_so,
+                                        pattern_hex=pattern_hex, limit=1)
             if not scan.get("ok") or not scan.get("points"):
                 return {"ok": False, "code": "NO_DISPATCH_POINT",
                         "error": "没有扫到派发点；确认 so 与 pattern_hex 是否匹配",
@@ -697,6 +708,11 @@ def vm_trace(serial: str, pid: int, so_name: str,
 def _code_base_literal(v) -> str:
     """把 code_base 转成 JS 字面量：没给就是 null（不猜基址）。
 
+    (6) 第六次修改（2026-11-26）
+    bug 原因：原实现返回裸十进制数字 str(n)，遇到 ARM64 64 位 TBI 指针（超过 2^53-1）
+              时 JS 双精度浮点会截断低位，导致 ptr(CODE_BASE) 算错 vm_idx。
+    解决方案：改为输出 "0x..." 字符串字面量，由 JS 侧 ptr("0x...") 无损解析 64 位地址。
+
     支持 int 与 "0x..." / "12345"。给不出合法值一律 null —— 宁可不算 idx，
     也不注入一个错的基址（错的基址会算出看起来合理的假 idx）。
     """
@@ -710,4 +726,4 @@ def _code_base_literal(v) -> str:
             n = int(v)
     except (TypeError, ValueError):
         return "null"
-    return str(n) if n > 0 else "null"
+    return json.dumps(f"0x{n:x}") if n > 0 else "null"

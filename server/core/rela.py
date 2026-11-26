@@ -136,7 +136,11 @@ _EM_X86_64 = 62
 
 _PTR_SIZE = {_EM_AARCH64: 8, _EM_X86_64: 8, _EM_ARM: 4, _EM_X86: 4}
 _RELATIVE_TYPE = {_EM_AARCH64: 1027, _EM_ARM: 23, _EM_X86_64: 8, _EM_X86: 8}
-_IRELATIVE_TYPE = {_EM_AARCH64: 1032, _EM_ARM: 160, _EM_X86_64: 37, _EM_X86: 37}
+# (2) 第二次修改（2026-11-26）
+# bug 原因：x86 的 R_386_IRELATIVE 误写成了与 x86_64 相同的 37（实际 ELF 规范为 42），
+#           导致 32 位 x86 IFUNC 重定位类型号和名称映射错误。
+# 解决方案：将 _IRELATIVE_TYPE[_EM_X86] 与 _RTYPE_NAMES[_EM_X86] 中的类型号修正为 42。
+_IRELATIVE_TYPE = {_EM_AARCH64: 1032, _EM_ARM: 160, _EM_X86_64: 37, _EM_X86: 42}
 
 # 只收录逆向时真会遇到的类型；未收录的按空名处理，不编造 "R_XXX_<数字>"。
 _RTYPE_NAMES: dict[int, dict[int, str]] = {
@@ -194,7 +198,7 @@ _RTYPE_NAMES: dict[int, dict[int, str]] = {
         6: "R_386_GLOB_DAT",
         7: "R_386_JMP_SLOT",
         8: "R_386_RELATIVE",
-        37: "R_386_IRELATIVE",
+        42: "R_386_IRELATIVE",
     },
 }
 
@@ -701,9 +705,14 @@ def _walk_relr(raw: bytes, file_off: int, size: int, word_size: int,
             )
             break
         w = int.from_bytes(raw[o:o + word_size], "little")
+        # (2) 第二次修改（2026-11-26）
+        # bug 原因：RELR 规范中偶数 word 发出地址 w 后必须把游标推进到 w + word_size，
+        #           旧代码写成 where = w 未推进，导致后续奇数位图的 bit 1 重复命中首槽 w，
+        #           所有位图项整体左偏 -word_size（libbase.so 实测半数槽读成 0）。
+        # 解决方案：偶数 word 记录 w 后立刻将 where 推进为 w + word_size。
         if w & 1 == 0:
-            where = w
-            addrs.append(where)
+            addrs.append(w)
+            where = w + word_size
         else:
             for bit in range(1, bits):
                 if w & (1 << bit):
@@ -827,11 +836,17 @@ def _names_from_dynamic(raw: bytes, loads, tags: dict[int, int],
 # ---------------------------------------------------------------- 两条路径
 
 
-def _parse_from_sections(so, raw: bytes, table: RelocTable) -> None:
+# (2) 第二次修改（2026-11-26）
+# bug 原因：节表路径调用 _walk 时漏传 loads 参数（默认 None），导致 32 位 SHT_REL
+#           无法通过 _v2o(loads, r_offset) 读取隐式 addend，addend 恒为 0。
+# 解决方案：接受可选 loads（未传时从 _loads_of(so, raw) 获取）并透传给 _walk。
+def _parse_from_sections(so, raw: bytes, table: RelocTable, loads=None) -> None:
     """节表路径：按 .rela.plt/.rela.dyn/.rel.plt/.rel.dyn 逐张解。"""
     secs = {s.name: s for s in (getattr(so, "sections", None) or [])}
     if not secs:
         return
+    if loads is None:
+        loads = _loads_of(so, raw)
     names = _names_from_sections(so, raw, table)
     ptr = table.ptr_size
     for name in _SECTION_ORDER:
@@ -868,7 +883,7 @@ def _parse_from_sections(so, raw: bytes, table: RelocTable) -> None:
         # source 统一成不带前导点的表名（rela.dyn/rela.plt/rel.dyn/rel.plt），
         # 与 PT_DYNAMIC 路径同名，两条路径的条目才能逐项直接比对
         _walk(raw, sec.offset, sec.size, ent, is_rela, ptr, name.lstrip("."),
-              names, table)
+              names, table, loads)
 
 
 def _parse_from_dynamic(raw: bytes, loads, table: RelocTable) -> None:
@@ -959,7 +974,7 @@ def parse(so, path: str = "auto") -> RelocTable:
         return table
 
     if path in ("auto", "sections") and sections_usable:
-        _parse_from_sections(so, raw, table)
+        _parse_from_sections(so, raw, table, loads)
         table.path = "sections"
         if table.entries or path == "sections":
             _parse_relr(so, raw, table, loads)

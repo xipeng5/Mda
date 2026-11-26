@@ -25,7 +25,24 @@ from __future__ import annotations
 
 import re
 
+from server.core.addr import parse_addr
 from server.core.plugins import PluginBase
+
+
+def _extract_last_hex_imm(text: str) -> str | None:
+    """从跳转指令文本提取最后一个 #(0x...) 目标地址，避免误取 tbz/tbnz 的位号。"""
+    hits = re.findall(r"#(0x[0-9a-fA-F]+)", text)
+    return hits[-1] if hits else None
+
+
+def _pair_step(reg: str) -> int:
+    """根据 ARM64 寄存器前缀返回 ldp/stp 第二个槽位的字节步长。"""
+    low = reg.lower()
+    if low.startswith(("w", "s")):
+        return 4
+    if low.startswith("q"):
+        return 16
+    return 8
 
 
 class Plugin(PluginBase):
@@ -45,16 +62,21 @@ class Plugin(PluginBase):
 
         from server.core.disasm import Disassembler
 
-        a = args["addr"]
-        addr = int(str(a), 16) if isinstance(a, str) and \
-               str(a).lower().startswith("0x") else int(a)
+        addr = parse_addr(args["addr"])
+        if addr is None:
+            return {"ok": False, "code": "BAD_ADDR",
+                    "error": f"非法地址参数 addr={args['addr']!r}"}
         fn = so.function_at(addr)
         if fn is None:
             return {"error": "地址不在函数内", "code": "NO_FUNCTION",
                     "hint": "先 build_xrefs"}
         max_lines = int(args.get("max_lines", 300))
 
-        insns = Disassembler(so).disasm_range(fn.addr, max(fn.size, 4))
+        try:
+            dis = Disassembler(so)
+        except ValueError as exc:
+            return {"ok": False, "code": "UNSUPPORTED_ARCH", "error": str(exc)}
+        insns = dis.disasm_range(fn.addr, max(fn.size, 4))
         blocks = self._basic_blocks(insns, fn.addr, fn.addr + fn.size)
 
         # (1) 第一次修改 bug 原因：块末 if 行是写死的 "cond"，且条件跳转指令在块内
@@ -139,6 +161,10 @@ class Plugin(PluginBase):
                      "变量/类型未恢复，关键结论需核对原始汇编。"),
         }
 
+    # (5) 第五次修改（2026-11-26）
+    # bug 原因：tbz/tbnz 位号 >= 10（如 tbz w0, #0xf, #0x1030）时，re.search/惰性正则
+    #           误将第一个 #0xf 当成跳转目标而非最后一个 #0x1030。
+    # 解决方案：统一通过 _extract_last_hex_imm 提取最后一个 #(0x...) 作为跳转目标。
     def _basic_blocks(self, insns, start, end):
         if not insns:
             return []
@@ -146,9 +172,9 @@ class Plugin(PluginBase):
         for i in insns:
             m = re.match(r"(b|br|blr|cbz|cbnz|tbz|tbnz|ret|b\.\w+)\b", i.text)
             if m:
-                t = re.search(r"#(0x[0-9a-f]+)", i.text)
-                if t:
-                    tgt = int(t.group(1), 16)
+                t_hex = _extract_last_hex_imm(i.text)
+                if t_hex:
+                    tgt = int(t_hex, 16)
                     if start <= tgt < end:
                         leaders.add(tgt)
                 if i.addr + 4 < end:
@@ -163,11 +189,13 @@ class Plugin(PluginBase):
                 continue
             succ = []
             last = ins[-1]["text"]
-            m = re.match(r"(b\.\w+|b|br|blr|cbz|cbnz|tbz|tbnz)\b.*?#(0x[0-9a-f]+)", last)
-            if m:
-                kind = "true" if m.group(1).startswith("b.") or \
-                       m.group(1) in ("cbz", "cbnz", "tbz", "tbnz") else "jump"
-                succ.append((m.group(2), kind))
+            m_op = re.match(r"(b\.\w+|b|br|blr|cbz|cbnz|tbz|tbnz)\b", last)
+            t_hex = _extract_last_hex_imm(last) if m_op else None
+            if m_op and t_hex:
+                op = m_op.group(1)
+                kind = "true" if op.startswith("b.") or \
+                       op in ("cbz", "cbnz", "tbz", "tbnz") else "jump"
+                succ.append((t_hex, kind))
                 if kind == "true":
                     # (4) 第四次修改 bug 原因：假分支原用"跳转目标+4"计算，
                     #     tbz/cbz 的真目标是别处，+4 得到的不是 fallthrough 地址。
@@ -243,11 +271,32 @@ class Plugin(PluginBase):
                     "target": m.group(4).lstrip("#")}
         return None
 
+    # (6) 第六次修改（2026-11-26）
+    # bug 原因：1) movn 直接输出原立即数而非按位取反值；
+    #           2) movz 带 lsl #shift 时输出多余逗号且丢弃移位量；
+    #           3) 不支持寄存器到寄存器的 mov rd, rm；
+    #           4) ldp/stp 不处理负偏移、零偏移和 32 位寄存器（w*/s* 步长应为 +4 而非写死 +8）。
+    # 解决方案：完整解析 mov/movz/movn（含 lsl 与位取反）和 mov rd, rm；
+    #           ldp/stp 区分寄存器宽度步长并正确计算正/负/零偏移。
     def _to_expr(self, text: str) -> str | None:
         """把常见指令转成类 C 表达式；不认识的返回 None（保留汇编由调用方决定）。"""
-        m = re.match(r"(mov|movz|movn)\s+(x\d+|w\d+),\s*(#?\S+)", text)
-        if m and m.group(3).startswith("#"):
-            return f"{m.group(2)} = {m.group(3)[1:]};"
+        m = re.match(
+            r"(mov|movz|movn)\s+(x\d+|w\d+|sp),\s*#(-?0x[0-9a-fA-F]+|-?\d+)"
+            r"(?:,\s*lsl\s*#(0x[0-9a-fA-F]+|\d+))?",
+            text,
+        )
+        if m:
+            op, rd = m.group(1), m.group(2)
+            imm = int(m.group(3), 0)
+            shift = int(m.group(4), 0) if m.group(4) else 0
+            val = imm << shift
+            if op == "movn":
+                mask = 0xFFFFFFFF if rd.startswith("w") else 0xFFFFFFFFFFFFFFFF
+                val = (~val) & mask
+            return f"{rd} = {val:#x};"
+        m = re.match(r"mov\s+(x\d+|w\d+|sp),\s*(x\d+|w\d+|sp|xzr|wzr)\b", text)
+        if m:
+            return f"{m.group(1)} = {m.group(2)};"
         m = re.match(r"(add|sub|eor|and|orr|mul)\s+(x\d+|w\d+),\s*(x\d+|w\d+),\s*(.+)", text)
         if m:
             op = {"add": "+", "sub": "-", "eor": "^", "and": "&",
@@ -256,22 +305,26 @@ class Plugin(PluginBase):
         # (3) 第三次修改 bug 原因：ldr/str 正则把助记符(m.group(1))当目的寄存器，
         #     "ldr x8, [x0]" 被输出成 "ldr = mem[x0]"，目的寄存器丢失。
         #     解决方案：正确取 m.group(2) 为目的寄存器；并补 ldp/stp 双寄存器访存。
-        m = re.match(r"(ldr|str)\s+(x\d+|w\d+),\s*\[(.+)\]", text)
+        m = re.match(r"(ldr|str)\s+(x\d+|w\d+|s\d+|d\d+|q\d+|xzr|wzr),\s*\[([^\]]+)\]", text)
         if m:
             mem = m.group(3)
             return (f"{m.group(2)} = mem[{mem}];" if m.group(1) == "ldr"
                     else f"mem[{mem}] = {m.group(2)};")
-        m = re.match(r"(ldp|stp)\s+(x\d+|w\d+),\s*(x\d+|w\d+),\s*\[(.+)\]", text)
+        m = re.match(
+            r"(ldp|stp)\s+([xwsdq]\d+|xzr|wzr),\s*([xwsdq]\d+|xzr|wzr),\s*\[([^\]]+)\]",
+            text,
+        )
         if m:
-            regs, mem = (m.group(2), m.group(3)), m.group(4)
-            # 偏移写回基址时 [x8, #8] 的偏移作用于首寄存器，次寄存器 +8
-            mo = re.match(r"(.+),\s*#(0x[0-9a-f]+|\d+)", mem)
+            regs, mem = (m.group(2), m.group(3)), m.group(4).strip()
+            step = _pair_step(regs[0])
+            mo = re.match(r"(.+?),\s*#(-?0x[0-9a-fA-F]+|-?\d+)$", mem)
             if mo:
-                base, off = mo.group(1), mo.group(2)
-                val = int(off, 16) if off.lower().startswith("0x") else int(off)
-                mem2 = f"{base}, #{val + 8:#x}"
+                base, off = mo.group(1).strip(), mo.group(2)
+                val2 = int(off, 0) + step
+                off2 = f"-0x{-val2:x}" if val2 < 0 else f"0x{val2:x}"
+                mem2 = f"{base}, #{off2}"
             else:
-                mem2 = mem
+                mem2 = f"{mem}, #{step:#x}"
             if m.group(1) == "ldp":
                 return f"{regs[0]} = mem[{mem}]; {regs[1]} = mem[{mem2}];"
             return f"mem[{mem}] = {regs[0]}; mem[{mem2}] = {regs[1]};"

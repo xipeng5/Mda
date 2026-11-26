@@ -129,47 +129,87 @@ struct hit {
     unsigned long ts_ms;
 };
 
+// 从环形缓冲安全拷贝跨尾边界的数据块
+static void ring_copy_wrap(const char *data, size_t data_size, size_t off,
+                           void *dst, size_t len) {
+    size_t first = data_size - off;
+    if (first >= len) {
+        memcpy(dst, data + off, len);
+    } else {
+        memcpy(dst, data + off, first);
+        memcpy((char *)dst + first, data, len - first);
+    }
+}
+
+// (3) 第三次修改（2026-11-26）
+// bug 原因：① 原 ring_drain 遇跨 ring 尾边界记录（off + h->size > data_size）时直接 break
+//             且不推进 tail，导致后续每次 drain 都在同一位置死锁、再也读不出新事件；
+//           ② 未检查 h->size == 0 和 off + sizeof(*h) > data_size，可能死循环或越界读；
+//           ③ 写回 meta->data_tail 未使用 __ATOMIC_RELEASE，ARM64 弱内存序下内核可能看到旧 tail。
+// 解决方案：用 ring_copy_wrap 安全拼接跨界头部与样本负载并始终推进 tail += hdr.size；
+//           对 hdr.size < sizeof(hdr) 或异常大值做防死循环保护；
+//           用 __atomic_store_n(&meta->data_tail, tail, __ATOMIC_RELEASE) 写回。
 static int ring_drain(struct ring *r, struct hit *out, int cap, unsigned long base_ts) {
     size_t pg = (size_t)sysconf(_SC_PAGESIZE);
+    const char *data = r->base + pg;
     struct perf_event_mmap_page *meta = r->meta;
     unsigned long head = __atomic_load_n(&meta->data_head, __ATOMIC_ACQUIRE);
     unsigned long tail = meta->data_tail;
     int n = 0;
 
     while (tail < head && n < cap) {
-        unsigned long off = tail % r->data_size;
-        struct perf_event_header *h =
-            (struct perf_event_header *)(r->base + pg + off);
+        unsigned long avail = head - tail;
+        if (avail < sizeof(struct perf_event_header)) break;
 
-        // 环形回绕：剩余不足一条记录就停止（简单策略，不拼接近界记录）
-        if (off + h->size > r->data_size) break;
+        size_t off = (size_t)(tail % r->data_size);
+        struct perf_event_header hdr;
+        if (off + sizeof(hdr) > r->data_size) {
+            ring_copy_wrap(data, r->data_size, off, &hdr, sizeof(hdr));
+        } else {
+            memcpy(&hdr, data + off, sizeof(hdr));
+        }
 
-        if (h->type == PERF_RECORD_SAMPLE) {
-            unsigned char *p = (unsigned char *)h + sizeof(*h);
-            unsigned char *end = (unsigned char *)h + h->size;
+        // 防死循环与畸形包：size 为 0 或小于头长度或超过环形容量时直接跳过至 head
+        if (hdr.size == 0 || hdr.size < sizeof(hdr) || hdr.size > r->data_size) {
+            tail = head;
+            break;
+        }
+        // 内核尚未写满整条记录：下次再读
+        if (hdr.size > avail) break;
+
+        if (hdr.type == PERF_RECORD_SAMPLE) {
+            size_t payload_len = hdr.size - sizeof(hdr);
+            unsigned char stack_buf[256];
+            size_t copy_len = payload_len < sizeof(stack_buf) ? payload_len : sizeof(stack_buf);
+            size_t payload_off = (off + sizeof(hdr)) % r->data_size;
+            ring_copy_wrap(data, r->data_size, payload_off, stack_buf, copy_len);
+
+            const unsigned char *p = stack_buf;
+            const unsigned char *end = stack_buf + copy_len;
             struct hit *it = &out[n];
             memset(it, 0, sizeof(*it));
             it->ts_ms = now_ms() - base_ts;
 
-            if (p + 8 <= end) { it->ip = *(unsigned long *)p; p += 8; }
-            if (p + 4 <= end) { it->pid = *(unsigned int *)p; p += 4; }
-            if (p + 4 <= end) { it->tid = *(unsigned int *)p; p += 4; }
+            if (p + 8 <= end) { memcpy(&it->ip, p, 8); p += 8; }
+            if (p + 4 <= end) { memcpy(&it->pid, p, 4); p += 4; }
+            if (p + 4 <= end) { memcpy(&it->tid, p, 4); p += 4; }
             if (p + 8 <= end) {
-                unsigned long abi = *(unsigned long *)p;
+                unsigned long abi = 0;
+                memcpy(&abi, p, 8);
                 p += 8;
                 if (abi == PERF_SAMPLE_REGS_ABI_64 && p + 32 <= end) {
-                    it->x[0] = *(unsigned long *)p; p += 8;
-                    it->x[1] = *(unsigned long *)p; p += 8;
-                    it->x[2] = *(unsigned long *)p; p += 8;
-                    it->x[3] = *(unsigned long *)p; p += 8;
+                    memcpy(&it->x[0], p, 8); p += 8;
+                    memcpy(&it->x[1], p, 8); p += 8;
+                    memcpy(&it->x[2], p, 8); p += 8;
+                    memcpy(&it->x[3], p, 8); p += 8;
                     it->has_regs = 1;
                 }
             }
             n++;
         }
-        tail += h->size;
+        tail += hdr.size;
     }
-    meta->data_tail = tail;
+    __atomic_store_n(&meta->data_tail, tail, __ATOMIC_RELEASE);
     return n;
 }
 
@@ -288,8 +328,15 @@ static int cmd_daemon(int slot, pid_t pid, unsigned long addr, int hw_len,
     a.exclude_kernel = 1;
     a.wakeup_events = 1;
 
+    // (3) 第三次修改（2026-11-26）：tid == 0（监控整进程）时设置 inherit=1 以便新线程继承观察点；
+    //     若特定内核版本拒绝 inherit=1 + 断点事件（EINVAL），自动回退 inherit=0。
+    if (tid <= 0) a.inherit = 1;
     int target = (tid > 0) ? tid : pid;
     int fd = perf_open(&a, target, -1, -1, PERF_FLAG_FD_CLOEXEC);
+    if (fd < 0 && a.inherit && errno == EINVAL) {
+        a.inherit = 0;
+        fd = perf_open(&a, target, -1, -1, PERF_FLAG_FD_CLOEXEC);
+    }
     if (fd < 0) {
         printf("{\"ok\":false,\"code\":\"%s\",\"errno\":%d,\"error\":\"%s\","
                "\"slot\":%d,\"target\":%d}\n",
@@ -355,7 +402,8 @@ static int cmd_daemon(int slot, pid_t pid, unsigned long addr, int hw_len,
 
     char hf[128];
     hits_path(hf, sizeof(hf), slot);
-    FILE *out = fopen(hf, "a");
+    // (3) 第三次修改（2026-11-26）：新会话以 "w" 截断重写 .hits，避免混入旧会话残留记录。
+    FILE *out = fopen(hf, "w");
     if (!out) { _exit(5); }
 
     unsigned long t0 = st.start_ms;
@@ -436,8 +484,15 @@ static int cmd_once(pid_t pid, unsigned long addr, int hw_len, int hw_type,
     a.exclude_kernel = 1;
     a.wakeup_events = 1;
 
+    // (3) 第三次修改（2026-11-26）：tid == 0（监控整进程）时设置 inherit=1 以便新线程继承观察点；
+    //     若特定内核版本拒绝 inherit=1 + 断点事件（EINVAL），自动回退 inherit=0。
+    if (tid <= 0) a.inherit = 1;
     int target = (tid > 0) ? tid : pid;
     int fd = perf_open(&a, target, -1, -1, PERF_FLAG_FD_CLOEXEC);
+    if (fd < 0 && a.inherit && errno == EINVAL) {
+        a.inherit = 0;
+        fd = perf_open(&a, target, -1, -1, PERF_FLAG_FD_CLOEXEC);
+    }
     if (fd < 0) {
         // ENOSPC 是最常见的失败：该线程调试槽位已被占满（实测部分进程主线程如此）
         printf("{\"ok\":false,\"code\":\"%s\",\"errno\":%d,\"error\":\"%s\","
@@ -551,21 +606,51 @@ int main(int argc, char **argv) {
 
     if (!strcmp(argv[1], "stop")) {
         // stop <slot>：杀 daemon 并清状态
+        // (3) 第三次修改（2026-11-26）
+        // bug 原因：① 未校验 slot 范围（0..MAX_DAEMONS-1）；
+        //           ② 读 pid 文件后直接 kill -9，若 PID 已被系统复用会误杀无关进程。
+        // 解决方案：校验 slot 范围，并校验 /proc/<dpid>/comm 或 cmdline 确认为 mda_perfwatch 后再发送信号。
         if (argc < 3) {
             printf("{\"ok\":false,\"error\":\"need slot\"}\n");
             return 1;
         }
         int slot = atoi(argv[2]);
+        if (slot < 0 || slot >= MAX_DAEMONS) {
+            printf("{\"ok\":false,\"code\":\"BAD_SLOT\",\"error\":\"slot 必须 0..3\"}\n");
+            return 1;
+        }
         char pf[128];
         pid_path(pf, sizeof(pf), slot);
         FILE *f = fopen(pf, "r");
         int dpid = 0;
         if (f) { if (fscanf(f, "%d", &dpid) != 1) dpid = 0; fclose(f); }
         int killed = 0;
-        if (dpid > 0) {
-            if (kill(dpid, SIGTERM) == 0) killed = 1;
-            usleep(120000);
-            kill(dpid, SIGKILL);          // 兜底：SIGTERM 没退就强杀
+        if (dpid > 1 && dpid != (int)getpid()) {
+            // 校验目标进程身份确为 mda_perfwatch，防止 PID 复用误杀
+            int is_ours = 0;
+            char proc_path[64], comm[128];
+            snprintf(proc_path, sizeof(proc_path), "/proc/%d/comm", dpid);
+            FILE *cf = fopen(proc_path, "r");
+            if (cf) {
+                if (fgets(comm, sizeof(comm), cf) && strstr(comm, "mda_perfwatch"))
+                    is_ours = 1;
+                fclose(cf);
+            }
+            if (!is_ours) {
+                snprintf(proc_path, sizeof(proc_path), "/proc/%d/cmdline", dpid);
+                cf = fopen(proc_path, "r");
+                if (cf) {
+                    size_t rlen = fread(comm, 1, sizeof(comm) - 1, cf);
+                    comm[rlen] = 0;
+                    if (strstr(comm, "mda_perfwatch")) is_ours = 1;
+                    fclose(cf);
+                }
+            }
+            if (is_ours) {
+                if (kill(dpid, SIGTERM) == 0) killed = 1;
+                usleep(120000);
+                if (kill(dpid, 0) == 0) kill(dpid, SIGKILL);
+            }
         }
         // 清理结果与状态文件
         char hp[128], sp[128];

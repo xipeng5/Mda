@@ -8,17 +8,35 @@
 from __future__ import annotations
 
 from capstone import Cs, CS_ARCH_ARM64, CS_MODE_LITTLE_ENDIAN
+from capstone import arm64_const as _arm64_c
 from capstone.arm64_const import ARM64_INS_BL, ARM64_INS_B, ARM64_INS_RET
 
 from server.core.elf_model import SoFile
 from server.models import Instruction
 
-# ARM64 无条件跳转族，用于控制流分析
+# (1) 第一次修改（2026-11-26）
+# bug 原因：① _COND_JUMPS 遗漏了 ARM64 条件分支别名 b.hs/b.lo；② blr 被错放进
+#           _UNCOND_JUMPS 标成了 is_jump 而非 is_call；③ 缺少 caller-saved 寄存器表，
+#           无法在 bl/blr 后清除被破坏的 adrp 页基址。
+# 解决方案：补全 b.hs/b.lo，将 blr 移出 _UNCOND_JUMPS 并在解码中标为 is_call，
+#           预构建 x0..x18 及 wN->xN 映射表用于失效 reg_page。
+# ARM64 跳转族，用于控制流分析
 _COND_JUMPS = {
-    "b.eq", "b.ne", "b.cs", "b.cc", "b.mi", "b.pl", "b.vs", "b.vc",
+    "b.eq", "b.ne", "b.cs", "b.cc", "b.hs", "b.lo", "b.mi", "b.pl", "b.vs", "b.vc",
     "b.hi", "b.ls", "b.ge", "b.lt", "b.gt", "b.le", "b.al", "b.nv",
 }
-_UNCOND_JUMPS = {"b", "br", "blr", "cbz", "cbnz", "tbz", "tbnz"}
+_UNCOND_JUMPS = {"b", "br", "cbz", "cbnz", "tbz", "tbnz"}
+# AAPCS64 caller-saved 寄存器 x0..x18（调用返回后页基址不再可信）
+_CALLER_SAVED_REGS = frozenset(
+    getattr(_arm64_c, f"ARM64_REG_X{i}") for i in range(19)
+    if hasattr(_arm64_c, f"ARM64_REG_X{i}")
+)
+# 32 位寄存器写入会零扩展覆写对应的 64 位寄存器
+_W_TO_X = {
+    getattr(_arm64_c, f"ARM64_REG_W{i}"): getattr(_arm64_c, f"ARM64_REG_X{i}")
+    for i in range(31)
+    if hasattr(_arm64_c, f"ARM64_REG_W{i}") and hasattr(_arm64_c, f"ARM64_REG_X{i}")
+}
 
 
 class Disassembler:
@@ -81,6 +99,7 @@ class Disassembler:
         if addr is None:
             for f in self.so.functions.values():
                 f.instructions = []
+            self._range_cache.clear()
             return
         fn = self.so.function_at(addr)
         if fn is not None:
@@ -124,15 +143,32 @@ class Disassembler:
                 out.append(item)
                 decoded += insn.size
                 pos += insn.size
-                # 下面与原先一致的语义标注
-                if m == "bl" and ops and ops[0].type == 2:  # CS_OP_IMM
+                # (1) 第一次修改（2026-11-26）
+                # bug 原因：① blr 未标为 is_call；② cbz/cbnz/tbz/tbnz 目标立即数不在 ops[0]
+                #           导致 call_target 恒为 None；③ adrp+ldr 过滤了 mem.disp == 0 丢失页对齐引用；
+                #           ④ add/ldr*/ldp 覆写目的寄存器后未清除 reg_page，且 bl/blr 未清除
+                #           caller-saved 寄存器 x0..x18，导致后续结构体成员访问产生大量假 xref。
+                # 解决方案：① bl/blr 均标 is_call 并清空 x0..x18 的 reg_page；② 分支目标从 ops
+                #           逆序取最后一个立即数操作数，统一覆盖 b/b.*/cbz/cbnz/tbz/tbnz；
+                #           ③ ldr*/ldp 允许 disp==0（仅排除带索引寄存器寻址），计算完 ref_addr 后
+                #           清除被覆写的目的寄存器（含 ldp 的 ops[0]/ops[1] 与 wN->xN）。
+                if m == "bl":
                     item.is_call = True
-                    item.call_target = ops[0].imm
-                    item.ref_addr = ops[0].imm
+                    if ops and ops[0].type == 2:  # CS_OP_IMM
+                        item.call_target = ops[0].imm
+                        item.ref_addr = ops[0].imm
+                    for r in _CALLER_SAVED_REGS:
+                        reg_page.pop(r, None)
+                elif m == "blr":
+                    item.is_call = True
+                    for r in _CALLER_SAVED_REGS:
+                        reg_page.pop(r, None)
                 elif m in _UNCOND_JUMPS or m in _COND_JUMPS:
                     item.is_jump = True
-                    if ops and ops[0].type == 2:
-                        item.call_target = ops[0].imm
+                    for op in reversed(ops):
+                        if op.type == 2:  # CS_OP_IMM（覆盖 b/b.*/cbz/cbnz/tbz/tbnz）
+                            item.call_target = op.imm
+                            break
                 elif m == "ret":
                     item.is_ret = True
                 elif m == "adrp" and len(ops) == 2 and ops[0].type == 1 and ops[1].type == 2:
@@ -140,14 +176,30 @@ class Disassembler:
                 elif m == "add" and len(ops) == 3 and ops[1].type == 1 and ops[2].type == 2:
                     base = reg_page.get(ops[1].reg)
                     if base is not None:
-                        item.ref_addr = (base + ops[2].imm) & 0xFFFFFFFFFFFFFFFF
-                elif m.startswith("ldr") and len(ops) == 2 and ops[1].type == 3:
-                    base = reg_page.get(ops[1].mem.base)
-                    if base is not None and ops[1].mem.disp:
-                        item.ref_addr = (base + ops[1].mem.disp) & 0xFFFFFFFFFFFFFFFF
-                elif m not in ("add", "ldr", "ldrsw", "ldrb", "ldrh", "ldp") and len(ops) > 0:
+                        imm = ops[2].imm
+                        if getattr(ops[2], "shift", None) and ops[2].shift.type == _arm64_c.ARM64_SFT_LSL:
+                            imm <<= ops[2].shift.value
+                        item.ref_addr = (base + imm) & 0xFFFFFFFFFFFFFFFF
                     if ops[0].type == 1:
-                        reg_page.pop(ops[0].reg, None)
+                        reg_page.pop(_W_TO_X.get(ops[0].reg, ops[0].reg), None)
+                elif m.startswith("ldr") and len(ops) >= 2 and ops[1].type == 3:
+                    base = reg_page.get(ops[1].mem.base)
+                    if base is not None and not ops[1].mem.index:
+                        item.ref_addr = (base + ops[1].mem.disp) & 0xFFFFFFFFFFFFFFFF
+                    if ops[0].type == 1:
+                        reg_page.pop(_W_TO_X.get(ops[0].reg, ops[0].reg), None)
+                elif m == "ldp" and len(ops) >= 3:
+                    if ops[2].type == 3:
+                        base = reg_page.get(ops[2].mem.base)
+                        if base is not None and not ops[2].mem.index:
+                            item.ref_addr = (base + ops[2].mem.disp) & 0xFFFFFFFFFFFFFFFF
+                    if ops[0].type == 1:
+                        reg_page.pop(_W_TO_X.get(ops[0].reg, ops[0].reg), None)
+                    if ops[1].type == 1:
+                        reg_page.pop(_W_TO_X.get(ops[1].reg, ops[1].reg), None)
+                elif len(ops) > 0 and ops[0].type == 1:
+                    if not m.startswith(("str", "stp", "stur", "stlr", "cmp", "cmn", "tst")):
+                        reg_page.pop(_W_TO_X.get(ops[0].reg, ops[0].reg), None)
             if decoded:
                 continue  # 这一段解完了，继续（可能还有剩余尾部）
             # 一个字节都没解出 → 数据块：跳一个指令宽度

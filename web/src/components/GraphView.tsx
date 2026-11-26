@@ -27,9 +27,14 @@ export function GraphView({ so, addr, fnName, onJump }: Props) {
   const boxRef = useRef<HTMLDivElement | null>(null);
   const [size, setSize] = useState({ w: W, h: H });
 
+  // (1) 第一次修改（2026-11-26）
+  // bug 原因：异步拉取 xrefTree 缺少取消标志，快速切换函数时慢请求会覆盖当前视图。
+  // 解决方案：在 useEffect 中加 alive 取消标志，卸载或依赖变更后丢弃过期响应。
   useEffect(() => {
+    let alive = true;
     void (async () => {
       const r = await api.xrefTree(so, addr, 1);
+      if (!alive) return;
       if (!r || (r as unknown as { error?: string }).error) {
         setErr("引用图未就绪：先建立引用图");
         setCallers([]);
@@ -40,6 +45,9 @@ export function GraphView({ so, addr, fnName, onJump }: Props) {
       setCallers(r.callers ?? []);
       setCallees(r.callees ?? []);
     })();
+    return () => {
+      alive = false;
+    };
   }, [so, addr]);
 
   /* 跟随容器尺寸，避免固定 900×460 在大屏上缩成一小块 */

@@ -28,7 +28,41 @@ from __future__ import annotations
 import re
 from collections import defaultdict
 
+from server.core.addr import parse_addr
 from server.core.plugins import PluginBase
+
+# 访存助记符集合（含非缩放/带符号扩展变体）
+_MEM_OPS = (
+    r"ldr|str|ldrb|strb|ldrh|strh|ldrsw|ldrsh|ldrsb|"
+    r"ldur|stur|ldurb|sturb|ldurh|sturh|ldursw|ldursh|ldursb|"
+    r"ldp|stp"
+)
+
+
+def _reg_width(operands_text: str) -> int:
+    """根据访存指令首个目标/源寄存器名推断字段字节宽度。"""
+    m = re.search(r"\b(wzr|xzr|[bhsdqwx]\d+)\b", operands_text.lower())
+    if not m:
+        return 8
+    tok = m.group(1)
+    if tok.startswith("b"):
+        return 1
+    if tok.startswith("h"):
+        return 2
+    if tok == "wzr" or tok.startswith(("w", "s")):
+        return 4
+    if tok.startswith("q"):
+        return 16
+    return 8
+
+
+def _record_field(fields, off: int, width: int, insn_addr: int, text: str) -> None:
+    """向偏移表登记一条字段访问宽度与示例指令。"""
+    f = fields[off]
+    if width not in f["widths"]:
+        f["widths"].append(width)
+    if len(f["accesses"]) < 3:
+        f["accesses"].append({"addr": hex(insn_addr), "insn": text})
 
 
 class Plugin(PluginBase):
@@ -49,53 +83,63 @@ class Plugin(PluginBase):
 
         from server.core.disasm import Disassembler
 
+        # (1) 第一次修改（2026-11-26）
+        # bug 原因：1) addr 未使用 parse_addr 且未捕获非 ARM64 的 Disassembler ValueError；
+        #           2) ldp/stp 仅登记首偏移，遗漏第二个寄存器对应字段；
+        #           3) 偏移正则不支持负十六进制，且指令表缺少 ldur/stur/ldurb/sturb/ldurh/sturh/ldursw/ldrsh/ldrsb；
+        #           4) reg_width 只认 w\d+，把 wzr/s*/b*/h* 全部误判为 8 字节。
+        # 解决方案：统一 parse_addr 并捕获非 ARM64；扩充指令表与负十六进制偏移正则；
+        #           按寄存器前缀精准推断宽度，并为 ldp/stp 同步登记第二个偏移字段。
         reg = self._norm(str(args.get("reg", "x0")).lower())
-        a = args["addr"]
-        a = int(str(a), 16) if isinstance(a, str) and \
-            str(a).lower().startswith("0x") else int(a)
+        a = parse_addr(args["addr"])
+        if a is None:
+            return {"ok": False, "code": "BAD_ADDR",
+                    "error": f"非法地址参数 addr={args['addr']!r}"}
         fn = so.function_at(a)
         if fn is None:
             return {"error": "地址不在已知函数内", "code": "NO_FUNCTION",
                     "hint": "先 build_xrefs"}
-        insns = Disassembler(so).disasm_range(fn.addr, max(fn.size, 4))
+        try:
+            dis = Disassembler(so)
+        except ValueError as exc:
+            return {"ok": False, "code": "UNSUPPORTED_ARCH", "error": str(exc)}
+        insns = dis.disasm_range(fn.addr, max(fn.size, 4))
 
         # offset → {widths, accesses}
         fields = defaultdict(lambda: {"widths": [], "accesses": []})
-        pat = re.compile(r"\b(ldr|str|ldrb|strb|ldrh|strh|ldrsw|ldp|stp|ldrsw)\b")
+        pat = re.compile(rf"\b({_MEM_OPS})\b")
+        mem_pat = re.compile(
+            rf"\b({_MEM_OPS})\b.*?\[({re.escape(reg)}|\w+)"
+            r"(?:,\s*#(-?0x[0-9a-fA-F]+|-?\d+))?\]"
+        )
         for insn in insns:
             text = insn.text or ""
             if not pat.search(text):
                 continue
-            m = re.search(r"\b(ldr|str|ldrb|strb|ldrh|strh|ldrsw|ldp|stp)\b.*?"
-                          r"\[(" + re.escape(reg) + r"|\w+)"
-                          r"(?:,\s*#(0x[0-9a-f]+|-?\d+))?\]", text)
+            m = mem_pat.search(text)
             if not m:
                 continue
             mn = m.group(1)
             base = self._norm(m.group(2))
             if base != reg:
                 continue
-            off = m.group(3)
-            off = int(off, 16) if isinstance(off, str) and off.startswith("0x") \
-                  else (int(off) if off else 0)
-            # 宽度：先看 mnemonic 后缀，再看寄存器宽度（w=4, x=8）
+            off_raw = m.group(3)
+            off = int(off_raw, 0) if off_raw else 0
             operands_text = text.split("[", 1)[0]
-            reg_width = 4 if re.search(r"\bw\d+\b", operands_text) else 8
+            # 去掉助记符本身再判断操作数寄存器宽度
+            ops_no_mn = operands_text[operands_text.find(mn) + len(mn):]
+            reg_width = _reg_width(ops_no_mn)
             if mn.endswith("b"):
                 w = 1
             elif mn.endswith("h"):
                 w = 2
-            elif mn == "ldrsw":
+            elif mn in ("ldrsw", "ldursw"):
                 w = 4
-            elif mn in ("ldp", "stp"):
-                w = reg_width
             else:
                 w = reg_width
-            f = fields[off]
-            if w not in f["widths"]:
-                f["widths"].append(w)
-            if len(f["accesses"]) < 3:
-                f["accesses"].append({"addr": hex(insn.addr), "insn": text})
+            _record_field(fields, off, w, insn.addr, text)
+            if mn in ("ldp", "stp"):
+                _record_field(fields, off + w, w, insn.addr, text)
 
         out = []
         for off in sorted(fields)[:int(args.get("max_fields", 64))]:

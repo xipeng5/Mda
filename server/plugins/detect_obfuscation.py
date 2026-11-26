@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import re
 
+from server.core.addr import parse_addr
 from server.core.plugins import PluginBase
 
 
@@ -44,14 +45,28 @@ class Plugin(PluginBase):
 
         from server.core.disasm import Disassembler
 
-        addr = args.get("addr")
+        # (2) 第二次修改（2026-11-26）
+        # bug 原因：1) addr 未统一用 parse_addr 解析且未捕获非 ARM64 的 Disassembler ValueError；
+        #           2) found 按字符串字典序排序，导致 0x1000 排在 0x200 之前。
+        # 解决方案：提前用 parse_addr 解析 addr（非法返 BAD_ADDR），捕获非 ARM64 返 UNSUPPORTED_ARCH，
+        #           结果按数值地址 int(r["addr"], 16) 排序。
+        raw_addr = args.get("addr")
+        addr = None
+        if raw_addr is not None:
+            addr = parse_addr(raw_addr)
+            if addr is None:
+                return {"ok": False, "code": "BAD_ADDR",
+                        "error": f"非法地址参数 addr={raw_addr!r}"}
         methods = set(args.get("methods") or [
             "retaddr_hijack", "binary_dispatch", "opaque_predicate",
             "jump_thunk", "identity_wrapper", "base_reloc",
         ])
         limit = int(args.get("limit", 100))
 
-        dis = Disassembler(so)
+        try:
+            dis = Disassembler(so)
+        except ValueError as exc:
+            return {"ok": False, "code": "UNSUPPORTED_ARCH", "error": str(exc)}
         ranges = self._ranges(so, addr)
         loads = getattr(so, "_loads", []) or []
         if loads:
@@ -71,7 +86,7 @@ class Plugin(PluginBase):
                     if hit:
                         found.append({"addr": hex(ia), "method": method, **hit})
 
-        found.sort(key=lambda r: r["addr"])
+        found.sort(key=lambda r: int(r["addr"], 16))
         return {
             "ok": True, "so": so.name,
             "scanned_ranges": len(ranges),
@@ -83,8 +98,9 @@ class Plugin(PluginBase):
 
     def _ranges(self, so, addr):
         if addr is not None:
-            a = int(str(addr), 16) if isinstance(addr, str) and \
-                str(addr).lower().startswith("0x") else int(addr)
+            a = parse_addr(addr)
+            if a is None:
+                return []
             fn = so.function_at(a)
             if fn:
                 return [(fn.addr, max(fn.size, 4))]
@@ -98,6 +114,12 @@ class Plugin(PluginBase):
                     out.append((va, end - va))
         return out
 
+    # (3) 第三次修改（2026-11-26）
+    # bug 原因：1) retaddr_hijack 用 startswith("br " + reg) 会让 x1 误匹配 x16；
+    #           2) opaque_predicate 捕获组比较写反，未按 lsl wA,wB,#N; sub wC,wA,wB 校验；
+    #           3) base_reloc 未排除 is_call/is_jump，导致普通外部调用被误报为基址重定位混淆。
+    # 解决方案：retaddr_hijack 改用正则词边界匹配；opaque_predicate 修正为
+    #           m1.group(1)==m2.group(2) and m1.group(2)==m2.group(3)；base_reloc 跳过调用/跳转指令。
     def _match(self, method, w, idx, texts, insns, mod_range):
         """返回命中详情或 None。w 是从当前指令开始的窗口。"""
         t = [x[1] for x in w]
@@ -110,10 +132,12 @@ class Plugin(PluginBase):
                 return None
             for j in range(1, min(len(t), 4)):
                 m = re.match(r"add\s+(x\d+),\s*\w+,\s*#(0x[0-9a-f]+|\d+)", t[j])
-                if m and any(x.startswith("br " + m.group(1)) for x in t[j + 1:]):
-                    return {"confidence": "high",
-                            "pattern": t[:j + 2],
-                            "note": "bl 后取返回地址加偏移再 br，等价于直接跳转"}
+                if m:
+                    br_pat = re.compile(rf"br\s+{re.escape(m.group(1))}\b")
+                    if any(br_pat.match(x) for x in t[j + 1:]):
+                        return {"confidence": "high",
+                                "pattern": t[:j + 2],
+                                "note": "bl 后取返回地址加偏移再 br，等价于直接跳转"}
 
         elif method == "binary_dispatch":
             # 连续多个 cmp + 条件跳转（>=3 组）
@@ -136,8 +160,8 @@ class Plugin(PluginBase):
             if len(t) >= 3:
                 m1 = re.match(r"lsl\s+(w\d+),\s*(w\d+),\s*#(\d+)", t[0])
                 m2 = re.match(r"sub\s+(w\d+),\s*(w\d+),\s*(w\d+)", t[1])
-                if m1 and m2 and m1.group(2) == m2.group(2) and \
-                        m1.group(1) == m2.group(1) and t[2].startswith("cmp "):
+                if m1 and m2 and m1.group(1) == m2.group(2) and \
+                        m1.group(2) == m2.group(3) and t[2].startswith("cmp "):
                     return {"confidence": "high",
                             "pattern": t[:3],
                             "note": "lsl/sub 构造 wB*(2^N-1) 后比较，疑似恒等谓词"}
@@ -155,6 +179,8 @@ class Plugin(PluginBase):
         elif method == "base_reloc":
             # adrp+add 目标超出模块范围（由 run() 传入上下文）
             insn = insns[idx]
+            if getattr(insn, "is_call", False) or getattr(insn, "is_jump", False):
+                return None
             t_addr = getattr(insn, "ref_addr", None)
             if t_addr is None:
                 return None
@@ -165,5 +191,4 @@ class Plugin(PluginBase):
                 return {"confidence": "high", "computed": hex(val),
                         "out_of_range_by": hex(over),
                         "note": "adrp+add 目标超出模块范围，疑似基址重定位混淆"}
-        return None
         return None

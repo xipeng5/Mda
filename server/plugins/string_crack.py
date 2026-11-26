@@ -11,7 +11,7 @@
     - rolling_xor          每字节密钥递增
     - lcg_xor              LCG 生成 keystream 后 XOR（参数可配）
     - not                  逐字节取反
-    - add_xor              加常数后 XOR
+    - add_xor              字节加常数（默认纯模加偏移，传入 xor_key 时再异或）
 
 ## 为什么是通用能力
 
@@ -39,6 +39,7 @@ from __future__ import annotations
 import itertools
 import string
 
+from server.core.addr import parse_addr
 from server.core.plugins import PluginBase
 
 PRINTABLE = set(bytes(string.printable[:95], "ascii"))
@@ -78,14 +79,16 @@ def _semantic_score(b: bytes) -> float:
                      _collect_blocks 的第 3 次修改），这样块内本来就应该
                      是单一字符串或密文，而不是整节混合数据。
     """
+    # (5) 第五次修改（2026-11-26）
+    # bug 原因：用 _clean(b).count(".") 计算不可打印比例，把域名/版本号/路径中的真实句点 '.'
+    #           误判为不可打印字符，导致含多个真实句点的合法文本被扣分甚至直接清零。
+    # 解决方案：直接基于原始字节 b 统计不在 PRINTABLE 集合内的字节占比。
     if not b:
         return 0.0
     text = _clean(b)
     if not text:
         return 0.0
-    # ① 不可打印占比过高的直接压到 0：那种块要么是密文、要么切分错了，
-    #    给它们打高分只会把噪音顶上来。
-    bad_ratio = text.count(".") / len(text)
+    bad_ratio = sum(1 for c in b if c not in PRINTABLE) / len(b)
     if bad_ratio > 0.4:
         return 0.0
     alnum = sum(1 for c in text if c.isalnum())
@@ -126,8 +129,30 @@ class Plugin(PluginBase):
         min_printable = float(args.get("min_printable", 0.85))
         min_len = int(args.get("min_len", 4))
         limit = int(args.get("limit", 30))
-        addr = args.get("addr")
-        size = args.get("size")
+        # (6) 第六次修改（2026-11-26）
+        # bug 原因：addr/size/lcg_multiplier/lcg_inc/lcg_seed 直接用 int() 解析，
+        #           传 "0x..." 字符串或非法值会直接抛出未捕获 ValueError。
+        # 解决方案：统一通过 parse_addr 解析所有地址/大小/种子参数，非法值返回 BAD_ARGS。
+        addr = None
+        if args.get("addr") is not None:
+            addr = parse_addr(args.get("addr"))
+            if addr is None or addr < 0:
+                return {"ok": False, "code": "BAD_ARGS",
+                        "error": f"非法 addr 参数：{args.get('addr')!r}"}
+        size = None
+        if args.get("size") is not None:
+            size = parse_addr(args.get("size"))
+            if size is None or size <= 0:
+                return {"ok": False, "code": "BAD_ARGS",
+                        "error": f"非法 size 参数：{args.get('size')!r}"}
+        parsed_args = dict(args)
+        for key in ("lcg_multiplier", "lcg_inc", "lcg_seed", "xor_key"):
+            if args.get(key) is not None:
+                val = parse_addr(args.get(key))
+                if val is None:
+                    return {"ok": False, "code": "BAD_ARGS",
+                            "error": f"非法 {key} 参数：{args.get(key)!r}"}
+                parsed_args[key] = val
 
         # (4) 第四次修改（2026-11-18）：plaintext 模式——只列已是明文的块。
         #     与解密结果分开返回：一个是"本来就是明文"，一个是"解出来的"，
@@ -149,7 +174,7 @@ class Plugin(PluginBase):
         results = []
         for block_addr, data in blocks:
             for method in methods:
-                for params, plain in self._try(method, data, args):
+                for params, plain in self._try(method, data, parsed_args):
                     printable_score = _score(plain)
                     if printable_score < min_printable:
                         continue
@@ -214,16 +239,20 @@ class Plugin(PluginBase):
         """
         out = []
         if addr is not None:
-            a = int(addr)
-            if size:
-                n = int(size)
+            a = parse_addr(addr)
+            if a is None:
+                return []
+            if size is not None:
+                n = parse_addr(size)
+                if n is None or n <= 0:
+                    return []
             else:
                 n = self._guess_len(so, a)
                 if n <= 0:
                     return []              # 调用方据 scanned_blocks=0 判断
             data = so.read(a, n)
             if data:
-                self._split_nul(out, a, data, min_len)
+                self._split_nul(out, a, data, min_len, exact=(size is not None))
             return out
 
         # 无节表时用 PT_LOAD 的只读段兜底
@@ -265,16 +294,18 @@ class Plugin(PluginBase):
                 return end - addr
         return 0
 
-    def _split_nul(self, out, base: int, data: bytes, min_len: int) -> None:
-        """按 NUL 切块，跳过本来就是明文的片段。
-
-        (3) 第三次修改（2026-11-18）：从 _collect_blocks 抽出。
-            两条路径（指定范围 / 全库）必须用**同一套**切分逻辑，
-            否则"指定范围解不出来但全库能解出来"这种矛盾会一直存在。
-
-        注意：可打印占比 >= 0.9 的块被**主动跳过**——它们是明文，不需要
-        解密。想看它们请用 plaintext 模式（见 _plaintext_blocks）。
-        """
+    # (7) 第七次修改（2026-11-26）
+    # bug 原因：_split_nul 与 _plaintext_blocks 仅在遇到 NUL 字节时产出片段，
+    #           导致缓冲区末尾不含尾 NUL 的最后一块（及显式 addr+size 且整块不含 NUL 的密文）被静默丢弃。
+    # 解决方案：循环结束后刷新尾部剩余 data[start:]；若为显式 addr+size 且整块不含 NUL，
+    #           将其作为完整块参与解密而不是返回 0 块。
+    def _split_nul(self, out, base: int, data: bytes, min_len: int,
+                   exact: bool = False) -> None:
+        """按 NUL 切块，跳过本来就是明文的片段。"""
+        if exact and b"\x00" not in data:
+            if len(data) >= min_len and _score(data) < 0.9:
+                out.append((base, data))
+            return
         start = 0
         for i, b in enumerate(data):
             if b == 0:
@@ -284,6 +315,10 @@ class Plugin(PluginBase):
                     if _score(chunk) < 0.9:
                         out.append((base + start, chunk))
                 start = i + 1
+        if start < len(data):
+            chunk = data[start:]
+            if min_len <= len(chunk) <= 256 and _score(chunk) < 0.9:
+                out.append((base + start, chunk))
 
     def _plaintext_blocks(self, so, addr, size, min_len: int) -> list:
         """枚举**已经是明文**的字符串块（不解密，直接列出来）。
@@ -299,11 +334,14 @@ class Plugin(PluginBase):
         """
         out = []
         ranges = []
+        exact = False
         if addr is not None:
-            a = int(addr)
-            n = int(size) if size else self._guess_len(so, a)
-            if n > 0:
-                ranges.append((a, n))
+            a = parse_addr(addr)
+            if a is not None:
+                n = parse_addr(size) if size is not None else self._guess_len(so, a)
+                if n and n > 0:
+                    ranges.append((a, n))
+                    exact = size is not None
         else:
             for sec in getattr(so, "sections", []):
                 if not getattr(sec, "is_exec", False) and sec.size:
@@ -315,6 +353,11 @@ class Plugin(PluginBase):
 
         for base, length in ranges:
             data = so.read(base, min(length, 1 << 20))
+            if exact and b"\x00" not in data:
+                if len(data) >= min_len and _score(data) >= 0.9:
+                    out.append({"addr": hex(base),
+                                "value": data.decode("ascii", "replace")})
+                continue
             start = 0
             for i, b in enumerate(data):
                 if b == 0:
@@ -323,6 +366,11 @@ class Plugin(PluginBase):
                         out.append({"addr": hex(base + start),
                                     "value": chunk.decode("ascii", "replace")})
                     start = i + 1
+            if start < len(data):
+                chunk = data[start:]
+                if min_len <= len(chunk) <= 256 and _score(chunk) >= 0.9:
+                    out.append({"addr": hex(base + start),
+                                "value": chunk.decode("ascii", "replace")})
         return out
 
     def _try(self, method, data, args):
@@ -337,8 +385,16 @@ class Plugin(PluginBase):
                 yield {"start": hex(k)}, bytes(c ^ ((k + i) & 0xFF)
                                                for i, c in enumerate(data))
         elif method == "add_xor":
+            # (8) 第八次修改（2026-11-26）
+            # bug 原因：add_xor 仅执行 (c + k) & 0xFF 字节模加偏移，未结合 xor_key 且注释与行为不符；
+            #           同时 lcg_xor 参数直接 int() 不支持 "0x..." 字符串。
+            # 解决方案：支持可选 xor_key（默认 0 即纯字节加常数偏移，指定时执行 ((c + k) & 0xFF) ^ xor_key），
+            #           并在 lcg_xor 中统一使用 parse_addr 解析参数。
+            xk = parse_addr(args.get("xor_key", 0))
+            xk = (xk & 0xFF) if xk is not None else 0
             for k in range(256):
-                yield {"add": hex(k)}, bytes((c + k) & 0xFF for c in data)
+                params = {"add": hex(k), "xor": hex(xk)} if xk else {"add": hex(k)}
+                yield params, bytes(((c + k) & 0xFF) ^ xk for c in data)
         elif method == "multi_byte_xor":
             # 短 key 暴力：2/4 字节（纯通用，不针对具体样本）
             # (2) key 空间收敛到常见可打印对，避免 9025×块数的组合爆炸
@@ -389,11 +445,18 @@ class Plugin(PluginBase):
             # （本模块只依赖标准库）
             return
         elif method == "lcg_xor":
-            mult = int(args.get("lcg_multiplier", 0x08088405))
-            inc = int(args.get("lcg_inc", 1))
+            mult = parse_addr(args.get("lcg_multiplier", 0x08088405))
+            inc = parse_addr(args.get("lcg_inc", 1))
+            if mult is None or inc is None:
+                return
             seed_arg = args.get("lcg_seed")
-            seeds = ([int(seed_arg)] if seed_arg is not None
-                     else [0xdeadbeef, 1, 0x12345678])
+            if seed_arg is not None:
+                sv = parse_addr(seed_arg)
+                if sv is None:
+                    return
+                seeds = [sv]
+            else:
+                seeds = [0xdeadbeef, 1, 0x12345678]
             for seed in seeds:
                 x = seed & 0xFFFFFFFF
                 out = bytearray()

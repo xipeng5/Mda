@@ -412,8 +412,13 @@ def test_libbase_packed() -> None:
               len(t.relative_entries()) == 15
               and all(e.source == "relr" for e in t.relative_entries()),
               str([(e.source, hex(e.offset)) for e in t.relative_entries()]))
-        check("code_targets 非空（来自真实 RELR addend）",
-              len(rela.code_targets(so)) == 6, str(rela.code_targets(so)))
+        # (1) 第一次修改（2026-11-26）
+        # bug 原因：旧 RELR 位图解码处理偶数 word 后未将游标推进 where += word_size，
+        #          导致 15 个槽左偏 8 字节，其中 7 个槽误读出 0x0，只解出 6 个代码目标。
+        # 解决方案：按 ELF RELR 规范修正游标推进后，libbase.so 真实解出全部 12 个
+        #          指向可执行函数入口的代码指针，更新断言为真实数量 12。
+        check("code_targets 非空（来自真实 RELR addend，共 12 个真实函数指针）",
+              len(rela.code_targets(so)) == 12, str(rela.code_targets(so)))
         check("函数表未被破坏（386 个）", len(so.functions) == 386, f"实际 {len(so.functions)}")
 
         # 动态路径与节表路径一致

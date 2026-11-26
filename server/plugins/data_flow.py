@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import re
 
+from server.core.addr import parse_addr
 from server.core.plugins import PluginBase
 
 # 写目的寄存器的模式：str 是"目的"，其余是自己解析
@@ -62,12 +63,16 @@ class Plugin(PluginBase):
 
         from server.core.disasm import Disassembler
 
+        # (2) 第二次修改（2026-11-26）
+        # bug 原因：addr 未使用 parse_addr 且未捕获非 ARM64 架构 Disassembler 的 ValueError。
+        # 解决方案：统一通过 parse_addr 解析 addr（非法返 BAD_ADDR），捕获非 ARM64 返 UNSUPPORTED_ARCH。
         reg = self._norm(str(args.get("reg", "x20")).lower())
         max_depth = int(args.get("max_depth", 4))
         max_nodes = int(args.get("max_nodes", 100))
-        addr = args.get("addr")
-        a = int(str(addr), 16) if isinstance(addr, str) and \
-            str(addr).lower().startswith("0x") else int(addr)
+        a = parse_addr(args.get("addr"))
+        if a is None:
+            return {"ok": False, "code": "BAD_ADDR",
+                    "error": f"非法地址参数 addr={args.get('addr')!r}"}
 
         fn = so.function_at(a)
         if fn is None:
@@ -81,11 +86,14 @@ class Plugin(PluginBase):
         #               原函数内行为完全不变（interproc 默认 false）。
         interproc = bool(args.get("interproc", False))
         up_depth = int(args.get("up_depth", 3))
+        try:
+            dis = Disassembler(so)
+        except ValueError as exc:
+            return {"ok": False, "code": "UNSUPPORTED_ARCH", "error": str(exc)}
         if interproc:
-            return self._run_interproc(session, so, fn, a, reg, max_depth, max_nodes,
+            return self._run_interproc(session, so, dis, fn, a, reg, max_depth, max_nodes,
                                        up_depth)
 
-        dis = Disassembler(so)
         insns = dis.disasm_range(fn.addr, max(fn.size, 4))
         if not insns:
             return {"error": "函数解码为空", "code": "DECODE_EMPTY"}
@@ -128,8 +136,8 @@ class Plugin(PluginBase):
             for j in range(idx, -1, -1):
                 insn = insns[j]
                 text = insn.text or ""
-                dst, srcs = self._parse(text)
-                if dst != cur_reg:
+                dsts, srcs = self._parse_rw(text)
+                if cur_reg not in dsts:
                     continue
                 node = {
                     "addr": hex(insn.addr),
@@ -147,7 +155,7 @@ class Plugin(PluginBase):
         walk(target_idx, reg, 0, [])
         return nodes
 
-    def _run_interproc(self, session, so, fn, a: int, reg: str,
+    def _run_interproc(self, session, so, dis, fn, a: int, reg: str,
                        max_depth: int, max_nodes: int, up_depth: int) -> dict:
         """跨函数模式：函数内切片追到参数 → 沿调用者往上传播（轻量静态近似）。
 
@@ -157,14 +165,24 @@ class Plugin(PluginBase):
             （x0-x7 / 入口无写入），就用 xrefs_to(fn.addr) 找调用点，在调用者里
             看 bl 前最后一次写入对应参数寄存器，递归 up_depth 层。
             不建模栈/堆/别名，"bl 前最后写入"是启发式，note 中如实说明。
-        """
-        from server.core.disasm import Disassembler
 
-        dis = Disassembler(so)
+        (3) 第三次修改（2026-11-26）
+            bug 原因：interproc=True 直接调用 xref.xrefs_to(cur_fn.addr)，未先构建 xref
+                      索引导致常返空列表，且 xrefs_to 混入了非调用的数据引用点。
+            解决方案：先调用 session.ensure_xrefs(so.name) / xr.build() 确保索引就绪，
+                      再优先通过 callers_of_fn 只取调用点。
+        """
         chain: list = []
         scanned_functions = 0
         scanned_insns = 0
         cross_function = False
+
+        # 确保跨函数调用索引已构建
+        if hasattr(session, "ensure_xrefs"):
+            session.ensure_xrefs(so.name)
+        xr = session.xref(so.name)
+        if hasattr(xr, "build"):
+            xr.build()
 
         # 当前正在分析的 (函数, 地址, 寄存器)
         cur_fn = fn
@@ -211,8 +229,14 @@ class Plugin(PluginBase):
             if not is_param or level == up_depth:
                 break
 
-            # 沿调用者往上传：找调用 cur_fn 的位置
-            callers = session.xref(so.name).xrefs_to(cur_fn.addr)
+            # 沿调用者往上传：优先只取调用点（callers_of_fn）
+            if hasattr(xr, "callers_of_fn"):
+                callers = xr.callers_of_fn(cur_fn.addr)
+            else:
+                callers = [
+                    site for site in xr.xrefs_to(cur_fn.addr)
+                    if any(i.is_call for i in dis.disasm_range(site, 4))
+                ]
             caller_sites = []
             for site in callers:
                 cf = so.function_at(site)
@@ -268,8 +292,8 @@ class Plugin(PluginBase):
         for ins in reversed(insns):
             if ins.addr >= addr:
                 continue
-            dst, _ = self._parse(ins.text or "")
-            if dst == reg:
+            dsts, _ = self._parse_rw(ins.text or "")
+            if reg in dsts:
                 return ins.addr
         return None
 
@@ -282,35 +306,75 @@ class Plugin(PluginBase):
         m = re.match(r"w(\d+)$", r)
         return "x" + m.group(1) if m else r
 
-    # 这些指令读第一个操作数，不写它
-    _READ_FIRST = {"cbz", "cbnz", "tbz", "tbnz", "str", "strb", "strh",
-                   "stp", "cmp", "cmn", "tst", "stur", "sturb", "sturh"}
+    # (4) 第四次修改（2026-11-26）
+    # bug 原因：1) ldp 把第二个目的寄存器 rd2 误当成源寄存器；
+    #           2) blr/br/ret/stlr* 未在 _READ_FIRST 中，会把 blr x8 的 x8 误判为写入；
+    #           3) movk 只覆写 16 位却丢弃原目的寄存器依赖，切断了前序 movz；
+    #           4) bl 未截断返回值寄存器 x0，导致后向切片越过调用连到旧值。
+    # 解决方案：扩充 _READ_FIRST；新增 _parse_rw 支持多目的寄存器（ldp/ldnp/ldxp/ldaxp），
+    #           movk 将目的寄存器加入源列表，bl 截断 x0；保留 _parse 兼容外部调用。
+    _READ_FIRST = {
+        "cbz", "cbnz", "tbz", "tbnz", "str", "strb", "strh", "stp", "stnp",
+        "cmp", "cmn", "tst", "stur", "sturb", "sturh",
+        "stlr", "stlrb", "stlrh", "blr", "br", "ret",
+    }
+    _PAIR_LOADS = {"ldp", "ldnp", "ldxp", "ldaxp", "ldpsw"}
 
-    def _parse(self, text: str):
-        """返回 (目的寄存器, 源寄存器列表)。"""
-        m = re.match(r"\s*(\w+)\s+([\w\[\]\s,#\-:]+)", text)
+    def _parse_rw(self, text: str) -> tuple[list[str], list[str]]:
+        """解析指令的读写寄存器，返回 (目的寄存器列表, 源寄存器列表)。"""
+        m = re.match(r"\s*(\w+)(?:\s+([\w\[\]\s,#\-:!]+))?", text)
         if not m:
-            return None, []
-        mnemonic = m.group(1)
+            return [], []
+        mnemonic = m.group(1).lower()
+        rest = (m.group(2) or "").strip()
+
+        if mnemonic == "bl":
+            # 函数调用会覆写返回值寄存器 x0，截断防止越过调用连到旧值
+            return ["x0"], []
+
         if mnemonic in self._READ_FIRST:
-            # 整条指令的所有寄存器都是"源"，没有目的
             srcs = []
-            for r in re.findall(r"\b(x\d+|w\d+|sp)\b", m.group(2)):
+            for r in re.findall(r"\b(x\d+|w\d+|sp)\b", rest):
                 r = self._norm(r)
                 if r not in srcs:
                     srcs.append(r)
-            return None, srcs
-        ops = [o.strip() for o in m.group(2).split(",")]
-        if not ops:
-            return None, []
+            return [], srcs
+
+        if not rest:
+            return [], []
+
+        ops = [o.strip() for o in rest.split(",")]
+        if mnemonic in self._PAIR_LOADS and len(ops) >= 3:
+            dsts = []
+            for op in ops[:2]:
+                dm = re.match(r"(x\d+|w\d+|sp|xzr|wzr)\b", op)
+                if dm:
+                    rn = self._norm(dm.group(1))
+                    if rn not in ("xzr", "wzr") and rn not in dsts:
+                        dsts.append(rn)
+            srcs = []
+            for op in ops[2:]:
+                for r in re.findall(r"\b(x\d+|w\d+|sp)\b", op):
+                    r = self._norm(r)
+                    if r not in srcs:
+                        srcs.append(r)
+            return dsts, srcs
+
         dst = ops[0]
-        # 取第一个 token：x0 / w0 / [x0, #8] 里的 x0
         dm = re.match(r"(\[)?(x\d+|w\d+|sp|xzr|wzr)", dst)
         d = self._norm(dm.group(2)) if dm else self._norm(dst)
+        dsts = [] if d in ("xzr", "wzr") else [d]
         srcs = []
+        if mnemonic == "movk" and dsts:
+            srcs.append(dsts[0])
         for op in ops[1:]:
             for r in re.findall(r"\b(x\d+|w\d+|sp)\b", op):
                 r = self._norm(r)
                 if r not in srcs:
                     srcs.append(r)
-        return d, srcs
+        return dsts, srcs
+
+    def _parse(self, text: str):
+        """返回 (首目的寄存器, 源寄存器列表)（兼容旧接口）。"""
+        dsts, srcs = self._parse_rw(text)
+        return (dsts[0] if dsts else None), srcs

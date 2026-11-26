@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import re
 
+from server.core.addr import parse_addr
 from server.core.plugins import PluginBase
 
 # 用途：从反汇编文本里抽取寄存器与寻址模式，用于虚调用启发式匹配。
@@ -132,9 +133,18 @@ class Plugin(PluginBase):
         except KeyError as exc:
             return {"error": str(exc),
                     "code": getattr(exc, "mda_code", "SO_NOT_LOADED")}
+        # (1) 第一次修改（2026-11-26）
+        # bug 原因：1) vtable_addr 未统一使用 parse_addr 且非法输入未返回 BAD_ADDR；
+        #           2) 未捕获非 ARM64 架构下 Disassembler(so) 抛出的 ValueError。
+        # 解决方案：使用 parse_addr 解析 vtable_addr（非法返 BAD_ADDR），捕获 ValueError 返 UNSUPPORTED_ARCH。
+        vtable_addr = parse_addr(args["vtable_addr"])
+        if vtable_addr is None:
+            return {"ok": False, "error": f"非法地址参数 vtable_addr={args['vtable_addr']!r}",
+                    "code": "BAD_ADDR"}
         try:
-            vtable_addr = self._parse_int(args["vtable_addr"])
-            radius = self._parse_int(args.get("radius", 0x1000))
+            radius = parse_addr(args.get("radius", 0x1000))
+            if radius is None:
+                raise ValueError(f"非法 radius={args.get('radius')!r}")
             limit = int(args.get("limit", 50))
         except (ValueError, TypeError) as exc:
             return {"error": f"参数解析失败：{exc}", "code": "BAD_ARGS"}
@@ -143,7 +153,10 @@ class Plugin(PluginBase):
 
         from server.core.disasm import Disassembler
 
-        dis = Disassembler(so)
+        try:
+            dis = Disassembler(so)
+        except ValueError as exc:
+            return {"ok": False, "code": "UNSUPPORTED_ARCH", "error": str(exc)}
         ranges = self._exec_ranges(so)
         if not ranges:
             return {"ok": True, "so": so.name, "vtable_addr": hex(vtable_addr),

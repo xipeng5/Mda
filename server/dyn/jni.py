@@ -335,6 +335,19 @@ def _entry_at(so: SoFile, addr: int, rela: dict[int, dict]) -> dict | None:
         return None
     name_p, sig_p, fn_p = struct.unpack_from("<QQQ", raw, off)
 
+    # (10) 第10次修改（2026-11-26）
+    # bug 原因：PIE 共享库的 .data.rel.ro 中 JNINativeMethod 的 name/sig 指针槽在文件里常为 0，
+    #           真实字符串地址放在 RELA 重定位的 addend 里；原实现只对 fn_p 查 rela，
+    #           导致 PIE 样本的明文表全部漏检。
+    # 解决方案：对 name_p（+0x00）与 sig_p（+0x08）同样查询 rela 重定位表取 addend。
+    _rela_ptr_types = (_R_AARCH64_RELATIVE, _R_AARCH64_ABS64, _R_AARCH64_GLOB_DAT)
+    rl_name = rela.get(addr)
+    if rl_name is not None and rl_name["rtype"] in _rela_ptr_types and rl_name.get("addend"):
+        name_p = rl_name["addend"]
+    rl_sig = rela.get(addr + 0x08)
+    if rl_sig is not None and rl_sig["rtype"] in _rela_ptr_types and rl_sig.get("addend"):
+        sig_p = rl_sig["addend"]
+
     name = _valid_name(so, name_p)
     if name is None:
         return None
@@ -347,9 +360,7 @@ def _entry_at(so: SoFile, addr: int, rela: dict[int, dict]) -> dict | None:
     if fn_p == 0:
         # fnPtr 在文件里是 0：真值在加载器要用的重定位里
         rl = rela.get(addr + 0x10)
-        if rl is not None and rl["rtype"] in (
-            _R_AARCH64_RELATIVE, _R_AARCH64_ABS64, _R_AARCH64_GLOB_DAT,
-        ):
+        if rl is not None and rl["rtype"] in _rela_ptr_types:
             fn_addr = rl["addend"]
             fn_source = "rela"
         else:
@@ -392,18 +403,16 @@ def scan_tables_by_pattern(so: SoFile, rela: dict[int, dict],
     covered_until = -1  # 防止一张表被重复切分：已经成表区间的尾部不再重新起表
 
     for start, end in sorted(regions):
-        # (9) 第9次修改（2026-11-06）：
-        # bug 原因：上一版用「区域起点向上取整到 24」定扫描起点，
-        #          隐含假设"区域起点本身 24 对齐"。真实 so 里 PT_LOAD 起点不一定
-        #          是 24 的倍数（例如 0x1af400 是，但别的样本可能是 0x1af410），
-        #          此时从该起点按 +24 步进访问的地址全部 ≡ 起点 (mod 24)，
-        #          **永远扫不到真正 24 对齐的表**，表现为"表明明在文件里却找不到"。
-        # 解决方案：按**绝对地址**对齐（往上找到第一个 addr % 24 == 0 的位置），
-        #          与区域起点无关。这样任何 24 对齐的表都必被访问到。
-        addr = -(-start // _ENTRY_SIZE) * _ENTRY_SIZE
+        # (11) 第11次修改（2026-11-26）
+        # bug 原因：JNINativeMethod 由 3 个 8 字节指针组成，AArch64 ABI 自然对齐为 8 字节
+        #           而非 24 字节；按 24 字节对齐与步进会直接跳过所有 mod 24 == 8/16 的合法表
+        #           （漏扫 2/3 的表）。
+        # 解决方案：改为按 8 字节对齐起点与 8 字节步进扫描，找到表后仍按 24 字节逐项读取。
+        align = 8
+        addr = -(-start // align) * align
         while addr + _ENTRY_SIZE * _MIN_ENTRIES <= end:
             if addr < covered_until:
-                addr = -(-covered_until // _ENTRY_SIZE) * _ENTRY_SIZE
+                addr = -(-covered_until // align) * align
                 continue
             entries: list[dict] = []
             cur = addr
@@ -425,7 +434,7 @@ def scan_tables_by_pattern(so: SoFile, rela: dict[int, dict],
                 if len(tables) >= max_tables:
                     return tables
             else:
-                addr += _ENTRY_SIZE
+                addr += align
     return tables
 
 
@@ -450,12 +459,19 @@ def _is_func_prologue(so: SoFile, vaddr: int) -> bool:
     raw = getattr(so, "_raw", None) or b""
     if o is None or o + 4 > len(raw):
         return False
+    # (12) 第12次修改（2026-11-26）
+    # bug 原因：开启 PAC/BTI 的现代 Android ARM64 库函数入口首指令多为 paciasp / pacibsp /
+    #           bti (c/j/jc)，原函数序言掩码未收录，导致重定位反推路径漏掉大量合法 JNI 函数。
+    # 解决方案：将 paciasp(0xD503233F)、pacibsp(0xD503237F) 与 bti 族((w & 0xFFFFFF3F)==0xD503241F)
+    #           纳入合法函数入口判定。
     w = struct.unpack_from("<I", raw, o)[0]
     return bool(
         (w & 0xFFC00000) == 0xA9800000
         or (w & 0xFFC00000) == 0xD1000000
         or (w & 0xFFC00000) == 0xA9000000
         or (w & 0xFFC00000) == 0xF8000000
+        or w in (0xD503233F, 0xD503237F)
+        or (w & 0xFFFFFF3F) == 0xD503241F
     )
 
 

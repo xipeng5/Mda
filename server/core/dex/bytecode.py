@@ -354,12 +354,22 @@ PAYLOAD_OP = {0x2b: 0x0100, 0x2c: 0x0200, 0x26: 0x0300}
 PAYLOAD_IDENT_NAME = {0x0100: "packed-switch-data", 0x0200: "sparse-switch-data",
                       0x0300: "array-data"}
 
-# invoke-* 家族（含 038 起引入的 polymorphic / custom），dex_callers 只扫这些
+# (1) 第一次修改（2026-11-26）
+# bug 原因：0xfc/0xfd（invoke-custom / invoke-custom/range）的操作数索引是 call_site_idx
+#           而非 method_idx，混入 INVOKE_OPS 会导致 dex_callers 把 call_site_idx 误当 method_idx 误报调用者。
+# 解决方案：从 INVOKE_OPS 中移除 0xfc/0xfd，仅保留引用 method_ids 的 invoke-* 指令。
+# invoke-* 家族（仅引用 method_ids 的指令；不含 invoke-custom），dex_callers 只扫这些
 INVOKE_OPS = frozenset({0x6e, 0x6f, 0x70, 0x71, 0x72, 0x74, 0x75, 0x76, 0x77, 0x78,
-                        0xfa, 0xfb, 0xfc, 0xfd})
+                        0xfa, 0xfb})
 
 
 # ---------- 位段取值的工具 ----------
+
+def _s4(v: int) -> int:
+    """4 位有符号整数符号扩展（-8..7），专供 11n（const/4）格式。"""
+    v &= 0xF
+    return v - 0x10 if v >= 8 else v
+
 
 def _s8(v: int) -> int:
     return v - 0x100 if v & 0x80 else v
@@ -568,13 +578,17 @@ def _ref_text(tables, kind: str, idx: int) -> tuple[str, str]:
     return "", ""
 
 
-def _reglist(regs: list[int]) -> str:
-    """寄存器列表：2 个以内逐个列出，3 个起用 {vN .. vM} 紧凑写法。"""
+# (1) 第一次修改（2026-11-26）
+# bug 原因：此前 _reglist 对任意 >=3 个寄存器都折叠成 `{v首 .. v尾}`，而 35c/45cc 的寄存器
+#           列表可以是非连续、任意顺序的（如 v0, v5, v2），折叠后会丢失中间寄存器并误导为连续区间。
+# 解决方案：默认逐个列出全部寄存器；仅当 is_range=True（3rc/4rcc 连续区间格式）且 >=2 个时才折叠。
+def _reglist(regs: list[int], is_range: bool = False) -> str:
+    """寄存器列表格式化：35c/45cc 逐个列出，3rc/4rcc 连续区间可用 {vN .. vM}。"""
     if not regs:
         return "{}"
-    if len(regs) <= 2:
-        return "{" + ", ".join(f"v{r}" for r in regs) + "}"
-    return f"{{v{regs[0]} .. v{regs[-1]}}}"
+    if is_range and len(regs) >= 2:
+        return f"{{v{regs[0]} .. v{regs[-1]}}}"
+    return "{" + ", ".join(f"v{r}" for r in regs) + "}"
 
 
 def _branch_text(target: int, rel: int) -> str:
@@ -607,8 +621,12 @@ def render(tables, op: int, units, i: int, base_insns: int) -> Insn:
     elif fmt == "12x":
         operands = f"v{vA}, v{vB}"
     elif fmt == "11n":
-        lit = _s8((u0 >> 12) & 0xF)  # 4 bit 有符号
-        operands = f"v{vA}, #int {lit} // #{lit & 0xFF:x}"
+        # (1) 第一次修改（2026-11-26）
+        # bug 原因：此前对 4 位有符号立即数调用 _s8((u0 >> 12) & 0xF)，位 7 恒为 0，
+        #           导致 -1 (0xF) 被错解为 15、-8 (0x8) 错解为 8。
+        # 解决方案：改用 _s4 做 4-bit 符号扩展。
+        lit = _s4((u0 >> 12) & 0xF)  # 4 bit 有符号（-8..7）
+        operands = f"v{vA}, #int {lit} // #{lit & 0xF:x}"
     elif fmt == "11x":
         operands = f"v{vAA}"
     elif fmt == "10t":
@@ -683,7 +701,7 @@ def render(tables, op: int, units, i: int, base_insns: int) -> Insn:
         regs = list(range(first, first + count))
         ref_idx = u1
         ref_txt, ref_note = _ref_text(tables, ref_kind, ref_idx)
-        operands = f"{_reglist(regs)}, {ref_txt}"
+        operands = f"{_reglist(regs, is_range=True)}, {ref_txt}"
     elif fmt == "45cc":
         # 4 units: A|G|op, meth@BBBB, F|E|D|C, proto@HHHH
         count = (u0 >> 12) & 0xF
@@ -705,7 +723,7 @@ def render(tables, op: int, units, i: int, base_insns: int) -> Insn:
         ref_idx = u1
         ref_txt, ref_note = _ref_text(tables, ref_kind, ref_idx)
         proto_txt, _pn = _ref_text(tables, REF_PROTO, u3)
-        operands = f"{_reglist(regs)}, {ref_txt}, {proto_txt}"
+        operands = f"{_reglist(regs, is_range=True)}, {ref_txt}, {proto_txt}"
         ref_note = f"{ref_note}, proto@{u3:04x}"
     elif fmt == "51l":
         lit = _s64(u1 | (u2 << 16) | (u3 << 32) | (u4 << 48))

@@ -29,6 +29,7 @@ plugin_run(name="disasm_func", args={
 """
 from __future__ import annotations
 
+from server.core.addr import parse_addr
 from server.core.plugins import PluginBase
 
 # ARM64 跳转/返回指令
@@ -54,8 +55,18 @@ class Plugin(PluginBase):
 
         from server.core.disasm import Disassembler
 
-        addr = int(str(args["addr"]), 16) if isinstance(args["addr"], str) and \
-               str(args["addr"]).lower().startswith("0x") else int(args["addr"])
+        # (1) 第一次修改（2026-11-26）
+        # bug 原因：1) addr 未统一用 parse_addr，非法值抛 ValueError；未捕获非 ARM64 架构异常；
+        #           2) 遇到 b/br/ret 未把下一条指令地址纳入 leaders，导致死代码/switch case 被粘进上一块；
+        #           3) blr 缺少 fallthrough 后继边，导致 CFG 在间接调用处断裂；
+        #           4) _target 对 tbz/tbnz 位号 >= 10 会误取第一个十六进制数而非最后的跳转目标。
+        # 解决方案：统一 parse_addr 并捕获非 ARM64 返 UNSUPPORTED_ARCH；
+        #           全部终结符（含 b/br/ret）均切开后续指令；blr 增加 fallthrough 边；
+        #           _target 取最后一个 #(0x...) 作为跳转目标。
+        addr = parse_addr(args["addr"])
+        if addr is None:
+            return {"ok": False, "code": "BAD_ADDR",
+                    "error": f"非法地址参数 addr={args['addr']!r}"}
         max_insns = int(args.get("max_insns", 5000))
 
         # 定位函数范围
@@ -68,26 +79,25 @@ class Plugin(PluginBase):
         if fn.size <= 0 or fn.size > max_insns * 8:
             end = min(start + max_insns * 8, self._module_end(so))
 
-        dis = Disassembler(so)
+        try:
+            dis = Disassembler(so)
+        except ValueError as exc:
+            return {"ok": False, "code": "UNSUPPORTED_ARCH", "error": str(exc)}
         # 1) 线性解码整个函数范围（只在函数边界内，不会落到数据区）
         all_insns = dis.disasm_range(start, end - start)
         if not all_insns:
             return {"error": f"函数 0x{start:x} 解码不出指令", "code": "DECODE_EMPTY"}
 
-        # 2) 收集所有基本块入口：函数入口 + 跳转目标 + 条件跳转的下一条
-        insn_by_addr = {i.addr: i for i in all_insns}
+        # 2) 收集所有基本块入口：函数入口 + 跳转目标 + 所有终结指令的下一条
         leaders = {start}
         for i in all_insns:
             text = i.text.split()[0].rstrip(",") if i.text else ""
             if text in _TERMINATORS or text in _COND:
-                # 跳转目标
                 target = self._target(i)
                 if target is not None and start <= target < end:
                     leaders.add(target)
-                # 条件跳转/调用的下一条也是 leader
                 nxt = i.addr + 4
-                if (text in _COND or text in ("cbz", "cbnz", "tbz", "tbnz", "blr")) \
-                        and start <= nxt < end:
+                if start <= nxt < end:
                     leaders.add(nxt)
 
         # 3) 切基本块
@@ -109,6 +119,8 @@ class Plugin(PluginBase):
                     succ.append({"to": hex(target), "kind": "jump"})
             elif text == "blr":
                 succ.append({"to": "indirect", "kind": "call"})
+                if last.addr + 4 < end:
+                    succ.append({"to": hex(last.addr + 4), "kind": "fallthrough"})
             elif text in _COND or text in ("cbz", "cbnz", "tbz", "tbnz"):
                 if target is not None:
                     succ.append({"to": hex(target), "kind": "true"})
@@ -137,7 +149,7 @@ class Plugin(PluginBase):
         }
 
     def _target(self, insn) -> int | None:
-        """从指令文本里取跳转目标地址。"""
+        """从指令文本里取跳转目标地址（取最后一个十六进制立即数，兼容 tbz/tbnz）。"""
         import re
 
         text = insn.text or ""
@@ -145,9 +157,9 @@ class Plugin(PluginBase):
         t = getattr(insn, "call_target", None) or getattr(insn, "ref_addr", None)
         if t is not None:
             return int(t)
-        m = re.search(r"#\s*(0x[0-9a-fA-F]+)", text)
-        if m:
-            return int(m.group(1), 16)
+        hits = re.findall(r"#\s*(0x[0-9a-fA-F]+)", text)
+        if hits:
+            return int(hits[-1], 16)
         return None
 
     def _module_end(self, so) -> int:

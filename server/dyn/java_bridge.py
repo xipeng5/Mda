@@ -413,14 +413,20 @@ def bridge_status(lang: str = "java", serial: str = "", pid: int = 0) -> dict:
     再按比例外推。全量统计要几十秒，对"够不够用"的判断没必要那么精确。
     """
     name = str(lang or "").strip().lower()
+    # (23) 第二十三次修改（2026-11-26）
+    # bug 原因：在调用 load_bridge_source(name) 后再判断 `name in _SRC_CACHE`，
+    #           由于刚加载完毕一定会写入缓存，loaded_from_cache 恒为 True，
+    #           调用方无法得知本次究竟是命中缓存还是首次从磁盘读取。
+    # 解决方案：在调用 load_bridge_source 之前先记录 was_cached，再赋给结果。
+    was_cached = name in _SRC_CACHE
     out: dict = {"ok": False, "lang": name, "path": "", "size_bytes": 0,
-                 "loaded_from_cache": name in _SRC_CACHE}
+                 "loaded_from_cache": was_cached}
     try:
         out["path"] = bridge_path(name)
         src = load_bridge_source(name)
         out["ok"] = True
         out["size_bytes"] = len(src.encode("utf-8"))
-        out["loaded_from_cache"] = name in _SRC_CACHE
+        out["loaded_from_cache"] = was_cached
     except JavaBridgeError as exc:
         out["error"] = str(exc)
         out["code"] = exc.code
@@ -756,44 +762,112 @@ def java_find_classes(serial: str, pid: int, pattern: str = "",
         catch (e) { send({kind: 'hook_error', error: '无法枚举类：' + e}); return; }
         out.total = all.length;
 
-        // (1) 多 ClassLoader：加固 App 的类由 DexClassLoader 动态加载，
-        //     enumerateLoadedClassesSync 只覆盖默认 loader，会漏。
+        // (24) 第二十四次修改（2026-11-26）
+        // bug 原因：原 all_loaders 实现先把 all 全部写入 SEEN，再从 all 取前 400 个类名做 probes
+        //           并判断 `if (SEEN[cand]) continue`，导致循环 100% 空转跳过；同时反射阶段
+        //           固定调用默认 Java.use(nm)，无法访问非默认 ClassLoader 加载的类。
+        // 解决方案：通过 Java.enumerateClassLoadersSync() 枚举全部 ClassLoader，优先从
+        //           BaseDexClassLoader.pathList.dexElements[].dexFile.entries() 及
+        //           ClassFactory.get(ld) 收集非默认 loader 的类并建立 classLoaderMap；
+        //           反射时优先用对应 loader 的 Java.ClassFactory.get(loader).use(nm)。
         var SEEN = {};
+        var classLoaderMap = {};
+        var loadersList = [];
         for (var si0 = 0; si0 < all.length; si0++) { SEEN[all[si0]] = 1; }
         if (ALL_LOADERS) {
             try {
-                var loaders = Java.enumerateClassLoadersSync();
-                out.loaders = loaders.length;
-                for (var li = 0; li < loaders.length; li++) {
-                    var ld = loaders[li];
+                loadersList = Java.enumerateClassLoadersSync() || [];
+                out.loaders = loadersList.length;
+                var BaseDexCL = null;
+                try { BaseDexCL = Java.use('dalvik.system.BaseDexClassLoader'); } catch (eB) {}
+                var exactPattern = (PATTERN && String(PATTERN).indexOf('.') >= 0
+                                    && !/[*?|\\[\](){}^$]/.test(String(PATTERN)))
+                    ? String(PATTERN) : '';
+                for (var li = 0; li < loadersList.length; li++) {
+                    var ld = loadersList[li];
+                    if (!ld) { continue; }
                     out.loaders_scanned = (out.loaders_scanned || 0) + 1;
-                    // 用 findClass 探测：先试 pattern 本身（若像全限定名），
-                    // 否则用已知类名列表逐个探测（成本高，受 LIMIT 限制）
-                    var probes = [];
-                    if (PATTERN && String(PATTERN).indexOf('.') >= 0) {
-                        probes.push(String(PATTERN).replace(/^[\^\$]/, ''));
-                    }
-                    // 用默认 loader 已见到的类名在这几个 loader 上试
-                    for (var pi = 0; pi < all.length && probes.length < 400; pi++) {
-                        probes.push(all[pi]);
-                    }
-                    for (var qi = 0; qi < probes.length; qi++) {
-                        var cand = probes[qi];
-                        if (SEEN[cand]) { continue; }
+                    // ① 精确类名直接探测该 loader
+                    if (exactPattern && !SEEN[exactPattern]) {
                         try {
-                            if (ld.findClass(cand)) {
-                                SEEN[cand] = 1;
-                                all.push(cand);
+                            if (ld.findClass(exactPattern)) {
+                                SEEN[exactPattern] = 1;
+                                all.push(exactPattern);
+                                classLoaderMap[exactPattern] = ld;
                                 out.loader_hits = (out.loader_hits || 0) + 1;
                             }
-                        } catch (e2) { /* 该 loader 里没有，正常 */ }
+                        } catch (eFind) {}
+                    }
+                    // ② 从 BaseDexClassLoader 的 DexFile 条目枚举动态加载类
+                    var gotFromDex = false;
+                    if (BaseDexCL) {
+                        try {
+                            var casted = Java.cast(ld, BaseDexCL);
+                            var pathList = casted.pathList.value;
+                            var elems = pathList ? pathList.dexElements.value : null;
+                            if (elems) {
+                                for (var ei = 0; ei < elems.length; ei++) {
+                                    try {
+                                        var df = elems[ei].dexFile.value;
+                                        if (!df) { continue; }
+                                        var en = df.entries();
+                                        while (en && en.hasMoreElements()) {
+                                            var cn = String(en.nextElement());
+                                            if (!SEEN[cn]) {
+                                                SEEN[cn] = 1;
+                                                all.push(cn);
+                                                classLoaderMap[cn] = ld;
+                                                out.loader_hits = (out.loader_hits || 0) + 1;
+                                            }
+                                        }
+                                        gotFromDex = true;
+                                    } catch (eDf) {}
+                                }
+                            }
+                        } catch (eCast) {}
+                    }
+                    // ③ 非 BaseDexClassLoader 回退走 ClassFactory.get(ld)
+                    if (!gotFromDex) {
+                        try {
+                            var cf = Java.ClassFactory.get(ld);
+                            if (cf && typeof cf.enumerateLoadedClassesSync === 'function') {
+                                var sub = cf.enumerateLoadedClassesSync();
+                                for (var sj = 0; sj < sub.length; sj++) {
+                                    var cn2 = sub[sj];
+                                    if (!SEEN[cn2]) {
+                                        SEEN[cn2] = 1;
+                                        all.push(cn2);
+                                        classLoaderMap[cn2] = ld;
+                                        out.loader_hits = (out.loader_hits || 0) + 1;
+                                    }
+                                }
+                            }
+                        } catch (eCf) {}
                     }
                 }
+                out.total = all.length;
             } catch (e) {
                 out.loader_error = String(e);
             }
         }
-        for (var si = 0; si < all.length; si++) { SEEN[all[si]] = 1; }
+
+        function useInLoader(nm) {
+            if (classLoaderMap[nm]) {
+                try { return Java.ClassFactory.get(classLoaderMap[nm]).use(nm); } catch (eU1) {}
+            }
+            try { return Java.use(nm); } catch (eU2) {
+                if (ALL_LOADERS && loadersList.length > 0) {
+                    for (var lu = 0; lu < loadersList.length; lu++) {
+                        try {
+                            var u = Java.ClassFactory.get(loadersList[lu]).use(nm);
+                            classLoaderMap[nm] = loadersList[lu];
+                            return u;
+                        } catch (eU3) {}
+                    }
+                }
+                throw eU2;
+            }
+        }
 
         for (var i = 0; i < all.length; i++) {
             var nm = all[i];
@@ -812,7 +886,7 @@ def java_find_classes(serial: str, pid: int, pattern: str = "",
 
             var hit = false, reason = [];
             try {
-                var jc = Java.use(nm).class;
+                var jc = useInLoader(nm).class;
                 if (fieldRe) {
                     var fs = jc.getDeclaredFields();
                     for (var f = 0; f < fs.length && !hit; f++) {
@@ -1421,6 +1495,65 @@ _JS_JAVA_HOOK_MULTI = r"""Java.perform(function () {
 
     var siblingHits = {};      // 同类兄弟方法的调用计数（0 命中时的旁证）
     var parentHits = {};       // (1) 第一次修改（2026-11-13）：祖先链同名方法的计数
+    // (25) 第二十五次修改（2026-11-26）
+    // bug 原因：① OVERLOAD 声明后未实际用于重载过滤，导致指定 overload 仍 hook 全部重载；
+    //           ② for 循环中 entry 用 var 声明且未作为参数传入 IIFE，多类 hook 时所有回调闭包
+    //              共享最后一个类的 entry，命中记录全串台到最后一个类；
+    //           ③ parent_probe 强依赖 deep_diag 才生成的子类 methodMap，未开 deep_diag 或父类
+    //              独有方法时完全失效；
+    //           ④ 退出/停止时未把已挂钩重载恢复为 implementation = null，可能残留挂钩。
+    // 解决方案：① 新增 overloadMatches 精确过滤匹配签名/参数类型的重载；
+    //           ② 将 entry 作为 entryObj 传入 IIFE，彻底隔离闭包；
+    //           ③ parent_probe 独立沿 getSuperclass() 链反射父类 declaredMethods 并挂计数探针；
+    //           ④ 用 installedHooks 记录全部已挂重载，在 stop 时统一恢复 implementation = null。
+    var installedHooks = [];
+    function cleanupHooks() {
+        for (var hi = 0; hi < installedHooks.length; hi++) {
+            try { installedHooks[hi].implementation = null; } catch (eCl) {}
+        }
+        installedHooks = [];
+    }
+    function overloadMatches(ovObj, sig, wanted) {
+        if (!wanted) { return true; }
+        var w = String(wanted).trim();
+        if (!w) { return true; }
+        var s = String(sig || '');
+        if (s === w) { return true; }
+        var argTypes = [];
+        try {
+            var ats = ovObj.argumentTypes || [];
+            for (var ai = 0; ai < ats.length; ai++) {
+                argTypes.push(String(ats[ai].className || ats[ai].name || ats[ai]));
+            }
+        } catch (eA) {}
+        if (argTypes.length === 0) {
+            var slp = s.indexOf('('), srp = s.lastIndexOf(')');
+            if (slp >= 0 && srp > slp) {
+                var inner = s.slice(slp + 1, srp).trim();
+                if (inner) {
+                    var parts = inner.split(',');
+                    for (var pi = 0; pi < parts.length; pi++) {
+                        argTypes.push(parts[pi].trim());
+                    }
+                }
+            }
+        }
+        var lp = w.indexOf('('), rp = w.lastIndexOf(')');
+        var wParams = (lp >= 0 && rp > lp) ? w.slice(lp + 1, rp).trim() : w;
+        if (w === '()' || (lp >= 0 && rp > lp && wParams === '')) {
+            return argTypes.length === 0;
+        }
+        var wList = wParams ? wParams.split(',') : [];
+        if (wList.length !== argTypes.length) { return false; }
+        for (var idx = 0; idx < wList.length; idx++) {
+            var wt = wList[idx].trim();
+            var at = argTypes[idx].trim();
+            if (wt === at) { continue; }
+            var shortAt = at.indexOf('.') >= 0 ? at.slice(at.lastIndexOf('.') + 1) : at;
+            if (wt !== shortAt) { return false; }
+        }
+        return true;
+    }
 
     // ② 逐个类 hook
     for (var ci = 0; ci < candidates.length; ci++) {
@@ -1487,20 +1620,22 @@ _JS_JAVA_HOOK_MULTI = r"""Java.perform(function () {
                 if (target === undefined || target.overloads === undefined) { continue; }
                 var ovs = target.overloads;
                 for (var oi = 0; oi < ovs.length; oi++) {
-                    (function (ovObj, sig, cls, mnm, cnm) {
+                    var ovSig = String(ovs[oi]);
+                    if (OVERLOAD && !overloadMatches(ovs[oi], ovSig, OVERLOAD)) { continue; }
+                    (function (ovObj, sig, cls, mnm, cnm, entryObj) {
                         // 降级状态按方法建立，同一方法的多个重载共用一个状态
                         var dp = mdaDegradePoint(cnm, mnm);
                         ovObj.implementation = function () {
                             var now = Date.now();
                             mdaDegradeTick(dp, now);
                             result.total_hits++;
-                            entry.call_count++;
+                            entryObj.call_count++;
                             // 三级降级：只累加计数，不再构造任何记录
-                            // （连 entry.calls 都不碰，消息体也不会变大）
+                            // （连 entryObj.calls 都不碰，消息体也不会变大）
                             if (dp.level >= 3) {
                                 return ovObj.apply(this, arguments);
                             }
-                            if (entry.calls.length >= MAX_CALLS) { entry.truncated = true; }
+                            if (entryObj.calls.length >= MAX_CALLS) { entryObj.truncated = true; }
                             else {
                                 var rec = {method: mnm, overload: sig,
                                            ts: now / 1000, args: [],
@@ -1531,14 +1666,15 @@ _JS_JAVA_HOOK_MULTI = r"""Java.perform(function () {
                                     }
                                 } catch (e) {
                                     rec.threw = String(e).slice(0, 200);
-                                    entry.calls.push(rec);
+                                    entryObj.calls.push(rec);
                                     throw e;
                                 }
-                                entry.calls.push(rec);
+                                entryObj.calls.push(rec);
                                 return ret;
                             }
                             return ovObj.apply(this, arguments);
                         };
+                        installedHooks.push(ovObj);
                         // (13) 第十三次修改（2026-11-06）：修正签名拼接。
                         //     bug 原因：原来写成 mnm + sig，而 sig 本身已是
                         //              "function execute(java.lang.Runnable): void"
@@ -1546,8 +1682,8 @@ _JS_JAVA_HOOK_MULTI = r"""Java.perform(function () {
                         //              "executefunction execute(...)"，方法名重复且粘连。
                         //     解决方案：直接用 sig（它已包含方法名），仅在
                         //              没有签名文本时退回 mnm。
-                        entry.hooked_methods.push(sig || mnm);
-                    })(ovs[oi], String(ovs[oi]), jc, mname, cname);
+                        entryObj.hooked_methods.push(sig || mnm);
+                    })(ovs[oi], ovSig, jc, mname, cname, entry);
                 }
             } catch (e) {
                 // 单个方法 hook 失败不影响其他方法
@@ -1598,6 +1734,7 @@ _JS_JAVA_HOOK_MULTI = r"""Java.perform(function () {
                                     siblingHits[k2] = (siblingHits[k2] || 0) + 1;
                                     return o2.apply(this, arguments);
                                 };
+                                installedHooks.push(o2);
                             })(ovs2[so], nmKey, cname);
                         }
                         probed++;
@@ -1628,16 +1765,23 @@ _JS_JAVA_HOOK_MULTI = r"""Java.perform(function () {
                     try { sup2 = pj.getSuperclass(); } catch (eP2) {}
                     cur = sup2 === null ? null : String(sup2.getName());
                 }
+                var parentMethRe = null;
+                try { parentMethRe = makeRe(METHOD, 'parent_method', false); }
+                catch (ePr) { parentMethRe = null; }
                 for (var pi = 0; pi < chain.length; pi++) {
                     var pname = chain[pi];
                     try {
                         var pjc = Java.use(pname);
-                        var allp = pname.indexOf('java.lang.') === 0 ? [] : null;
-                        // 名字筛选必须用**未锚定**的匹配：父类里方法名可能
-                        // 带前后缀（doXxx / xxxInternal），锚定会把它们漏掉。
-                        for (var key2 in (methodMap || {})) {
-                            if (key2 === '__truncated__') { continue; }
-                            if (!(new RegExp(METHOD.replace(/[*?]/g, '.'), 'i')).test(key2)) { continue; }
+                        var pms = pjc.class.getDeclaredMethods();
+                        var pSeen = {};
+                        for (var pmi = 0; pmi < pms.length; pmi++) {
+                            var key2 = String(pms[pmi].getName());
+                            if (pSeen[key2]) { continue; }
+                            if (key2 === 'finalize' || key2 === '<init>' || key2 === '<clinit>' ||
+                                key2 === 'wait' || key2 === 'notify' || key2 === 'equals' ||
+                                key2 === 'hashCode' || key2 === 'toString') { continue; }
+                            if (parentMethRe && !parentMethRe.test(key2)) { continue; }
+                            pSeen[key2] = true;
                             var t2 = pjc[key2];
                             if (t2 === undefined || t2.overloads === undefined) { continue; }
                             for (var po = 0; po < t2.overloads.length; po++) {
@@ -1647,6 +1791,7 @@ _JS_JAVA_HOOK_MULTI = r"""Java.perform(function () {
                                         parentHits[kk] = (parentHits[kk] || 0) + 1;
                                         return o3.apply(this, arguments);
                                     };
+                                    installedHooks.push(o3);
                                 })(t2.overloads[po], key2, pname);
                             }
                             if (!entry.parent_probed) { entry.parent_probed = []; }
@@ -1671,6 +1816,7 @@ _JS_JAVA_HOOK_MULTI = r"""Java.perform(function () {
           })});
 
     recv('stop', function () {
+        cleanupHooks();
         result.sibling_hits = siblingHits;
         // (15) 第十五次修改（2026-11-13）：带上祖先链的计数。
         //     不传的话 Python 侧 parent_hits 永远是空，诊断里"可试父类"
@@ -1944,6 +2090,11 @@ def java_find_callers(serial: str, pid: int, class_name: str, method: str,
     user_js = _JS_HELPERS + """
     Java.perform(function () {
         var SIZE = 0, samples = [], callers = {}, total = 0;
+        // (26) 第二十六次修改（2026-11-26）
+        // bug 原因：java_find_callers 退出时未恢复 ov.implementation = null，
+        //           在 detach 失败或阻塞时会在目标进程留下悬挂 hook。
+        // 解决方案：用 installed 记录全部已挂重载，在 stop 回调里统一恢复。
+        var installed = [];
         try {
             var cls = Java.use(__CLASS__);
             var target = cls[__METHOD__];
@@ -1992,6 +2143,7 @@ def java_find_callers(serial: str, pid: int, class_name: str, method: str,
                         } catch (e) {}
                         return ov.apply(this, arguments);
                     };
+                    installed.push(ov);
                     hookedN++;
                 })(ovs[i], String(ovs[i]));
             }
@@ -2008,6 +2160,10 @@ def java_find_callers(serial: str, pid: int, class_name: str, method: str,
             return;
         }
         recv('stop', function () {
+            for (var k0 = 0; k0 < installed.length; k0++) {
+                try { installed[k0].implementation = null; } catch (eCl) {}
+            }
+            installed = [];
             var list = [];
             for (var k in callers) { list.push({frame: k, hits: callers[k]}); }
             list.sort(function (a, b) { return b.hits - a.hits; });
@@ -2290,6 +2446,8 @@ def _run_java_callers(serial: str, pid: int, user_js: str,
         return _java_pending("java_find_callers", str(exc), {"code_detail": exc.code})
 
     sess = None
+    script = None
+    stop_sent = False
     try:
         dev = frida.get_device(serial, timeout=15)
         sess = dev.attach(int(pid))
@@ -2335,6 +2493,7 @@ def _run_java_callers(serial: str, pid: int, user_js: str,
         _time.sleep(max(0.1, float(duration)))
         try:
             script.post({"type": "stop"})
+            stop_sent = True
         except Exception:                                 # noqa: BLE001
             pass
         for _ in range(60):
@@ -2345,6 +2504,13 @@ def _run_java_callers(serial: str, pid: int, user_js: str,
         return {"ok": False, "implemented": True, "code": "CALLERS_FAILED",
                 "error": f"{type(exc).__name__}: {exc}"}
     finally:
+        # (26) 超时或异常路径同样先通知脚本恢复 ov.implementation = null
+        if script is not None and not stop_sent:
+            try:
+                script.post({"type": "stop"})
+                _time.sleep(0.05)
+            except Exception:                             # noqa: BLE001
+                pass
         _detach_async(sess)
 
     d = box.get("data") or {}
@@ -2407,6 +2573,8 @@ def _run_java_hook(serial: str, pid: int, user_js: str,
         return _java_pending("java_hook", str(exc), {"code_detail": exc.code})
 
     sess = None
+    script = None
+    stop_sent = False
     try:
         dev = frida.get_device(serial, timeout=15)
         sess = dev.attach(int(pid))
@@ -2457,6 +2625,7 @@ def _run_java_hook(serial: str, pid: int, user_js: str,
         _time.sleep(max(0.1, float(duration)))
         try:
             script.post({"type": "stop"})
+            stop_sent = True
         except Exception:                                 # noqa: BLE001
             pass
         for _ in range(60):
@@ -2479,6 +2648,13 @@ def _run_java_hook(serial: str, pid: int, user_js: str,
         return {"ok": False, "implemented": True, "code": code,
                 "error": msg, "process_probe": probe}
     finally:
+        # (25) 异常/超时退出前先通知 JS 恢复已挂重载，避免残留 hook
+        if script is not None and not stop_sent:
+            try:
+                script.post({"type": "stop"})
+                _time.sleep(0.05)
+            except Exception:                             # noqa: BLE001
+                pass
         _detach_async(sess)
 
     data = box.get("data") or {}
@@ -2776,6 +2952,15 @@ def java_hook_hint(serial: str, pid: int, query: str = "",
         var METHOD = __METHOD__;
         var LIMIT = __LIMIT__;
         var SCAN_CAP = __SCAN_CAP__;
+        // (27) 第二十七次修改（2026-11-26）
+        // bug 原因：① 模板缺少 __ALL_LOADERS__，replace 后该参数被静默丢弃；
+        //           ② max_scan_classes==0（无上限）时 `out.scanned >= SCAN_CAP` 与
+        //              `picked.length >= SCAN_CAP * 4` 立即触发截断，结果为空；
+        //           ③ 在打分前直接按枚举顺序截断 LIMIT，真正相关的类排在后面被丢弃。
+        // 解决方案：① 补齐 ALL_LOADERS 多 ClassLoader 枚举与按 loader 反射；
+        //           ② 所有上限判断加上 `SCAN_CAP > 0 && ...`；
+        //           ③ JS 侧先按关键词相关性排序并保留更宽候选池，再由 Python 精确打分截断。
+        var ALL_LOADERS = __ALL_LOADERS__;
 
         // 与 java_find_classes 同一套匹配语义：正则优先，通配符兜底，不锚定。
         // 保持一致很重要——两个工具对同一个 pattern 的匹配结果不同会让人困惑。
@@ -2808,7 +2993,83 @@ def java_hook_hint(serial: str, pid: int, query: str = "",
         var all;
         try { all = Java.enumerateLoadedClassesSync(); }
         catch (e) { send({kind: 'hook_error', error: '无法枚举类：' + e}); return; }
+        var classLoaderMap = {};
+        var loadersList = [];
+        var seenAll = {};
+        for (var si0 = 0; si0 < all.length; si0++) { seenAll[all[si0]] = 1; }
+        if (ALL_LOADERS) {
+            try {
+                loadersList = Java.enumerateClassLoadersSync() || [];
+                out.loaders = loadersList.length;
+                var BaseDexCL = null;
+                try { BaseDexCL = Java.use('dalvik.system.BaseDexClassLoader'); } catch (eB) {}
+                for (var li = 0; li < loadersList.length; li++) {
+                    var ld = loadersList[li];
+                    if (!ld) { continue; }
+                    var gotDex = false;
+                    if (BaseDexCL) {
+                        try {
+                            var casted = Java.cast(ld, BaseDexCL);
+                            var pl = casted.pathList.value;
+                            var els = pl ? pl.dexElements.value : null;
+                            if (els) {
+                                for (var ei = 0; ei < els.length; ei++) {
+                                    try {
+                                        var df = els[ei].dexFile.value;
+                                        if (!df) { continue; }
+                                        var en = df.entries();
+                                        while (en && en.hasMoreElements()) {
+                                            var cn = String(en.nextElement());
+                                            if (!seenAll[cn]) {
+                                                seenAll[cn] = 1;
+                                                all.push(cn);
+                                                classLoaderMap[cn] = ld;
+                                            }
+                                        }
+                                        gotDex = true;
+                                    } catch (eDf) {}
+                                }
+                            }
+                        } catch (eCast) {}
+                    }
+                    if (!gotDex) {
+                        try {
+                            var cf = Java.ClassFactory.get(ld);
+                            if (cf && typeof cf.enumerateLoadedClassesSync === 'function') {
+                                var sub = cf.enumerateLoadedClassesSync();
+                                for (var sj = 0; sj < sub.length; sj++) {
+                                    var cn2 = sub[sj];
+                                    if (!seenAll[cn2]) {
+                                        seenAll[cn2] = 1;
+                                        all.push(cn2);
+                                        classLoaderMap[cn2] = ld;
+                                    }
+                                }
+                            }
+                        } catch (eCf) {}
+                    }
+                }
+            } catch (eLd) { out.loader_error = String(eLd); }
+        }
         out.total_classes = all.length;
+
+        function useInLoader(nm) {
+            if (classLoaderMap[nm]) {
+                try { return Java.ClassFactory.get(classLoaderMap[nm]).use(nm); } catch (eU1) {}
+            }
+            try { return Java.use(nm); } catch (eU2) {
+                if (ALL_LOADERS && loadersList.length > 0) {
+                    for (var lu = 0; lu < loadersList.length; lu++) {
+                        try {
+                            var u = Java.ClassFactory.get(loadersList[lu]).use(nm);
+                            classLoaderMap[nm] = loadersList[lu];
+                            return u;
+                        } catch (eU3) {}
+                    }
+                }
+                throw eU2;
+            }
+        }
 
         // 系统包不参与候选：它们既不可能"像业务类"，hook 了也容易崩
         var SKIP = ['java.', 'javax.', 'android.', 'androidx.', 'dalvik.',
@@ -2859,19 +3120,46 @@ def java_hook_hint(serial: str, pid: int, query: str = "",
             if (qRe && !byName) { continue; }
             if (!qRe && !PACKAGE && !mRe) { continue; }
             picked.push({class: nm, by_name: byName});
-            // 类名命中的先占满，剩下的名额留给按方法筛的
-            if (!mRe && picked.length >= SCAN_CAP * 4) { break; }
+            // 类名命中的先占满，剩下的名额留给按方法筛的；SCAN_CAP==0 表示不设上限
+            if (!mRe && SCAN_CAP > 0 && picked.length >= SCAN_CAP * 4) { break; }
         }
 
-        // 方法维度：需要反射，受 SCAN_CAP 限制
+        // JS 侧先按关键词相关性粗排，防止后续反射上限或候选池截断把真正匹配的类提前丢掉
+        if (QUERY && picked.length > 1) {
+            var qTokens = String(QUERY).toLowerCase().split(/[^a-z0-9]+/).filter(function (t) { return t.length > 0; });
+            var qLower = String(QUERY).toLowerCase();
+            function jsRelScore(cname) {
+                var dot = cname.lastIndexOf('.');
+                var simple = (dot >= 0 ? cname.slice(dot + 1) : cname).toLowerCase();
+                var full = cname.toLowerCase();
+                var sc = 0;
+                if (simple === qLower || full === qLower) { sc += 1000; }
+                else if (simple.indexOf(qLower) >= 0) { sc += 500; }
+                for (var ti = 0; ti < qTokens.length; ti++) {
+                    var tk = qTokens[ti];
+                    if (simple === tk) { sc += 400; }
+                    else if (simple.indexOf(tk) >= 0) { sc += 150; }
+                    else if (full.indexOf(tk) >= 0) { sc += 40; }
+                }
+                // 同等相关性下短类名优先（排除冗长内部类）
+                sc -= Math.min(simple.length, 60);
+                return sc;
+            }
+            for (var ri = 0; ri < picked.length; ri++) {
+                picked[ri]._rel = jsRelScore(picked[ri].class);
+            }
+            picked.sort(function (a, b) { return b._rel - a._rel; });
+        }
+
+        // 方法维度：需要反射，受 SCAN_CAP 限制（0 = 不限）
         if (mRe) {
             var methodPicked = [];
             for (var j = 0; j < picked.length; j++) {
-                if (out.scanned >= SCAN_CAP) { out.scan_capped = true; break; }
+                if (SCAN_CAP > 0 && out.scanned >= SCAN_CAP) { out.scan_capped = true; break; }
                 var nm2 = picked[j].class;
                 out.scanned++;
                 try {
-                    var jc = Java.use(nm2).class;
+                    var jc = useInLoader(nm2).class;
                     var ms = jc.getDeclaredMethods();
                     var hit = false, cnt = 0;
                     for (var k = 0; k < ms.length; k++) {
@@ -2891,23 +3179,31 @@ def java_hook_hint(serial: str, pid: int, query: str = "",
             // 给了方法名就只保留含该方法的类（这是最硬的筛选条件）
             picked = methodPicked;
         } else if (picked.length > 0) {
-            // 没给方法名时补方法数，用于排序与展示（也受上限保护）
-            for (var j2 = 0; j2 < picked.length && out.scanned < SCAN_CAP; j2++) {
+            // 没给方法名时补方法数，用于排序与展示（SCAN_CAP==0 不限）
+            for (var j2 = 0; j2 < picked.length && (SCAN_CAP === 0 || out.scanned < SCAN_CAP); j2++) {
                 out.scanned++;
                 try {
                     picked[j2].method_count =
-                        Java.use(picked[j2].class).class.getDeclaredMethods().length;
+                        useInLoader(picked[j2].class).class.getDeclaredMethods().length;
                 } catch (e) { picked[j2].method_count = -1; }
             }
-            if (out.scanned >= SCAN_CAP) { out.scan_capped = true; }
+            if (SCAN_CAP > 0 && out.scanned >= SCAN_CAP) { out.scan_capped = true; }
         }
 
+        // 没给 query 时按方法数降序先排一次，避免在截断前丢掉方法丰富的核心类
+        if (!QUERY && picked.length > 1) {
+            picked.sort(function (a, b) { return (b.method_count || 0) - (a.method_count || 0); });
+        }
+
+        // 保留更宽候选池回传给 Python 精确打分，再按 LIMIT 截断
+        var poolCap = Math.min(picked.length, Math.max(LIMIT * 3, 60));
         // 带上每个候选的"能不能 hook"事实：接口/抽象类的声明方法没有实现体，
         // hook 它们注定 0 命中——这是最容易白跑一轮的原因，必须提前说。
-        for (var p = 0; p < picked.length && p < LIMIT; p++) {
+        for (var p = 0; p < poolCap; p++) {
             var c = picked[p];
+            delete c._rel;
             try {
-                var JC = Java.use(c.class).class;
+                var JC = useInLoader(c.class).class;
                 c.superclass = String(JC.getSuperclass() || '');
                 var mod = JC.getModifiers();
                 c.is_interface = (mod & 0x200) !== 0;
@@ -2925,7 +3221,7 @@ def java_hook_hint(serial: str, pid: int, query: str = "",
                 c.facts_error = String(e).slice(0, 120);
             }
         }
-        out.candidates = picked.slice(0, LIMIT);
+        out.candidates = picked.slice(0, poolCap);
         out.matched = picked.length;
         send(out);
     });
@@ -2993,6 +3289,8 @@ def java_hook_hint(serial: str, pid: int, query: str = "",
     if zero_scored:
         zero_scored.sort(key=lambda x: -(x.get("method_count") or 0))
         cands.extend(zero_scored[:3])
+    # 打分并排序完成后再按 limit 截断，避免高分候选在 JS 侧被提前丢弃
+    cands = cands[:n]
 
     out = {
         "ok": True,
@@ -3160,6 +3458,11 @@ def _java_count_calls(serial: str, pid: int, classes: list, method: str = "",
         var counts = {};        // 类名 → 次数
         var hookedN = {};       // 类名 → 实际挂上的方法数
         var errs = {};
+        // (28) 第二十八次修改（2026-11-26）
+        // bug 原因：_java_count_calls 退出时未将已挂钩重载恢复为 implementation = null，
+        //           在 detach 异常或阻塞时会在目标进程留下永久计数 hook。
+        // 解决方案：记录全部已挂重载到 installed，stop 回调时统一清理恢复。
+        var installed = [];
         for (var ci = 0; ci < CLASSES.length; ci++) {
             var cname = CLASSES[ci];
             counts[cname] = 0;
@@ -3205,6 +3508,7 @@ def _java_count_calls(serial: str, pid: int, classes: list, method: str = "",
                                     counts[cn2]++;
                                     return ov.apply(this, arguments);
                                 };
+                                installed.push(ov);
                             })(ovs[oi], cname);
                         }
                         n++;
@@ -3217,6 +3521,10 @@ def _java_count_calls(serial: str, pid: int, classes: list, method: str = "",
         }
         send({kind: 'ready', classes: CLASSES.length});
         recv('stop', function () {
+            for (var k0 = 0; k0 < installed.length; k0++) {
+                try { installed[k0].implementation = null; } catch (eCl) {}
+            }
+            installed = [];
             var out = [];
             for (var c = 0; c < CLASSES.length; c++) {
                 var nm = CLASSES[c];
@@ -3232,6 +3540,8 @@ def _java_count_calls(serial: str, pid: int, classes: list, method: str = "",
         "__MAXM__", str(max(1, min(int(max_methods_per_class), 400))))
 
     sess = None
+    script = None
+    stop_sent = False
     box = {"ready": False, "done": False, "data": None}
     try:
         from server.dyn import java_bridge as _self
@@ -3274,6 +3584,7 @@ def _java_count_calls(serial: str, pid: int, classes: list, method: str = "",
         _time.sleep(dur)
         try:
             script.post({"type": "stop"})
+            stop_sent = True
         except Exception:                                 # noqa: BLE001
             pass
         for _ in range(60):
@@ -3284,6 +3595,13 @@ def _java_count_calls(serial: str, pid: int, classes: list, method: str = "",
         return {"ok": False, "implemented": True, "code": "COUNT_FAILED",
                 "error": f"{type(exc).__name__}: {exc}"}
     finally:
+        # (28) 超时/异常退出前先发送 stop，触发 JS 侧统一恢复 implementation = null
+        if script is not None and not stop_sent:
+            try:
+                script.post({"type": "stop"})
+                _time.sleep(0.05)
+            except Exception:                             # noqa: BLE001
+                pass
         _detach_async(sess)
 
     rows = (box.get("data") or {}).get("classes") or []
@@ -3546,10 +3864,16 @@ def _overload_method_name(signature: str) -> str:
         "public final okhttp3.Request build()" → "build"
         "void add(java.lang.String, int)"      → "add"
     """
+    # (29) 第二十九次修改（2026-11-26）
+    # bug 原因：Java 反射 Method.toString() 返回 "public void pkg.Cls.foo(int)"，
+    #           原实现只按空格切分取 parts[-1]，得到 "pkg.Cls.foo" 而非裸方法名 "foo"，
+    #           导致 next_actions 里的 method 参数匹配失败。
+    # 解决方案：对括号前末段再按 "." 取 rsplit(".", 1)[-1]，只保留裸方法名。
     sig = str(signature or "").strip()
     if not sig:
         return ""
     idx = sig.find("(")
     head = sig[:idx] if idx > 0 else sig
     parts = head.replace("<", " ").replace(">", " ").split()
-    return parts[-1] if parts else ""
+    raw_name = parts[-1] if parts else ""
+    return raw_name.rsplit(".", 1)[-1] if raw_name else ""

@@ -183,6 +183,16 @@ class StringAnalyzer:
         kw = keyword.lower()
         return [s for s in self._strings if kw in s.value.lower()][:limit]
 
+    # (2) 第二次修改（2026-11-26）
+    # bug 原因：引用图因函数发现扩展/边界切分而重建后，StringAnalyzer._annotated 仍为 True，
+    #           annotate_refs 直接短路，导致新增函数中的字符串引用永远不会被归并。
+    # 解决方案：提供 reset_annotations() 清空旧 referenced_by 并重置 _annotated，供重建时调用。
+    def reset_annotations(self) -> None:
+        """清空字符串引用归并状态，供引用图重建后重新归并。"""
+        self._annotated = False
+        for s in self._strings:
+            s.referenced_by.clear()
+
     def annotate_refs(self, data_refs: dict[int, list[int]]) -> None:
         """把 xref 的 data_refs 归并到字符串的 referenced_by。
 

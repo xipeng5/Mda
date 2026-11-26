@@ -78,34 +78,45 @@ def _find_so(session, name: str):
         return (getattr(session, "modules", {}) or {}).get(name)
 
 
+# (19) 第十九次修改（2026-11-26）
+# bug 原因：原实现检查不存在的 so.read_bytes 和 so._segments 后直接 fh.seek(offset)，
+#           当虚拟地址 != 文件偏移（非首段 PT_LOAD）时会读错字节。
+# 解决方案：优先调用 SoFile 真实存在的 so.read(int(offset), int(size))，
+#           回退时兼容 so._loads 四元组 (va, end, file_off, flags) 换算文件偏移。
 def _read_so_bytes(so, offset: int, size: int) -> bytes:
-    """读 so 静态文件的原始字节（按段把虚拟地址换算成文件偏移）。
-
-    (10) 第十次修改（2026-11-06）：新增。
-        为什么需要：resolve_br 要从文件里读指针表；虚拟地址 ≠ 文件偏移，
-                    直接 seek 会读错位置（尤其 BSS 之前的段对齐差异）。
-    """
-    fn = getattr(so, "read_bytes", None)
-    if callable(fn):
-        try:
-            data = fn(int(offset), int(size))
-            if data:
-                return bytes(data)
-        except Exception:                                 # noqa: BLE001
-            pass
+    """读 so 静态文件的原始字节（优先走 so.read，再按段表换算文件偏移）。"""
+    off_i = int(offset)
+    sz_i = int(size)
+    if sz_i <= 0:
+        return b""
+    for attr in ("read", "read_bytes"):
+        fn = getattr(so, attr, None)
+        if callable(fn):
+            try:
+                data = fn(off_i, sz_i)
+                if data:
+                    return bytes(data)
+            except Exception:                             # noqa: BLE001
+                pass
     path = getattr(so, "path", "") or ""
     if not path:
         return b""
     try:
         with open(path, "rb") as fh:
+            for item in (getattr(so, "_loads", None) or []):
+                if isinstance(item, (tuple, list)) and len(item) >= 3:
+                    va, end, file_off = int(item[0]), int(item[1]), int(item[2])
+                    if va <= off_i < end:
+                        fh.seek(file_off + (off_i - va))
+                        return fh.read(sz_i)
             for seg in (getattr(so, "_segments", None) or []):
                 va = int(getattr(seg, "vaddr", 0) or 0)
                 memsz = int(getattr(seg, "memsz", 0) or 0)
-                if va <= offset < va + max(memsz, 1):
-                    fh.seek(int(getattr(seg, "offset", 0) or 0) + (offset - va))
-                    return fh.read(int(size))
-            fh.seek(int(offset))
-            return fh.read(int(size))
+                if va <= off_i < va + max(memsz, 1):
+                    fh.seek(int(getattr(seg, "offset", 0) or 0) + (off_i - va))
+                    return fh.read(sz_i)
+            fh.seek(off_i)
+            return fh.read(sz_i)
     except Exception:                                     # noqa: BLE001
         return b""
 
@@ -1627,6 +1638,14 @@ def _ti_reg_name(op: str) -> str:
     return name
 
 
+def _ti_reg_width(reg: str) -> int:
+    """在 _ti_norm 归一前识别原始寄存器位宽（wN 返回 4，其余返回 8）。"""
+    r = (reg or "").strip().lower()
+    if len(r) >= 2 and r[0] == "w" and r[1:].isdigit():
+        return 4
+    return 8
+
+
 def _ti_norm(reg: str) -> str:
     """w0-w30 → x0-x30。AArch64 里 wN 是 xN 的低 32 位，同一个物理寄存器。"""
     r = (reg or "").strip().lower()
@@ -1770,7 +1789,8 @@ def _ti_analyse(insns, idx: int, so) -> dict | None:
     if _ti_norm(_ti_reg_name(adr_ins.op_str)) != target_reg:
         return None
     ops = [p.strip() for p in (add_ins.op_str or "").split(",")]
-    load_dst = _ti_norm(_ti_reg_name(ldr_ins.op_str))
+    raw_load_dst = _ti_reg_name(ldr_ins.op_str)
+    load_dst = _ti_norm(raw_load_dst)
     if len(ops) != 3 or _ti_norm(ops[2]) != load_dst:
         return None
     # ADR 的立即数就是绝对地址（capstone 已按当前地址算好）；ADRP 给的是页基址
@@ -1795,11 +1815,19 @@ def _ti_analyse(insns, idx: int, so) -> dict | None:
         return None
 
     # ---- ④ 表项个数 ----
+    # (20) 第二十次修改（2026-11-26）
+    # bug 原因：load_dst 已经 _ti_norm 把 wN 转为 xN，导致 load_dst.startswith("x") 恒为 True，
+    #           把 ldr wN 错判成 8 字节；同时 ldrsh 也被误判成 8 字节。
+    # 解决方案：在 _ti_norm 前保留 raw_load_dst 原始寄存器位宽，区分 ldrsh(2B)/ldrsw(4B)/ldr w(4B)/ldr x(8B)。
     index_reg = _ti_ti_index_reg(ldr_ins.op_str)
-    entry_size = 4 if ldr_ins.mnemonic.startswith("ldrsw") or "w" in (ldr_ins.op_str or "") else 8
-    if ldr_ins.mnemonic == "ldr":
-        # ldr wN 取 4 字节、ldr xN 取 8 字节，看目标寄存器宽度
-        entry_size = 8 if load_dst.startswith("x") else 4
+    if ldr_ins.mnemonic == "ldrsh":
+        entry_size = 2
+    elif ldr_ins.mnemonic == "ldrsw":
+        entry_size = 4
+    elif ldr_ins.mnemonic == "ldr":
+        entry_size = _ti_reg_width(raw_load_dst)
+    else:
+        entry_size = 4 if _ti_reg_width(raw_load_dst) == 4 else 8
     count, bound_detail = _ti_table_count(insns, add_pos, index_reg)
 
     return {
@@ -1852,43 +1880,53 @@ def _ti_trace_table_base(insns, before_idx: int, reg: str, so):
 
     返回 (表地址, 说明, 是否确定)。求不出返回 (None, 说明, False)。
     """
-    offset_sum = 0
-
-    def _walk(candidates) -> tuple[int | None, object, str]:
-        """在候选指令（应已按"由近及远"排列）里推 base。返回 (base, 命中指令, 原因)。"""
-        acc = 0
+    # (21) 第二十一次修改（2026-11-26）
+    # bug 原因：① _walk 遇到 add 时未校验第一个源寄存器是否为 reg，会把 `add x12, x19, #imm`
+    #             这类来自其它寄存器的加法误当成 reg 自增偏移并继续往前回溯；
+    #           ② 跨函数第二次调用 _walk(reversed(earlier)) 时局部 acc 重新归零，丢掉本函数内
+    #             已累计的 add 页内偏移，导致表基址少了低 12 位。
+    # 解决方案：校验 add 源寄存器 == reg（不符即视为数据流屏障返回失败）；_walk 接受并返回
+    #           累计偏移 acc，跨函数回溯时延续第一段的 acc。
+    def _walk(candidates, init_acc: int = 0) -> tuple[int | None, object, str, int]:
+        """在候选指令（应已按"由近及远"排列）里推 base。返回 (base, 命中指令, 原因, 累计偏移)。"""
+        acc = int(init_acc)
         for ins in candidates:
             if not _ti_writes(ins, reg):
                 continue
             if ins.mnemonic == "add":
+                ops = [p.strip() for p in (ins.op_str or "").split(",")]
+                if len(ops) < 3 or _ti_norm(ops[0]) != reg or _ti_norm(ops[1]) != reg:
+                    return None, ins, f"取址链被 {ins.mnemonic} {ins.op_str} 覆盖", acc
+                if not ops[2].startswith("#"):
+                    return None, ins, f"add 偏移非立即数（{ins.op_str}）", acc
                 imm = _ti_imm(ins)
                 if imm is None:
-                    return None, ins, "add 立即数解析失败"
+                    return None, ins, "add 立即数解析失败", acc
                 acc += imm
                 continue
             if ins.mnemonic == "adrp":
                 page = _ti_imm(ins)
                 if page is None:
-                    return None, ins, "adrp 立即数解析失败"
-                return page + acc, ins, ""
+                    return None, ins, "adrp 立即数解析失败", acc
+                return page + acc, ins, "", acc
             if ins.mnemonic == "adr":
                 absv = _ti_imm(ins)
                 if absv is None:
-                    return None, ins, "adr 立即数解析失败"
-                return absv + acc, ins, ""
+                    return None, ins, "adr 立即数解析失败", acc
+                return absv + acc, ins, "", acc
             # 其它指令写 reg：取址链被覆盖，静态无法确定
-            return None, ins, f"取址链被 {ins.mnemonic} {ins.op_str} 覆盖"
-        return None, None, ""
+            return None, ins, f"取址链被 {ins.mnemonic} {ins.op_str} 覆盖", acc
+        return None, None, "", acc
 
     # ---- 第一段：本函数内该地址之前 ----
     inner = list(reversed(insns[:max(0, before_idx)]))
-    base, hit, why = _walk(inner)
+    base, hit, why, acc = _walk(inner, 0)
     if base is not None:
         return base, f"表基址 {reg}={base:#x}（来源 {hex(_ti_ins_addr(hit))}）", True
     if why:
         return None, why, False
 
-    # ---- 第二段：跨函数/跨块，按文件往更早的代码扫 ----
+    # ---- 第二段：跨函数/跨块，按文件往更早的代码扫（保留本函数内已累计的 acc）----
     if so is None:
         return None, "表基址需跨函数回溯，但拿不到 so 无法扫描", False
     fn_lo = _ti_ins_addr(insns[0]) if insns else 0
@@ -1900,7 +1938,7 @@ def _ti_trace_table_base(insns, before_idx: int, reg: str, so):
     if not earlier:
         return None, "跨函数回溯读不到更早的代码", False
 
-    base, hit, why = _walk(reversed(earlier))
+    base, hit, why, _acc2 = _walk(reversed(earlier), acc)
     if base is not None:
         return (base,
                 f"表基址 {reg}={base:#x}（跨函数回溯，来源 {hex(_ti_ins_addr(hit))}）",
@@ -2100,7 +2138,21 @@ def resolve_br(session, so_name: str, addr: int, lookback: int = 8,
         return {"ok": False, "code": "READ_FAILED",
                 "error": f"读不到 {so_name} 在 {start:#x} 的代码"}
 
-    insns = list(md.disasm(data, start))
+    # (22) 第二十二次修改（2026-11-26）
+    # bug 原因：裸 md.disasm(data, start) 遇到函数内联数据/跳转表/填充字时会立刻中止迭代，
+    #           漏掉内联数据之后的全部 br 指令。
+    # 解决方案：按 ARM64 4 字节对齐循环反汇编，遇不可解码字节跳过 4 字节继续向后解码。
+    insns = []
+    pos = 0
+    end_pos = len(data) - (len(data) % 4)
+    while pos < end_pos:
+        batch = list(md.disasm(data[pos:end_pos], start + pos))
+        if batch:
+            insns.extend(batch)
+            last_end = (int(batch[-1].address) - start) + int(batch[-1].size)
+            pos = max(pos + 4, last_end)
+        else:
+            pos += 4
     branches: list[dict] = []
     resolved = unresolved = 0
 
@@ -2321,10 +2373,12 @@ def read_jump_table(so_name: str, table_static_addr: int, entry_size: int = 4,
         return {"ok": False, "code": "SO_NOT_LOADED",
                 "error": f"{so_name} 未加载到 mda；先调 load_so"}
 
-    es = 8 if int(entry_size) == 8 else 4
+    es = int(entry_size) if int(entry_size) in (2, 4, 8) else 4
     n = max(1, min(int(count), 4096))
     source = "static"
     raw = b""
+    rt_mod_base = 0
+    rt_mod_size = 0
 
     # (13) 第十三次修改（2026-11-06）：支持从**运行时内存**读表。
     #      bug 原因：加固样本的跳转表常在运行时才被填入真实指针（实测
@@ -2410,15 +2464,33 @@ def read_jump_table(so_name: str, table_static_addr: int, entry_size: int = 4,
                     "else {"
                     "  try {"
                     "    var b = mod.base.add(TBL).readByteArray(N);"
-                    "    send({ok: true, base: mod.base.toString(), name: mod.name,"
+                    "    send({ok: true, base: mod.base.toString(), size: mod.size, name: mod.name,"
                     "          hex: b === null ? null : Array.from(new Uint8Array(b))"
                     "              .map(function(x){return x.toString(16).padStart(2,'0')}).join('')});"
                     "  } catch (e) { send({ok: false, code: 'READ_FAILED', err: String(e)}); }"
                     "}"
                 )
+                # (23) 第二十三次修改（2026-11-26）
+                # bug 原因：① sc.on("message") 未处理 type=="error" 消息，JS 报错时 box 始终为空，
+                #             白白空等 20 秒超时；
+                #           ② 脚本用完从未异步卸载，残留于目标进程；
+                #           ③ 8 字节运行时绝对指针表（code_base==0）未减模块基址，返回运行时大地址而非静态地址。
+                # 解决方案：捕获 error 立即填入 box 唤醒退出；finally 中异步卸载脚本；
+                #           8B 运行时指针落在本模块内时减去模块基址转静态偏移。
                 sc = sess0.create_script(js)
                 box: dict = {}
-                sc.on("message", lambda m, d: box.update(m.get("payload") or {}))
+
+                def _on_jtab_msg(m, d) -> None:
+                    if isinstance(m, dict) and m.get("type") == "error":
+                        box["ok"] = False
+                        box["code"] = "JS_ERROR"
+                        box["err"] = m.get("description") or m.get("stack") or "JS error"
+                        return
+                    payload = m.get("payload") if isinstance(m, dict) else None
+                    if isinstance(payload, dict):
+                        box.update(payload)
+
+                sc.on("message", _on_jtab_msg)
                 sc.load()
                 t1 = _t.time()
                 while not box and _t.time() - t1 < 20.0:
@@ -2427,14 +2499,25 @@ def read_jump_table(so_name: str, table_static_addr: int, entry_size: int = 4,
                     raw = bytes.fromhex(box["hex"])
                     source = "runtime"
                     _rb_base_used = box.get("base")
+                    try:
+                        rt_mod_base = int(str(_rb_base_used), 16) if _rb_base_used else 0
+                    except (TypeError, ValueError):
+                        rt_mod_base = 0
+                    try:
+                        rt_mod_size = int(box.get("size") or 0)
+                    except (TypeError, ValueError):
+                        rt_mod_size = 0
                 else:
                     raw = b""
             finally:
+                try:
+                    from server.dyn.rebase import unload_script_async
+
+                    if "sc" in locals() and sc is not None:
+                        unload_script_async(sc, timeout=2.0)
+                except Exception:                         # noqa: BLE001
+                    pass
                 # (18) 第十八次修改（2026-11-06）：detach 放守护线程。
-                #      bug 原因：session.detach() 在该设备上会永久阻塞
-                #               （已多次实测），写在 finally 里等于每次调用
-                #               都卡死。rebase.py 早就用守护线程绕开了，
-                #               这里遗漏。
                 try:
                     import threading as _th2
 
@@ -2456,12 +2539,20 @@ def read_jump_table(so_name: str, table_static_addr: int, entry_size: int = 4,
     base = int(code_base)
     for i in range(len(raw) // es):
         chunk = raw[i * es:(i + 1) * es]
-        if es == 4:
+        if es == 2:
+            v = _struct.unpack("<h" if signed else "<H", chunk)[0]
+        elif es == 4:
             v = _struct.unpack("<i" if signed else "<I", chunk)[0]
         else:
-            v = _struct.unpack("<q" if signed else "<Q", chunk)[0]
+            use_signed = bool(signed) and not (source == "runtime" and not base)
+            v = _struct.unpack("<q" if use_signed else "<Q", chunk)[0]
         offsets.append(v)
-        targets.append(base + v if base else v)
+        tgt_val = base + v if base else v
+        if (source == "runtime" and es == 8 and not base
+                and rt_mod_base > 0 and tgt_val >= rt_mod_base
+                and (rt_mod_size <= 0 or tgt_val < rt_mod_base + rt_mod_size)):
+            tgt_val = tgt_val - rt_mod_base
+        targets.append(tgt_val)
 
     return {
         "ok": True,

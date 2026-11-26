@@ -33,14 +33,9 @@ AI 调工具的返回走 MCP 给 AI 读，与本终端无关。不要再接旁�
 
 ## 两种模式（由调用方显式指定，不做内容推断）
 
-  once   执行 → 收集**所有**输出行 → unload。适合主动查询。
-  keep   执行后保持脚本存活，后续每次打印都推给终端，直到 stop()。
-
-## 两种模式（由调用方显式指定，不做内容推断）
-
-  once   执行 → 等首个 send 载荷 → 立刻 unload。适合主动查询
+  once   执行 → 收集该次脚本打印的全部输出行 → unload。适合主动查询
          （`Process.enumerateModules()`、`Memory.scanSync(...)` 这类）。
-  keep   执行后**保持脚本存活**，后续每次 `send()` 都推给控制台，
+  keep   执行后**保持脚本存活**，后续每次 `console.log()` / `send()` 都推给终端，
          直到调用 `stop()`。适合 `Interceptor.attach` 这类需要持续观测的场景。
 
 为什么不让模块自己看脚本内容判断：
@@ -63,11 +58,12 @@ import threading
 import time
 from dataclasses import dataclass, field
 
-# (2) 第二次修改（2026-11-20）：删除了 _current_tool / _hook_installed /
-# _hook_lock / _RATE_LIMIT / _rate_* 等一整套全局旁路所需的常量。
-# 原因：那套机制把工具内部数据传输也塞进终端，用户看到的是一坨模块 JSON。
-# _local 保留（run_js 用它标记"终端自己的脚本"）。
-_local = threading.local()
+from server.dyn.rebase import unload_script_async
+
+# (3) 第三次修改（2026-11-26）
+# bug 原因：模块顶部残留重复矛盾的"两种模式"文档段落，以及全局旁路删除后不再使用的
+#           _local 与 _jsonable 死代码。
+# 解决方案：合并清理文档，移除未使用的 _local 与 _jsonable，引入公共异步卸载辅助函数。
 
 # 常驻脚本表：key = (serial, pid) -> list[ConsoleScript]
 # 同一进程允许多个常驻脚本（用户可能先后挂两个不同 hook），每个可单独停。
@@ -161,10 +157,14 @@ class ConsoleScript:
     last_error: str = ""
     stop_reason: str = ""
 
+    # (4) 第四次修改（2026-11-26）
+    # bug 原因：stop() 同步调用 frida_script.unload()，在 frida 17.23.3 上可能永久阻塞，
+    #           且原 stop_js 在持有 _lock 时调 stop() 会与 _on_message 形成 AB-BA 死锁。
+    # 解决方案：改用带有限超时的异步卸载 unload_script_async，不阻塞调用方。
     def stop(self) -> None:
-        """卸载脚本。重复调用安全（frida 侧 unload 幂等）。"""
+        """卸载脚本（带超时守护线程，防 frida 同步 unload 卡死）。"""
         try:
-            self.frida_script.unload()
+            unload_script_async(self.frida_script, timeout=2.0)
             self.stop_reason = self.stop_reason or "stopped"
         except Exception as exc:                           # noqa: BLE001
             self.stop_reason = f"unload_failed: {exc}"
@@ -221,9 +221,22 @@ def run_js(serial: str, pid: int, js: str, mode: str = "once",
         return {"ok": False, "code": "NO_SESSION",
                 "error": "目标已附加但拿不到 frida 会话"}
 
+    # (5) 第五次修改（2026-11-26）
+    # bug 原因：① mode == "keep" 常驻脚本每次输出仍无限向闭包局部 box["lines"] append，
+    #             且永不释放，高频日志下必然 OOM；
+    #           ② box["lines"] 在 frida 回调线程写入、主线程读取，缺少锁保护；
+    #           ③ mode == "once" 结束后未清理 _counts[sid]，长期调用会泄漏字典项；
+    #           ④ once 结束同步调用 script.unload() 存在卡死风险。
+    # 解决方案：keep 模式不向 box["lines"] 追加（仅走有界 _emit 缓冲）；用局部 box_lock
+    #           保护 box 读写；once 结束异步 unload 并在 finally 中清理 _counts[sid]。
     sid = _new_id()
-    # box["lines"] 存**纯文本行**（终端语义），不再是原始 payload。
+    is_keep = (mode == "keep")
+    # 预先登记计数槽，stop_js / once 结束摘除后迟到消息不会再把 sid 重新塞回 _counts 造成泄漏
+    with _lock:
+        _counts[sid] = 0
+    # box["lines"] 仅在 once 模式下存纯文本行，keep 模式只走有界 _emit 环形缓冲
     box: dict = {"lines": [], "error": ""}
+    box_lock = threading.Lock()
     done = threading.Event()
 
     def _on_message(msg, data=None):
@@ -231,17 +244,23 @@ def run_js(serial: str, pid: int, js: str, mode: str = "once",
             return
         mtype = msg.get("type")
         if mtype == "error":
-            box["error"] = (msg.get("description") or "").strip() or str(msg)
-            _emit("error", script_id=sid, error=box["error"],
+            err_msg = (msg.get("description") or "").strip() or str(msg)
+            if not is_keep:
+                with box_lock:
+                    box["error"] = err_msg
+            _emit("error", script_id=sid, error=err_msg,
                   stack=msg.get("stack"))
             done.set()
             return
         if mtype == "log":
             # frida 原生 log（少数版本会走这条），直接当文本行
             text = str(msg.get("payload") or "")
-            box["lines"].append(text)
+            if not is_keep:
+                with box_lock:
+                    box["lines"].append(text)
             with _lock:
-                _counts[sid] = _counts.get(sid, 0) + 1
+                if sid in _counts:
+                    _counts[sid] += 1
             _emit("line", script_id=sid, text=text)
             done.set()
             return
@@ -249,38 +268,25 @@ def run_js(serial: str, pid: int, js: str, mode: str = "once",
             return
         # 每条输出变成一行纯文本——终端里 console.log/send 打印什么就显示什么
         text = _line_text(msg.get("payload"))
-        box["lines"].append(text)
+        if not is_keep:
+            with box_lock:
+                box["lines"].append(text)
         with _lock:
-            _counts[sid] = _counts.get(sid, 0) + 1
+            if sid in _counts:
+                _counts[sid] += 1
         _emit("line", script_id=sid, serial=serial, pid=int(pid), text=text)
         done.set()
 
-    # 只注入 console.log 重定向（frida 消息通道所必需），
-    # **不再包 eval wrapper**——用户要的是 frida 自己吐出来的结果，
-    # 不是我用 eval 算完再套一层 {__result: ...} 的转述。
-    # (1) 第一次修改（2026-11-19）：删掉 _JS_RESULT_WRAPPER。
-    #     bug 原因：为了"裸表达式也能显示值"，我给脚本套了
-    #               eval('(' + CODE + ')') 再 send({__result: ...})。
-    #               用户要的是 frida 的执行结果；这层包装等于我用自己
-    #               的求值替换了 frida 的求值，输出的是"我算的结果"。
-    #               而且它还会改写用户脚本的作用域与错误堆栈。
-    #     解决方案：脚本原样注入，不 eval、不封装。
-    #               脚本要出结果就自己 send() / console.log() —— 这是
-    #               frida 脚本的本来写法。
+    # 只注入 console.log 重定向（frida 消息通道所必需），原样执行脚本不套包装。
     full_js = _JS_REDIRECT + "\n" + js
 
     try:
-        # (1) 标记当前线程是"终端自己执行"，全局 hook 会跳过旁路——
-        #     否则这段脚本的输出会被 run_js 自己 push 一次、又被 hook 旁路一次，
-        #     终端里同一行显示两遍。
-        _local.in_console = True
-        try:
-            script = session.create_script(full_js)
-            script.on("message", _on_message)
-            script.load()
-        finally:
-            _local.in_console = False
+        script = session.create_script(full_js)
+        script.on("message", _on_message)
+        script.load()
     except Exception as exc:                               # noqa: BLE001
+        with _lock:
+            _counts.pop(sid, None)
         err = str(exc)
         _emit("error", script_id=sid, error=err)
         return {"ok": False, "code": "LOAD_FAILED", "error": err,
@@ -288,7 +294,7 @@ def run_js(serial: str, pid: int, js: str, mode: str = "once",
 
     t0 = time.monotonic()
 
-    if mode == "keep":
+    if is_keep:
         cs = ConsoleScript(script_id=sid, serial=serial, pid=int(pid),
                            frida_script=script, mode="keep")
         with _lock:
@@ -300,68 +306,72 @@ def run_js(serial: str, pid: int, js: str, mode: str = "once",
                         "用完点「停止」或调 stop 释放"}
 
     # once：等首个输出（或错误），超时就如实报告没有输出
-    got = done.wait(timeout=max(float(timeout), 0.1))
-    # (1) 修订：首个输出到达后再给一点点时间收集同一批的后续输出。
-    #     bug 原因：脚本里连续 console.log 三行时，原实现只等第一行就
-    #               unload——终端里只显示第一行，后两行永远看不到。
-    #     解决方案：首行到达后再等 0.15s 收集剩余行（一次性脚本通常瞬间打完），
-    #              然后 unload，返回**全部**文本行。
-    if got and not box["error"]:
-        time.sleep(0.15)
-    ms = round((time.monotonic() - t0) * 1000, 1)
     try:
-        script.unload()
-    except Exception:                                      # noqa: BLE001
-        pass
+        got = done.wait(timeout=max(float(timeout), 0.1))
+        # 首行到达后再给 0.15s 收集同一批后续输出
+        with box_lock:
+            has_err = bool(box["error"])
+        if got and not has_err:
+            time.sleep(0.15)
+        ms = round((time.monotonic() - t0) * 1000, 1)
+        unload_script_async(script, timeout=2.0)
+        with box_lock:
+            err_text = box["error"]
+            lines = list(box["lines"])
+    finally:
+        with _lock:
+            _counts.pop(sid, None)
 
-    if box["error"]:
-        return {"ok": False, "code": "SCRIPT_ERROR", "error": box["error"],
-                "script_id": sid, "ms": ms, "lines": box["lines"]}
-    if not got or not box["lines"]:
+    if err_text:
+        return {"ok": False, "code": "SCRIPT_ERROR", "error": err_text,
+                "script_id": sid, "ms": ms, "lines": lines}
+    if not got or not lines:
         return {"ok": False, "code": "NO_OUTPUT",
                 "error": f"等待 {timeout}s 内脚本没有打印任何内容"
                          f"（脚本可能正常执行完了，但没有 console.log/send；"
                          f"要持续观测请用 mode=keep）",
                 "script_id": sid, "ms": ms, "lines": []}
     return {"ok": True, "script_id": sid, "mode": "once", "ms": ms,
-            "lines": box["lines"]}
+            "lines": lines}
 
 
+# (6) 第六次修改（2026-11-26）
+# bug 原因：原 stop_js 在持有 _lock 期间直接调用 cs.stop() -> frida_script.unload()，
+#           而 frida 回调线程的 _on_message 需要获取 _lock 更新 _counts，形成典型 AB-BA 死锁。
+# 解决方案：在 _lock 内仅摘除要停止的 ConsoleScript 列表并清理对应 _counts，
+#           完全释放 _lock 之后再逐个调用 cs.stop() 执行异步卸载。
 def stop_js(script_id: int | None = None, serial: str = "",
             pid: int = 0) -> dict:
     """停止常驻脚本。给 script_id 停单个；否则停该 (serial,pid) 下全部。"""
-    stopped = []
+    to_stop: list[ConsoleScript] = []
     with _lock:
         if script_id:
             for key, lst in list(_scripts.items()):
-                for cs in list(lst):
+                kept = []
+                for cs in lst:
                     if cs.script_id == script_id:
-                        cs.stop()
-                        lst.remove(cs)
-                        stopped.append(cs.script_id)
-                if not lst:
+                        to_stop.append(cs)
+                    else:
+                        kept.append(cs)
+                if kept:
+                    _scripts[key] = kept
+                else:
                     _scripts.pop(key, None)
         elif serial and pid:
-            lst = _scripts.get((serial, int(pid)), [])
-            for cs in list(lst):
-                cs.stop()
-                stopped.append(cs.script_id)
-            _scripts.pop((serial, int(pid)), None)
+            to_stop = list(_scripts.pop((serial, int(pid)), []))
         else:
-            for key, lst in list(_scripts.items()):
-                for cs in list(lst):
-                    cs.stop()
-                    stopped.append(cs.script_id)
+            for lst in _scripts.values():
+                to_stop.extend(lst)
             _scripts.clear()
-    if not stopped:
+        for cs in to_stop:
+            _counts.pop(cs.script_id, None)
+    if not to_stop:
         return {"ok": False, "code": "NOT_FOUND",
                 "error": "没有匹配的常驻脚本（可能已经停止或 id 不对）"}
-    # (1) 第一次修改（2026-11-19）：停掉的脚本要把计数一起清掉。
-    #     bug 原因：_counts 只增不删，长时间反复挂/停会无界增长（内存泄漏）。
-    #     解决方案：与脚本生命周期同步释放。
-    with _lock:
-        for s in stopped:
-            _counts.pop(s, None)
+    stopped: list[int] = []
+    for cs in to_stop:
+        cs.stop()
+        stopped.append(cs.script_id)
     return {"ok": True, "stopped": stopped, "count": len(stopped)}
 
 
@@ -388,23 +398,3 @@ def list_scripts() -> list[dict]:
                     "messages": _counts.get(cs.script_id, 0),
                 })
     return out
-
-
-def _jsonable(value):
-    """把 frida 传来的值整理成可 JSON 序列化的形态。
-
-    NativePointer / ArrayBuffer 这类对象直接做 JSON 序列化会炸，
-    这里统一转字符串并在必要时截断——控制台要的是"能看懂"，
-    不是完整二进制。截断会明确标注（不静默丢）。
-    """
-    try:
-        if isinstance(value, (str, int, float, bool)) or value is None:
-            return value
-        if isinstance(value, (list, tuple)):
-            return [_jsonable(v) for v in value[:200]]
-        if isinstance(value, dict):
-            return {str(k): _jsonable(v) for k, v in list(value.items())[:200]}
-        text = str(value)
-        return text[:2000]
-    except Exception:                                      # noqa: BLE001
-        return "<unserializable>"

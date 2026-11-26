@@ -25,6 +25,7 @@ from __future__ import annotations
 
 from collections import Counter
 
+from server.core.addr import parse_addr
 from server.core.plugins import PluginBase
 
 
@@ -68,49 +69,59 @@ class Plugin(PluginBase):
             return {"error": str(exc),
                     "code": getattr(exc, "mda_code", "SO_NOT_LOADED")}
 
-        a = args["addr"]
-        root = int(str(a), 16) if isinstance(a, str) and \
-               str(a).lower().startswith("0x") else int(a)
+        # (3) 第三次修改（2026-11-26）
+        # bug 原因：1) addr 未使用 parse_addr 且未捕获非 ARM64 架构 ValueError；
+        #           2) callees 未去重导致同一函数多次调用时 callees/hubs/cross_so 重复膨胀；
+        #           3) mod_lo/mod_hi 只看 sections，无节表时失效；
+        #           4) indirect_only 未真正过滤掉已有直接 bl 调用者的函数。
+        # 解决方案：使用 parse_addr 并捕获非 ARM64 返 UNSUPPORTED_ARCH；对 callees 按目标去重；
+        #           mod_lo/mod_hi 增加 so._loads 兜底；indirect_only 基于直接调用入边过滤掉有 bl 调用者者。
+        root = parse_addr(args["addr"])
+        if root is None:
+            return {"ok": False, "code": "BAD_ADDR",
+                    "error": f"非法地址参数 addr={args['addr']!r}"}
         depth = int(args.get("depth", 3))
         max_nodes = int(args.get("max_nodes", 200))
         # (1) 第一次修改（2026-11-18）：vtable 间接边（见 _vtable_edges）
         include_vtable = bool(args.get("include_vtable", True))
         vt_edges = self._vtable_edges(so) if include_vtable else {}
 
-        # 用 session 的 xref 模型取 callee
+        # 用 session 的 xref 模型取 callee（使用规范名 so.name）
         try:
-            xr = session.xref(so_name)
+            xr = session.xref(so.name)
+        except ValueError as exc:
+            return {"ok": False, "code": "UNSUPPORTED_ARCH", "error": str(exc)}
         except Exception as exc:                          # noqa: BLE001
             return {"error": f"取引用模型失败：{exc}", "code": "NO_XREF"}
 
         def callees(addr):
-            """返回 [(目标地址, via)]。via 为 'bl' 或 'vtable@槽'。
-
-            ## 为什么 vtable 边算在「被指向的函数」上而不是「调用者」上
-
-            `ldr x8,[x0,#8]; blr x8` 里，x0 来自哪里、运行时指向哪个 vtable，
-            静态**算不出来**（要数据流 + 对象布局）。能确定的事实只有一条：
-            「槽 S 里存着函数 F 的地址」。
-
-            所以本插件不假装知道"谁调了 F"，而是给出**入边**：
-            F 的 incoming 里多一条 `kind=vtable, slot=S`。这既诚实
-            （有据可查：重定位表），又正好回答使用者的问题——
-            "这个函数没有任何 bl 引用，它是被谁指向的？" 答：vtable 槽 S。
-            """
+            """返回去重后的 [(目标地址, via)]。via 为 'bl' 或 'vtable@槽'。"""
             out = []
+            seen_targets: set[int] = set()
             try:
                 # bl 目标在 .call_target（xrefs_from 返回 Instruction 列表）
                 insns = xr.xrefs_from(addr) or []
                 for ins in insns:
                     t = getattr(ins, "call_target", None)
                     if t is not None:
-                        out.append((int(t), "bl"))
+                        ti = int(t)
+                        if ti not in seen_targets:
+                            seen_targets.add(ti)
+                            out.append((ti, "bl"))
             except Exception:                             # noqa: BLE001
                 pass
             return out
 
-        mod_lo = min([s.addr for s in getattr(so, "sections", [])] or [0])
-        mod_hi = max([s.addr + s.size for s in getattr(so, "sections", [])] or [1 << 63])
+        loads = getattr(so, "_loads", []) or []
+        secs = [s for s in getattr(so, "sections", []) if getattr(s, "size", 0)]
+        if loads:
+            mod_lo = min(a for a, _b, _o, _f in loads)
+            mod_hi = max(b for _a, b, _o, _f in loads)
+        elif secs:
+            mod_lo = min(s.addr for s in secs)
+            mod_hi = max(s.addr + s.size for s in secs)
+        else:
+            mod_lo, mod_hi = 0, 1 << 63
         cross_so = []
         visited: dict[int, int] = {}
         tree = []
@@ -144,7 +155,7 @@ class Plugin(PluginBase):
                 node["callees"].append(hex(c))
                 if not (mod_lo <= c < mod_hi):
                     cross_so.append({"from": hex(addr), "to": hex(c),
-                                     "note": "目标本 so 范围内，可能在其它 so 或 PLT"})
+                                     "note": "目标不在本 so 范围内，可能在其它 so 或 PLT"})
                 else:
                     walk(c, d + 1, hex(addr))
 
@@ -158,12 +169,14 @@ class Plugin(PluginBase):
         hubs = [{"addr": a, "incoming": n} for a, n in incoming.most_common(5)]
         leaves = [n for n in tree if not n["callees"]]
 
-        # (1) 全库 vtable 反查：没有 bl 调用者、只被函数指针表指向的函数。
-        #     这些函数在只看 bl 边时会显得"凭空存在又无人引用"。
+        # (1)(3) 全库 vtable 反查：过滤掉已有直接 bl 调用者的函数，只保留纯间接引用者。
+        direct_calls = xr.calls_to if vt_edges else {}
         indirect_only = []
         for tgt, slots in vt_edges.items():
             fn = so.function_at(tgt)
             if fn is None:
+                continue
+            if direct_calls.get(tgt) or direct_calls.get(fn.addr):
                 continue
             indirect_only.append({
                 "addr": hex(tgt),

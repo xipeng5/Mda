@@ -324,6 +324,13 @@ class Session:
         self.modules[key] = so
         so.name = key
         so.renamed_from = renamed_from
+        # (5) 第五次修改（2026-11-26）
+        # bug 原因：重名加载改写 so.name = key 后，SoFile._parse_functions 期间已生成的
+        #           Function.so_name 仍停留在旧名字，导致上层按 fn.so_name 索引或展示错乱。
+        # 解决方案：重命名时同步更新所有已有函数的 fn.so_name = key。
+        if renamed_from is not None:
+            for fn in so.functions.values():
+                fn.so_name = key
 
         for name, sym in so.exports.items():
             if sym.is_func and sym.addr > 0:
@@ -550,19 +557,38 @@ class Session:
                       别名进来时会在构建的最后一步（字符串归并）才炸。
             解决方案：方法开头一次性换成规范键，后续全部用 key。
         """
-        _so, key = self.resolve(name)
+        # (5) 第五次修改（2026-11-26）
+        # bug 原因：① ensure_xrefs 未先将 use_prologue 归一进 aggressive 就写入 x.discover_tier，
+        #           导致传 use_prologue=True 时记录的 discover_tier['aggressive'] 仍为 False；
+        #           ② 当 x._built 已为 True 时，后续 discover_functions 新增函数或切分宿主后
+        #           x.build() 直接短路返回且 strings._annotated 仍为 True，引用图与字符串引用
+        #           从未重建，新函数调用边和切分后的归属长期陈旧。
+        # 解决方案：先归一 use_prologue -> aggressive；若本次 discover 新增函数（added > 0）
+        #           或函数表 (addr, size) 快照相对上次建图发生变化，则调用 x.reset() 与
+        #           strings.reset_annotations() 后重新构建。
+        so, key = self.resolve(name)
+        if use_prologue is not None:
+            aggressive = bool(use_prologue)
         x = self.xref(key)
+        disc_added = 0
         if discover:
             # 阶段一：递归函数发现（0-15%）。这一步会明显改变函数数，
             # 是"为什么这么慢"的主要来源之一，必须让调用方看见。
             if progress:
                 progress(0, 100, "函数发现")
-            self.discover_functions(key, aggressive=aggressive,
-                                    strict_prologue=strict_prologue,
-                                    use_rela=use_rela,
-                                    use_prologue=use_prologue)
+            disc_res = self.discover_functions(key, aggressive=aggressive,
+                                               strict_prologue=strict_prologue,
+                                               use_rela=use_rela,
+                                               use_prologue=use_prologue)
+            disc_added = int(disc_res.get("added", 0) or 0)
             if progress:
                 progress(15, 100, "函数发现完成")
+
+        if x._built:
+            cur_sig = tuple(sorted((a, f.size) for a, f in so.functions.items()))
+            if disc_added > 0 or (x._built_fn_sig is not None and x._built_fn_sig != cur_sig):
+                x.reset()
+                self._strings[key].reset_annotations()
 
         # 阶段二：逐函数反汇编收集（15-85%）
         def _bridge(done: int, total: int) -> None:
@@ -577,8 +603,8 @@ class Session:
         #               以为"激进模式也没多出函数"，实际是被缓存吞了。
         #     解决方案：把档位挂在 Xref 实例上，让上层能如实对比并提示。
         x.discover_tier = {"aggressive": bool(aggressive),
-                          "strict_prologue": bool(strict_prologue),
-                          "use_rela": bool(use_rela)}
+                           "strict_prologue": bool(strict_prologue),
+                           "use_rela": bool(use_rela)}
         x.build(progress=_bridge if progress else None)
 
         # 阶段三：字符串归并（85-100%）
@@ -635,6 +661,10 @@ class Session:
 
     # ---------- 跨 so 符号解析 ----------
 
+    # (5) 第五次修改（2026-11-26）
+    # bug 原因：resolve_import 与 resolve_call 直接拿原始 so_name 与 _export_index 的规范键比较，
+    #           调用方传别名（如 log.so / 带路径）时会误判“非本 so”或在 CallLink 中写入非规范名。
+    # 解决方案：先经 _resolve_key / resolve 归一化为内部规范键 key，再进行比对和构造 CallLink。
     def resolve_import(self, so_name: str, symbol: str) -> tuple[str, int] | None:
         """解析某 so 的导入符号实际落在哪个 so 的哪个地址。
 
@@ -644,20 +674,22 @@ class Session:
         cands = self._export_index.get(symbol)
         if not cands:
             return None
+        key = self._resolve_key(so_name) or so_name
         # 同名导出时优先非本 so 的（调用方通常不会调用自己的导入）
-        mine = [c for c in cands if c[0] != so_name]
+        mine = [c for c in cands if c[0] != key]
         return (mine or cands)[0]
 
     def resolve_call(self, so_name: str, target: int) -> CallLink | None:
         """把 so 内的一个调用目标解析为跨 so 的 CallLink。"""
-        so = self.get(so_name)
+        key = self._resolve_key(so_name)
+        so, key = self.resolve(key or so_name)
         fn = so.function_at(target)
         if fn is not None:
             return CallLink(
-                caller_so=so_name,
+                caller_so=key,
                 caller=fn.name or f"sub_{fn.addr:x}",
                 caller_addr=fn.addr,
-                callee_so=so_name,
+                callee_so=key,
                 callee=fn.name or f"sub_{fn.addr:x}",
                 callee_addr=fn.addr,
             )
@@ -665,7 +697,7 @@ class Session:
         imp = so.plt_name(target)
         if imp:
             link = CallLink(
-                caller_so=so_name,
+                caller_so=key,
                 caller=imp + "@plt",
                 caller_addr=target,
                 callee_so="",
@@ -673,7 +705,7 @@ class Session:
                 callee_addr=0,
                 via_plt=True,
             )
-            resolved = self.resolve_import(so_name, imp)
+            resolved = self.resolve_import(key, imp)
             if resolved:
                 link.callee_so, link.callee_addr = resolved
             return link
@@ -685,7 +717,7 @@ class Session:
         # 不臆造真实符号名；callee_addr=0 表示外部，调用方据此可提示未解析。
         if so.in_plt_stub(target):
             return CallLink(
-                caller_so=so_name,
+                caller_so=key,
                 caller="",
                 caller_addr=target,
                 callee_so="",
@@ -885,13 +917,28 @@ class Session:
         #                  还在，gc 回收不掉，所以实测卸载后只回收 0.6/23 MB。
         #        解决方案：pop 之前**先把 Xref / StringAnalyzer 内部的大容器清空**，
         #                  再断开它们对 so 的引用，最后才从字典移除。
+        # (5) 第五次修改（2026-11-26）
+        # bug 原因：unload() 时未清理 xref_obj.disasm（内含 _range_cache 与对 SoFile 的引用）、
+        #           未断开 so._rela_table 与 so._elf 对象引用，也未清除 self.comments/self.patches
+        #           里该模块的条目，导致卸载后残留引用与陈旧标注。
+        # 解决方案：递归清理 xref_obj.disasm 并断开引用，移除 comments/patches 中该模块键，
+        #           并在 _break_references 中显式清理并置空 _rela_table / _elf / _dwarf_cfi_cache。
         xref_obj = self._xrefs.pop(key, None)
         strs_obj = self._strings.pop(key, None)
+        if xref_obj is not None:
+            disasm_obj = getattr(xref_obj, "disasm", None)
+            if disasm_obj is not None:
+                self._purge_helper(disasm_obj)
+                xref_obj.disasm = None
         self._purge_helper(xref_obj)
         self._purge_helper(strs_obj)
 
         self.modules.pop(key, None)
         self._import_edges.pop(key, None)
+        for ck in [k for k in self.comments if k[0] == key]:
+            self.comments.pop(ck, None)
+        for pk in [k for k in self.patches if k[0] == key]:
+            self.patches.pop(pk, None)
         # (1) 第一次修改（2026-11-18）：签名是元组，逐个档位清除。
         for _sig in [t for t in self._discovered if t[0] == key]:
             self._discovered.discard(_sig)
@@ -1093,7 +1140,7 @@ class Session:
                      "exports", "strings", "relocations", "plt",
                      "loads", "_raw", "data",
                      # (3) 补漏的字段
-                     "_cache", "_elf", "_starts", "_loads",
+                     "_cache", "_starts", "_loads",
                      "plt_map", "plt_stubs", "_stub_sorted",
                      "_func_ranges", "_segments", "_phdrs"):
             obj = getattr(so, attr, None)
@@ -1111,10 +1158,27 @@ class Session:
                     n += 1
             except Exception:                             # noqa: BLE001
                 continue
+        # (5) 第五次修改（2026-11-26）：断开对象型缓存引用（无 clear 方法，此前未能置空）
+        rela_tbl = getattr(so, "_rela_table", None)
+        if rela_tbl is not None:
+            n += Session._purge_helper(rela_tbl)
+            try:
+                so._rela_table = None
+                n += 1
+            except Exception:                             # noqa: BLE001
+                pass
+        for obj_attr in ("_elf", "_dwarf_cfi_cache"):
+            if getattr(so, obj_attr, None) is not None:
+                try:
+                    setattr(so, obj_attr, None)
+                    n += 1
+                except Exception:                         # noqa: BLE001
+                    pass
         try:
             sol = getattr(so, "_stream", None)
             if sol is not None:
                 sol.close()
+                so._stream = None
                 n += 1
         except Exception:                                 # noqa: BLE001
             pass

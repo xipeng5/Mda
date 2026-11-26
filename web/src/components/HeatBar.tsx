@@ -13,21 +13,36 @@ import { api, type ApiHeatmap } from "../lib/api";
 
 type Props = {
   so: string;
+  /** 引用图是否已构建，变化时自动重新拉取真实引用密度 */
+  xrefBuilt?: boolean;
   onPickAddr?: (addr: number) => void;
 };
 
-export function HeatBar({ so, onPickAddr }: Props) {
+// (1) 第一次修改（2026-11-26）
+// bug 原因：① 异步拉取 heatmap 缺少取消标志，快速切换 so 时旧结果会覆盖新模块热力条；
+//           ② 后端未建引用图时快速返回函数密度，前端需如实标注避免误导用户。
+// 解决方案：useEffect 增加 alive 取消标志；根据 data.xref_built 区分展示"引用"与"函数密度"。
+export function HeatBar({ so, xrefBuilt, onPickAddr }: Props) {
   const [data, setData] = useState<ApiHeatmap | null>(null);
   const [hover, setHover] = useState<number | null>(null);
   const boxRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
-    if (!so) return;
+    if (!so) {
+      setData(null);
+      return;
+    }
+    let alive = true;
+    setData(null);
     void (async () => {
       const r = await api.heatmap(so);
+      if (!alive) return;
       if (r) setData(r);
     })();
-  }, [so]);
+    return () => {
+      alive = false;
+    };
+  }, [so, xrefBuilt]);
 
   const maxRefs = data?.max_refs ?? 0;
 
@@ -81,8 +96,10 @@ export function HeatBar({ so, onPickAddr }: Props) {
             }}
             title={
               addrAt
-                ? `0x${addrAt(i)[0].toString(16)} – 0x${addrAt(i)[1].toString(16)} · 引用 ${v}`
-                : `引用 ${v}`
+                ? `0x${addrAt(i)[0].toString(16)} – 0x${addrAt(i)[1].toString(16)} · ${
+                    data.xref_built === false ? "函数" : "引用"
+                  } ${v}`
+                : `${data.xref_built === false ? "函数" : "引用"} ${v}`
             }
           />
         ))}
@@ -93,6 +110,7 @@ export function HeatBar({ so, onPickAddr }: Props) {
         <span><i style={{ background: "var(--hot2)" }} />温</span>
         <span><i style={{ background: "var(--hot1)" }} />冷</span>
         <span className="r">
+          {data.xref_built === false ? "函数密度（未建引用图） · " : ""}
           {data.functions} 个函数 · {data.lo} → {data.hi}
           {hover != null && addrAt ? ` · 指向 0x${addrAt(hover)[0].toString(16)}` : ""}
         </span>

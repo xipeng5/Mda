@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import importlib.util
+import sys
 from pathlib import Path
 
 from server.core.session import Session
@@ -52,7 +53,26 @@ class PluginManager:
         self.log = log or (lambda text: None)
         self.plugins: dict[str, PluginBase] = {}
         self._hooks: dict[str, list] = {}
+        # 记录每个插件注册的钩子，重载/同名替换时用于精确清理旧钩子
+        self._plugin_hooks: dict[str, dict] = {}
 
+    def _unregister_hooks(self, name: str) -> None:
+        """移除指定插件此前注册的所有事件回调，避免重载/同名覆盖导致钩子重复。"""
+        old = self._plugin_hooks.pop(name, None)
+        if not old:
+            return
+        for event, cb in old.items():
+            lst = self._hooks.get(event)
+            if lst:
+                self._hooks[event] = [x for x in lst if x is not cb]
+
+    # (1) 第一次修改（2026-11-26）
+    # bug 原因：① exec_module 前未把模块注册到 sys.modules，导致插件内使用 dataclass /
+    #           get_type_hints 时按 __module__ 查表失败；② 在 inst.hooks() 调用前就写入
+    #           self.plugins[inst.name]，hooks() 抛异常会残留半注册实例；③ 重复加载或同名
+    #           覆盖插件时未清理旧钩子，导致同一事件被重复触发。
+    # 解决方案：exec_module 前写入 sys.modules（失败则回滚）；先完整执行 init() 和 hooks()
+    #           后再原子写入 plugins 与 _hooks；写入前通过 _unregister_hooks 清除旧同名钩子。
     def scan_and_load(self) -> list[str]:
         """加载 plugins/ 目录全部 .py，返回加载的插件名。"""
         loaded = []
@@ -61,11 +81,17 @@ class PluginManager:
         for path in sorted(PLUGIN_DIR.glob("*.py")):
             if path.name.startswith("_"):
                 continue
+            mod_name = f"mda_plugin_{path.stem}"
             try:
-                spec = importlib.util.spec_from_file_location(f"mda_plugin_{path.stem}", path)
+                spec = importlib.util.spec_from_file_location(mod_name, path)
+                if spec is None or spec.loader is None:
+                    self.log(f"[插件] 无法构造模块 spec: {path.name}")
+                    continue
                 mod = importlib.util.module_from_spec(spec)
+                sys.modules[spec.name] = mod
                 spec.loader.exec_module(mod)
             except Exception as e:
+                sys.modules.pop(mod_name, None)
                 self.log(f"[插件] 加载失败 {path.name}: {e}")
                 continue
             # 约定：模块内定义 Plugin 类
@@ -75,13 +101,17 @@ class PluginManager:
             try:
                 inst = cls()
                 inst.init(self.session, self.log)
-                self.plugins[inst.name] = inst
-                for event, cb in inst.hooks().items():
-                    self._hooks.setdefault(event, []).append(cb)
-                loaded.append(inst.name)
-                self.log(f"[插件] 已加载: {inst.name} — {inst.description}")
+                hooks = dict(inst.hooks() or {})
             except Exception as e:
                 self.log(f"[插件] 初始化失败 {path.name}: {e}")
+                continue
+            self._unregister_hooks(inst.name)
+            self.plugins[inst.name] = inst
+            self._plugin_hooks[inst.name] = hooks
+            for event, cb in hooks.items():
+                self._hooks.setdefault(event, []).append(cb)
+            loaded.append(inst.name)
+            self.log(f"[插件] 已加载: {inst.name} — {inst.description}")
         return loaded
 
     def emit(self, event: str, payload=None) -> None:

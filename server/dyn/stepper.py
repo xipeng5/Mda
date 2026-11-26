@@ -45,9 +45,14 @@ INSN_SIZE = 4          # ARM64 指令定长
 _SCAN_CHUNK = 4096     # 静态扫描分块字节数（一次读、一次解码，减少 IO）
 
 # ---- 分支分类表（按 capstone 助记符归组，避免各处重复写 set） ----
-# 无条件直接跳转：目标在指令里，但下一条指令不会执行
-# 无条件直接跳转。含 b.al（always）与带指针认证的直接跳转。
-_UNCOND_DIRECT = frozenset({"b", "b.al", "braa", "braaz"})
+# (12) 第十二次修改（2026-11-26）
+# bug 原因：braa/braaz 被误放进 _UNCOND_DIRECT，且 _classify 先查 _UNCOND_DIRECT 再查
+#           _INDIRECT_JUMP，导致这两条带 PAC 的间接跳转被误判为无条件直接跳转（target=None），
+#           在 plan_step_over 格式化 f"{target:#x}" 时抛 TypeError。
+# 解决方案：从 _UNCOND_DIRECT 移除 braa/braaz（仅保留在 _INDIRECT_JUMP），并在格式化
+#           直接分支目标处防御 target is None。
+# 无条件直接跳转：目标在指令里，但下一条指令不会执行（含 b.al）
+_UNCOND_DIRECT = frozenset({"b", "b.al"})
 # 条件直接跳转：目标在指令里，但走哪边取决于运行时标志位
 # (2) 第二次修改（2026-11-02）：补齐 b.hs / b.lo。
 #     bug 原因：ARM64 的条件码 0b0010/0b0011 有**两个别名**——hs==cs、lo==cc。
@@ -413,14 +418,68 @@ def plan_step_over(debugger, so_name: str, static_addr: int,
     base = {"instruction": snap, "next_addr": next_addr, **_session_note(debugger)}
 
     if kind == "ret":
-        # (9) 第九次修改（2026-11-05）：`if lr:` 会把 lr=0 当成"没给"。
-        #     改成显式判 None，并把非 int 的情况包成可读错误而不是 ValueError 逃逸。
+        # (13) 第十三次修改（2026-11-26）
+        # bug 原因：原实现直接把调用方传入的运行时 lr（int(lr)）当成静态 temp_breakpoint_addr 返回，
+        #           且不支持十六进制字符串；后续 set_breakpoint 再加基址导致二次加基址打到野地址。
+        # 解决方案：用 parse_addr 解析 lr，有 debugger.rb 时经 _runtime_to_static 换算静态偏移；
+        #           无 rb 且 lr 明显是模块范围外的运行时地址时，与 plan_step_out 一致返回
+        #           LR_STATIC_UNRESOLVED。
         if lr is not None:
+            from server.core.addr import parse_addr
+
+            parsed_lr = parse_addr(lr, None)
+            if parsed_lr is None:
+                return _fail("temp_breakpoint_at_lr", "BAD_LR",
+                             f"LR 值非法（{lr!r}），无法规划 step over", **base)
+            if parsed_lr <= 0:
+                return _fail("temp_breakpoint_at_lr", "BAD_LR",
+                             f"LR 值为 {parsed_lr:#x}，不是有效返回地址", **base)
+            if parsed_lr % INSN_SIZE:
+                return _fail("temp_breakpoint_at_lr", "LR_NOT_ALIGNED",
+                             f"LR 值 {parsed_lr:#x} 未按 4 字节对齐，不可能是 ARM64 指令地址", **base)
+
+            regions = so.exec_regions() if so is not None else []
+            max_end = max((int(end) for _va, end, _o, _f in regions), default=0)
+            in_static_range = (0 < parsed_lr < max_end) if max_end > 0 else False
+
+            rb = getattr(debugger, "rb", None)
+            if rb is not None:
+                static_lr, base_note = _runtime_to_static(debugger, so_name, parsed_lr)
+                if static_lr is not None and static_lr >= 0:
+                    return _ok(
+                        "temp_breakpoint_at_lr", static_lr,
+                        f"当前是 ret，返回地址取自运行时 LR（静态 {static_lr:#x}，运行时 {parsed_lr:#x}），"
+                        "在 LR 处下临时断点即等价于 step out",
+                        resolvable=True, next_will_execute=True,
+                        lr=static_lr, runtime_lr=parsed_lr, **base,
+                    )
+                if in_static_range:
+                    return _ok(
+                        "temp_breakpoint_at_lr", parsed_lr,
+                        f"当前是 ret，使用静态 LR（{parsed_lr:#x}）作为临时断点",
+                        resolvable=True, next_will_execute=True,
+                        lr=parsed_lr, **base,
+                    )
+                return _fail(
+                    "temp_breakpoint_at_lr", "LR_STATIC_UNRESOLVED",
+                    f"拿不到 {so_name} 的有效运行时基址（{base_note or '换算失败'}），"
+                    f"无法把运行时 LR {parsed_lr:#x} 换算成静态地址",
+                    **base,
+                )
+            # 无 rb 时：仅当 lr 明显处于本模块静态区间内才直接视为静态偏移，否则拒绝
+            if not in_static_range:
+                return _fail(
+                    "temp_breakpoint_at_lr", "LR_STATIC_UNRESOLVED",
+                    f"debugger 未提供 rb，且 LR {parsed_lr:#x} 超出 {so_name} 静态范围，"
+                    "无法换算成静态地址（避免 set_breakpoint 二次加基址）",
+                    **base,
+                )
             return _ok(
-                "temp_breakpoint_at_lr", int(lr),
-                f"当前是 ret，返回地址取自运行时 LR（{int(lr):#x}），"
+                "temp_breakpoint_at_lr", parsed_lr,
+                f"当前是 ret，返回地址取自静态 LR（{parsed_lr:#x}），"
                 "在 LR 处下临时断点即等价于 step out",
-                resolvable=True, next_will_execute=True, **base,
+                resolvable=True, next_will_execute=True,
+                lr=parsed_lr, **base,
             )
         return _fail(
             "unresolvable", "RET_NEEDS_LR",
@@ -451,11 +510,12 @@ def plan_step_over(debugger, so_name: str, static_addr: int,
         return out
 
     if kind == "jump":
+        target_str = f"{target:#x}" if target is not None else "未知"
         out = _ok(
             "temp_breakpoint_next_tail", next_addr,
-            f"当前是无条件直接跳转 b -> {target:#x}（尾调用），"
+            f"当前是无条件直接跳转 {insn.mnemonic} -> {target_str}（尾调用），"
             f"下一条指令 {next_addr:#x} 不会执行；按要求仍在下一地址下临时断点，"
-            "但命中可能不会发生，实际去向为 b 的目标地址",
+            "但命中可能不会发生，实际去向为跳转目标地址",
             resolvable=True, next_will_execute=False,
             branch_target=target, **base,
         )
@@ -501,9 +561,10 @@ def plan_step_over(debugger, so_name: str, static_addr: int,
 
     # seq / call：下一条指令就是正确落点
     if kind == "call":
+        target_str = f"{target:#x}" if target is not None else "未知"
         return _ok(
             "temp_breakpoint_next", next_addr,
-            f"当前是 bl 调用（目标 {target:#x}），step over 不进入被调函数，"
+            f"当前是 bl 调用（目标 {target_str}），step over 不进入被调函数，"
             f"临时断点放在下一条指令 {next_addr:#x}（即返回点）",
             resolvable=True, next_will_execute=True, call_target=target, **base,
         )
@@ -943,6 +1004,73 @@ def plan_step_until_mnemonic(debugger, so_name: str, start_addr: int,
 # ---------------- 5. 执行（按要求留空） ----------------
 
 
+def _step_hit_seq(hit) -> int:
+    """提取命中对象的单调序号（无 seq 或非正整数返回 0）。"""
+    raw = hit.get("seq") if isinstance(hit, dict) else getattr(hit, "seq", None)
+    try:
+        val = int(raw) if raw is not None else 0
+    except (TypeError, ValueError):
+        val = 0
+    return val if val > 0 else 0
+
+
+def _lookup_existing_hook(dbg, so_name: str, static_addr: int) -> dict | None:
+    """查询 debugger 的 _hooks 中该地址是否已存在用户断点，避免单步清理时误删。"""
+    try:
+        hooks = getattr(dbg, "_hooks", None)
+        rb = getattr(dbg, "rb", None)
+        if isinstance(hooks, dict) and rb is not None:
+            mod = rb.find_module(so_name)
+            if mod is not None:
+                rt_key = rb.to_runtime(static_addr, mod)
+                rec = hooks.get(rt_key)
+                if isinstance(rec, dict):
+                    return dict(rec)
+    except Exception:                                     # noqa: BLE001 - 查询失败按"没有"处理
+        pass
+    return None
+
+
+def _sync_service_state(dbg) -> None:
+    """若该 debugger 归属 DynamicService 的某个目标，同步刷新 tgt.state。"""
+    try:
+        from server.dyn.service import (
+            STATE_ATTACHED,
+            STATE_DETACHED,
+            STATE_PAUSED,
+            get_dyn,
+        )
+
+        svc = get_dyn()
+        with svc._lock:
+            matched_tgt = None
+            for tgt in svc._targets.values():
+                if getattr(tgt, "dbg", None) is dbg:
+                    matched_tgt = tgt
+                    break
+        if matched_tgt is None or matched_tgt.state == STATE_DETACHED:
+            return
+        svc._sync_hits(matched_tgt)
+        cur_dbg_state = str(getattr(dbg, "state", "") or "")
+        with svc._lock:
+            if matched_tgt.state != STATE_DETACHED:
+                if cur_dbg_state == STATE_PAUSED:
+                    matched_tgt.state = STATE_PAUSED
+                elif cur_dbg_state == STATE_ATTACHED:
+                    matched_tgt.state = STATE_ATTACHED
+    except Exception:                                     # noqa: BLE001
+        pass
+
+
+# (14) 第十四次修改（2026-11-26）
+# bug 原因：① 原实现按 before_hits = len(dbg.hits) 与 all_hits[before_hits:] 检测新命中，
+#             当 dbg._hits 满 2000 条环形上限时 len 恒为 2000，永远切出空列表并报 STEP_TIMEOUT；
+#           ② alt_breakpoint_addr 未检查 pre_existing_alt，清理时会误删用户原有断点；
+#           ③ 单步直接操作 dbg.set_breakpoint/resume 未刷新 DynamicService 的 tgt.state，
+#             导致后续 service.resume 误报 not_paused。
+# 解决方案：① 优先按单调 seq 捕获新命中，无 seq 时以 (len, before_last) 兜底；
+#           ② 对 alt_breakpoint_addr 同样记录 pre_existing_alt 并在收尾时恢复原策略；
+#           ③ 在 finally 中通过 _sync_service_state 同步刷新关联 target 状态。
 def execute_step(debugger, plan: dict, so_name: str = "",
                  timeout: float = 5.0) -> dict:
     """真正执行一次单步：在临时断点处停下，返回停下的现场。
@@ -1002,27 +1130,13 @@ def execute_step(debugger, plan: dict, so_name: str = "",
                 "code": "DEBUGGER_INCOMPLETE"}
 
     before_state = str(getattr(dbg, "state", ""))
-    before_hits = len(getattr(dbg, "hits", []) or [])
+    init_hits = list(getattr(dbg, "hits", []) or [])
+    before_hits = len(init_hits)
+    before_seq = _step_hit_seq(init_hits[-1]) if init_hits else 0
+    before_last = init_hits[-1] if init_hits else None
 
     # (9) 第九次修改（2026-11-05）：进入前记下该地址**原本是否已有断点**。
-    #     bug 原因：finally 里无条件 remove_breakpoint，而 set_breakpoint 对
-    #               "同地址重复下断"只更新策略（不新建），所以如果用户在该地址
-    #               本来就有断点，单步结束后会把**用户自己的断点整条删掉**。
-    #     解决方案：先查断点表（_hooks 以运行时地址为键）；原本有就记下它的 policy，
-    #               结束时**恢复原策略**而不是删除；原本没有才真正摘钩。
-    pre_existing = None
-    try:
-        hooks = getattr(dbg, "_hooks", None)
-        rb = getattr(dbg, "rb", None)
-        if isinstance(hooks, dict) and rb is not None:
-            mod = rb.find_module(so_name)
-            if mod is not None:
-                rt_key = rb.to_runtime(addr, mod)
-                rec = hooks.get(rt_key)
-                if isinstance(rec, dict):
-                    pre_existing = dict(rec)
-    except Exception:                                     # noqa: BLE001 - 查询失败按"没有"处理
-        pre_existing = None
+    pre_existing = _lookup_existing_hook(dbg, so_name, addr)
 
     ok = False
     try:
@@ -1034,17 +1148,16 @@ def execute_step(debugger, plan: dict, so_name: str = "",
                 "code": "SET_BP_FAILED"}
 
     # (11) 第十一次修改（2026-11-05）：条件跳转有两个可能落点，两处都要下断点。
-    #      bug 原因：plan 只给 next_addr 一个落点，而条件跳转被取走时会直接跳到
-    #                target、根本不经 next_addr，于是临时断点可能永不命中，
-    #                表现为"单步超时"，而真实原因是落点选错了。
-    #      解决方案：plan 若给出 alt_breakpoint_addr，也在那里下 hold 断点；
-    #                哪个先命中，哪个就是真实落点（matched 按实际命中地址判定）。
     alt_addr = plan.get("alt_breakpoint_addr")
     extra_set: list[int] = []
+    pre_existing_alt: dict[int, dict] = {}
     if isinstance(alt_addr, int) and alt_addr != addr:
+        alt_rec = _lookup_existing_hook(dbg, so_name, alt_addr)
         try:
             if setter(so_name, alt_addr, policy="hold"):
                 extra_set.append(alt_addr)
+                if alt_rec is not None:
+                    pre_existing_alt[alt_addr] = alt_rec
         except Exception:                                 # noqa: BLE001 - 备用落点失败不影响主流程
             pass
 
@@ -1057,16 +1170,6 @@ def execute_step(debugger, plan: dict, so_name: str = "",
             except Exception as exc:                      # noqa: BLE001
                 return {**base, "error": f"放行失败：{exc}", "code": "RESUME_FAILED"}
 
-        # (7) 第七次修改（2026-11-05）：不再把 wait_hits 当"睡一会儿"。
-        #     bug 原因：Debugger.wait_hits 的语义是"有没被它取过的命中就立即返回"
-        #               （内部 `while self._version <= self._wait_cursor`）。
-        #               而调用方若已经停在一个命中上再单步，`_version > _wait_cursor`
-        #               恒成立 → wait_hits **立刻返回** → 取不到新增命中 →
-        #               0 秒就报 STEP_TIMEOUT，还写着"timeout 秒内没有命中"（谎报时长）。
-        #               全库只有这里调 wait_hits（service 走 poll_events），所以必然踩中。
-        #     解决方案：不依赖 wait_hits 的游标语义，改为**自己轮询命中数变化**：
-        #               进入时记下 before_hits，循环等到 len(hits) 增长或超时。
-        #               等待时长用单调时钟真算，回给调用方的 waited_s 是真实秒数。
         import time as _t
 
         t_begin = _t.monotonic()
@@ -1074,7 +1177,20 @@ def execute_step(debugger, plan: dict, so_name: str = "",
         fresh: list = []
         while True:
             all_hits = list(getattr(dbg, "hits", []) or [])
-            fresh = all_hits[before_hits:]
+            if all_hits and _step_hit_seq(all_hits[-1]) > 0 and (before_seq > 0 or before_hits == 0):
+                fresh = [h for h in all_hits if _step_hit_seq(h) > before_seq]
+            elif len(all_hits) > before_hits:
+                fresh = all_hits[before_hits:]
+            elif all_hits and before_last is not None and all_hits[-1] is not before_last:
+                # 兼容无 seq 的定长环形缓冲满队场景：从队尾定位 before_last
+                idx = -1
+                for i in range(len(all_hits) - 1, -1, -1):
+                    if all_hits[i] is before_last:
+                        idx = i
+                        break
+                fresh = all_hits[idx + 1:] if idx >= 0 else list(all_hits)
+            else:
+                fresh = []
             if fresh:
                 break
             if _t.monotonic() >= deadline:
@@ -1091,17 +1207,17 @@ def execute_step(debugger, plan: dict, so_name: str = "",
             })
             return result
 
-        # (8) 第八次修改（2026-11-05）：优先挑**命中目标地址**的那条。
-        #     bug 原因：原来直接取 fresh[-1]，若等待期间别的断点先命中
-        #               （目标进程本来就有其他断点），会把别人的命中当成"单步落点"，
-        #               报 matched=False 且给出错误的现场。
-        #     解决方案：先在新增命中里找 static_addr == 目标 的；找不到再退回最后一条
-        #               （并明确标注这是"没停到目标"）。
+        # (8) 第八次修改（2026-11-05）：优先挑**命中目标地址**（或备用分支地址）的那条。
         hit = None
         for cand in fresh:
             if int(getattr(cand, "static_addr", 0) or 0) == addr:
                 hit = cand
                 break
+        if hit is None and extra_set:
+            for cand in fresh:
+                if int(getattr(cand, "static_addr", 0) or 0) in extra_set:
+                    hit = cand
+                    break
         if hit is None:
             hit = fresh[-1]
         got_static = int(getattr(hit, "static_addr", 0) or 0)
@@ -1145,13 +1261,20 @@ def execute_step(debugger, plan: dict, so_name: str = "",
                 remover(so_name, addr)
             except Exception:                             # noqa: BLE001
                 result["remove_warning"] = "临时断点摘钩失败，可能残留在断点表里"
-        # 备用落点（条件跳转的另一条分支）无论主落点是否成功都要清理
+        # 备用落点（条件跳转的另一条分支）同样区分是否原本已有用户断点
         for a in extra_set:
-            if callable(remover):
+            if a in pre_existing_alt:
+                try:
+                    setter(so_name, a,
+                           policy=str(pre_existing_alt[a].get("policy") or "resume"))
+                except Exception:                         # noqa: BLE001
+                    pass
+            elif callable(remover):
                 try:
                     remover(so_name, a)
                 except Exception:                         # noqa: BLE001
                     pass
+        _sync_service_state(dbg)
 
 
 __all__ = [

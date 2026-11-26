@@ -45,6 +45,7 @@ from __future__ import annotations
 import ast
 import re
 
+from server.core.addr import parse_addr
 from server.core.plugins import PluginBase
 
 # 允许的 AST 节点（白名单，防注入）
@@ -99,33 +100,47 @@ class Plugin(PluginBase):
             v = env[name]
             spec = spec or {}
             if spec.get("lo") is not None:
-                solver.add(z3.UGE(v, z3.BitVecVal(int(spec["lo"]), v.size())))
+                lo_val = parse_addr(spec["lo"])
+                if lo_val is None:
+                    return {"ok": False, "code": "BAD_ARGS",
+                            "error": f"{name} 的 lo 非法：{spec['lo']!r}"}
+                solver.add(z3.UGE(v, z3.BitVecVal(lo_val, v.size())))
             if spec.get("hi") is not None:
-                solver.add(z3.ULE(v, z3.BitVecVal(int(spec["hi"]), v.size())))
+                hi_val = parse_addr(spec["hi"])
+                if hi_val is None:
+                    return {"ok": False, "code": "BAD_ARGS",
+                            "error": f"{name} 的 hi 非法：{spec['hi']!r}"}
+                solver.add(z3.ULE(v, z3.BitVecVal(hi_val, v.size())))
 
+        # (2) 第二次修改（2026-11-26）
+        # bug 原因：1) solver.add(zexpr) 不在 try/except 内，非布尔表达式或位宽冲突会抛未捕获 Z3Exception；
+        #           2) 多解循环中后续求解返回 unknown 时直接丢弃已求得的解。
+        # 解决方案：将 solver.add(zexpr) 纳入异常处理返回 CONV_FAILED；
+        #           多解循环遇到 unknown 时若已有解则保留结果并标注 partial=True。
         # ---- 编译表达式 ----
         translated = []
         for raw in exprs:
             try:
                 node = ast.parse(str(raw), mode="eval")
             except SyntaxError as exc:
-                return {"error": f"表达式语法错：{raw}（{exc}）",
+                return {"ok": False, "error": f"表达式语法错：{raw}（{exc}）",
                         "code": "BAD_EXPR"}
             for sub in ast.walk(node):
                 if not isinstance(sub, _ALLOWED):
-                    return {"error": f"表达式含不允许的语法：{type(sub).__name__}",
+                    return {"ok": False, "error": f"表达式含不允许的语法：{type(sub).__name__}",
                             "code": "UNSAFE_EXPR"}
             try:
                 zexpr = self._to_z3(node.body, env, z3)
+                solver.add(zexpr)
             except Exception as exc:                      # noqa: BLE001
-                return {"error": f"表达式转换失败：{raw}（{exc}）",
+                return {"ok": False, "error": f"表达式转换失败：{raw}（{exc}）",
                         "code": "CONV_FAILED"}
-            solver.add(zexpr)
             translated.append(str(raw))
 
         # ---- 求解 ----
         want = max(1, int(args.get("max_solutions", 1)))
         solutions = []
+        partial = False
         for _ in range(want):
             r = solver.check()
             if r == z3.sat:
@@ -140,6 +155,9 @@ class Plugin(PluginBase):
                 solver.add(z3.Or(*[v != m.eval(v, model_completion=True)
                                    for v in env.values()]))
             elif r == z3.unknown:
+                if solutions:
+                    partial = True
+                    break
                 return {"ok": False, "code": "UNKNOWN",
                         "reason": (f"求解超时或无法判定（{timeout_ms}ms）。"
                                    "加密哈希类问题通常需要专门的求解技术，"
@@ -154,7 +172,7 @@ class Plugin(PluginBase):
                     "constraints": translated,
                     "vars": {k: dict(v or {}) for k, v in var_defs.items()}}
 
-        return {
+        out = {
             "ok": True,
             "solutions": solutions,
             "solution_count": len(solutions),
@@ -163,6 +181,10 @@ class Plugin(PluginBase):
             "note": ("这是**定向约束求解**，不是全函数符号执行。"
                      "解出的值满足你给的等式；等式不完整时解不唯一。"),
         }
+        if partial:
+            out["partial"] = True
+            out["reason"] = f"已求得 {len(solutions)} 组解，继续枚举后续解时超时（{timeout_ms}ms）"
+        return out
 
     class _IntLit(int):
         """标记"这是字面量"，用于延迟决定位宽。"""
@@ -176,11 +198,16 @@ class Plugin(PluginBase):
         except Exception:                                 # noqa: BLE001
             return None
 
+    # (3) 第三次修改（2026-11-26）
+    # bug 原因：1) _coerce 在两侧均为字面量时立即固化为 64 位 BitVecVal，导致与 32 位变量组合时报 Sort mismatch；
+    #           2) _ALLOWED 放行了 ast.BoolOp(And/Or) 与 ast.UnaryOp(Not)，但 _to_z3 未实现导致转换失败。
+    # 解决方案：两侧均为纯 Python int 时延迟位宽绑定（直接按 int 运算）；
+    #           在 _to_z3 中补齐 ast.BoolOp（z3.And/z3.Or）与 ast.Not（z3.Not）支持。
     def _coerce(self, a, b, z3):
-        """把两侧对齐到同一位宽（字面量跟随另一侧）。"""
+        """把两侧对齐到同一位宽（纯整数常量延迟绑定，随另一侧 BitVec 位宽匹配）。"""
         ba, bb = self._bits_of(a), self._bits_of(b)
         if ba is None and bb is None:
-            return z3.BitVecVal(int(a), 64), z3.BitVecVal(int(b), 64)
+            return a, b
         if ba is None:
             a = z3.BitVecVal(int(a), bb)
         if bb is None:
@@ -191,6 +218,8 @@ class Plugin(PluginBase):
         """把 AST 节点转成 z3 表达式。"""
         if isinstance(node, ast.Constant):
             v = node.value
+            if isinstance(v, bool):
+                return z3.BoolVal(v)
             if isinstance(v, int):
                 # (1) 字面量先保持 Python int，等与变量运算时再定位宽
                 return int(v)
@@ -199,10 +228,37 @@ class Plugin(PluginBase):
             if node.id not in env:
                 raise ValueError(f"未定义的变量：{node.id}")
             return env[node.id]
+        if isinstance(node, ast.BoolOp):
+            vals = [self._to_z3(val, env, z3) for val in node.values]
+            if isinstance(node.op, ast.And):
+                return z3.And(*vals)
+            if isinstance(node.op, ast.Or):
+                return z3.Or(*vals)
+            raise ValueError(f"不支持的布尔运算符：{type(node.op).__name__}")
         if isinstance(node, ast.BinOp):
             l = self._to_z3(node.left, env, z3)
             r = self._to_z3(node.right, env, z3)
             op = node.op
+            if self._bits_of(l) is None and self._bits_of(r) is None \
+                    and isinstance(l, int) and isinstance(r, int):
+                if isinstance(op, (ast.Div, ast.FloorDiv, ast.Mod)) and r == 0:
+                    raise ValueError("除数不能为 0")
+                int_ops = {
+                    ast.Add: lambda a, b: a + b,
+                    ast.Sub: lambda a, b: a - b,
+                    ast.Mult: lambda a, b: a * b,
+                    ast.BitAnd: lambda a, b: a & b,
+                    ast.BitOr: lambda a, b: a | b,
+                    ast.BitXor: lambda a, b: a ^ b,
+                    ast.LShift: lambda a, b: a << b,
+                    ast.RShift: lambda a, b: a >> b,
+                    ast.Div: lambda a, b: a // b,
+                    ast.FloorDiv: lambda a, b: a // b,
+                    ast.Mod: lambda a, b: a % b,
+                }
+                if type(op) not in int_ops:
+                    raise ValueError(f"不支持的运算符：{type(op).__name__}")
+                return int_ops[type(op)](l, r)
             mapping = {
                 ast.Add: lambda a, b: a + b,
                 ast.Sub: lambda a, b: a - b,
@@ -228,24 +284,40 @@ class Plugin(PluginBase):
                 return -v
             if isinstance(node.op, ast.UAdd):
                 return v
+            if isinstance(node.op, ast.Not):
+                return z3.Not(v)
             raise ValueError(f"不支持的一元运算符：{type(node.op).__name__}")
         if isinstance(node, ast.Compare):
             left = self._to_z3(node.left, env, z3)
             result = None
             for op, comparator in zip(node.ops, node.comparators):
                 right = self._to_z3(comparator, env, z3)
-                cmp = {
-                    ast.Eq: lambda a, b: a == b,
-                    ast.NotEq: lambda a, b: a != b,
-                    ast.Lt: lambda a, b: z3.ULT(a, b),
-                    ast.LtE: lambda a, b: z3.ULE(a, b),
-                    ast.Gt: lambda a, b: z3.UGT(a, b),
-                    ast.GtE: lambda a, b: z3.UGE(a, b),
-                }.get(type(op))
-                if cmp is None:
-                    raise ValueError(f"不支持的比较：{type(op).__name__}")
-                left, right = self._coerce(left, right, z3)
-                c = cmp(left, right)
+                if self._bits_of(left) is None and self._bits_of(right) is None \
+                        and isinstance(left, int) and isinstance(right, int):
+                    py_cmp = {
+                        ast.Eq: lambda a, b: a == b,
+                        ast.NotEq: lambda a, b: a != b,
+                        ast.Lt: lambda a, b: a < b,
+                        ast.LtE: lambda a, b: a <= b,
+                        ast.Gt: lambda a, b: a > b,
+                        ast.GtE: lambda a, b: a >= b,
+                    }.get(type(op))
+                    if py_cmp is None:
+                        raise ValueError(f"不支持的比较：{type(op).__name__}")
+                    c = z3.BoolVal(py_cmp(left, right))
+                else:
+                    cmp = {
+                        ast.Eq: lambda a, b: a == b,
+                        ast.NotEq: lambda a, b: a != b,
+                        ast.Lt: lambda a, b: z3.ULT(a, b),
+                        ast.LtE: lambda a, b: z3.ULE(a, b),
+                        ast.Gt: lambda a, b: z3.UGT(a, b),
+                        ast.GtE: lambda a, b: z3.UGE(a, b),
+                    }.get(type(op))
+                    if cmp is None:
+                        raise ValueError(f"不支持的比较：{type(op).__name__}")
+                    cl, cr = self._coerce(left, right, z3)
+                    c = cmp(cl, cr)
                 result = c if result is None else z3.And(result, c)
                 left = right
             return result

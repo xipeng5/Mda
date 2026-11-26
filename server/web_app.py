@@ -47,13 +47,26 @@ def _dist_version() -> int:
     return int(newest) if newest else int(_time.time())
 
 _ver = _dist_version()
+# (2) 第二次修改（2026-11-26）
+# bug 原因：① URL 硬编码 localhost 而 HEALTH 用 API_HOST，导致 API_HOST=127.0.0.1 时两者主机名错配，
+#              API_HOST=0.0.0.0 时 HEALTH 指向 0.0.0.0 无法探测；
+#           ② _serve 使用 uvicorn.run() 无法在窗口关闭时优雅停机（lifespan 不执行、MCP 端口残留）；
+#           ③ pick_so 使用已弃用的 webview.OPEN_DIALOG；
+#           ④ webview.start() 仅在 private_mode=True 时传参，因 pywebview 默认值为 True，
+#              导致 MDA_WEB_PRIVATE=0 完全无效。
+# 解决方案：① 统一用 _CLIENT_HOST（0.0.0.0/:: 时归为 127.0.0.1）拼 URL 与 HEALTH；
+#           ② 持有 uvicorn.Server 实例，退出时置 should_exit=True 并 join 等待优雅停机；
+#           ③ 优先用 webview.FileDialog.OPEN 并向后回退 webview.OPEN_DIALOG；
+#           ④ 显式传递 private_mode=bool(...)。
+_CLIENT_HOST = "127.0.0.1" if API_HOST in ("0.0.0.0", "::", "") else API_HOST
 # 每次启动都用唯一 URL：同一进程内 _ver 不变，WKWebView 会把整个文档
 # （含服务端内联的 __MDA_BOOT__）缓存住，后端后加的模块就进不去。
-URL = f"http://localhost:{API_PORT}/?v={_ver}.{int(_time.time() * 1000)}&theme=light"
+URL = f"http://{_CLIENT_HOST}:{API_PORT}/?v={_ver}.{int(_time.time() * 1000)}&theme=light"
 # 健康检查必须用**不带查询参数**的基础地址。
 # 之前这里写成 URL + "api/health"，而 URL 带 ?v=...，拼出来是无效地址，
 # 返回 index.html → 永远判定"未就绪"。
-HEALTH = f"http://{API_HOST}:{API_PORT}/api/health"
+HEALTH = f"http://{_CLIENT_HOST}:{API_PORT}/api/health"
+_uvicorn_server = None
 
 
 def _wait_ready(timeout: float = 45.0) -> bool:
@@ -71,21 +84,36 @@ def _wait_ready(timeout: float = 45.0) -> bool:
 
 
 def _serve() -> None:
-    """在后台线程里跑 uvicorn。
+    """在后台线程里跑 uvicorn.Server（持有实例以支持优雅停机）。
 
-    失败必须打出来：daemon 线程里的异常默认被吞掉，主线程只会看到
-    「15 秒未就绪」，根本不知道真实原因（端口占用、导入失败、权限……）。
+    失败必须打出来：线程里的异常默认被吞掉，主线程只会看到
+    「未就绪」，根本不知道真实原因（端口占用、导入失败、权限……）。
     """
+    global _uvicorn_server
     import traceback
 
     try:
-        print('[API] _serve 线程已启动，准备 uvicorn.run', flush=True)
+        print("[API] _serve 线程已启动，准备 uvicorn.Server", flush=True)
         import uvicorn
 
-        uvicorn.run(app, host=API_HOST, port=API_PORT, log_level="info")
+        config = uvicorn.Config(app, host=API_HOST, port=API_PORT, log_level="info")
+        server = uvicorn.Server(config)
+        # 后台线程不能注册主线程信号处理器，停机由主线程显式置 should_exit=True 触发
+        server.install_signal_handlers = lambda: None
+        _uvicorn_server = server
+        server.run()
     except Exception:                                  # noqa: BLE001
         print("[API] 启动失败，真实原因如下：")
         traceback.print_exc()
+
+
+def _shutdown_server(srv_thread: threading.Thread, timeout: float = 5.0) -> None:
+    """通知后台 uvicorn 优雅退出并等待线程结束，确保 lifespan 正常清理 MCP 与后台任务。"""
+    srv = _uvicorn_server
+    if srv is not None:
+        srv.should_exit = True
+    if srv_thread.is_alive():
+        srv_thread.join(timeout=timeout)
 
 
 class JsApi:
@@ -117,8 +145,14 @@ class JsApi:
 
         if not webview.windows:
             return ""
+        file_dialog = getattr(webview, "FileDialog", None)
+        open_mode = (
+            getattr(file_dialog, "OPEN", None)
+            if file_dialog is not None
+            else getattr(webview, "OPEN_DIALOG", 10)
+        )
         result = webview.windows[0].create_file_dialog(
-            webview.OPEN_DIALOG,
+            open_mode,
             allow_multiple=False,
             file_types=("Shared library (*.so)", "ELF (*.elf)", "All files (*.*)"),
         )
@@ -145,38 +179,35 @@ def _open_window() -> bool:
         print("[webview] 页面已加载：", window.get_current_url())
 
     window.events.loaded += _on_loaded
-    # 每次启动用干净的私有数据目录：WKWebView 会缓存 GET 响应和资源，
-    # 开发期旧缓存会造成"窗口显示旧状态、浏览器正常"的假象（实测踩过）。
-    # 用独立临时目录而不是删用户的缓存目录——不破坏、可随时丢弃。
+    # 显式传递 private_mode=bool(...)：pywebview >= 4 默认 private_mode=True，
+    # 不显式传 False 会导致 MDA_WEB_PRIVATE=0 无法生效。
     private_mode = os.environ.get("MDA_WEB_PRIVATE", "0") == "1"
-    kwargs: dict = {}
-    if private_mode:
-        try:
-            kwargs["private_mode"] = True            # pywebview >= 4
-        except Exception:                            # noqa: BLE001
-            pass
-    webview.start(**kwargs)
+    webview.start(private_mode=bool(private_mode))
     return True
 
 
 def main() -> None:
-    threading.Thread(target=_serve, daemon=True).start()
-    if not _wait_ready():
-        # 不 return：uvicorn 可能只是慢（MCP/插件初始化很重）。
-        # 真起不来时窗口里会显示连不上，比静默退出更容易排查。
-        print("API 在 45 秒内未就绪，仍尝试开窗口：", API_PORT,
-              "| 健康检查地址:", HEALTH, flush=True)
-
-    if _open_window():
-        return
-    print(f"未安装 pywebview，用默认浏览器打开：{URL}")
-    webbrowser.open(URL)
-    # 浏览器模式下进程常驻，Ctrl+C 结束
+    srv_thread = threading.Thread(target=_serve, daemon=True)
+    srv_thread.start()
     try:
-        while True:
-            time.sleep(3600)
-    except KeyboardInterrupt:
-        pass
+        if not _wait_ready():
+            # 不 return：uvicorn 可能只是慢（MCP/插件初始化很重）。
+            # 真起不来时窗口里会显示连不上，比静默退出更容易排查。
+            print("API 在 45 秒内未就绪，仍尝试开窗口：", API_PORT,
+                  "| 健康检查地址:", HEALTH, flush=True)
+
+        if _open_window():
+            return
+        print(f"未安装 pywebview，用默认浏览器打开：{URL}")
+        webbrowser.open(URL)
+        # 浏览器模式下进程常驻，Ctrl+C 结束
+        try:
+            while True:
+                time.sleep(3600)
+        except KeyboardInterrupt:
+            pass
+    finally:
+        _shutdown_server(srv_thread)
 
 
 if __name__ == "__main__":

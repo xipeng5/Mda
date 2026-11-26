@@ -19,16 +19,28 @@ import threading
 class McpService:
     """在后台线程跑 MCP HTTP 服务（供 AI 客户端连接）。"""
 
+    # (1) 第一次修改（2026-11-26）
+    # bug 原因：① start_http() 仅拉起线程就立刻返回 True，不等 uvicorn 实际绑定端口就绪，
+    #             若绑定失败/启动抛 SystemExit 调用方会拿到假成功；
+    #          ② start_http() 与 stop() 存在竞态窗口：若在后台线程创建 _server 之前调用
+    #             stop()，stop() 看到 _server 为 None 无法下发 should_exit，随后后台线程
+    #             仍继续启动 uvicorn，失控占住 8765 端口。
+    # 解决方案：引入 threading.Lock 保护生命周期状态与 _stop_requested 标志，并用
+    #          threading.Event 等待 uvicorn 实际 startup 就绪或失败退出；若在创建 _server
+    #          前后检测到 _stop_requested，后台线程直接退出不监听端口。
     def __init__(self, log=None):
         self.log = log or (lambda t: None)
+        self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
         self._server = None  # uvicorn.Server 实例，用于优雅停机
         self._running = False
+        self._stop_requested = False
         self.port = 8765
 
     @property
     def running(self) -> bool:
-        return self._running
+        with self._lock:
+            return self._running
 
     # ---------- 端口 ----------
 
@@ -44,15 +56,20 @@ class McpService:
 
     # ---------- 生命周期 ----------
 
-    def start_http(self) -> bool:
-        """以 streamable-http 启动（后台线程）。"""
-        if self._running:
-            return True
-        if self.port_in_use():
-            self.log(f"[MCP] 端口 {self.port} 被占用——可能有另一个 MDA 实例在运行，"
-                     f"服务未启动")
-            return False
-        self._running = True
+    def start_http(self, timeout: float = 5.0) -> bool:
+        """以 streamable-http 启动（后台线程），等待 uvicorn 实际就绪或失败。"""
+        with self._lock:
+            if self._running:
+                return True
+            if self.port_in_use():
+                self.log(f"[MCP] 端口 {self.port} 被占用——可能有另一个 MDA 实例在运行，"
+                         f"服务未启动")
+                return False
+            self._running = True
+            self._stop_requested = False
+
+        ready = threading.Event()
+        start_state: dict = {"started": False, "error": None}
 
         def run():
             try:
@@ -60,22 +77,59 @@ class McpService:
 
                 from server.mcp_server.tools import server as mcp_server
 
+                with self._lock:
+                    if self._stop_requested:
+                        return
+
+                class _ReadyServer(uvicorn.Server):
+                    """启动监听成功后通知 ready 事件的 uvicorn.Server 子类。"""
+
+                    async def startup(self, sockets=None) -> None:
+                        await super().startup(sockets=sockets)
+                        if self.started:
+                            start_state["started"] = True
+                            ready.set()
+
                 app = mcp_server.streamable_http_app()
                 config = uvicorn.Config(
                     app, host="127.0.0.1", port=self.port, log_level="warning"
                 )
-                self._server = uvicorn.Server(config)
-                self._server.run()
-            except Exception as e:
+                srv = _ReadyServer(config)
+                with self._lock:
+                    if self._stop_requested:
+                        srv.should_exit = True
+                        return
+                    self._server = srv
+                srv.run()
+            except BaseException as e:                    # noqa: BLE001 - uvicorn 绑定失败抛 SystemExit
+                start_state["error"] = e
                 self.log(f"[MCP] 服务异常退出: {e}")
             finally:
-                self._running = False
-                self._server = None
+                with self._lock:
+                    self._running = False
+                    self._server = None
+                ready.set()
 
-        self._thread = threading.Thread(target=run, daemon=True, name="mda-mcp")
-        self._thread.start()
-        self.log(f"[MCP] 已启动: http://127.0.0.1:{self.port}/mcp  (AI 客户端接入点)")
-        return True
+        t = threading.Thread(target=run, daemon=True, name="mda-mcp")
+        with self._lock:
+            if self._stop_requested:
+                self._running = False
+                return False
+            self._thread = t
+        t.start()
+
+        ready.wait(timeout=max(0.1, float(timeout)))
+        with self._lock:
+            if self._stop_requested:
+                return False
+            ok = bool(start_state["started"]) and start_state["error"] is None and self._running
+        if ok:
+            self.log(f"[MCP] 已启动: http://127.0.0.1:{self.port}/mcp  (AI 客户端接入点)")
+            return True
+        if start_state["error"] is None and not start_state["started"]:
+            self.log(f"[MCP] 服务启动超时（>{timeout}s），端口 {self.port} 未就绪")
+            self.stop(wait=0.5)
+        return False
 
     def stop(self, wait: float = 0.0) -> None:
         """优雅停机：通知 uvicorn 退出。
@@ -86,30 +140,40 @@ class McpService:
             冻结窗口关闭动画甚至死锁在 Qt 事件循环里）
           - 需要确认端口已释放时（测试/退出前）传 wait=3.0
         """
-        if not self._running and self._server is None:
-            return
-        self._running = False
-        if self._server is not None:
-            self._server.should_exit = True  # uvicorn 的优雅停机开关
+        with self._lock:
+            if not self._running and self._server is None and self._thread is None:
+                return
+            self._stop_requested = True
+            self._running = False
+            srv = self._server
+            th = self._thread
+            if srv is not None:
+                srv.should_exit = True  # uvicorn 的优雅停机开关
         # 守护线程会随进程退出自动结束；不需要时不做 join
         if wait <= 0:
             return
-        if self._thread is not None and self._thread.is_alive():
-            self._thread.join(timeout=wait)
-        self._thread = None
-        self._server = None
+        if th is not None and th.is_alive():
+            th.join(timeout=wait)
+        with self._lock:
+            if self._thread is th and (th is None or not th.is_alive()):
+                self._thread = None
+                self._server = None
         self.log("[MCP] 已停止，端口已释放")
 
     def wait_stopped(self, timeout: float = 3.0) -> bool:
         """等待服务线程真正退出。返回是否已停止（供退出前确认端口释放）。"""
-        if self._thread is None:
+        with self._lock:
+            th = self._thread
+        if th is None:
             return True
-        self._thread.join(timeout=timeout)
-        stopped = not self._thread.is_alive()
+        th.join(timeout=timeout)
+        stopped = not th.is_alive()
         if stopped:
-            self._thread = None
-            self._server = None
+            with self._lock:
+                if self._thread is th:
+                    self._thread = None
+                    self._server = None
         return stopped
 
     def status(self) -> str:
-        return f"http://127.0.0.1:{self.port}/mcp" if self._running else "未启动"
+        return f"http://127.0.0.1:{self.port}/mcp" if self.running else "未启动"

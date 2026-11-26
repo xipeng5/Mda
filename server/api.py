@@ -18,8 +18,10 @@ import re
 import sys
 import time
 import threading
+import uuid
 from contextlib import asynccontextmanager
 from typing import Any
+from urllib.parse import urlsplit
 
 from starlette.applications import Starlette
 from starlette.concurrency import run_in_threadpool
@@ -34,6 +36,115 @@ API_HOST = os.environ.get("MDA_API_HOST", "127.0.0.1")
 API_PORT = int(os.environ.get("MDA_API_PORT", "8766"))
 # 开发期前端跑在 5173；打包后前端由本服务托管，同样走这个端口
 DEV_ORIGINS = ["http://localhost:5173", "http://127.0.0.1:5173"]
+
+# (48) 第四十八次修改（2026-11-26）
+# bug 原因：本地服务未校验 Host / Origin / 简单跨站 POST 与 WebSocket Origin，
+#           存在 DNS Rebinding 与跨站 CSRF 远程执行 frida 脚本（RCE）风险；
+#           且多个接口需要复用的本地校验、so 名称匹配、在线设备探测、调用者入口归一等逻辑缺失。
+# 解决方案：集中定义本地 Host/Origin 白名单正则与纯辅助函数，供 HTTP 中间件、
+#           WebSocket 握手及各路由端点复用。
+_LOCAL_HOST_RE = re.compile(
+    r"^(?:127\.0\.0\.1|localhost|\[::1\])(?::\d{1,5})?$",
+    re.IGNORECASE,
+)
+_LOCAL_ORIGIN_RE = re.compile(
+    r"^https?://(?:127\.0\.0\.1|localhost|\[::1\])(?::\d{1,5})?$",
+    re.IGNORECASE,
+)
+_PROTECTED_POST_PATHS = frozenset({
+    "/api/frida_js",
+    "/api/frida_js/stop",
+    "/api/load",
+    "/api/load_upload",
+    "/api/unload",
+    "/api/clear_modules",
+    "/api/armed/clear",
+    "/api/xrefs/build",
+})
+
+
+def _is_local_host(host: str) -> bool:
+    """校验 Host 头是否仅指向本机回环地址，防止 DNS Rebinding。"""
+    return bool(host and _LOCAL_HOST_RE.match(host.strip()))
+
+
+def _is_local_origin(origin: str) -> bool:
+    """校验 Origin 头是否属于本机白名单来源（localhost / 127.0.0.1 / [::1]）。"""
+    return bool(origin and _LOCAL_ORIGIN_RE.match(origin.strip()))
+
+
+def _is_local_referer(referer: str) -> bool:
+    """校验 Referer 头的来源部分是否属于本机白名单。"""
+    try:
+        u = urlsplit(referer.strip())
+    except ValueError:
+        return False
+    if not u.scheme or not u.netloc:
+        return False
+    return _is_local_origin(f"{u.scheme}://{u.netloc}")
+
+
+def _so_matches(a: str, b: str) -> bool:
+    """判断两个 so 名称是否指向同一模块（复用 core.session 统一匹配规则）。"""
+    sa = str(a or "").strip()
+    sb = str(b or "").strip()
+    if not sa or not sb:
+        return False
+    if sa == sb or os.path.basename(sa) == os.path.basename(sb):
+        return True
+    try:
+        from server.core.session import match_name
+
+        hit, _how, _amb = match_name(sa, [sb])
+        return hit is not None
+    except Exception:                                     # noqa: BLE001
+        return sa.lower() == sb.lower()
+
+
+def _same_addr(raw: Any, target: int) -> bool:
+    """比较任意格式地址值（int / 0x hex / 纯 hex / 十进制串）是否等于 target。"""
+    if raw in (None, ""):
+        return False
+    try:
+        val = int(raw, 0) if isinstance(raw, str) else int(raw)
+        if val == target:
+            return True
+    except (TypeError, ValueError):
+        pass
+    if isinstance(raw, str):
+        try:
+            return int(raw.strip(), 16) == target
+        except ValueError:
+            return False
+    return False
+
+
+def _first_online_device_serial() -> str:
+    """直接经 Adb.list_devices() 获取首个在线设备序列号（不调用挂了 @logged 的 preflight）。"""
+    from server.dyn.adb import Adb
+
+    for dev in Adb.list_devices():
+        if getattr(dev, "state", "") == "device":
+            return dev.serial
+    return ""
+
+
+def _normalize_callers(so, raw_sites) -> list[tuple[int, int]]:
+    """将 callers_of_fn 返回的调用指令地址归一为调用者函数入口，并按入口去重。"""
+    seen: set[int] = set()
+    out: list[tuple[int, int]] = []
+    for raw in (raw_sites or []):
+        try:
+            site = raw if isinstance(raw, int) else int(str(raw), 0)
+        except (TypeError, ValueError):
+            continue
+        fn = so.function_at(site)
+        entry = fn.addr if fn else site
+        if entry in seen:
+            continue
+        seen.add(entry)
+        out.append((entry, site))
+    return out
 
 # (1) 第一次修改：与 MCP 共用同一个 Session
 #     bug 原因：这里原本自己 new 了一个 Session，导致 AI 通过 MCP 看到的会话
@@ -223,20 +334,66 @@ def _arm_label(tool: str, args: dict[str, Any]) -> tuple[str, str, str] | None:
     return key, label, target
 
 
-def _track_armed(tool: str, args: dict[str, Any], summary: str = "") -> bool:
+# (49) 第四十九次修改（2026-11-26）
+# bug 原因：① 失败调用（summary 以 "✗" 开头或 ok is False）虽然不新增待命项，
+#              但仍会执行 _CLEAR_MAP 误清空已有待命状态；
+#           ② remove_breakpoint 命中 _CLEAR_MAP 后会直接清空所有模块的全部断点，
+#              而非仅移除对应 bp_id 的那一条。
+# 解决方案：失败调用直接跳过；remove_breakpoint 解析 bp_id 后仅精确移除匹配条目，
+#           unload_so 有明确模块名时也按模块名精确移除。
+def _track_armed(tool: str, args: dict[str, Any], summary: str = "", ok: bool = True) -> bool:
     """维护待命表；状态有变化返回 True（调用方据此决定要不要广播）。
 
-    summary 以 "✗" 开头表示这次调用失败了——失败不能记成待命，
-    否则界面会显示一个根本不存在的断点。
+    summary 以 "✗" 开头或 ok is False 表示这次调用失败了——失败不能记成待命，
+    也不应误清空现有待命状态。
     """
-    ok = not summary.startswith("✗")
+    if ok is False or (summary or "").startswith("✗"):
+        return False
+    args = args or {}
     changed = False
     with _armed_lock:
-        for t in _CLEAR_MAP.get(tool, ()):
-            for k in [k for k in _armed if k.startswith(t + "|")]:
-                _armed.pop(k, None)
-                changed = True
-        got = _arm_label(tool, args) if ok else None
+        if tool == "remove_breakpoint":
+            bp_id = str(args.get("bp_id") or "").strip()
+            parts = bp_id.rsplit(":", 2) if bp_id else []
+            if len(parts) == 3:
+                prefix, bp_so, bp_addr_hex = parts
+                bp_serial, _, bp_pid = prefix.rpartition(":")
+                try:
+                    bp_addr = int(bp_addr_hex, 16)
+                except ValueError:
+                    bp_addr = None
+                if bp_addr is not None:
+                    for k, v in list(_armed.items()):
+                        if v.get("tool") != "set_breakpoint":
+                            continue
+                        va = v.get("args") or {}
+                        if not _so_matches(va.get("so_name", ""), bp_so):
+                            continue
+                        if not _same_addr(va.get("static_addr"), bp_addr):
+                            continue
+                        if bp_serial and va.get("serial") and str(va.get("serial")) != bp_serial:
+                            continue
+                        if bp_pid and va.get("pid") not in (None, "") and str(va.get("pid")) != bp_pid:
+                            continue
+                        _armed.pop(k, None)
+                        changed = True
+        elif tool == "unload_so" and (args.get("name") or args.get("so_name")):
+            target_so = str(args.get("name") or args.get("so_name") or "").strip()
+            for t in _CLEAR_MAP.get(tool, ()):
+                for k, v in list(_armed.items()):
+                    if not k.startswith(t + "|"):
+                        continue
+                    va = v.get("args") or {}
+                    if _so_matches(va.get("so_name", ""), target_so):
+                        _armed.pop(k, None)
+                        changed = True
+        else:
+            for t in _CLEAR_MAP.get(tool, ()):
+                for k in [k for k in _armed if k.startswith(t + "|")]:
+                    _armed.pop(k, None)
+                    changed = True
+
+        got = _arm_label(tool, args)
         if got:
             key, label, target = got
             if key not in _armed:
@@ -249,7 +406,7 @@ def _track_armed(tool: str, args: dict[str, Any], summary: str = "") -> bool:
                 "ts": time.strftime("%H:%M:%S"),
                 # 保留原始参数：界面上要据此还原「这个监控开了哪些开关」
                 # （例如 behavior_monitor 的 crypto/file/activity/assets）
-                "args": dict(args or {}),
+                "args": dict(args),
             }
     return changed
 
@@ -338,6 +495,8 @@ async def unload(request):
         body = await request.json()
     except Exception:                                     # noqa: BLE001
         return _err("请求体不是合法 JSON", 400)
+    if not isinstance(body, dict):
+        return _err("请求体必须是 JSON 对象", 400)
     name = str(body.get("so", "")).strip()
     if not name:
         return _err("缺少 so")
@@ -365,6 +524,8 @@ async def clear_modules(request):
         body = await request.json()
     except Exception:                                     # noqa: BLE001
         body = {}
+    if not isinstance(body, dict):
+        return _err("请求体必须是 JSON 对象", 400)
     keep = body.get("keep")
     # keep 的类型校验在 Session.clear 里做（传 str 视为单个模块名，
     # 传其它类型直接报 BAD_KEEP），这里只负责透传
@@ -470,12 +631,15 @@ async def heatmap(request):
     if so is None:
         return _err(f"未加载的 so：{name}", 404)
 
+    # (50) 第五十次修改（2026-11-26）
+    # bug 原因：heatmap 每次加载都会调用 _session.ensure_xrefs(name)，在大 so 上强制阻塞
+    #           20-30 秒跑全量反汇编建图，导致打开页面卡死。
+    # 解决方案：仅读取惰性 Xref 对象状态，未建图时不触发全量 build，快速按函数密度统计
+    #           并返回 xref_built 标志供前端准确提示。
     def work():
-        # calls 只在引用图建好后才有值；先确保建好，否则整条热力条全灰
-        try:
-            _session.ensure_xrefs(name)
-        except Exception:                                  # noqa: BLE001
-            pass
+        x = _session.xref(name)
+        xref_built = bool(getattr(x, "_built", False))
+        calls_to = getattr(x, "_calls_to", None) or {}
 
         funcs = so.functions() if callable(getattr(so, "functions", None)) else so.functions
         if isinstance(funcs, dict):
@@ -483,17 +647,21 @@ async def heatmap(request):
         funcs = sorted(funcs, key=lambda f: f.addr)
         if not funcs:
             return {"so": so.name, "lo": "0x0", "hi": "0x0",
-                    "functions": 0, "max_refs": 0, "buckets": []}
+                    "functions": 0, "max_refs": 0, "buckets": [],
+                    "xref_built": xref_built}
 
         lo = funcs[0].addr
         hi = max(f.end if getattr(f, "end", 0) else f.addr + max(4, f.size or 4) for f in funcs)
         span = max(1, hi - lo)
 
-        # 每桶累计引用数：位置是地址，颜色是密度，这是测量不是装饰
+        # 已建图时累计真实引用数；未建图时快速按函数分布密度生成，不阻塞主流程
         acc = [0] * buckets
         for f in funcs:
             idx = min(buckets - 1, int((f.addr - lo) / span * buckets))
-            acc[idx] += len(getattr(f, "calls", []) or [])
+            if xref_built:
+                acc[idx] += len(calls_to.get(f.addr, [])) + len(getattr(f, "calls", []) or [])
+            else:
+                acc[idx] += 1
 
         return {
             "so": so.name,
@@ -501,12 +669,18 @@ async def heatmap(request):
             "functions": len(funcs),
             "max_refs": max(acc) if acc else 0,
             "buckets": acc,
+            "xref_built": xref_built,
         }
 
     return JSONResponse(await run_in_threadpool(work))
 
 
-
+# (51) 第五十一次修改（2026-11-26）
+# bug 原因：/api/foreground 直接在 asyncio 事件循环中同步执行 adb 子进程阻塞循环，
+#           且调用了挂有 @logged() 装饰器的 tools.preflight()，导致每次打开界面
+#           都凭空伪造多条 preflight AI 调用事件。
+# 解决方案：全部移入 run_in_threadpool 执行，改调底层 _first_online_device_serial()
+#           （Adb.list_devices()）直接获取在线设备，彻底消除阻塞与假 AI 事件。
 async def foreground(request):
     """当前前台 App 的包名（左栏目标栏用来决定展示谁）。
 
@@ -514,33 +688,36 @@ async def foreground(request):
     此刻在前台的那个。设备没连或读不到就如实返回错误，不猜。
     """
     serial = (request.query_params.get("serial") or "").strip()
-    try:
-        from server.mcp_server.tools import preflight
 
-        if not serial:
-            pf = json.loads(preflight())
-            devs = pf.get("devices") or []
-            if not devs:
-                return JSONResponse({"ok": False, "error": "没有可用的 adb 设备"})
-            first = devs[0]
-            serial = first.get("serial") if isinstance(first, dict) else str(first)
-
+    def work():
         from server.dyn.adb import Adb
 
-        adb = Adb(serial)
+        ser = serial or _first_online_device_serial()
+        if not ser:
+            return {"ok": False, "error": "没有可用的 adb 设备"}
+
+        adb = Adb(ser)
         pkg = adb.foreground_package() if hasattr(adb, "foreground_package") else ""
         if not pkg:
             # 退一步：直接问 dumpsys
             out = adb._cmd("shell", "dumpsys", "activity", "activities") or ""
-            import re as _re
-
-            m = _re.search(r"mResumedActivity.*?u0 ([\w.]+)/", out)
+            m = re.search(r"mResumedActivity.*?u0 ([\w.]+)/", out)
             pkg = m.group(1) if m else ""
-        return JSONResponse({"ok": bool(pkg), "package": pkg, "serial": serial})
+        return {"ok": bool(pkg), "package": pkg, "serial": ser}
+
+    try:
+        return JSONResponse(await run_in_threadpool(work))
     except Exception as exc:                              # noqa: BLE001
         return JSONResponse({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
 
 
+# (52) 第五十二次修改（2026-11-26）
+# bug 原因：① dyn_state 裸读 dyn._targets 与 dbg._hits 未加锁，存在并发迭代异常风险；
+#           ② VM 事实键只检查了 find_dispatch_tables / vm_regs_snapshot / trace_code，
+#              漏掉了 LeftNav 已映射的 find_vm_dispatch_points / trace_module_load /
+#              trace_app_startup / trace_call_tree，导致左栏有计数但详情页为空。
+# 解决方案：在 dyn._lock 下快照目标与断点，读取命中改走加锁公开属性 dbg.hits，
+#           并补齐全部 VM / trace 工具事实键与 LeftNav 对齐。
 async def dyn_state(request):
     """动态侧的全部真实状态，供左栏各入口使用。
 
@@ -566,13 +743,38 @@ async def dyn_state(request):
         from server.dyn.service import get_dyn
 
         dyn = get_dyn()
-        for key, tgt in list(getattr(dyn, "_targets", {}).items()):
-            bps = list((getattr(tgt, "breakpoints", {}) or {}).values())
+        lock = getattr(dyn, "_lock", None)
+        snap_targets = []
+        if lock is not None:
+            with lock:
+                for key, tgt in list(getattr(dyn, "_targets", {}).items()):
+                    bps = [dict(bp) for bp in (getattr(tgt, "breakpoints", {}) or {}).values()]
+                    snap_targets.append((
+                        key,
+                        getattr(tgt, "serial", ""),
+                        getattr(tgt, "pid", None),
+                        getattr(tgt, "state", ""),
+                        bps,
+                        getattr(tgt, "dbg", None),
+                    ))
+        else:
+            for key, tgt in list(getattr(dyn, "_targets", {}).items()):
+                bps = [dict(bp) for bp in (getattr(tgt, "breakpoints", {}) or {}).values()]
+                snap_targets.append((
+                    key,
+                    getattr(tgt, "serial", ""),
+                    getattr(tgt, "pid", None),
+                    getattr(tgt, "state", ""),
+                    bps,
+                    getattr(tgt, "dbg", None),
+                ))
+
+        for key, ser, pid_val, st_val, bps, dbg in snap_targets:
             out["targets"].append({
                 "key": key,
-                "serial": getattr(tgt, "serial", ""),
-                "pid": getattr(tgt, "pid", None),
-                "state": getattr(tgt, "state", ""),
+                "serial": ser,
+                "pid": pid_val,
+                "state": st_val,
                 "breakpoints": len(bps),
             })
             for bp in bps:
@@ -587,9 +789,8 @@ async def dyn_state(request):
                     "serial": bp.get("serial", ""),
                     "pid": bp.get("pid"),
                 })
-            # 2) 命中记录。debugger._hits 是有界 deque，直接读最近 100 条。
-            dbg = getattr(tgt, "dbg", None)
-            raw_hits = list(getattr(dbg, "_hits", []) or [])
+            # 2) 命中记录：改走加锁公开属性 dbg.hits，避免裸读 _hits 引发竞态
+            raw_hits = list(getattr(dbg, "hits", None) or []) if dbg is not None else []
             for h in raw_hits[-100:]:
                 if isinstance(h, dict):
                     out["hits"].append(h)
@@ -637,20 +838,27 @@ async def dyn_state(request):
     except Exception:                                     # noqa: BLE001
         pass
 
-    # 5) 待命表里能反映的 VM / 派发点痕迹
+    # 5) 待命表里能反映的 VM / 派发点痕迹（与 LeftNav.FACT_SRC 完全对齐）
     try:
         facts = _facts_snapshot()
-        for tool, nm in (("find_dispatch_tables", "dispatch"),
-                         ("vm_regs_snapshot", "regs"),
-                         ("trace_code", "trace")):
-            f = facts.get(tool)
-            if f:
-                out["vm"][nm] = [{
-                    "calls": f.get("calls"),
-                    "num": f.get("num"),
-                    "ts": f.get("ts"),
-                    "summary": f.get("summary", ""),
-                }]
+        for nm, tool_names in (
+            ("dispatch", ("find_vm_dispatch_points", "find_dispatch_tables")),
+            ("regs", ("vm_regs_snapshot",)),
+            ("trace", ("trace_code", "trace_module_load", "trace_app_startup", "trace_call_tree")),
+        ):
+            rows_vm = []
+            for tool in tool_names:
+                f = facts.get(tool)
+                if f:
+                    rows_vm.append({
+                        "tool": tool,
+                        "calls": f.get("calls"),
+                        "num": f.get("num"),
+                        "ts": f.get("ts"),
+                        "summary": f.get("summary", ""),
+                    })
+            if rows_vm:
+                out["vm"][nm] = rows_vm
     except Exception:                                     # noqa: BLE001
         pass
 
@@ -678,6 +886,10 @@ async def tools_catalog(request):
     return JSONResponse({"count": len(out), "tools": out})
 
 
+# (53) 第五十三次修改（2026-11-26）
+# bug 原因：/api/app_processes 直接在事件循环中同步执行 adb /proc 查询阻塞循环，
+#           且调用了挂 @logged() 的 tools.preflight()，在事件流里伪造 preflight 调用。
+# 解决方案：全流程移入 run_in_threadpool，并改用 _first_online_device_serial() 直接查设备。
 async def app_processes(request):
     """列出一个包名下的全部进程（真实网络活动）。
 
@@ -690,35 +902,44 @@ async def app_processes(request):
     pid_raw = (request.query_params.get("pid") or "").strip()
     serial = (request.query_params.get("serial") or "").strip()
 
-    try:
-        from server.mcp_server.tools import preflight
+    def work():
+        ser = serial or _first_online_device_serial()
+        if not ser:
+            return {"error": "没有可用的 adb 设备"}, 404
 
-        # 没给 serial 就用第一个在线设备
-        if not serial:
-            pf = json.loads(preflight())
-            devs = pf.get("devices") or []
-            if not devs:
-                return _err("没有可用的 adb 设备", 404)
-            first = devs[0]
-            serial = first.get("serial") if isinstance(first, dict) else str(first)
-
-        if not pkg and pid_raw.isdigit():
+        target_pkg = pkg
+        if not target_pkg and pid_raw.isdigit():
             from server.dyn.appproc import package_of_pid
 
-            pkg = package_of_pid(serial, int(pid_raw))
-        if not pkg:
-            return _err("需要 package 或 pid")
+            target_pkg = package_of_pid(ser, int(pid_raw))
+        if not target_pkg:
+            return {"error": "需要 package 或 pid"}, 400
 
         from server.dyn.appproc import list_app_processes
 
-        res = list_app_processes(serial, pkg)
-        return JSONResponse(res)
+        return list_app_processes(ser, target_pkg), 200
+
+    try:
+        payload, status = await run_in_threadpool(work)
+        return JSONResponse(payload, status_code=status)
     except Exception as exc:                              # noqa: BLE001
         return _err(f"{type(exc).__name__}: {exc}", 500)
 
 
+# (54) 第五十四次修改（2026-11-26）
+# bug 原因：① load 未捕获坏 JSON、非对象 body 及 ELF 解析异常，直接抛 500；
+#           ② load_upload 直接写 .cache/uploads/<name> 会覆写正在打开的同名 SoFile 句柄，
+#              且加载后未广播 modules_changed 与快照，导致多端/WKWebView 状态不同步。
+# 解决方案：① load 对 JSON/参数/ELF 错误返回 400 JSON 并在线程池构建快照；
+#           ② load_upload 写入独立子目录 uploads/<ts_uuid>/<name> 避免覆写已打开句柄同时
+#              保留干净文件名，并在加载完成后广播 modules_changed 与快照。
 async def load(request):
-    body = await request.json()
+    try:
+        body = await request.json()
+    except Exception:                                     # noqa: BLE001
+        return _err("请求体不是合法 JSON", 400)
+    if not isinstance(body, dict):
+        return _err("请求体必须是 JSON 对象", 400)
     path = str(body.get("path", "")).strip()
     if not path:
         return _err("缺少 path")
@@ -736,35 +957,39 @@ async def load(request):
         _loaded_paths[real] = so.name
         return _mod_brief(so)
 
-    info = await run_in_threadpool(work)
+    try:
+        info = await run_in_threadpool(work)
+    except Exception as exc:                              # noqa: BLE001 - 坏 ELF/解析错误
+        return _err(f"加载或解析失败：{exc}", 400)
     # 通知前端：模块列表变了。前端收到就重建模块（和 unload/clear 同一个协议），
     # 否则用 REST 加载后界面一直显示"未加载"，必须手动刷新。
-    # 先推模块名（让前端知道有变化），再推完整快照（含函数表）。
-    # 前端在 WKWebView 里拉不动 HTTP，只能靠推。
     _broadcast_sync({
         "type": "modules_changed",
         "modules": list(_session.modules.keys()),
     })
-    _broadcast_sync_json(_snapshot_payload())
+    snap = await run_in_threadpool(_snapshot_payload)
+    _broadcast_sync_json(snap)
     _activity("load_so", f"{info['so']}:{info['functions']}")
     return JSONResponse({"module": info})
 
 
 async def load_upload(request):
-    """接收前端拖入的文件：落盘到 .cache/uploads/ 后再走正常加载流程。
+    """接收前端拖入的文件：落盘到 .cache/uploads/<唯一目录>/ 后再走正常加载流程。
 
     为什么要落盘：分析内核按路径读 ELF，浏览器拖入拿到的是字节内容，
-    先在本地存一份（不参与打包、不提交）是最小改动。
+    先在本地存一份（不参与打包、不提交）是最小改动；用唯一子目录既避免覆写
+    正在打开的同名 SoFile 文件句柄，又保留原始文件名供 SoFile 命名。
     """
-    name = os.path.basename(request.query_params.get("name", "") or "uploaded.so")
+    raw_name = os.path.basename((request.query_params.get("name") or "").strip())
+    name = raw_name if raw_name and raw_name not in (".", "..") else "uploaded.so"
     body = await request.body()
     if not body:
         return _err("空文件")
     if len(body) > 512 * 1024 * 1024:
         return _err("文件超过 512MB", 413)
-    cache = os.path.join(_cache_root(), "uploads")
-    os.makedirs(cache, exist_ok=True)
-    path = os.path.join(cache, name)
+    slot_dir = os.path.join(_cache_root(), "uploads", f"{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}")
+    os.makedirs(slot_dir, exist_ok=True)
+    path = os.path.join(slot_dir, name)
 
     def work():
         with open(path, "wb") as fh:
@@ -777,6 +1002,12 @@ async def load_upload(request):
         info = await run_in_threadpool(work)
     except Exception as exc:                       # noqa: BLE001 - 坏 ELF 等
         return _err(f"解析失败：{exc}", 422)
+    _broadcast_sync({
+        "type": "modules_changed",
+        "modules": list(_session.modules.keys()),
+    })
+    snap = await run_in_threadpool(_snapshot_payload)
+    _broadcast_sync_json(snap)
     _activity("load_so", f"{info['so']}:{info['functions']}")
     return JSONResponse({"module": info, "path": path})
 
@@ -794,14 +1025,16 @@ async def functions(request):
         return _err(f"未加载的 so：{name}，当前有 {list(_session.modules)}", 404)
 
     def work():
-        # (1) 第一次修改：函数表补上"被引用次数"，供球体分级着色/列表排序。
-        #     未构建引用图时一律 0，构建后才有真实值（不估算、不猜）。
+        # (55) 第五十五次修改（2026-11-26）
+        # bug 原因：refs 原先读 x.called_by（出度）且走 property，语义与"被引用次数"相反。
+        # 解决方案：仅在 x._built 为真时读取 x._calls_to（被引用入度），不触发隐式建图。
         x = _session.xref(name)
-        built = x.progress().get("built", False)
+        built = bool(getattr(x, "_built", False))
+        calls_to = getattr(x, "_calls_to", None) or {}
         rows = []
         for fn in so.functions.values():
             row = _fn_row(fn)
-            row["refs"] = len(x.called_by.get(fn.addr, [])) if built else 0
+            row["refs"] = len(calls_to.get(fn.addr, [])) if built else 0
             if kw and kw not in row["name"].lower() and kw not in hex(row["addr"]):
                 continue
             rows.append(row)
@@ -856,6 +1089,15 @@ async def xrefs(request):
     except ValueError:
         return _err("addr 非法")
 
+    # (56) 第五十六次修改（2026-11-26）
+    # bug 原因：① callers_of_fn 返回的是 bl 调用指令地址而非调用者函数入口，
+    #              导致前端点击调用者跳转失败且 xref_tree?depth=2 二层调用者恒为空；
+    #           ② fn_detail 访问 x.plt_calls 属性会触发 20-30s 全量 build，
+    #              且 attached/hits 硬编码 False/0、断点匹配未校验 so_name 会跨 so 误报；
+    #           ③ xref_tree 未命名函数缺少 sub_xxx 兜底导致 stripped so 显示空白名。
+    # 解决方案：通过 _normalize_callers 统一将调用点归一到调用者函数入口并按入口去重，
+    #           保留可选 site 字段；fn_detail 改为只读 _plt_calls 并向 DynamicService
+    #           真实查询 attached/hits 与按 so_name+static_addr 匹配断点；所有未命名函数统一兜底。
     def work():
         x = _session.xref(name)
         x.ensure_function(addr)
@@ -863,7 +1105,7 @@ async def xrefs(request):
         base = fn.addr if fn else addr
         return {
             "addr": base,
-            "callers": [hex(a) for a in (x.callers_of_fn(base) or [])],
+            "callers": [hex(entry) for entry, _site in _normalize_callers(so, x.callers_of_fn(base))],
             "callees": [hex(a) for a in (x.callees_of_fn(base) or [])],
         }
 
@@ -927,20 +1169,25 @@ async def fn_detail(request):
         fn = so.function_at(addr)
         base = fn.addr if fn else addr
 
-        def named(a: int) -> dict:
+        def named(a: int, site: int | None = None) -> dict:
             f = so.function_at(a)
-            return {
-                "addr": hex(a),
+            entry = f.addr if f else a
+            item = {
+                "addr": hex(entry),
                 # 未命名函数的 name 可能是空串，必须兜底，否则界面上一行只有地址
-                "name": (f.name or f"sub_{a:x}") if f else f"sub_{a:x}",
+                "name": (f.name or f"sub_{entry:x}") if f else f"sub_{entry:x}",
                 "is_export": bool(f.is_export) if f else False,
             }
+            if site is not None:
+                item["site"] = hex(site)
+            return item
 
-        # 调用者 / 被调用：地址 → 名字
-        callers = [named(a) for a in x.callers_of_fn(base)]
+        # 调用者 / 被调用：调用点归一到调用者函数入口并按入口去重
+        callers = [named(entry, site) for entry, site in _normalize_callers(so, x.callers_of_fn(base))]
         callees: list[dict] = []
-        plt_addrs = set(getattr(x, "plt_calls", {}) or {})
-        for a in x.callees_of_fn(base):
+        # 绝不访问 @property plt_calls（会触发 20-30s 全量 build），只读内部 _plt_calls
+        plt_addrs = set(getattr(x, "_plt_calls", None) or {})
+        for a in (x.callees_of_fn(base) or []):
             item = named(a)
             # 落在 PLT 的是外部导入（calloc / __errno 这类），标出来
             item["plt"] = a in plt_addrs
@@ -967,11 +1214,69 @@ async def fn_detail(request):
             except Exception:                             # noqa: BLE001
                 continue
 
-        # 动态：这个地址上有没有断点、命中过几次
-        bp = any(v.get("tool") in ("set_breakpoint", "vm_breakpoint")
-                 and str((v.get("args") or {}).get("static_addr", "")).lower()
-                 in (hex(base), str(base), hex(base).replace("0x", ""))
-                 for v in _armed_list())
+        # 动态：向 DynamicService 真实查询该 so + base 的 attached、断点与命中数
+        attached = False
+        bp_live = False
+        hits_count = 0
+        try:
+            from server.dyn.service import STATE_DETACHED, get_dyn
+
+            dyn = get_dyn()
+            lock = getattr(dyn, "_lock", None)
+            snap_tgts = []
+            if lock is not None:
+                with lock:
+                    for tgt in list(getattr(dyn, "_targets", {}).values()):
+                        snap_tgts.append((
+                            getattr(tgt, "state", ""),
+                            list((getattr(tgt, "breakpoints", {}) or {}).values()),
+                            list(getattr(getattr(tgt, "rb", None), "_modules", None) or []),
+                            getattr(tgt, "dbg", None),
+                        ))
+            else:
+                for tgt in list(getattr(dyn, "_targets", {}).values()):
+                    snap_tgts.append((
+                        getattr(tgt, "state", ""),
+                        list((getattr(tgt, "breakpoints", {}) or {}).values()),
+                        list(getattr(getattr(tgt, "rb", None), "_modules", None) or []),
+                        getattr(tgt, "dbg", None),
+                    ))
+
+            for st_val, bps, rb_mods, dbg in snap_tgts:
+                if st_val != STATE_DETACHED:
+                    if rb_mods:
+                        if any(_so_matches(getattr(m, "name", ""), so.name) for m in rb_mods):
+                            attached = True
+                    else:
+                        attached = True
+                    for b in bps:
+                        if (
+                            b.get("armed", True)
+                            and (
+                                _so_matches(b.get("so_name", ""), so.name)
+                                or _so_matches(b.get("original_name", ""), so.name)
+                            )
+                        ):
+                            attached = True
+                            if _same_addr(b.get("static_addr"), base):
+                                bp_live = True
+                raw_hits = list(getattr(dbg, "hits", None) or []) if dbg is not None else []
+                for h in raw_hits:
+                    h_so = h.get("so_name", "") if isinstance(h, dict) else getattr(h, "so_name", "")
+                    h_addr = h.get("static_addr") if isinstance(h, dict) else getattr(h, "static_addr", None)
+                    if _so_matches(h_so, so.name) and _same_addr(h_addr, base):
+                        hits_count += 1
+        except Exception:                                 # noqa: BLE001
+            pass
+
+        # 待命表断点匹配同时校验 so_name 与 static_addr，避免多 so 同偏移误报
+        bp_armed = any(
+            v.get("tool") in ("set_breakpoint", "vm_breakpoint")
+            and _so_matches((v.get("args") or {}).get("so_name", ""), so.name)
+            and _same_addr((v.get("args") or {}).get("static_addr"), base)
+            for v in _armed_list()
+        )
+        bp = bp_live or bp_armed
 
         return {
             "ok": True,
@@ -983,12 +1288,12 @@ async def fn_detail(request):
             "refs_in": len(callers),
             "refs_out": len(callees),
             "section": section,
-            "attached": False,          # mda 的分析会话本身不 attach 进程
+            "attached": attached,
             "callers": callers,
             "callees": callees,
             "strings": strings,
             "breakpoint": bp,
-            "hits": 0,
+            "hits": hits_count,
         }
 
     return JSONResponse(await run_in_threadpool(work))
@@ -1029,32 +1334,38 @@ async def xref_tree(request):
                 return v
             return int(str(v), 0)
 
-        def named(a: int) -> dict:
+        def named(a: int, site: int | None = None) -> dict:
             f = so.function_at(a)
-            return {
-                "addr": hex(a),
-                "name": f.name if f else f"sub_{a:x}",
+            entry = f.addr if f else a
+            item = {
+                "addr": hex(entry),
+                "name": (f.name or f"sub_{entry:x}") if f else f"sub_{entry:x}",
                 "is_export": bool(f.is_export) if f else False,
                 "size": int(f.size) if f else 0,
             }
+            if site is not None:
+                item["site"] = hex(site)
+            return item
 
-        def layer(a: int, level: int) -> dict:
-            node = named(a)
+        def layer(a: int, level: int, site: int | None = None) -> dict:
+            f = so.function_at(a)
+            entry = f.addr if f else a
+            node = named(entry, site)
             if level <= 1:
                 return node
             node["callers_tree"] = [
-                layer(_as_int(c), level - 1)
-                for c in (x.callers_of_fn(a) or [])[:5]
+                layer(c_entry, level - 1, c_site)
+                for c_entry, c_site in _normalize_callers(so, x.callers_of_fn(entry))[:5]
             ]
             node["callees_tree"] = [
                 layer(_as_int(c), level - 1)
-                for c in (x.callees_of_fn(a) or [])[:5]
+                for c in (x.callees_of_fn(entry) or [])[:5]
             ]
             return node
 
         return {
             "root": layer(base, depth),
-            "callers": [named(_as_int(c)) for c in (x.callers_of_fn(base) or [])],
+            "callers": [named(c_entry, c_site) for c_entry, c_site in _normalize_callers(so, x.callers_of_fn(base))],
             "callees": [named(_as_int(c)) for c in (x.callees_of_fn(base) or [])],
         }
 
@@ -1069,9 +1380,10 @@ async def strings(request):
 
     def work():
         st = _session.strings(name)
+        kw_l = kw.lower()
         rows = []
         for s in st.all_strings():
-            if kw and kw not in s.value:
+            if kw_l and kw_l not in s.value.lower():
                 continue
             rows.append({"addr": s.addr, "value": s.value[:200], "refs": len(s.referenced_by)})
             if len(rows) >= 500:
@@ -1081,10 +1393,20 @@ async def strings(request):
     return JSONResponse(await run_in_threadpool(work))
 
 
+# (57) 第五十七次修改（2026-11-26）
+# bug 原因：① build_xrefs / frida_js / frida_js_stop / console_events 对坏 JSON 或非法整数
+#              参数（如非数字 pid/script_id/after）未做捕获，直接返回 500；
+#           ② /api/mcp-config 在冻结打包版（sys.frozen=True）下仍拼不存在的 app.py 路径。
+# 解决方案：统一校验 JSON 与整数/浮点参数返回 400 JSON；冻结模式下 stdio.args 仅返回 ["--mcp-stdio"]。
 async def build_xrefs(request):
     """全量引用图构建：大样本 20-30 秒，进度通过 WebSocket 推进前端。"""
-    body = await request.json()
-    name = str(body.get("so", ""))
+    try:
+        body = await request.json()
+    except Exception:                                     # noqa: BLE001
+        return _err("请求体不是合法 JSON", 400)
+    if not isinstance(body, dict):
+        return _err("请求体必须是 JSON 对象", 400)
+    name = str(body.get("so", "")).strip()
     if name not in _session.modules:
         return _err(f"未加载的 so：{name}", 404)
 
@@ -1097,18 +1419,23 @@ async def build_xrefs(request):
         _broadcast_sync({"type": "xref_progress", "so": name, "percent": 100})
         return {"so": name, "ok": True, "progress": x.progress()}
 
-    return JSONResponse(await run_in_threadpool(work))
+    try:
+        return JSONResponse(await run_in_threadpool(work))
+    except ValueError as exc:
+        return _err(str(exc), 400)
 
 
 async def mcp_config(request):
     """给 AI 用的 MCP 配置：路径按当前运行形态算，不让用户手写绝对路径。"""
-    import sys
-
+    stdio_args = (
+        ["--mcp-stdio"]
+        if getattr(sys, "frozen", False)
+        else [os.path.join(_ROOT, "app.py"), "--mcp-stdio"]
+    )
     return JSONResponse({
         "mcp_port": _mcp_port,
         "http_url": f"http://127.0.0.1:{_mcp_port}/mcp",
-        "stdio": {"command": sys.executable,
-                  "args": [os.path.join(_ROOT, "app.py"), "--mcp-stdio"]},
+        "stdio": {"command": sys.executable, "args": stdio_args},
     })
 
 
@@ -1144,13 +1471,12 @@ async def console_events(request):
     after 为时间戳游标：只返回 t > after 的事件，前端增量拉取不会重复渲染。
     """
     try:
+        after = float(request.query_params.get("after") or 0)
+    except ValueError:
+        return _err("after 必须是数字", 400)
+    try:
         from server.dyn.console import recent_events
 
-        # (1) 修订：用 query_params 而不是 request.query。
-        # bug 原因：这个项目基于 Starlette，Request 没有 `.query` 属性
-        #          （那是 Flask 的写法），实测直接 500。全项目其它端点
-        #          都用 request.query_params，这里必须一致。
-        after = float(request.query_params.get("after") or 0)
         items = recent_events(after)
     except Exception as exc:                              # noqa: BLE001
         return JSONResponse({"ok": False, "error": f"{type(exc).__name__}: {exc}",
@@ -1167,9 +1493,15 @@ async def frida_js(request):
     try:
         body = await request.json()
     except Exception:                                     # noqa: BLE001
-        return _err("body 必须是 JSON")
+        return _err("body 必须是 JSON", 400)
+    if not isinstance(body, dict):
+        return _err("请求体必须是 JSON 对象", 400)
     serial = str(body.get("serial") or "").strip()
-    pid = body.get("pid")
+    pid_raw = body.get("pid")
+    try:
+        pid_val = int(pid_raw) if pid_raw not in (None, "") else 0
+    except (TypeError, ValueError):
+        return _err("pid 必须是整数", 400)
     js = str(body.get("js") or "")
     mode = str(body.get("mode") or "once")
     try:
@@ -1180,34 +1512,42 @@ async def frida_js(request):
     def work():
         from server.dyn.console import run_js
 
-        return run_js(serial, int(pid or 0), js, mode=mode, timeout=timeout)
+        return run_js(serial, pid_val, js, mode=mode, timeout=timeout)
 
     # 脚本可能卡住（死循环 / 等设备响应），放到线程池里跑，别堵住事件循环
     out = await run_in_threadpool(work)
-    # (1) 第一次修改（2026-11-19）
-    # bug 原因：原先这里调 tools._activity() 把手动执行也记成一条"AI 调用"，
-    #          结果控制台里同一次执行显示两遍——上面一条 frida_js(手动) 的
-    #          AI 记录（含 args/result），下面一条 frida 实际输出，内容重复。
-    #          而且手动执行根本不是 AI 调用，混进"AI 调用"筛选里语义也错。
-    # 解决方案：不再写 _activity。手动执行的输出统一由 dyn/console.py 的
-    #          _emit 事件流承载，前端 ConsoleOverlay 只从那条流取，
-    #          与 AI 调用彻底分开——两路数据各走各的通道，不会互相污染。
     return JSONResponse(out)
 
 
 async def frida_js_stop(request):
     """停止常驻脚本。body: {script_id?} 或 {serial, pid}；都不给则全停。"""
-    try:
-        body = await request.json()
-    except Exception:                                     # noqa: BLE001
+    raw_body = await request.body()
+    if raw_body.strip():
+        try:
+            body = json.loads(raw_body)
+        except Exception:                                 # noqa: BLE001
+            return _err("请求体不是合法 JSON", 400)
+        if not isinstance(body, dict):
+            return _err("请求体必须是 JSON 对象", 400)
+    else:
         body = {}
+
+    sid_raw = body.get("script_id")
+    try:
+        sid_val = int(sid_raw) if sid_raw not in (None, "") else None
+    except (TypeError, ValueError):
+        return _err("script_id 必须是整数", 400)
+    pid_raw = body.get("pid")
+    try:
+        pid_val = int(pid_raw) if pid_raw not in (None, "") else 0
+    except (TypeError, ValueError):
+        return _err("pid 必须是整数", 400)
+    serial_val = str(body.get("serial") or "")
+
     def work():
         from server.dyn.console import stop_js
 
-        sid = body.get("script_id")
-        return stop_js(int(sid) if sid else None,
-                       str(body.get("serial") or ""),
-                       int(body.get("pid") or 0))
+        return stop_js(sid_val, serial_val, pid_val)
 
     return JSONResponse(await run_in_threadpool(work))
 
@@ -1218,6 +1558,29 @@ async def frida_js_list(request):
 
     items = list_scripts()
     return JSONResponse({"ok": True, "count": len(items), "items": items})
+
+
+# (58) 第五十八次修改（2026-11-26）
+# bug 原因：① _snapshot_payload 与 events sync 重复实现且未给未命名函数做 sub_xxx 兜底；
+#           ② WS /api/events 握手前未校验 Origin / Host，存在跨站 WebSocket 劫持风险；
+#           ③ lifespan 中的 _push_loop 每 2 秒直接在事件循环中无条件序列化十几 MB 快照，
+#              阻塞事件循环，且退出时未取消该后台任务；
+#           ④ _on_ai 调用 _track_armed 时未传入 ok 字段。
+# 解决方案：① _snapshot_payload 统一兜底 f.name or f"sub_{f.addr:x}" 并被 events 复用；
+#           ② events 握手前校验 Host 与 Origin，非法来源直接 ws.close(code=1008)；
+#           ③ 新增轻量版本签名 _modules_version()，_push_loop 仅在变化时于线程池构建快照，
+#              并在 lifespan 退出时正确 cancel & await 该任务；
+#           ④ _on_ai 向 _track_armed 透传 ok。
+def _modules_version() -> tuple:
+    """计算当前模块集合与函数/引用构建状态的轻量版本号，用于避免无意义重复快照。"""
+    sig = []
+    for name, m in _session.modules.items():
+        fns = getattr(m, "functions", None)
+        n_fns = len(fns) if isinstance(fns, (dict, list, tuple)) else 0
+        x = _session._xrefs.get(name) if hasattr(_session, "_xrefs") else None
+        built = bool(getattr(x, "_built", False)) if x is not None else False
+        sig.append((name, id(m), n_fns, built))
+    return tuple(sig)
 
 
 def _snapshot_payload() -> str:
@@ -1238,7 +1601,7 @@ def _snapshot_payload() -> str:
             "path": getattr(m, "path", ""),
             "functions": [
                 {
-                    "name": f.name,
+                    "name": f.name or f"sub_{f.addr:x}",
                     "addr": f.addr,
                     "size": int(getattr(f, "size", 0) or 0),
                     "is_export": bool(getattr(f, "is_export", False)),
@@ -1247,11 +1610,22 @@ def _snapshot_payload() -> str:
                 for f in (fns or [])
             ],
         })
-    return json.dumps({"type": "modules_snapshot", "details": details},
-                      ensure_ascii=False)
+    return json.dumps({
+        "type": "modules_snapshot",
+        "modules": list(_session.modules),
+        "details": details,
+    }, ensure_ascii=False)
 
 
 async def events(ws):
+    host = ws.headers.get("host")
+    if host is not None and not _is_local_host(host):
+        await ws.close(code=1008)
+        return
+    origin = ws.headers.get("origin")
+    if origin is not None and not _is_local_origin(origin):
+        await ws.close(code=1008)
+        return
     await ws.accept()
     _clients.add(ws)
     try:
@@ -1259,7 +1633,7 @@ async def events(ws):
                                       ensure_ascii=False))
         # 连上就先推一份完整快照：前端定时器在 WKWebView 里不可靠（实测不触发），
         # 所以数据必须由后端主动送到。
-        await ws.send_text(_snapshot_payload())
+        await ws.send_text(await run_in_threadpool(_snapshot_payload))
         while True:
             raw = await ws.receive_text()
             # 前端可以主动要一次模块列表：WebSocket 不走 HTTP 缓存，
@@ -1269,33 +1643,7 @@ async def events(ws):
             except Exception:                             # noqa: BLE001
                 continue
             if isinstance(msg, dict) and msg.get("type") == "sync":
-                await ws.send_text(json.dumps({
-                    "type": "modules_snapshot",
-                    "modules": list(_session.modules),
-                    "details": [
-                        {
-                            "so": m.name,
-                            "path": getattr(m, "path", ""),
-                            # 函数表一起推：前端 appendModule 需要它，
-                            # 走 HTTP 会被 WKWebView 复用旧响应（实测）
-                            "functions": [
-                                {
-                                    "name": f.name,
-                                    "addr": f.addr,
-                                    "size": int(getattr(f, "size", 0) or 0),
-                                    "is_export": bool(getattr(f, "is_export", False)),
-                                    "refs": len(getattr(f, "calls", []) or []),
-                                }
-                                for f in (
-                                    m.functions() if callable(getattr(m, "functions", None))
-                                    else (m.functions.values() if isinstance(getattr(m, "functions", None), dict)
-                                          else m.functions)
-                                )
-                            ],
-                        }
-                        for m in _session.modules.values()
-                    ],
-                }, ensure_ascii=False))
+                await ws.send_text(await run_in_threadpool(_snapshot_payload))
     except Exception:                          # noqa: BLE001 - 正常断开
         pass
     finally:
@@ -1351,19 +1699,28 @@ async def lifespan(_app):
     if _reaped:
         print(f"[MCP] 已清理 {_reaped} 个孤儿 stdio 代理", flush=True)
 
-    # 定时把所有模块快照推给连着的客户端（2 秒一次）。
-    # 前端定时器在 WKWebView 里不可靠，数据必须由后端主动送。
+    # 仅当模块集合或版本号变化时，才在线程池构建并推送快照，避免每 2 秒无脑序列化大 JSON
+    last_ver = None
+
     async def _push_loop():
+        nonlocal last_ver
         while True:
             await asyncio.sleep(2.0)
             if not _clients:
                 continue
+            cur_ver = _modules_version()
+            if cur_ver == last_ver:
+                continue
             try:
-                await _broadcast_raw(_snapshot_payload())
+                payload = await run_in_threadpool(_snapshot_payload)
+                await _broadcast_raw(payload)
+                last_ver = cur_ver
+            except asyncio.CancelledError:
+                raise
             except Exception:                             # noqa: BLE001
                 pass
 
-    asyncio.create_task(_push_loop())
+    push_task = asyncio.create_task(_push_loop())
 
     # (3) 第三次修改（2026-10-30）：标记本进程是 GUI。
     #     bug 原因：新增「工具调用转发到 GUI」机制后（mcp_server/link.py），
@@ -1396,7 +1753,7 @@ async def lifespan(_app):
         except Exception:                                 # noqa: BLE001
             pass
         try:
-            if _track_armed(tool, args, entry.get("summary", "")):
+            if _track_armed(tool, args, entry.get("summary", ""), ok=entry.get("ok", True)):
                 items = _armed_list()
                 _broadcast_sync({"type": "armed_changed",
                                  "count": len(items), "items": items})
@@ -1441,8 +1798,15 @@ async def lifespan(_app):
     mcp.port = int(os.environ.get("MDA_MCP_PORT", "8765"))
     _mcp_port = mcp.port
     mcp.start_http()
-    yield
-    mcp.stop(wait=1.0)
+    try:
+        yield
+    finally:
+        push_task.cancel()
+        try:
+            await push_task
+        except asyncio.CancelledError:
+            pass
+        mcp.stop(wait=1.0)
 
 
 routes = [
@@ -1462,7 +1826,15 @@ routes = [
     Route("/api/sections", sections),
     Route("/api/armed", armed),
     Route("/api/dyn_state", dyn_state),
-    Route("/api/armed/clear", armed_clear),
+    # (59) 第五十九次修改（2026-11-26）
+    # bug 原因：① /api/armed/clear 仅注册默认 GET，与前端 POST 冲突报 405 且暴露 GET CSRF；
+    #           ② index_html 直接拼接 json.dumps 到 <script> 未转义 </ 与 \u2028/\u2029，
+    #              恶意文件名可闭合 </script> 造成 XSS；
+    #           ③ 缺少本地 Host 校验（防 DNS Rebinding）与写接口 Origin/自定义头 CSRF 校验。
+    # 解决方案：① /api/armed/clear 改为 methods=["POST"]；
+    #           ② index_html 对内联 JSON 做 </ -> <\/ 及 \u2028/\u2029 转义；
+    #           ③ 新增 _LocalGuardMiddleware 拦截非本地 Host、跨站 Origin 与无凭据简单 POST。
+    Route("/api/armed/clear", armed_clear, methods=["POST"]),
     Route("/api/app_processes", app_processes),
     Route("/api/load_upload", load_upload, methods=["POST"]),
     Route("/api/functions", functions),
@@ -1519,12 +1891,15 @@ async def index_html(request):
         {"so": m.name, "path": getattr(m, "path", "")}
         for m in _session.modules.values()
     ]
-    # 注入到 window.__MDA_BOOT__，前端启动时优先用它
-    boot = (
-        '<script>window.__MDA_BOOT__=' +
-        json.dumps({"modules": mods}, ensure_ascii=False) +
-        ';</script>'
+    # 注入到 window.__MDA_BOOT__，转义 </ 与行分隔符防止 </script> XSS 逃逸
+    boot_json = (
+        json.dumps({"modules": mods}, ensure_ascii=False)
+        .replace("</", "<\\/")
+        .replace("<!--", "\\u003c!--")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
     )
+    boot = f"<script>window.__MDA_BOOT__={boot_json};</script>"
     html = html.replace("</head>", boot + "</head>", 1)
     return HTMLResponse(html, headers={
         "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
@@ -1576,9 +1951,84 @@ class _NoCacheAPI:
         await self.app(scope, receive, send_wrapper)
 
 
+class _LocalGuardMiddleware:
+    """纯 ASGI 安全中间件：防 DNS Rebinding（Host 白名单）与跨站 CSRF 写请求。"""
+
+    def __init__(self, app):
+        self.app = app
+
+    @staticmethod
+    async def _reject_http(scope, receive, send, msg: str, status: int = 403) -> None:
+        resp = JSONResponse({"error": msg}, status_code=status)
+        await resp(scope, receive, send)
+
+    async def __call__(self, scope, receive, send):
+        stype = scope.get("type")
+        if stype not in ("http", "websocket"):
+            await self.app(scope, receive, send)
+            return
+
+        headers = {
+            k.decode("latin-1").lower(): v.decode("latin-1")
+            for k, v in (scope.get("headers") or [])
+        }
+
+        # 1) Host 白名单：仅允许 127.0.0.1 / localhost / [::1]（防 DNS Rebinding）
+        host = headers.get("host", "")
+        if not _is_local_host(host):
+            if stype == "http":
+                await self._reject_http(scope, receive, send, "禁止非本地 Host 访问")
+            else:
+                await send({"type": "websocket.close", "code": 1008})
+            return
+
+        if stype == "websocket":
+            origin = headers.get("origin")
+            if origin is not None and not _is_local_origin(origin):
+                await send({"type": "websocket.close", "code": 1008})
+                return
+            await self.app(scope, receive, send)
+            return
+
+        # 2) 写操作 / 敏感 POST 接口防 CSRF（覆盖全部 8 个写端点及后续新增 /api/ 写端点）
+        method = (scope.get("method") or "GET").upper()
+        path = scope.get("path") or ""
+        if method not in ("GET", "HEAD", "OPTIONS") and (
+            path in _PROTECTED_POST_PATHS or path.startswith("/api/")
+        ):
+            origin = headers.get("origin")
+            referer = headers.get("referer")
+            sec_fetch_site = (headers.get("sec-fetch-site") or "").strip().lower()
+
+            if origin is not None:
+                if not _is_local_origin(origin):
+                    await self._reject_http(scope, receive, send, "禁止非本地 Origin 发起写请求")
+                    return
+            else:
+                if referer is not None and not _is_local_referer(referer):
+                    await self._reject_http(scope, receive, send, "禁止非本地 Referer 发起写请求")
+                    return
+                if sec_fetch_site == "cross-site":
+                    await self._reject_http(scope, receive, send, "禁止跨站写请求")
+                    return
+
+            # 要求自定义客户端头 X-MDA-Client: 1 或严格 application/json（拒绝零预检简单跨站表单/纯文本请求）
+            has_client_hdr = headers.get("x-mda-client") == "1"
+            ctype = (headers.get("content-type") or "").split(";", 1)[0].strip().lower()
+            if not (has_client_hdr or ctype == "application/json"):
+                await self._reject_http(
+                    scope, receive, send,
+                    "缺少 X-MDA-Client 头或合法 application/json Content-Type",
+                )
+                return
+
+        await self.app(scope, receive, send)
+
+
 app = Starlette(routes=routes, lifespan=lifespan)
 app = CORSMiddleware(app, allow_origins=DEV_ORIGINS, allow_methods=["*"], allow_headers=["*"])
 app = _NoCacheAPI(app)
+app = _LocalGuardMiddleware(app)
 
 
 

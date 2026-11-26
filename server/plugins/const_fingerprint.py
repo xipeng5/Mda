@@ -41,9 +41,12 @@ FINGERPRINTS = {
     0xCC9E2D51: ("MurmurHash3 c1", "hash"),
     0x1B873593: ("MurmurHash3 c2", "hash"),
     0x5BD1E995: ("MurmurHash2 magic", "hash"),
+    # (2) 第二次修改（2026-11-26）
+    # bug 原因：1) 字典内同时存在 0x01000193 与 0x1000193 重复键导致覆盖；
+    #           2) CRC32 多项式写成 33 位 0x104C11DB7，无法被 4 字节扫描命中。
+    # 解决方案：删除重复键 0x1000193；CRC32 多项式改为标准 32 位截断表示 0x04C11DB7。
     0x01000193: ("FNV-1a prime (32)", "hash"),
     0x811C9DC5: ("FNV offset basis (32)", "hash"),
-    0x1000193: ("FNV-1a prime (alt)", "hash"),
     0xDEADBEEF: ("common debug/seed value", "marker"),
     0xCAFEBABE: ("common magic/seed value", "marker"),
     0x08088405: ("common LCG multiplier", "prng"),
@@ -51,7 +54,7 @@ FINGERPRINTS = {
     0x3039: ("common LCG multiplier (12345)", "prng"),
     0x4B1D: ("CRC16-CCITT poly (0x1021 variant)", "crc"),
     0xEDB88320: ("CRC32 reversed poly", "crc"),
-    0x104C11DB7: ("CRC32 poly", "crc"),
+    0x04C11DB7: ("CRC32 poly (IEEE 802.3)", "crc"),
     0xD765A20C: ("AES S-box related", "cipher"),
 }
 

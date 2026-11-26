@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import threading
 import time
 
 import frida
@@ -17,6 +18,41 @@ import frida
 # 设备侧（find_module）一旦用不同规则，就会出现"静态认得、动态不认得"
 # 的矛盾现象，而用户看到的是同一句"未加载的 so"。
 from server.core.session import match_name
+
+# (7) 第七次修改（2026-11-26）
+# bug 原因：frida 17.23.3 上同步调用 script.unload() 可能永久阻塞，
+#           同时反复起守护线程又会导致线程泄漏。
+# 解决方案：提供带超时和并发上限的公共异步卸载辅助函数 unload_script_async，
+#           供 rebase / debugger / console / bridge 共同复用。
+_UNLOAD_PENDING: set[int] = set()
+_UNLOAD_LOCK = threading.Lock()
+
+
+def unload_script_async(script, timeout: float = 2.0) -> None:
+    """在带超时与并发上限的守护线程里卸载 frida script，避免同步 unload 卡死。"""
+    if script is None:
+        return
+    key = id(script)
+    with _UNLOAD_LOCK:
+        if key in _UNLOAD_PENDING or len(_UNLOAD_PENDING) >= 16:
+            return
+        _UNLOAD_PENDING.add(key)
+
+    def _worker() -> None:
+        try:
+            script.unload()
+        except Exception:                                 # noqa: BLE001
+            pass
+        finally:
+            with _UNLOAD_LOCK:
+                _UNLOAD_PENDING.discard(key)
+
+    th = threading.Thread(target=_worker, name="mda-script-unload", daemon=True)
+    th.start()
+    try:
+        th.join(max(0.1, float(timeout)))
+    except Exception:                                     # noqa: BLE001
+        pass
 
 
 class RuntimeModule:
@@ -54,6 +90,7 @@ class Rebase:
         self.pid = pid
         self.session = device.attach(pid)
         self._modules: list[RuntimeModule] = []
+        self._last_error: str = ""
 
     # ---------- 连接管理 ----------
 
@@ -110,15 +147,36 @@ class Rebase:
             send(mods);
             """
         )
+        # (8) 第八次修改（2026-11-26）
+        # bug 原因：原回调无条件按 payload=[] 处理并置 done=True，遇到 JS error 消息时
+        #           既不记录错误也不抛异常，直接静默返回空列表，上层误以为进程无模块。
+        # 解决方案：区分 type=="error" 并记录到 self._last_error 后向上抛出 RuntimeError。
         got: list = []
+        err_box: list[str] = []
         done = {"ok": False}
-        script.on("message", lambda msg, data: (got.extend(msg.get("payload", [])), done.__setitem__("ok", True)))
+
+        def _on_msg(msg, data) -> None:
+            mtype = msg.get("type") if isinstance(msg, dict) else None
+            if mtype == "error":
+                desc = msg.get("description") or msg.get("stack") or "JS error"
+                err_box.append(str(desc))
+                done["ok"] = True
+                return
+            payload = msg.get("payload", []) if isinstance(msg, dict) else []
+            if isinstance(payload, list):
+                got.extend(payload)
+            done["ok"] = True
+
+        script.on("message", _on_msg)
         script.load()
         # 消息回调是异步的，轮询等待
         for _ in range(50):
             if done["ok"]:
                 break
             time.sleep(0.1)
+        if err_box:
+            self._last_error = err_box[0]
+            raise RuntimeError(f"refresh_modules JS error: {err_box[0]}")
         # (5) 第五次修改（2026-11-06）：**不再调用 script.unload()**。
         #     bug 原因：实测 frida 17.23.3 + 该设备上，script.unload() 会
         #               永久阻塞（不是慢，是完全不返回）。refresh_modules
@@ -208,7 +266,11 @@ class Rebase:
 
         if not regions:
             return []
-        spec = [[int(r["addr"]), int(r["size"])] for r in regions]
+        # (9) 第九次修改（2026-11-26）
+        # bug 原因：原实现把 64 位地址以整数序列化进 JSON，JS 侧按 IEEE-754 float64
+        #           解析时会截断超过 53 位的 ARM64 TBI 指针（如 0xb4...），导致读歪或崩溃。
+        # 解决方案：统一序列化为 "0x..." 字符串交给 JS ptr("0x...") 无损解析。
+        spec = [[hex(int(r["addr"])), int(r["size"])] for r in regions]
         script = self.session.create_script(
             "var SPEC = " + _json.dumps(spec) + ";"
             "var out = [];"
@@ -262,28 +324,43 @@ class Rebase:
         版本下 data 为 None，故在 JS 端转 hex 字符串走 JSON 通道，稳定。
         解决：JS 内 Uint8Array 转 hex，Python 端 bytes.fromhex 还原。
         """
+        # (10) 第十次修改（2026-11-26）
+        # bug 原因：① ptr({hex(addr)}) 缺少引号，JS 解析为 float64 数字会截断 ARM64 TBI 64 位指针；
+        #           ② 同步调用 script.unload() 在 frida 17.23.3 上会永久阻塞。
+        # 解决方案：地址改为带引号字符串 ptr("0x...")；unload 改为带超时的异步卸载 unload_script_async。
         script = self.session.create_script(
             f"""
-            var buf = ptr({hex(addr)}).readByteArray({size});
-            if (buf === null) {{
-                send({{err: "unreadable"}});
-            }} else {{
-                send({{
-                    hex: Array.from(new Uint8Array(buf))
-                        .map(function(x) {{ return x.toString(16).padStart(2, "0"); }})
-                        .join("")
-                }});
+            try {{
+                var buf = ptr("{hex(int(addr))}").readByteArray({int(size)});
+                if (buf === null) {{
+                    send({{err: "unreadable"}});
+                }} else {{
+                    send({{
+                        hex: Array.from(new Uint8Array(buf))
+                            .map(function(x) {{ return x.toString(16).padStart(2, "0"); }})
+                            .join("")
+                    }});
+                }}
+            }} catch (e) {{
+                send({{err: String(e)}});
             }}
             """
         )
         got: list = []
-        script.on("message", lambda msg, data: got.append(msg.get("payload", {})))
+
+        def _on_msg(msg, data) -> None:
+            if isinstance(msg, dict) and msg.get("type") == "error":
+                got.append({"err": msg.get("description") or "JS error"})
+                return
+            got.append(msg.get("payload", {}) if isinstance(msg, dict) else {})
+
+        script.on("message", _on_msg)
         script.load()
         for _ in range(50):
             if got:
                 break
             time.sleep(0.1)
-        script.unload()
+        unload_script_async(script, timeout=2.0)
         if not got:
             return b""
         payload = got[0]

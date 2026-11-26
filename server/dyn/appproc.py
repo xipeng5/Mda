@@ -476,18 +476,29 @@ def probe_env(serial: str, pid=None) -> dict:
             except (TypeError, ValueError):
                 tpart = ""
 
-        # 一条命令：dumpsys 的原始行 + 分隔符 + 目标 cmdline 原始字节
+        # (7) 第七次修改（2026-11-26）
+        # bug 原因：Android 10+ 多屏/多栈设备的 dumpsys activity activities 往往在真实
+        #           前台 Activity 之前先输出 `mResumedActivity: null` 行，原 `grep -m1`
+        #           命中第一条 null 行就退出，导致前台包名恒识别失败。
+        # 解决方案：去掉 `-m1` 取全部 mResumedActivity 行，在 Python 侧跳过 null 行，
+        #           提取第一条真实非 null 的 Activity 包名。
         script = ("dumpsys activity activities 2>/dev/null "
-                  "| grep -m1 mResumedActivity; " + tpart)
+                  "| grep mResumedActivity; " + tpart)
         r = _adb(script, serial, timeout=25)
         raw = r.stdout or ""
 
         head, _, tail = raw.partition("---MDA-TARGET---")
-        # 前台包名：从中取 pkg/Activity 里的 pkg
-        m = re.search(r"([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)+)/",
-                       head)
-        if m:
-            out["fg_package"] = m.group(1)
+        # 前台包名：跳过 mResumedActivity: null 行，从首个真实 Activity 取 pkg/Activity 里的 pkg
+        matched_pkg = ""
+        for ln in head.splitlines():
+            if re.search(r"mResumedActivity\s*:\s*null\b", ln):
+                continue
+            m = re.search(r"([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)+)/", ln)
+            if m:
+                matched_pkg = m.group(1)
+                break
+        if matched_pkg:
+            out["fg_package"] = matched_pkg
             out["ok"] = True
         else:
             out["error"] = "dumpsys 里找不到前台包名（可能锁屏/桌面未就绪）"

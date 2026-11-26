@@ -80,6 +80,7 @@ static volatile int g_active = 0;
 static volatile int g_records = 0;
 static volatile int g_max_records = MAX_RECORDS_DEFAULT;
 static volatile int g_armed = 0;   /* 防止 handler 重入 */
+static volatile int g_need_rearm = 0;
 
 /* 单条记录 */
 struct rec {
@@ -94,24 +95,88 @@ struct rec {
     unsigned char before[64];
 };
 
-static void emit_record(const struct rec *r) {
-    char hex[129];
-    int i, n = r->before_len;
+/*
+ * (1) 第一次修改（2026-11-26）
+ * bug 原因：① on_segv 调用了 snprintf / printf / fflush，均非异步信号安全函数，
+ *             在持有 stdio 锁期间触发 SIGSEGV 会直接死锁；
+ *           ② 同页无关地址写入时将 g_active 置 0，导致整轮监控永久中止；
+ *           ③ cmd_watch 忽略传入的非自身 pid，静默 mprotect 自身进程内存。
+ * 解决方案：① 改用纯栈缓冲 + 异步信号安全 write(STDOUT_FILENO, ...) 输出 JSON；
+ *           ② 同页无关写仅临时放开页权限并置原子标志 g_need_rearm，由主循环重新加锁；
+ *           ③ cmd_watch 检测到非自身 pid 明确返回错误并提示使用注入版 mda_memguard_inject。
+ */
+static size_t append_str(char *buf, size_t pos, size_t cap, const char *s) {
+    while (*s && pos + 1 < cap) buf[pos++] = *s++;
+    return pos;
+}
+
+static size_t append_u64_dec(char *buf, size_t pos, size_t cap, uint64_t v) {
+    char tmp[24];
+    int k = 0;
+    if (v == 0) {
+        if (pos + 1 < cap) buf[pos++] = '0';
+        return pos;
+    }
+    while (v > 0 && k < (int)sizeof(tmp)) {
+        tmp[k++] = (char)('0' + (v % 10));
+        v /= 10;
+    }
+    while (k > 0 && pos + 1 < cap) buf[pos++] = tmp[--k];
+    return pos;
+}
+
+static size_t append_u64_hex(char *buf, size_t pos, size_t cap, uint64_t v) {
+    static const char HEX[] = "0123456789abcdef";
+    char tmp[20];
+    int k = 0;
+    pos = append_str(buf, pos, cap, "0x");
+    if (v == 0) {
+        if (pos + 1 < cap) buf[pos++] = '0';
+        return pos;
+    }
+    while (v > 0 && k < (int)sizeof(tmp)) {
+        tmp[k++] = HEX[v & 0xf];
+        v >>= 4;
+    }
+    while (k > 0 && pos + 1 < cap) buf[pos++] = tmp[--k];
+    return pos;
+}
+
+static void emit_record_safe(const struct rec *r) {
+    static const char HEX[] = "0123456789abcdef";
+    char out[512];
+    size_t pos = 0, cap = sizeof(out);
+    int n = r->before_len;
+    if (n < 0) n = 0;
     if (n > 64) n = 64;
-    for (i = 0; i < n && i < 64; i++)
-        snprintf(hex + i * 2, 3, "%02x", r->before[i]);
-    hex[n * 2] = 0;
-    printf("{\"seq\":%llu,\"ts_ms\":%llu,\"fault_addr\":\"0x%llx\","
-           "\"pc\":\"0x%llx\",\"lr\":\"0x%llx\",\"sp\":\"0x%llx\","
-           "\"x0\":\"0x%llx\",\"x1\":\"0x%llx\","
-           "\"before_hex\":\"%s\",\"before_len\":%d}\n",
-           (unsigned long long)r->seq, (unsigned long long)r->ts_ms,
-           (unsigned long long)r->fault_addr,
-           (unsigned long long)r->pc, (unsigned long long)r->lr,
-           (unsigned long long)r->sp,
-           (unsigned long long)r->x0, (unsigned long long)r->x1,
-           hex, r->before_len);
-    fflush(stdout);
+
+    pos = append_str(out, pos, cap, "{\"seq\":");
+    pos = append_u64_dec(out, pos, cap, r->seq);
+    pos = append_str(out, pos, cap, ",\"ts_ms\":");
+    pos = append_u64_dec(out, pos, cap, r->ts_ms);
+    pos = append_str(out, pos, cap, ",\"fault_addr\":\"");
+    pos = append_u64_hex(out, pos, cap, r->fault_addr);
+    pos = append_str(out, pos, cap, "\",\"pc\":\"");
+    pos = append_u64_hex(out, pos, cap, r->pc);
+    pos = append_str(out, pos, cap, "\",\"lr\":\"");
+    pos = append_u64_hex(out, pos, cap, r->lr);
+    pos = append_str(out, pos, cap, "\",\"sp\":\"");
+    pos = append_u64_hex(out, pos, cap, r->sp);
+    pos = append_str(out, pos, cap, "\",\"x0\":\"");
+    pos = append_u64_hex(out, pos, cap, r->x0);
+    pos = append_str(out, pos, cap, "\",\"x1\":\"");
+    pos = append_u64_hex(out, pos, cap, r->x1);
+    pos = append_str(out, pos, cap, "\",\"before_hex\":\"");
+    for (int i = 0; i < n && pos + 2 < cap; i++) {
+        out[pos++] = HEX[(r->before[i] >> 4) & 0xf];
+        out[pos++] = HEX[r->before[i] & 0xf];
+    }
+    pos = append_str(out, pos, cap, "\",\"before_len\":");
+    pos = append_u64_dec(out, pos, cap, (uint64_t)n);
+    pos = append_str(out, pos, cap, "}\n");
+
+    ssize_t unused = write(STDOUT_FILENO, out, pos);
+    (void)unused;
 }
 
 static uint64_t now_ms(void) {
@@ -121,14 +186,15 @@ static uint64_t now_ms(void) {
 }
 
 /*
- * SIGSEGV handler：核心逻辑
+ * SIGSEGV handler：核心逻辑（全程异步信号安全，不调用 printf/fflush/snprintf）
  *
  * 关键点：此刻那条写指令**还没有执行**，所以内存里仍是"写入前"的值。
  * 这正是 perf_event 拿不到的东西。
  */
 static void on_segv(int sig, siginfo_t *si, void *uctx) {
     (void)sig;
-    if (!g_armed || !g_active) {
+    if (!__atomic_load_n(&g_armed, __ATOMIC_ACQUIRE) ||
+        !__atomic_load_n(&g_active, __ATOMIC_ACQUIRE)) {
         /* 不是我们关心的地址：恢复默认行为，让真正的问题暴露出来 */
         struct sigaction dfl;
         memset(&dfl, 0, sizeof(dfl));
@@ -136,27 +202,29 @@ static void on_segv(int sig, siginfo_t *si, void *uctx) {
         sigaction(SIGSEGV, &dfl, NULL);
         return;
     }
-    if (g_records >= g_max_records) {
+    int cur_recs = __atomic_load_n(&g_records, __ATOMIC_ACQUIRE);
+    if (cur_recs >= g_max_records) {
         /* 到上限：解除保护并退出监控，避免拖死目标 */
-        g_active = 0;
+        __atomic_store_n(&g_active, 0, __ATOMIC_RELEASE);
         mprotect((void *)g_page_base, PAGE_SIZE, PROT_READ | PROT_WRITE);
         return;
     }
-    g_armed = 0;
+    __atomic_store_n(&g_armed, 0, __ATOMIC_RELEASE);
 
     unsigned long faddr = (unsigned long)si->si_addr;
     /* 只关心落在目标区间内的写（同页可能有别的地址） */
     if (faddr < g_addr || faddr >= g_addr + g_size) {
-        /* 不是目标：临时放开这一页，避免死循环 */
+        /* 不是目标区间：临时放开页权限让无关写完成，不置 g_active=0，由主循环重新加锁 */
         mprotect((void *)g_page_base, PAGE_SIZE, PROT_READ | PROT_WRITE);
-        g_active = 0;
-        g_armed = 1;
+        __atomic_store_n(&g_need_rearm, 1, __ATOMIC_RELEASE);
+        __atomic_store_n(&g_armed, 1, __ATOMIC_RELEASE);
         return;
     }
 
     struct rec r;
     memset(&r, 0, sizeof(r));
-    r.seq = (uint64_t)g_records + 1;
+    int seq = __atomic_add_fetch(&g_records, 1, __ATOMIC_ACQ_REL);
+    r.seq = (uint64_t)seq;
     r.ts_ms = now_ms();
     r.fault_addr = faddr;
 
@@ -178,14 +246,14 @@ static void on_segv(int sig, siginfo_t *si, void *uctx) {
     memcpy(r.before, (void *)g_addr, (size_t)want);
     r.before_len = want;
 
-    emit_record(&r);
-    g_records++;
+    emit_record_safe(&r);
 
     /* 恢复可写让这条写指令能完成；下次访问前再设回只读 */
     mprotect((void *)g_page_base, PAGE_SIZE, PROT_READ | PROT_WRITE);
+    __atomic_store_n(&g_need_rearm, 1, __ATOMIC_RELEASE);
     /* 注意：真实生产需要在单步后重新加锁。这里用"每次都重新加锁"的
      * 简化策略：由主循环轮询重新加锁（见 cmd_watch）。 */
-    g_armed = 1;
+    __atomic_store_n(&g_armed, 1, __ATOMIC_RELEASE);
 }
 
 static int install_handler(void) {
@@ -230,13 +298,18 @@ static int cmd_selftest(void) {
 static int cmd_watch(pid_t pid, unsigned long addr, unsigned long size,
                      int max_records, int duration_ms) {
     /*
-     * 注意：跨进程 mprotect 需要目标进程自己执行。本程序作为独立进程运行时，
-     * 只能监控**自身**地址空间。跨进程场景由 Python 侧通过注入/协作完成。
-     *
-     * 这里提供的是"进程内监控"实现，Python 侧若要跨进程，
-     * 需把本程序作为 .so 注入或用 ptrace 协作。
+     * (1) 第一次修改（2026-11-26）：若传入非自身 pid 则明确拒绝并引导使用注入版
+     *     mda_memguard_inject，避免静默对自身进程执行 mprotect。
      */
-    (void)pid;
+    pid_t self = getpid();
+    if (pid > 0 && pid != self) {
+        printf("{\"ok\":false,\"code\":\"CROSS_PROCESS_NOT_SUPPORTED\","
+               "\"pid\":%d,\"self_pid\":%d,"
+               "\"error\":\"mda_memguard 仅支持进程内监控(self pid=%d)，"
+               "不支持直接监控外部进程 pid=%d；跨进程写监控请改用注入版 mda_memguard_inject\"}\n",
+               (int)pid, (int)self, (int)self, (int)pid);
+        return 4;
+    }
     g_addr = addr;
     g_size = size;
     g_page_base = addr & ~(unsigned long)(PAGE_SIZE - 1);
@@ -251,8 +324,9 @@ static int cmd_watch(pid_t pid, unsigned long addr, unsigned long size,
                "\"error\":\"%s\"}\n", errno, strerror(errno));
         return 3;
     }
-    g_active = 1;
-    g_armed = 1;
+    __atomic_store_n(&g_need_rearm, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_active, 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_armed, 1, __ATOMIC_RELEASE);
 
     printf("{\"ok\":true,\"mode\":\"watch\",\"page\":\"0x%lx\","
            "\"addr\":\"0x%lx\",\"size\":%lu,\"max_records\":%d}\n",
@@ -260,17 +334,21 @@ static int cmd_watch(pid_t pid, unsigned long addr, unsigned long size,
     fflush(stdout);
 
     uint64_t t0 = now_ms();
-    while (g_active) {
+    while (__atomic_load_n(&g_active, __ATOMIC_ACQUIRE)) {
         usleep(2000);
         if (duration_ms > 0 && (now_ms() - t0) >= (uint64_t)duration_ms) break;
-        /* 每次 handler 后都恢复成可写（让写指令能完成），
+        /* 每次 handler 后都恢复成可写（让写指令或同页无关写完成），
          * 这里在空闲时重新加锁，形成"写→捕获→重新加锁"的循环 */
-        if (g_armed && g_records < g_max_records) {
+        if (__atomic_load_n(&g_armed, __ATOMIC_ACQUIRE) &&
+            __atomic_load_n(&g_need_rearm, __ATOMIC_ACQUIRE) &&
+            __atomic_load_n(&g_records, __ATOMIC_ACQUIRE) < g_max_records) {
+            __atomic_store_n(&g_need_rearm, 0, __ATOMIC_RELEASE);
             mprotect((void *)g_page_base, PAGE_SIZE, PROT_READ);
         }
     }
     mprotect((void *)g_page_base, PAGE_SIZE, PROT_READ | PROT_WRITE);
-    printf("{\"ok\":true,\"done\":true,\"records\":%d}\n", g_records);
+    printf("{\"ok\":true,\"done\":true,\"records\":%d}\n",
+           __atomic_load_n(&g_records, __ATOMIC_ACQUIRE));
     return 0;
 }
 

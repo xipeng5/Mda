@@ -41,6 +41,7 @@ frida 注入（运行时 attach），和 Xposed 的区别：
 from __future__ import annotations
 
 import json
+import threading
 import time
 
 __all__ = [
@@ -93,9 +94,11 @@ def _js_str(s) -> str:
 
 
 
-_DETACH_LOCK = __import__("threading").Lock()
+_DETACH_LOCK = threading.Lock()
 _DETACHING: set = set()
 _DETACH_MAX = 16
+# (6) 第六次修改（2026-11-26）：保护全局常驻监控表 _ACTIVE，防止并发 start/poll/stop 竞态。
+_ACTIVE_LOCK = threading.Lock()
 
 _JS_BEHAVIOR = r"""
 Java.perform(function () {
@@ -132,6 +135,7 @@ Java.perform(function () {
     }
 
     function hexOf(arr, limit) {
+        if (!arr) { return ''; }
         try {
             var n = Math.min(arr.length, limit || 48);
             var s = '';
@@ -143,7 +147,23 @@ Java.perform(function () {
     }
 
     // 供调用方在**求值之前**判断是否已达上限
-    function atLimit() { return events.length >= MAX_EVENTS; }
+    function atLimit() {
+        if (events.length >= MAX_EVENTS) { truncated = true; return true; }
+        return false;
+    }
+
+    // (6) 第六次修改（2026-11-26）
+    // bug 原因：① 全部 crypto 钩子直接读 buf.length / res.length，遇到 null 参数或 null 返回值会抛 TypeError 搞崩 App；
+    //           ② atLimit() 虽已定义但从未接入，达到 MAX_EVENTS 后仍继续抓栈与转十六进制拖慢目标；
+    //           ③ stop 时未把已挂钩重载恢复为 implementation = null。
+    // 解决方案：① 统一对 buf / res / cmd / lst 判空保护；
+    //           ② 所有 hook 回调先判 !atLimit() 再求值与记录；
+    //           ③ 用 hookedOverloads 收集所有挂钩重载，stop 时统一恢复 implementation = null。
+    var hookedOverloads = [];
+    function hookOv(ov, fn) {
+        ov.implementation = fn;
+        hookedOverloads.push(ov);
+    }
 
     function tryHook(label, fn) {
         try { fn(); return true; }
@@ -160,102 +180,134 @@ Java.perform(function () {
     if (CFG.crypto) {
         if (tryHook('MessageDigest', function () {
             var MD = Java.use('java.security.MessageDigest');
-            MD.getInstance.overload('java.lang.String').implementation = function (algo) {
+            hookOv(MD.getInstance.overload('java.lang.String'), function (algo) {
                 var r = this.getInstance(algo);
-                record('crypto', 'digest_algo',
-                       {algo: algo, stack: javaStack(6, 2)});
+                if (!atLimit()) {
+                    record('crypto', 'digest_algo',
+                           {algo: algo, stack: javaStack(6, 2)});
+                }
                 return r;
-            };
-            MD.digest.overload('[B').implementation = function (buf) {
+            });
+            hookOv(MD.digest.overload('[B'), function (buf) {
                 var res = this.digest(buf);
-                record('crypto', 'digest_io', {
-                    algo: this.getAlgorithm ? this.getAlgorithm() : '?',
-                    in_hex: hexOf(buf), in_len: buf.length,
-                    out: hexOf(res, 64), stack: javaStack(5, 2)
-                });
+                if (!atLimit()) {
+                    record('crypto', 'digest_io', {
+                        algo: this.getAlgorithm ? this.getAlgorithm() : '?',
+                        in_hex: buf ? hexOf(buf) : '',
+                        in_len: buf ? buf.length : 0,
+                        out: res ? hexOf(res, 64) : '',
+                        out_len: res ? res.length : 0,
+                        stack: javaStack(5, 2)
+                    });
+                }
                 return res;
-            };
+            });
             // (3) 第三次修改（2026-11-11）：补无参 digest()。
             //     bug 原因：原来只 hook 了 digest(byte[])，但最常见的用法是
             //               update(byte[]) + digest()（无参）——抓不到密文。
             //     解决方案：同样挂上无参重载，输出长度信息用于识别。
-            MD.digest.overload().implementation = function () {
+            hookOv(MD.digest.overload(), function () {
                 var res = this.digest();
-                record('crypto', 'digest_out', {
-                    algo: this.getAlgorithm ? this.getAlgorithm() : '?',
-                    out: hexOf(res, 64), out_len: res.length,
-                    stack: javaStack(5, 2)
-                });
+                if (!atLimit()) {
+                    record('crypto', 'digest_out', {
+                        algo: this.getAlgorithm ? this.getAlgorithm() : '?',
+                        out: res ? hexOf(res, 64) : '',
+                        out_len: res ? res.length : 0,
+                        stack: javaStack(5, 2)
+                    });
+                }
                 return res;
-            };
+            });
             // update 记录输入（无参 digest 场景下，明文只在这里出现过）
-            MD.update.overload('[B').implementation = function (buf) {
-                record('crypto', 'digest_update', {
-                    algo: this.getAlgorithm ? this.getAlgorithm() : '?',
-                    in_hex: hexOf(buf), in_len: buf.length
-                });
+            hookOv(MD.update.overload('[B'), function (buf) {
+                if (!atLimit()) {
+                    record('crypto', 'digest_update', {
+                        algo: this.getAlgorithm ? this.getAlgorithm() : '?',
+                        in_hex: buf ? hexOf(buf) : '',
+                        in_len: buf ? buf.length : 0
+                    });
+                }
                 return this.update(buf);
-            };
+            });
         })) { installed.push('MessageDigest'); }
 
         if (tryHook('Cipher', function () {
             var C = Java.use('javax.crypto.Cipher');
-            C.getInstance.overload('java.lang.String').implementation = function (t) {
+            hookOv(C.getInstance.overload('java.lang.String'), function (t) {
                 var r = this.getInstance(t);
-                record('crypto', 'cipher_algo', {transformation: t});
+                if (!atLimit()) {
+                    record('crypto', 'cipher_algo', {transformation: t});
+                }
                 return r;
-            };
-            C.doFinal.overload('[B').implementation = function (buf) {
+            });
+            hookOv(C.doFinal.overload('[B'), function (buf) {
                 var res = this.doFinal(buf);
-                record('crypto', 'cipher_io', {
-                    in_hex: hexOf(buf), in_len: buf.length,
-                    out_hex: hexOf(res, 64), out_len: res.length,
-                    stack: javaStack(5, 2)
-                });
+                if (!atLimit()) {
+                    record('crypto', 'cipher_io', {
+                        in_hex: buf ? hexOf(buf) : '',
+                        in_len: buf ? buf.length : 0,
+                        out_hex: res ? hexOf(res, 64) : '',
+                        out_len: res ? res.length : 0,
+                        stack: javaStack(5, 2)
+                    });
+                }
                 return res;
-            };
+            });
             // (3) 第三次修改（2026-11-11）：补无参 doFinal()。
             //     原因同 digest：Cipher 也常用 update()+doFinal() 的分段写法。
-            C.doFinal.overload().implementation = function () {
+            hookOv(C.doFinal.overload(), function () {
                 var res = this.doFinal();
-                record('crypto', 'cipher_out', {
-                    out_hex: hexOf(res, 64), out_len: res.length,
-                    stack: javaStack(5, 2)
-                });
+                if (!atLimit()) {
+                    record('crypto', 'cipher_out', {
+                        out_hex: res ? hexOf(res, 64) : '',
+                        out_len: res ? res.length : 0,
+                        stack: javaStack(5, 2)
+                    });
+                }
                 return res;
-            };
+            });
         })) { installed.push('Cipher'); }
 
         if (tryHook('Mac', function () {
             var M = Java.use('javax.crypto.Mac');
-            M.getInstance.overload('java.lang.String').implementation = function (algo) {
+            hookOv(M.getInstance.overload('java.lang.String'), function (algo) {
                 var r = this.getInstance(algo);
-                record('crypto', 'mac_algo', {algo: algo});
+                if (!atLimit()) {
+                    record('crypto', 'mac_algo', {algo: algo});
+                }
                 return r;
-            };
+            });
             // (3) 第三次修改（2026-11-11）：
             //     bug 原因：Mac 原来只 hook 了 getInstance，没有 doFinal——
             //               但 BEHAVIOR_CATEGORIES 里声称抓「密钥+输入输出」，
             //               实际一条都拿不到。这是文档与实现不符。
             //     解决方案：补 doFinal 两个重载。
-            M.doFinal.overload('[B').implementation = function (buf) {
+            hookOv(M.doFinal.overload('[B'), function (buf) {
                 var res = this.doFinal(buf);
-                record('crypto', 'mac_io', {
-                    algo: this.getAlgorithm ? this.getAlgorithm() : '?',
-                    in_hex: hexOf(buf), in_len: buf.length,
-                    out: hexOf(res, 64), stack: javaStack(5, 2)
-                });
+                if (!atLimit()) {
+                    record('crypto', 'mac_io', {
+                        algo: this.getAlgorithm ? this.getAlgorithm() : '?',
+                        in_hex: buf ? hexOf(buf) : '',
+                        in_len: buf ? buf.length : 0,
+                        out: res ? hexOf(res, 64) : '',
+                        out_len: res ? res.length : 0,
+                        stack: javaStack(5, 2)
+                    });
+                }
                 return res;
-            };
-            M.doFinal.overload().implementation = function () {
+            });
+            hookOv(M.doFinal.overload(), function () {
                 var res = this.doFinal();
-                record('crypto', 'mac_out', {
-                    algo: this.getAlgorithm ? this.getAlgorithm() : '?',
-                    out: hexOf(res, 64), out_len: res.length,
-                    stack: javaStack(5, 2)
-                });
+                if (!atLimit()) {
+                    record('crypto', 'mac_out', {
+                        algo: this.getAlgorithm ? this.getAlgorithm() : '?',
+                        out: res ? hexOf(res, 64) : '',
+                        out_len: res ? res.length : 0,
+                        stack: javaStack(5, 2)
+                    });
+                }
                 return res;
-            };
+            });
         })) { installed.push('Mac'); }
     }
 
@@ -263,18 +315,22 @@ Java.perform(function () {
     if (CFG.file) {
         if (tryHook('FileInputStream', function () {
             var FIS = Java.use('java.io.FileInputStream');
-            FIS.$init.overload('java.lang.String').implementation = function (p) {
-                record('file', 'open_read', {path: String(p), stack: javaStack(6, 2)});
+            hookOv(FIS.$init.overload('java.lang.String'), function (p) {
+                if (!atLimit()) {
+                    record('file', 'open_read', {path: String(p), stack: javaStack(6, 2)});
+                }
                 return this.$init(p);
-            };
+            });
         })) { installed.push('FileInputStream'); }
 
         if (tryHook('FileOutputStream', function () {
             var FOS = Java.use('java.io.FileOutputStream');
-            FOS.$init.overload('java.lang.String').implementation = function (p) {
-                record('file', 'open_write', {path: String(p), stack: javaStack(6, 2)});
+            hookOv(FOS.$init.overload('java.lang.String'), function (p) {
+                if (!atLimit()) {
+                    record('file', 'open_write', {path: String(p), stack: javaStack(6, 2)});
+                }
                 return this.$init(p);
-            };
+            });
         })) { installed.push('FileOutputStream'); }
     }
 
@@ -282,15 +338,19 @@ Java.perform(function () {
     if (CFG.activity) {
         if (tryHook('Activity', function () {
             var A = Java.use('android.app.Activity');
-            A.onCreate.overload('android.os.Bundle').implementation = function (b) {
-                record('activity', 'onCreate',
-                       {cls: this.getClass().getName(), stack: javaStack(6, 2)});
+            hookOv(A.onCreate.overload('android.os.Bundle'), function (b) {
+                if (!atLimit()) {
+                    record('activity', 'onCreate',
+                           {cls: this.getClass().getName(), stack: javaStack(6, 2)});
+                }
                 return this.onCreate(b);
-            };
-            A.onResume.implementation = function () {
-                record('activity', 'onResume', {cls: this.getClass().getName()});
+            });
+            hookOv(A.onResume, function () {
+                if (!atLimit()) {
+                    record('activity', 'onResume', {cls: this.getClass().getName()});
+                }
                 return this.onResume();
-            };
+            });
         })) { installed.push('Activity'); }
     }
 
@@ -298,10 +358,12 @@ Java.perform(function () {
     if (CFG.assets) {
         if (tryHook('AssetManager', function () {
             var AM = Java.use('android.content.res.AssetManager');
-            AM.open.overload('java.lang.String').implementation = function (n) {
-                record('assets', 'open', {name: String(n), stack: javaStack(6, 2)});
+            hookOv(AM.open.overload('java.lang.String'), function (n) {
+                if (!atLimit()) {
+                    record('assets', 'open', {name: String(n), stack: javaStack(6, 2)});
+                }
                 return this.open(n);
-            };
+            });
         })) { installed.push('AssetManager'); }
     }
 
@@ -309,31 +371,39 @@ Java.perform(function () {
     if (CFG.shell) {
         if (tryHook('Runtime', function () {
             var R = Java.use('java.lang.Runtime');
-            R.exec.overload('[Ljava.lang.String;').implementation = function (cmd) {
-                record('shell', 'exec',
-                       {cmd: String(cmd.join ? cmd.join(' ') : cmd),
-                        stack: javaStack(6, 2)});
+            hookOv(R.exec.overload('[Ljava.lang.String;'), function (cmd) {
+                if (!atLimit()) {
+                    var cstr = cmd ? String(cmd.join ? cmd.join(' ') : cmd) : '';
+                    record('shell', 'exec',
+                           {cmd: cstr, stack: javaStack(6, 2)});
+                }
                 return this.exec(cmd);
-            };
-            R.exec.overload('java.lang.String').implementation = function (cmd) {
-                record('shell', 'exec', {cmd: String(cmd), stack: javaStack(6, 2)});
+            });
+            hookOv(R.exec.overload('java.lang.String'), function (cmd) {
+                if (!atLimit()) {
+                    record('shell', 'exec', {cmd: String(cmd), stack: javaStack(6, 2)});
+                }
                 return this.exec(cmd);
-            };
+            });
         })) { installed.push('Runtime.exec'); }
 
         if (tryHook('ProcessBuilder', function () {
             var PB = Java.use('java.lang.ProcessBuilder');
-            PB.start.implementation = function () {
-                var cmd = '';
-                try {
-                    var lst = this.command();
-                    var arr = [];
-                    for (var i = 0; i < lst.size(); i++) { arr.push(String(lst.get(i))); }
-                    cmd = arr.join(' ');
-                } catch (e) {}
-                record('shell', 'start', {cmd: cmd, stack: javaStack(6, 2)});
+            hookOv(PB.start, function () {
+                if (!atLimit()) {
+                    var cmd = '';
+                    try {
+                        var lst = this.command();
+                        if (lst) {
+                            var arr = [];
+                            for (var i = 0; i < lst.size(); i++) { arr.push(String(lst.get(i))); }
+                            cmd = arr.join(' ');
+                        }
+                    } catch (e) {}
+                    record('shell', 'start', {cmd: cmd, stack: javaStack(6, 2)});
+                }
                 return this.start();
-            };
+            });
         })) { installed.push('ProcessBuilder'); }
     }
 
@@ -360,6 +430,10 @@ Java.perform(function () {
     registerDump();
 
     recv('stop', function () {
+        for (var hi = 0; hi < hookedOverloads.length; hi++) {
+            try { hookedOverloads[hi].implementation = null; } catch (eCl) {}
+        }
+        hookedOverloads = [];
         send({kind: 'result', events: events, counts: counts,
               truncated: truncated, installed: installed});
     });
@@ -494,8 +568,9 @@ def behavior_monitor_start(serial: str, pid: int,
     #     直接删掉——上面已经按入参组装好 cfg，不需要重新初始化。
     key = _active_key(serial, int(pid))
     try:
-        # ② 重复 start：先停旧的
-        old = _ACTIVE.pop(key, None)
+        # ② 重复 start：先停旧的（加锁保护 _ACTIVE）
+        with _ACTIVE_LOCK:
+            old = _ACTIVE.pop(key, None)
         replaced = False
         if old:
             try:
@@ -545,9 +620,10 @@ def behavior_monitor_start(serial: str, pid: int,
 
         # duration=0 表示常驻
         if not duration:
-            _ACTIVE[key] = {"script": script, "session": sess, "box": box,
-                            "cfg": cfg, "started": time.time(),
-                            "serial": serial, "pid": int(pid)}
+            with _ACTIVE_LOCK:
+                _ACTIVE[key] = {"script": script, "session": sess, "box": box,
+                                "cfg": cfg, "started": time.time(),
+                                "serial": serial, "pid": int(pid)}
             keep_session = True
             out = {
                 "ok": True,
@@ -647,7 +723,13 @@ def behavior_monitor_poll(serial: str = "", pid: int = 0) -> dict:
     if err:
         return err
 
-    # 主动要增量
+    # (6) 第六次修改（2026-11-26）
+    # bug 原因：① 原实现用 `total is None` 判超时，只要第一次 poll 成功写入过 total，
+    #           后续脚本假死无响应时也会误判成功并返回陈旧事件；
+    #           ② post("dump") 前未清零 dumped 标志，可能被残留标志短路。
+    # 解决方案：在 post("dump") 前先重置 dumped=False，用本次循环是否收到回应
+    #           got_response 精确判定超时，彻底杜绝假成功。
+    st["box"]["dumped"] = False
     try:
         st["script"].post({"type": "dump"})
     except Exception as exc:                              # noqa: BLE001
@@ -655,16 +737,16 @@ def behavior_monitor_poll(serial: str = "", pid: int = 0) -> dict:
                 "error": f"{type(exc).__name__}: {exc}",
                 "hint": "脚本可能已经失效，用 behavior_monitor_stop 收尾后重启监控"}
 
-    # 等 dump 回来。用 dumped 标志判断，而不是死等固定时长
+    got_response = False
     t0 = time.time()
     while time.time() - t0 < 3.0:
         if st["box"].get("dumped"):
             st["box"]["dumped"] = False
+            got_response = True
             break
         time.sleep(0.05)
 
-    if not st["box"].get("total") and st["box"].get("total") is None:
-        # 一次都没 dump 成功过——如实说明，不要伪装成"没有事件"
+    if not got_response:
         return {"ok": False, "code": "POLL_NO_RESPONSE",
                 "error": "脚本 3 秒内没有回应 dump 请求",
                 "collected_so_far": len(st["box"].get("events") or []),
@@ -692,7 +774,8 @@ def behavior_monitor_stop(serial: str = "", pid: int = 0) -> dict:
     while time.time() - t0 < 8 and not st["box"].get("done"):
         time.sleep(0.05)
 
-    _ACTIVE.pop(key, None)
+    with _ACTIVE_LOCK:
+        _ACTIVE.pop(key, None)
     _detach_async(st.get("session"))
 
     out = _summarize(int(st.get("pid") or 0), st["box"],
@@ -706,36 +789,63 @@ def behavior_monitor_stop(serial: str = "", pid: int = 0) -> dict:
 def _pick_active(serial: str, pid: int):
     """找出要操作的常驻监控。返回 (记录, key, 错误响应)。
 
+    (6) 第六次修改（2026-11-26）
+    bug 原因：① 访问全局 _ACTIVE 无锁保护；
+              ② 只传 serial 不传 pid 时忽略了 serial 条件，直接返回别的设备的唯一监控；
+              ③ 按 pid 查找 0 命中时误落入 AMBIGUOUS_TARGET，报错“有 0 个监控的 pid 都是 X”。
+    解决方案：全程持 _ACTIVE_LOCK；补全仅传 serial 的筛选分支；
+              len(hits) == 0 明确返回 NO_ACTIVE_MONITOR。
+
     明确要求：给了 serial+pid 就精确匹配（不再"随便取第一个"）。
-    只给 pid 时，如果恰好只有一个匹配就用它，否则要求补 serial。
+    只给 pid 或只给 serial 时，若恰好只有一个匹配就用它，0 个报未找到，多个报歧义。
     """
-    if not _ACTIVE:
-        return None, "", {"ok": False, "code": "NO_ACTIVE_MONITOR",
-                          "error": "没有正在运行的监控",
-                          "hint": "先用 behavior_monitor_start(duration=0) 启动"}
+    with _ACTIVE_LOCK:
+        if not _ACTIVE:
+            return None, "", {"ok": False, "code": "NO_ACTIVE_MONITOR",
+                              "error": "没有正在运行的监控",
+                              "hint": "先用 behavior_monitor_start(duration=0) 启动"}
 
-    if serial and pid:
-        key = _active_key(serial, int(pid))
-        if key in _ACTIVE:
-            return _ACTIVE[key], key, None
-        return None, "", {"ok": False, "code": "NO_ACTIVE_MONITOR",
-                          "error": f"没有 {key} 的监控",
-                          "active": sorted(_ACTIVE)}
+        if serial and pid:
+            key = _active_key(serial, int(pid))
+            if key in _ACTIVE:
+                return _ACTIVE[key], key, None
+            return None, "", {"ok": False, "code": "NO_ACTIVE_MONITOR",
+                              "error": f"没有 {key} 的监控",
+                              "active": sorted(_ACTIVE)}
 
-    if pid:
-        hits = [k for k, v in _ACTIVE.items() if int(v.get("pid") or 0) == int(pid)]
-        if len(hits) == 1:
-            return _ACTIVE[hits[0]], hits[0], None
+        if pid:
+            hits = [k for k, v in _ACTIVE.items()
+                    if int(v.get("pid") or 0) == int(pid)]
+            if len(hits) == 0:
+                return None, "", {"ok": False, "code": "NO_ACTIVE_MONITOR",
+                                  "error": f"没有找到 pid={pid} 的监控",
+                                  "active": sorted(_ACTIVE)}
+            if len(hits) == 1:
+                return _ACTIVE[hits[0]], hits[0], None
+            return None, "", {"ok": False, "code": "AMBIGUOUS_TARGET",
+                              "error": f"有 {len(hits)} 个监控的 pid 都是 {pid}，"
+                                       "请同时传 serial 来区分",
+                              "active": sorted(_ACTIVE)}
+
+        if serial:
+            hits = [k for k, v in _ACTIVE.items()
+                    if str(v.get("serial") or "") == str(serial)]
+            if len(hits) == 0:
+                return None, "", {"ok": False, "code": "NO_ACTIVE_MONITOR",
+                                  "error": f"设备 {serial} 上没有正在运行的监控",
+                                  "active": sorted(_ACTIVE)}
+            if len(hits) == 1:
+                return _ACTIVE[hits[0]], hits[0], None
+            return None, "", {"ok": False, "code": "AMBIGUOUS_TARGET",
+                              "error": f"设备 {serial} 上有 {len(hits)} 个监控，"
+                                       "请同时指定 pid 来区分",
+                              "active": sorted(_ACTIVE)}
+
+        if len(_ACTIVE) == 1:
+            k = next(iter(_ACTIVE))
+            return _ACTIVE[k], k, None
+
         return None, "", {"ok": False, "code": "AMBIGUOUS_TARGET",
-                          "error": f"有 {len(hits)} 个监控的 pid 都是 {pid}，"
-                                   "请同时传 serial 来区分",
+                          "error": f"当前有 {len(_ACTIVE)} 个监控，"
+                                   "请指定 serial 和 pid",
                           "active": sorted(_ACTIVE)}
-
-    if len(_ACTIVE) == 1:
-        k = next(iter(_ACTIVE))
-        return _ACTIVE[k], k, None
-
-    return None, "", {"ok": False, "code": "AMBIGUOUS_TARGET",
-                      "error": f"当前有 {len(_ACTIVE)} 个监控，"
-                               "请指定 serial 和 pid",
-                      "active": sorted(_ACTIVE)}

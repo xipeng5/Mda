@@ -63,20 +63,41 @@
 #define REC_SIZE 128
 #define REC_CAP 64
 
-/* 共享内存布局（与 mda_payload.S 保持一致） */
+/*
+ * (24) 第二十四次修改（2026-11-26）
+ * bug 原因：① OFF_PAGE/OFF_PAGELEN/OFF_TARGET/OFF_TLEN 原按 4 字节间隔排布，8 字节写入互相覆盖；
+ *             SHM_SIZE 原为 0x2000，装不下 OFF_RECS(0x400)+64*128(0x2000)=0x2400，第 57 条起越界；
+ *           ② write_mem 对 < 8 字节写入直接清零高位字，PTRACE_POKEDATA 破坏相邻字段；
+ *           ③ remote_syscall 把恢复 PC 错设为 svc_addr+4 而非 saved.pc，导致目标执行流跑飞；
+ *             且 mmap 失败仅判断 !shm，未检查 Linux 负 errno [-4095, -1]；
+ *           ④ install_sigaction_via_syscall L295 误写 saved = regs 覆写掉原现场，
+ *             regs.x[2] 传 0 丢弃 oldact_buf，且 [dbg] 用 printf 打到 stdout 污染 JSON；
+ *           ⑤ cmd_watch 回填 shared_slot/slot_page 后又二次整段写入 mda_payload_bin 将槽位清零，
+ *             且 slot_page 截断为 16 位、oldact_buf 误传 shm+0x400 与 OFF_RECS 冲突；
+ *           ⑥ cmd_poll 用 i ? "," : "" 判断逗号（start > 0 时产生非法 JSON 前导逗号）且未按环形取模。
+ * 解决方案：统一 8 字节对齐布局并扩 SHM_SIZE 至 0x3000、增 OFF_OLDACT=0x300；
+ *           write_mem 对不足一字先 PTRACE_PEEKDATA 再合并低位字节；
+ *           remote_syscall 恢复完整 saved（含 saved.pc），增 is_syscall_err 判 [-4095, -1]；
+ *           修正 install_sigaction_via_syscall 的 regs = saved / iov 重置 / oldact_buf / stderr 日志；
+ *           cmd_watch 仅写一次 payload 后再回填 shared_slot 与 64 位 slot_page；
+ *           cmd_poll 改用 64 位字段、环形下标与 (i > start) ? "," : ""。
+ */
+/* 共享内存布局（与 mda_payload.S 保持严格一致，全部 8 字节对齐） */
+#define OFF_MAGIC     0x000
 #define OFF_STATE     0x004
 #define OFF_COUNT     0x008
-#define OFF_HEAD      0x00c
-#define OFF_CAPACITY  0x010
-#define OFF_PAGE      0x014
-#define OFF_PAGELEN   0x018
-#define OFF_TARGET    0x01c
-#define OFF_TLEN      0x020
-#define OFF_ERRNO     0x028
-#define OFF_ARGS      0x100      /* (20) 与 mda_payload.S 的 OFF_ARGS 一致 */
+#define OFF_HEAD      0x010
+#define OFF_CAPACITY  0x018
+#define OFF_PAGE      0x020
+#define OFF_PAGELEN   0x028
+#define OFF_TARGET    0x030
+#define OFF_TLEN      0x038
+#define OFF_ERRNO     0x040
+#define OFF_ARGS      0x100
 #define OFF_ACT       0x200
-#define OFF_RECS      0x400      /* (20) 记录区移到参数区之后，避免覆盖 */
-#define SHM_SIZE      0x2000
+#define OFF_OLDACT    0x300
+#define OFF_RECS      0x400
+#define SHM_SIZE      0x3000     /* >= OFF_RECS(0x400) + REC_CAP(64)*REC_SIZE(128) = 0x2400 */
 
 /* syscall 号（arm64） */
 #define SYS_MMAP      222
@@ -103,15 +124,31 @@ extern const unsigned long mda_payload_handler_ran_off;
 
 /* ---------------------------------------------------------------- 工具 */
 
+/* 判断 Linux 系统调用返回值是否落在内核负 errno 区间 [-4095, -1] */
+static int is_syscall_err(uint64_t ret) {
+    long s = (long)ret;
+    return (s < 0 && s >= -4095);
+}
+
 static int write_mem(pid_t pid, unsigned long dst, const void *src, size_t n) {
     /* 用 PTRACE_POKEDATA：process_vm_writev 在目标处于 ptrace stop 时
-     * 会"返回成功但没写进去"（实测 readback 全 0）。 */
+     * 会"返回成功但没写进去"（实测 readback 全 0）。
+     * 写入不足 1 个机器字（< sizeof(unsigned long)）时先 PTRACE_PEEKDATA
+     * 读出原字再覆盖低位字节，绝不清零邻近字段。 */
     const unsigned char *p = (const unsigned char *)src;
     size_t off = 0;
     while (off < n) {
-        long word = 0;
-        size_t take = sizeof(long);
+        unsigned long word = 0;
+        size_t take = sizeof(unsigned long);
         if (off + take > n) take = n - off;
+        if (take < sizeof(unsigned long)) {
+            errno = 0;
+            long orig = ptrace(PTRACE_PEEKDATA, pid,
+                               (void *)(uintptr_t)(dst + off), NULL);
+            if (orig == -1 && errno != 0)
+                return -1;
+            word = (unsigned long)orig;
+        }
         memcpy(&word, p + off, take);
         if (ptrace(PTRACE_POKEDATA, pid, (void *)(uintptr_t)(dst + off),
                    (void *)(uintptr_t)word) < 0)
@@ -235,16 +272,12 @@ static int remote_syscall(pid_t pid, int nr, uint64_t a0, uint64_t a1,
     if (ptrace(PTRACE_GETREGSET, pid, (void *)1, &iov) < 0) return -1;
     if (ret) *ret = cur.x[0];
     /*
-     * (18) 恢复调用前的现场。
-     *      只把 pc 放回 svc 之后（svc_addr + 4），其余寄存器全部还原——
-     *      这样目标会接着执行 libc syscall() 包装的后续逻辑
-     *      （返回值处理、errno、锁释放），而不是从半路继续。
+     * (24) 恢复调用前的完整现场（包含原始 saved.pc），
+     *      不再改写为 svc_addr + 4，避免目标线程脱离原执行流崩溃。
      */
     {
-        struct arm64_regs restore = saved;
-        restore.pc = svc_addr + 4;
-        iov.iov_base = &restore;
-        iov.iov_len = sizeof(restore);
+        iov.iov_base = &saved;
+        iov.iov_len = sizeof(saved);
         g_stage = "restore";
         if (ptrace(PTRACE_SETREGSET, pid, (void *)1, &iov) < 0) return -1;
     }
@@ -255,12 +288,8 @@ static int remote_syscall(pid_t pid, int nr, uint64_t a0, uint64_t a1,
  * 用 PTRACE_SYSCALL 搭便车执行 rt_sigaction。
  *
  * 原理：目标正常运行时，内核在它每次 syscall 的入口/出口各停一次。
- * 我们在入口把参数换成 rt_sigaction(11, act, NULL, 8)，
+ * 我们在入口把参数换成 rt_sigaction(11, act, oldact_buf, 8)，
  * 在出口读 x0（内核给的返回值），然后把参数恢复原值。
- *
- * 目标原本的这次 syscall 就"变成了" rt_sigaction —— 副作用是它原本
- * 要做的操作没做成。所以只在**只读类** syscall 上做（如 clock_gettime、
- * getpid），把它们的副作用降到最低。
  *
  * 返回 0 表示 rt_sigaction 成功。
  */
@@ -268,6 +297,7 @@ static int install_sigaction_via_syscall(pid_t pid, unsigned long shm,
                                          unsigned long code,
                                          unsigned long oldact_buf,
                                          unsigned long our_handler) {
+    (void)code;
     unsigned long sc_off = 0x88190;
     const char *env = getenv("MDA_SYSCALL_OFF");
     if (env && *env) sc_off = strtoul(env, NULL, 0);
@@ -276,7 +306,7 @@ static int install_sigaction_via_syscall(pid_t pid, unsigned long shm,
 
     /* act 已由调用方写好在 shm+OFF_ACT */
     struct arm64_regs saved, regs;
-    struct iovec iov = {&saved, sizeof(saved)};
+    struct iovec iov;
     uint64_t deadline = now_ms() + 5000;
     int in_call = 0;
 
@@ -286,45 +316,46 @@ static int install_sigaction_via_syscall(pid_t pid, unsigned long shm,
         if (waitpid(pid, &st, 0) < 0) return -1;
         if (!WIFSTOPPED(st)) return -1;
 
-        if (ptrace(PTRACE_GETREGSET, pid, (void *)1, &iov) < 0) return -1;
-
         if (!in_call) {
-            /* syscall 入口：把这次调用换成 rt_sigaction。
-             * (23) 不再挑 syscall —— PTRACE_SYSCALL 入口读到的 x8
-             *      实测不可靠（全是 101），无法据此判断该不该搭便车。 */
-            saved = regs;
-            /* (19) AAPCS64：sig=x0, act=x1, oact=x2, sigsetsize=x3 */
+            /* syscall 入口：先将原现场读入 saved，再复制到 regs 覆写 rt_sigaction 参数 */
+            iov.iov_base = &saved;
+            iov.iov_len = sizeof(saved);
+            if (ptrace(PTRACE_GETREGSET, pid, (void *)1, &iov) < 0) return -1;
+            regs = saved;
+            /* AAPCS64：sig=x0, act=x1, oact=x2, sigsetsize=x3 */
             regs.x[8] = 134;              /* rt_sigaction */
             regs.x[0] = 11;               /* SIGSEGV */
             regs.x[1] = shm + OFF_ACT;    /* act */
-            regs.x[2] = 0;                /* oldact */
+            regs.x[2] = oldact_buf;       /* oldact */
             regs.x[3] = 8;                /* sigsetsize */
             iov.iov_base = &regs;
             iov.iov_len = sizeof(regs);
-            ptrace(PTRACE_SETREGSET, pid, (void *)1, &iov);
+            if (ptrace(PTRACE_SETREGSET, pid, (void *)1, &iov) < 0) return -1;
             in_call = 1;
         } else {
-            /* syscall 出口：x0 是返回值 */
+            /* syscall 出口：读入 regs 取内核返回值 x0，再还原完整 saved */
             in_call = 0;
+            iov.iov_base = &regs;
+            iov.iov_len = sizeof(regs);
+            if (ptrace(PTRACE_GETREGSET, pid, (void *)1, &iov) < 0) return -1;
             uint64_t ret = regs.x[0];
-            /* 恢复原寄存器（重要：不能让目标的调用被破坏） */
             iov.iov_base = &saved;
             iov.iov_len = sizeof(saved);
-            ptrace(PTRACE_SETREGSET, pid, (void *)1, &iov);
+            if (ptrace(PTRACE_SETREGSET, pid, (void *)1, &iov) < 0) return -1;
             if (ret == 0) {
                 /*
-                 * (21) 用 oldact 验证：rt_sigaction 成功时，
-                 *      内核会把**旧的** handler 写进 oldact。
-                 *      读回来看是不是我们的地址被替换了。
+                 * 用 oldact 验证：rt_sigaction 成功时，内核把旧 handler 写进 oldact_buf；
+                 * 调试日志走 stderr，绝不污染 stdout 的 JSON 输出。
                  */
                 if (oldact_buf) {
                     uint64_t old_h = 0;
                     read_mem(pid, &old_h, oldact_buf, 8);
-                    printf("[dbg] rt_sigaction 成功, old_handler=0x%llx "
-                           "(ours=0x%llx)\n",
-                           (unsigned long long)old_h,
-                           (unsigned long long)our_handler);
-                    fflush(stdout);
+                    fprintf(stderr,
+                            "[dbg] rt_sigaction 成功, old_handler=0x%llx "
+                            "(ours=0x%llx)\n",
+                            (unsigned long long)old_h,
+                            (unsigned long long)our_handler);
+                    fflush(stderr);
                 }
                 return 0;
             }
@@ -361,6 +392,7 @@ static void detach(pid_t pid) {
  */
 static int cmd_watch(pid_t pid, unsigned long target, unsigned long tlen,
                     const char *serial) {
+    (void)serial;
     unsigned long page = target & ~(unsigned long)(PAGE - 1);
     unsigned long page_len = PAGE;
 
@@ -393,9 +425,10 @@ static int cmd_watch(pid_t pid, unsigned long target, unsigned long tlen,
                "\"errno\":%d,\"error\":\"%s\"}\n", g_stage, errno, strerror(errno));
         return 4;
     }
-    if (!shm) {
+    if (!shm || is_syscall_err(shm)) {
         detach(pid);
-        printf("{\"ok\":false,\"code\":\"SHM_MMAP_FAILED\",\"error\":\"映射返回 0\"}\n");
+        printf("{\"ok\":false,\"code\":\"SHM_MMAP_FAILED\",\"ret\":%lld,"
+               "\"error\":\"远程 mmap 共享内存失败\"}\n", (long long)(int64_t)shm);
         return 4;
     }
 
@@ -409,72 +442,69 @@ static int cmd_watch(pid_t pid, unsigned long target, unsigned long tlen,
         printf("{\"ok\":false,\"code\":\"CODE_MMAP_FAILED\",\"stage\":\"%s\"}\n", g_stage);
         return 5;
     }
-    if (!code) {
+    if (!code || is_syscall_err(code)) {
         detach(pid);
-        printf("{\"ok\":false,\"code\":\"CODE_MMAP_FAILED\",\"error\":\"映射返回 0\"}\n");
+        printf("{\"ok\":false,\"code\":\"CODE_MMAP_FAILED\",\"ret\":%lld,"
+               "\"error\":\"远程 mmap 代码页失败\"}\n", (long long)(int64_t)code);
         return 5;
     }
 
-    /* --- 3) 把 payload 写进代码页 --- */
+    /* --- 3) 先把完整 payload 写进代码页（仅写这一次，后续再回填运行时槽位，绝不二次覆盖） --- */
     if (write_mem(pid, code, mda_payload_bin, mda_payload_len) != 0) {
         detach(pid);
         printf("{\"ok\":false,\"code\":\"WRITE_PAYLOAD_FAILED\"}\n");
         return 6;
     }
 
-    /* --- 4) 填参数区 + payload 的 shared_slot 全局变量 --- */
+    /* --- 4) 填共享内存控制区 + 回填 payload 的 shared_slot / slot_page 全局槽 --- */
     uint32_t magic = 0x474d444d;   /* "MDMG" */
-    uint32_t state = 0, count = 0, head = 0, capacity = REC_CAP;
+    uint32_t state = 0;
+    uint64_t count = 0, head = 0, capacity = REC_CAP;
     uint64_t a_page = page, a_pagelen = page_len;
     uint64_t a_target = target, a_tlen = tlen;
-    uint64_t args[6] = {0, 0, 0, 0, 0, 0};
-    /* 参数区在 payload 内部（偏移 0x200），但我们直接把参数放共享内存更好读：
-     * payload 入口会把 x0..x4 备份到共享内存 0x200。 */
-    (void)args;
 
-    /* 先在共享内存里写好 payload 需要的所有字段 */
-    write_mem(pid, shm + OFF_STATE, &state, 4);
-    write_mem(pid, shm + OFF_COUNT, &count, 4);
-    write_mem(pid, shm + OFF_HEAD, &head, 4);
-    write_mem(pid, shm + OFF_CAPACITY, &capacity, 4);
-    write_mem(pid, shm + OFF_PAGE, &a_page, 8);
-    write_mem(pid, shm + OFF_PAGELEN, &a_pagelen, 8);
-    write_mem(pid, shm + OFF_TARGET, &a_target, 8);
-    write_mem(pid, shm + OFF_TLEN, &a_tlen, 8);
-    write_mem(pid, shm, &magic, 4);
+    if (write_mem(pid, shm + OFF_MAGIC, &magic, 4) != 0 ||
+        write_mem(pid, shm + OFF_STATE, &state, 4) != 0 ||
+        write_mem(pid, shm + OFF_COUNT, &count, 8) != 0 ||
+        write_mem(pid, shm + OFF_HEAD, &head, 8) != 0 ||
+        write_mem(pid, shm + OFF_CAPACITY, &capacity, 8) != 0 ||
+        write_mem(pid, shm + OFF_PAGE, &a_page, 8) != 0 ||
+        write_mem(pid, shm + OFF_PAGELEN, &a_pagelen, 8) != 0 ||
+        write_mem(pid, shm + OFF_TARGET, &a_target, 8) != 0 ||
+        write_mem(pid, shm + OFF_TLEN, &a_tlen, 8) != 0) {
+        detach(pid);
+        printf("{\"ok\":false,\"code\":\"SHM_WRITE_FAILED\"}\n");
+        return 6;
+    }
 
-    /* payload 里的 shared_slot 全局变量（在代码页内的 .data 段偏移） */
+    /* 回填 payload 里的 shared_slot（8 字节）与 slot_page（完整 64 位页基址 + 64 位页长度） */
     unsigned long slot_addr = code + mda_payload_shared_slot_off;
-    write_mem(pid, slot_addr, &shm, 8);
-
-    /*
-     * (17) 把监控页地址/长度写进 payload 的 slot_page（handler 从那里读，
-     *      不依赖共享内存——那层间接失效会导致 mprotect 恢复失败）。
-     */
-    {
-        unsigned short lo = (unsigned short)(page & 0xffff);
-        unsigned short hi = (unsigned short)((page >> 16) & 0xffff);
-        unsigned short len = (unsigned short)page_len;
-        unsigned long sp = code + mda_payload_slot_page_off;
-        write_mem(pid, sp, &lo, 2);
-        write_mem(pid, sp + 4, &hi, 2);
-        write_mem(pid, sp + 8, &len, 2);
+    unsigned long sp = code + mda_payload_slot_page_off;
+    if (write_mem(pid, slot_addr, &shm, 8) != 0 ||
+        write_mem(pid, sp, &a_page, 8) != 0 ||
+        write_mem(pid, sp + 8, &a_pagelen, 8) != 0) {
+        detach(pid);
+        printf("{\"ok\":false,\"code\":\"SLOT_WRITE_FAILED\"}\n");
+        return 7;
     }
     {
-        /* (19) 读回验证 shared_slot 真的写对了 */
-        uint64_t back_slot = 0;
+        /* 读回验证 shared_slot 与 slot_page 确实写对且未被覆写 */
+        uint64_t back_slot = 0, back_page = 0;
         read_mem(pid, &back_slot, slot_addr, 8);
-        if (back_slot != (uint64_t)shm) {
+        read_mem(pid, &back_page, sp, 8);
+        if (back_slot != (uint64_t)shm || back_page != a_page) {
             detach(pid);
             printf("{\"ok\":false,\"code\":\"SLOT_WRITE_FAILED\","
-                   "\"slot_addr\":\"0x%lx\",\"readback\":\"0x%llx\",\"want\":\"0x%llx\"}\n",
+                   "\"slot_addr\":\"0x%lx\",\"readback\":\"0x%llx\",\"want\":\"0x%llx\","
+                   "\"page_readback\":\"0x%llx\",\"page_want\":\"0x%llx\"}\n",
                    slot_addr, (unsigned long long)back_slot,
-                   (unsigned long long)shm);
+                   (unsigned long long)shm,
+                   (unsigned long long)back_page, (unsigned long long)a_page);
             return 7;
         }
     }
 
-    /* (20) 预先把 act 结构写好（handler/restorer 指向 payload 里的地址） */
+    /* 预先把 sigaction 结构写好（handler/restorer 指向 payload 里的地址） */
     {
         unsigned char act[64];
         memset(act, 0, sizeof(act));
@@ -484,48 +514,23 @@ static int cmd_watch(pid_t pid, unsigned long target, unsigned long tlen,
         memcpy(act + 0x00, &h, 8);
         memcpy(act + 0x08, &flags, 8);
         memcpy(act + 0x10, &r, 8);
-        write_mem(pid, shm + OFF_ACT, act, sizeof(act));
+        if (write_mem(pid, shm + OFF_ACT, act, sizeof(act)) != 0) {
+            detach(pid);
+            printf("{\"ok\":false,\"code\":\"ACT_WRITE_FAILED\"}\n");
+            return 7;
+        }
     }
 
-    /* --- 4.4) 把 handler 代码写进目标的可执行页（只写不执行） ---
-     * (17) 关键架构调整：**写代码 ≠ 执行代码**。
-     *      内核在 SIGSEGV 发生时**会自动跳到 handler**，
-     *      所以 handler 只需要"存在于目标的可执行页"，
-     *      不需要我们跳过去执行它。
-     *      这样就彻底避开了 payload 收尾的难题
-     *      （payload 末尾 brk → SIGTRAP → detach 后目标被杀）。
-     */
-    /*
-     * (18) 写**整个 payload**，不只 handler 段：
-     *      restorer_entry 排在 handler_entry **之前**（offset 更小），
-     *      而 sa_restorer 必须指向有效代码，否则 handler 返回时跳飞。
-     */
-    if (write_mem(pid, code, mda_payload_bin, mda_payload_len) != 0) {
-        detach(pid);
-        printf("{\"ok\":false,\"code\":\"WRITE_HANDLER_FAILED\"}\n");
-        return 7;
-    }
-
-    /* --- 4.5) 用 PTRACE_SYSCALL 搭便车执行 rt_sigaction ---
-     *
-     * (22) 为什么不直接让 payload 调：目标处于 ptrace stop 状态时，
-     *      内核拒绝 rt_sigaction（EINVAL），而 getpid/mmap 在同状态下成功
-     *      ——说明内核只拒绝"改变信号处理状态"的调用。
-     *      解决办法：让目标**正常运行**（PTRACE_SYSCALL），
-     *      在它自己发起的某个 syscall **入口**把参数换成 rt_sigaction，
-     *      在**出口**读结果。这样内核走的是正常执行路径。
-     */
-    if (install_sigaction_via_syscall(pid, shm, code, shm + 0x400,
-                                    code + mda_payload_handler_off) != 0) {
+    /* --- 4.5) 用 PTRACE_SYSCALL 搭便车执行 rt_sigaction（oldact 使用独立区 OFF_OLDACT） --- */
+    if (install_sigaction_via_syscall(pid, shm, code, shm + OFF_OLDACT,
+                                      code + mda_payload_handler_off) != 0) {
         detach(pid);
         printf("{\"ok\":false,\"code\":\"SIGACTION_VIA_SYSCALL_FAILED\","
                "\"error\":\"目标在 5 秒内没发起任何 syscall，无法搭便车\"}\n");
         return 8;
     }
 
-    /* --- 4.6) 远程 mprotect 把目标页改成只读（已验证可行） ---
-     * (17) 不再执行 payload，改为直接远程调用 mprotect。
-     */
+    /* --- 4.6) 远程 mprotect 把目标页改成只读 --- */
     {
         uint64_t mp_ret = 0;
         if (remote_syscall(pid, SYS_MPROTECT, page, page_len, 1 /*PROT_READ*/,
@@ -535,10 +540,10 @@ static int cmd_watch(pid_t pid, unsigned long target, unsigned long tlen,
                    "\"stage\":\"%s\"}\n", g_stage);
             return 8;
         }
-        if ((int64_t)mp_ret < 0) {
+        if (is_syscall_err(mp_ret)) {
             detach(pid);
             printf("{\"ok\":false,\"code\":\"MPROTECT_DENIED\","
-                   "\"ret\":%lld}\n", (long long)mp_ret);
+                   "\"ret\":%lld}\n", (long long)(int64_t)mp_ret);
             return 8;
         }
         uint32_t st1 = 1;
@@ -692,20 +697,22 @@ static int cmd_watch(pid_t pid, unsigned long target, unsigned long tlen,
  * 从共享内存读回命中记录。
  */
 static int cmd_poll(pid_t pid, unsigned long shm, unsigned long code, int max) {
-    uint32_t count = 0, capacity = 0;
-    read_mem(pid, &count, shm + OFF_COUNT, 4);
-    read_mem(pid, &capacity, shm + OFF_CAPACITY, 4);
-    if (!capacity) capacity = REC_CAP;
-    if (max <= 0 || max > (int)capacity) max = (int)capacity;
+    uint64_t count = 0, capacity = 0;
+    read_mem(pid, &count, shm + OFF_COUNT, 8);
+    read_mem(pid, &capacity, shm + OFF_CAPACITY, 8);
+    if (!capacity || capacity > REC_CAP) capacity = REC_CAP;
+    if (max <= 0 || (uint64_t)max > capacity) max = (int)capacity;
 
-    /* (19) handler 是否跑过：读注入页的 handler_ran 槽 */
-    unsigned int ran = 0;
-    if (code) read_mem(pid, &ran, code + mda_payload_handler_ran_off, 4);
-    printf("{\"ok\":true,\"count\":%u,\"capacity\":%u,\"handler_ran\":%u,\"records\":[", count, capacity, ran);
-    int start = (int)count - max;
-    if (start < 0) start = 0;
-    for (int i = start; i < (int)count && i < (int)capacity; i++) {
-        unsigned long rec = shm + OFF_RECS + (unsigned long)i * REC_SIZE;
+    /* (24) 8 字节读取 handler_ran，且环形取模 + (i > start) 判断 JSON 逗号 */
+    uint64_t ran = 0;
+    if (code) read_mem(pid, &ran, code + mda_payload_handler_ran_off, 8);
+    printf("{\"ok\":true,\"count\":%llu,\"capacity\":%llu,\"handler_ran\":%llu,\"records\":[",
+           (unsigned long long)count, (unsigned long long)capacity,
+           (unsigned long long)ran);
+    uint64_t start = (count > (uint64_t)max) ? (count - (uint64_t)max) : 0;
+    for (uint64_t i = start; i < count; i++) {
+        uint64_t slot_idx = i % capacity;
+        unsigned long rec = shm + OFF_RECS + (unsigned long)slot_idx * REC_SIZE;
         uint64_t fault = 0, pc = 0, lr = 0, sp = 0, x0 = 0, x1 = 0;
         uint32_t blen = 0;
         unsigned char before[48];
@@ -717,18 +724,19 @@ static int cmd_poll(pid_t pid, unsigned long shm, unsigned long code, int max) {
         read_mem(pid, &x0, rec + 0x20, 8);
         read_mem(pid, &x1, rec + 0x28, 8);
         read_mem(pid, &blen, rec + 0x30, 4);
-        read_mem(pid, before, rec + 0x40, blen > 48 ? 48 : blen);
+        if (blen > 48) blen = 48;
+        if (blen > 0) read_mem(pid, before, rec + 0x40, blen);
 
         char hex[97];
-        int n = blen > 48 ? 48 : (int)blen;
+        int n = (int)blen;
         for (int k = 0; k < n; k++)
             snprintf(hex + k * 2, 3, "%02x", before[k]);
         hex[n * 2] = 0;
 
-        printf("%s{\"idx\":%d,\"fault_addr\":\"0x%llx\",\"pc\":\"0x%llx\","
+        printf("%s{\"idx\":%llu,\"fault_addr\":\"0x%llx\",\"pc\":\"0x%llx\","
                "\"lr\":\"0x%llx\",\"sp\":\"0x%llx\",\"x0\":\"0x%llx\",\"x1\":\"0x%llx\","
                "\"before_hex\":\"%s\",\"before_len\":%u}",
-               i ? "," : "", i,
+               (i > start) ? "," : "", (unsigned long long)i,
                (unsigned long long)fault, (unsigned long long)pc,
                (unsigned long long)lr, (unsigned long long)sp,
                (unsigned long long)x0, (unsigned long long)x1,

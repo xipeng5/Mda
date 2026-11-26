@@ -33,6 +33,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -67,26 +68,78 @@ def _resolve_adb() -> str:
     return resolve_adb()
 
 
+def _device_file_size(serial: str, path: str) -> int | None:
+    """读取设备端文件真实字节数（优先 stat -c %s，回退 ls -ln 第 5 列）。"""
+    q = shlex.quote(path)
+    try:
+        r = subprocess.run([_resolve_adb(), "-s", str(serial), "shell",
+                            f"stat -c %s {q} 2>/dev/null"],
+                           capture_output=True, text=True, timeout=20)
+        lines = (r.stdout or "").strip().splitlines()
+        if lines and lines[0].strip().isdigit():
+            return int(lines[0].strip())
+    except Exception:                                     # noqa: BLE001
+        pass
+    try:
+        r2 = subprocess.run([_resolve_adb(), "-s", str(serial), "shell",
+                             f"ls -ln {q} 2>/dev/null"],
+                            capture_output=True, text=True, timeout=20)
+        for ln in (r2.stdout or "").splitlines():
+            parts = ln.split()
+            if len(parts) >= 5 and parts[0].startswith("-") and parts[4].isdigit():
+                return int(parts[4])
+    except Exception:                                     # noqa: BLE001
+        pass
+    return None
+
+
 def ensure_injector(serial: str, force_push: bool = False) -> dict:
     """确保设备上有 mda_memguard_inject。
 
+    (3) 第三次修改（2026-11-26）
+    bug 原因：① force_push=False 时从未检查设备上二进制是否存在及大小是否一致，直接假报 ok=True；
+              ② push 与 chmod 未检查 returncode，失败被静默忽略。
+    解决方案：检查设备端文件大小与本地是否一致，缺失/不一致或 force_push 时推送并严格校验返回码。
+
     本地没编译产物时给明确指引（而不是让上层拿到看不懂的失败）。
     """
-    out: dict = {"ok": False, "device_path": _HELPER_DEVICE}
+    out: dict = {"ok": False, "device_path": _HELPER_DEVICE, "pushed": False}
     if not os.path.isfile(_HELPER_LOCAL):
         out["code"] = "HELPER_NOT_BUILT"
         out["error"] = (
             f"本地没有编译产物：{_HELPER_LOCAL}。"
             "编译方式见 docs/12-跨进程注入.md（build_payload.py + clang）")
         return out
-    if force_push:
+    local_size = os.path.getsize(_HELPER_LOCAL)
+    out["local_size"] = local_size
+    need_push = bool(force_push)
+    if not need_push:
+        dev_size = _device_file_size(serial, _HELPER_DEVICE)
+        if dev_size is None or dev_size != local_size:
+            need_push = True
+        else:
+            out["ok"] = True
+            out["note"] = "设备上已有同版本 injector，跳过推送"
+            return out
+    if need_push:
         try:
-            subprocess.run([_resolve_adb(), "-s", str(serial), "push",
-                            _HELPER_LOCAL, _HELPER_DEVICE],
-                           capture_output=True, text=True, timeout=90, check=False)
-            subprocess.run([_resolve_adb(), "-s", str(serial), "shell",
-                            f"su -c 'chmod 755 {_HELPER_DEVICE}'"],
-                           capture_output=True, text=True, timeout=30, check=False)
+            pr = subprocess.run([_resolve_adb(), "-s", str(serial), "push",
+                                 _HELPER_LOCAL, _HELPER_DEVICE],
+                                capture_output=True, text=True, timeout=90, check=False)
+            if pr.returncode != 0:
+                out["code"] = "PUSH_FAILED"
+                out["error"] = (f"推送失败(rc={pr.returncode})："
+                                f"{((pr.stderr or '') + (pr.stdout or '')).strip()[:200]}")
+                return out
+            chmod_inner = f"chmod 755 {shlex.quote(_HELPER_DEVICE)}"
+            cr = subprocess.run([_resolve_adb(), "-s", str(serial), "shell",
+                                 f"su -c {shlex.quote(chmod_inner)}"],
+                                capture_output=True, text=True, timeout=30, check=False)
+            if cr.returncode != 0:
+                out["code"] = "CHMOD_FAILED"
+                out["error"] = f"chmod 失败(rc={cr.returncode})：{(cr.stderr or '')[:200]}"
+                return out
+            out["pushed"] = True
         except Exception as exc:                          # noqa: BLE001
             out["code"] = "PUSH_FAILED"
             out["error"] = f"{type(exc).__name__}: {exc}"
@@ -96,9 +149,20 @@ def ensure_injector(serial: str, force_push: bool = False) -> dict:
 
 
 def _run_helper(serial: str, args: list[str], timeout: int = 60) -> dict:
-    """跑一次 helper，返回它打印的 JSON。"""
-    ensure_injector(serial)
-    cmd = " ".join(["su", "-c", f"'{_HELPER_DEVICE} " + " ".join(args) + "'"])
+    """跑一次 helper，返回它打印的 JSON。
+
+    (3) 第三次修改（2026-11-26）
+    bug 原因：① 调用 ensure_injector(serial) 后丢弃返回值，未就绪仍继续执行；
+              ② 直接字符串拼接 args 到单引号 su -c，存在命令注入且含引号会破坏语法。
+    解决方案：检查 ensure_injector 返回值，失败立即抛 InjectError；
+              用 shlex.quote 安全拼接所有参数与整段 su -c 命令。
+    """
+    h = ensure_injector(serial)
+    if not h.get("ok"):
+        raise InjectError(h.get("code") or "HELPER_NOT_READY",
+                          h.get("error") or "mda_memguard_inject 未就绪", h)
+    inner = " ".join([shlex.quote(_HELPER_DEVICE)] + [shlex.quote(str(a)) for a in args])
+    cmd = f"su -c {shlex.quote(inner)}"
     try:
         r = subprocess.run([_resolve_adb(), "-s", str(serial), "shell", cmd],
                            capture_output=True, text=True, timeout=timeout)
@@ -149,47 +213,91 @@ def remote_syscall_probe(serial: str, pid: int) -> dict:
 
 
 def read_target_mem(serial: str, pid: int, addr: int, size: int = 64) -> bytes:
-    """读目标进程的内存（走 /proc/<pid>/mem，adb 通道）。"""
+    """读目标进程的内存（走 /proc/<pid>/mem，按 4KB 页分块读取，支持跨页）。
+
+    (3) 第三次修改（2026-11-26）
+    bug 原因：① 原实现写死 `bs=4096 skip=addr//4096 count=1`，当 addr%4096 + size > 4096
+              （跨越 4KB 页边界）时静默截断，返回残缺字节；
+              ② 未检查 dd/adb 返回码与读取错误；且创建了无用的 tempfile.mktemp。
+    解决方案：按 4KB 页边界分块循环读取并拼接，检查每块 returncode 与 dd 退出码，
+              并用 shlex.quote 保护 su -c 命令串。
+    """
     if size <= 0 or size > 4096:
         raise InjectError("BAD_SIZE", f"size 必须在 1..4096，收到 {size}")
-    out = tempfile.mktemp(prefix="mda_rtm_")
-    try:
-        cmd = (f"dd if=/proc/{int(pid)}/mem bs=4096 "
-               f"skip={int(addr)//4096} count=1 2>/dev/null | "
-               f"dd bs=1 skip={int(addr) % 4096} count={size} 2>/dev/null | "
-               f"od -An -tx1 -v")
-        r = subprocess.run([_resolve_adb(), "-s", str(serial), "shell",
-                            f"su -c '{cmd}'"],
-                           capture_output=True, text=True, timeout=60)
+    pid_i = int(pid)
+    cur = int(addr)
+    rem = int(size)
+    chunks: list[bytes] = []
+    while rem > 0:
+        page_idx = cur // 4096
+        page_off = cur % 4096
+        take = min(rem, 4096 - page_off)
+        inner = (
+            f"dd if=/proc/{pid_i}/mem bs=4096 skip={page_idx} count=1 2>/dev/null | "
+            f"dd bs=1 skip={page_off} count={take} 2>/dev/null | "
+            f"od -An -tx1 -v"
+        )
+        r = subprocess.run(
+            [_resolve_adb(), "-s", str(serial), "shell", f"su -c {shlex.quote(inner)}"],
+            capture_output=True, text=True, timeout=60,
+        )
+        if r.returncode != 0:
+            raise InjectError(
+                "READ_FAILED",
+                f"读取 0x{cur:x}({take}B) 失败(rc={r.returncode})：{(r.stderr or '')[:200]}",
+            )
         hexs = re.sub(r"\s+", "", r.stdout or "")
+        if len(hexs) % 2:
+            hexs = hexs[:-1]
         if not hexs:
-            return b""
-        return bytes.fromhex(hexs)
-    finally:
+            if not chunks:
+                return b""
+            raise InjectError(
+                "READ_SHORT",
+                f"跨页读取在 0x{cur:x} 处中断（已读 {sum(len(c) for c in chunks)}/{size} 字节）",
+            )
         try:
-            os.unlink(out)
-        except Exception:                                 # noqa: BLE001
-            pass
+            got = bytes.fromhex(hexs)
+        except ValueError as exc:
+            raise InjectError("BAD_HEX", f"读取 0x{cur:x} 返回非法十六进制：{exc}") from exc
+        chunks.append(got)
+        if len(got) < take:
+            break
+        cur += take
+        rem -= take
+    return b"".join(chunks)
 
 
 def write_target_mem(serial: str, pid: int, addr: int, data: bytes) -> bool:
-    """写目标进程的内存。
+    """写目标进程的内存（走 root `dd of=/proc/<pid>/mem`）。
 
-    注意：**不能用 process_vm_writev** —— 实测它在目标处于 ptrace stop 状态时
-    会"返回成功但根本没写进去"。必须走 ptrace 的 POKEDATA 通道
-    （由设备端 helper 完成）。
+    (3) 第三次修改（2026-11-26）
+    bug 原因：① 原注释声称走 ptrace POKEDATA，与实际 /proc/<pid>/mem 写入实现不符；
+              ② `su -c "{cmd}"` 未经 shlex.quote 保护，且 `dd ... 2>/dev/null` 吞掉了错误，
+                 仅凭外层 su 的 returncode 无法可靠判断 dd 写入是否真的成功。
+    解决方案：修正文档说明与实现一致（注：目标处于 ptrace stop 状态时应走 helper 的
+              PTRACE_POKEDATA）；使用 shlex.quote 保护整段管道，并通过显式回显 dd 退出码
+              `__DD_RC__=$?` 校验写入结果。
     """
     if not data:
         return True
     # (1) 用 \xNN 转义输出真正的二进制，不能直接 printf 十六进制文本
     esc = "".join(f"\\x{b:02x}" for b in data)
-    cmd = (f"printf '{esc}' | "
-           f"dd of=/proc/{int(pid)}/mem bs=1 seek={int(addr)} "
-           f"conv=notrunc 2>/dev/null")
-    r = subprocess.run([_resolve_adb(), "-s", str(serial), "shell",
-                        f"su -c \"{cmd}\""],
-                       capture_output=True, text=True, timeout=60)
-    return r.returncode == 0
+    inner = (
+        f"printf '{esc}' | "
+        f"dd of=/proc/{int(pid)}/mem bs=1 seek={int(addr)} conv=notrunc 2>/dev/null; "
+        f"echo __DD_RC__=$?"
+    )
+    r = subprocess.run(
+        [_resolve_adb(), "-s", str(serial), "shell", f"su -c {shlex.quote(inner)}"],
+        capture_output=True, text=True, timeout=60,
+    )
+    if r.returncode != 0:
+        return False
+    m = re.search(r"__DD_RC__=(\d+)", r.stdout or "")
+    if m:
+        return int(m.group(1)) == 0
+    return False
 
 
 def resolve_libc_syscall_offset(serial: str, pid: int) -> int:

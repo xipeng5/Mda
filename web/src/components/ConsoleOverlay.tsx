@@ -23,6 +23,8 @@ import { api, type ApiConsoleEvent } from "../lib/api";
 
 type Props = {
   open: boolean;
+  /** 活跃常驻脚本数量变化回调，供顶部 Tab 显示真实角标 */
+  onScriptsChange?: (count: number) => void;
 };
 
 type Line = {
@@ -32,8 +34,22 @@ type Line = {
   ts?: string;
 };
 
-export function ConsoleOverlay({ open }: Props) {
+// (1) 第一次修改（2026-11-26）
+// bug 原因：① 刷新页面后 refreshScripts 未将已存活脚本的 script_id 同步进 keepIds，常驻脚本永久静默；
+//           ② keep 模式请求期间 800ms 轮询提前推进 cursor 导致首条输出丢失；
+//           ③ once 模式强推 cursor=Math.max(cursor, Date.now()/1000) 吞掉并发常驻脚本输出；
+//           ④ 头部「全停」发 {serial, pid} 无法全停，且不检查 r.ok 就清空 keepIds；
+//           ⑤ once 出错时既丢弃已打印的 r.lines 又清空用户输入；
+//           ⑥ 贴底依赖 lines.length 在满 500 行后失效；
+//           ⑦ textarea 的 onKeyDown 未 stopPropagation 触发全局 Enter 快捷键；
+//           ⑧ 残留废弃 isToolOutput/e.source 分支，且未校验 !fg.package 就请求 appProcesses。
+// 解决方案：同步存活脚本到 keepIds；keep 模式记录 runStart 并在拿到 script_id 后补拉并去重；
+//           once 改为维护 onceIds 过滤而绝不强推游标；全停发送 {} 且仅 r.ok 才清理 keepIds；
+//           once 出错先输出已有 lines 且保留 input；贴底改用单调递增 lineSeq；
+//           onKeyDown 调 e.stopPropagation()；清理废弃分支并加 !fg?.package 守卫。
+export function ConsoleOverlay({ open, onScriptsChange }: Props) {
   const [lines, setLines] = useState<Line[]>([]);
+  const [lineSeq, setLineSeq] = useState(0);
   const [input, setInput] = useState("");
   const [mode, setMode] = useState<"once" | "keep">("once");
   const [serial, setSerial] = useState("");
@@ -43,13 +59,46 @@ export function ConsoleOverlay({ open }: Props) {
 
   const cursor = useRef(0);
   const keepIds = useRef<Set<number>>(new Set());
+  const onceIds = useRef<Set<number>>(new Set());
+  const seenEvents = useRef<Set<string>>(new Set());
   const seq = useRef(0);
   const bodyRef = useRef<HTMLDivElement | null>(null);
   const stick = useRef(true);
+  const onScriptsRef = useRef(onScriptsChange);
+  onScriptsRef.current = onScriptsChange;
 
   const push = useCallback((text: string, kind: Line["kind"] = "out", ts?: string) => {
-    setLines((prev) => [...prev, { id: ++seq.current, text, kind, ts }].slice(-500));
+    const id = ++seq.current;
+    setLines((prev) => [...prev, { id, text, kind, ts }].slice(-500));
+    setLineSeq(id);
   }, []);
+
+  /** 将后端事件流渲染为终端行，按事件指纹去重防止补拉与轮询重复输出。 */
+  const renderEvents = useCallback(
+    (items: ApiConsoleEvent[], onlyScriptId?: number) => {
+      for (const e of items) {
+        const sid = e.script_id;
+        if (sid == null) continue;
+        if (onceIds.current.has(sid)) continue;
+        if (onlyScriptId != null) {
+          if (sid !== onlyScriptId) continue;
+        } else if (!keepIds.current.has(sid)) {
+          continue;
+        }
+        const evKey = `${e.t}|${sid}|${e.kind}|${e.text ?? e.error ?? e.reason ?? ""}`;
+        if (seenEvents.current.has(evKey)) continue;
+        seenEvents.current.add(evKey);
+        if (seenEvents.current.size > 1000) {
+          const first = seenEvents.current.values().next().value;
+          if (first !== undefined) seenEvents.current.delete(first);
+        }
+        if (e.kind === "line") push(e.text ?? "", "out", e.ts);
+        else if (e.kind === "error") push(e.error ?? "未知错误", "err", e.ts);
+        else if (e.kind === "stop") push(`[脚本 #${sid} 已停止]`, "sys", e.ts);
+      }
+    },
+    [push]
+  );
 
   // 打开时自动填目标（已附加会话优先，其次前台主进程）
   useEffect(() => {
@@ -66,7 +115,8 @@ export function ConsoleOverlay({ open }: Props) {
       }
       const fg = await api.foreground();
       if (!alive || !fg?.serial) return;
-      setSerial((v) => v || fg.serial);
+      setSerial((v) => v || fg.serial!);
+      if (!fg.package) return;
       try {
         const pr = await api.appProcesses({ package: fg.package, serial: fg.serial });
         if (!alive) return;
@@ -77,11 +127,24 @@ export function ConsoleOverlay({ open }: Props) {
     return () => { alive = false; };
   }, [open]);
 
-  // 轮询脚本输出事件，两类：
-  //   ① AI 调工具时内部脚本的输出：带 source 字段、无 script_id → 直接显示
-  //      （全局 frida hook 旁路来的，这是本终端最主要的输出来源）
-  //   ② 手动常驻脚本的持续输出：有 script_id 且在 keepIds 里 → 显示
-  //      once 的输出已由 run() 返回值直接 push，不在这里处理，避免重复。
+  const refreshScripts = useCallback(async () => {
+    const r = await api.fridaJsList();
+    if (!r?.ok) return;
+    const list = r.items ?? [];
+    for (const s of list) {
+      if (s.script_id != null) keepIds.current.add(s.script_id);
+    }
+    setScripts(list);
+    onScriptsRef.current?.(list.length);
+  }, []);
+
+  // 启动时探测一次常驻脚本数，让 Tab 角标在未打开终端时也准确
+  useEffect(() => {
+    void refreshScripts();
+  }, [refreshScripts]);
+
+  // 轮询常驻脚本的持续输出：仅渲染属于 keepIds 且不在 onceIds 中的事件；
+  // 先同步 refreshScripts 再拉首次事件，保证刷新页面后已存活常驻脚本立即恢复显示。
   useEffect(() => {
     if (!open) return;
     let alive = true;
@@ -91,29 +154,27 @@ export function ConsoleOverlay({ open }: Props) {
       const items = r.items ?? [];
       if (!items.length) return;
       cursor.current = items.reduce((m, e) => Math.max(m, e.t || 0), cursor.current);
-      for (const e of items as ApiConsoleEvent[]) {
-        const isToolOutput = !!e.source;             // AI 工具旁路输出
-        const isKeep = e.script_id != null && keepIds.current.has(e.script_id);
-        if (!isToolOutput && !isKeep) continue;
-        if (e.kind === "line") push(e.text ?? "", "out", e.ts);
-        else if (e.kind === "error") push(e.error ?? "未知错误", "err", e.ts);
-        else if (e.kind === "stop") push(`[脚本 #${e.script_id} 已停止]`, "sys", e.ts);
-      }
+      renderEvents(items);
     };
-    void tick();
-    const h = window.setInterval(tick, 800);
-    return () => { alive = false; window.clearInterval(h); };
-  }, [open, push]);
-
-  const refreshScripts = useCallback(async () => {
-    const r = await api.fridaJsList();
-    if (r?.ok) setScripts(r.items ?? []);
-  }, []);
+    let timerId: number | null = null;
+    void (async () => {
+      await refreshScripts();
+      if (!alive) return;
+      await tick();
+      if (!alive) return;
+      timerId = window.setInterval(tick, 800);
+    })();
+    return () => {
+      alive = false;
+      if (timerId != null) window.clearInterval(timerId);
+    };
+  }, [open, refreshScripts, renderEvents]);
 
   useEffect(() => {
     if (!open) return;
-    void refreshScripts();
-    const h = window.setInterval(refreshScripts, 3000);
+    const h = window.setInterval(() => {
+      void refreshScripts();
+    }, 3000);
     return () => window.clearInterval(h);
   }, [open, refreshScripts]);
 
@@ -128,42 +189,60 @@ export function ConsoleOverlay({ open }: Props) {
       return;
     }
     setBusy(true);
+    const runStart = Date.now() / 1000;
     try {
       const r = await api.runFridaJs({ serial: serial.trim(), pid: pidNum, js, mode });
       if (mode === "once") {
-        // once：把脚本打印的每一行原样铺出来
-        if (r?.ok && r.lines?.length) {
+        if (r?.script_id != null) onceIds.current.add(r.script_id);
+        // once：即使脚本中途报错，也先把已打印出的行展示出来再报错误，且出错不清空 input
+        if (r?.lines?.length) {
           for (const line of r.lines) push(line, "out");
-        } else if (!r?.ok) {
+        }
+        if (!r?.ok) {
           push(r?.error ?? "执行失败", "err");
         } else {
-          push("（脚本没有打印任何内容）", "sys");
+          if (!r.lines?.length) push("（脚本没有打印任何内容）", "sys");
+          setInput("");
         }
-        cursor.current = Math.max(cursor.current, Date.now() / 1000);
-        setInput("");
       } else {
         if (r?.script_id != null) keepIds.current.add(r.script_id);
-        if (!r?.ok) push(r?.error ?? "挂载失败", "err");
-        else push(`[常驻脚本 #${r.script_id} 已启动，输出会实时打印在下面]`, "sys");
+        if (!r?.ok) {
+          push(r?.error ?? "挂载失败", "err");
+        } else {
+          push(`[常驻脚本 #${r.script_id} 已启动，输出会实时打印在下面]`, "sys");
+          setInput("");
+          // 补拉自 runStart - 1 起该脚本已产生的事件，防止 800ms 轮询提前推进游标丢首条输出
+          if (r.script_id != null) {
+            const back = await api.consoleEvents(Math.max(0, runStart - 1));
+            if (back?.ok && back.items?.length) {
+              cursor.current = back.items.reduce((m, e) => Math.max(m, e.t || 0), cursor.current);
+              renderEvents(back.items, r.script_id);
+            }
+          }
+        }
       }
       void refreshScripts();
     } finally {
       setBusy(false);
     }
-  }, [input, serial, pid, mode, push, refreshScripts]);
+  }, [input, serial, pid, mode, push, refreshScripts, renderEvents]);
 
   const stopAll = useCallback(async (scriptId?: number) => {
-    await api.stopFridaJs(scriptId ? { script_id: scriptId } : { serial: serial.trim(), pid: Number(pid) || undefined });
-    if (scriptId != null) keepIds.current.delete(scriptId);
-    else keepIds.current.clear();
+    const r = await api.stopFridaJs(scriptId != null ? { script_id: scriptId } : {});
+    if (r?.ok) {
+      if (scriptId != null) keepIds.current.delete(scriptId);
+      else keepIds.current.clear();
+    } else if (r?.error) {
+      push(`停止失败：${r.error}`, "err");
+    }
     void refreshScripts();
-  }, [serial, pid, refreshScripts]);
+  }, [push, refreshScripts]);
 
-  // 贴底
+  // 贴底：依赖单调递增的 lineSeq，满 500 行截断后仍持续自动滚动到底部
   useEffect(() => {
     const el = bodyRef.current;
     if (el && stick.current) el.scrollTop = el.scrollHeight;
-  }, [lines.length]);
+  }, [lineSeq]);
 
   const onScroll = () => {
     const el = bodyRef.current;
@@ -229,6 +308,7 @@ export function ConsoleOverlay({ open }: Props) {
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={(e) => {
+              e.stopPropagation();
               if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
                 e.preventDefault();
                 if (!busy) void run();

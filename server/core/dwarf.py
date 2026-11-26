@@ -178,20 +178,29 @@ class _Cie:
 class _Fde:
     """一条 Frame Description Entry。"""
 
-    __slots__ = ("pc_begin", "pc_end", "insns", "cie")
+    __slots__ = ("pc_begin", "pc_end", "insns", "cie", "insns_va")
 
-    def __init__(self, pc_begin: int, pc_end: int, insns: bytes, cie: _Cie):
+    def __init__(self, pc_begin: int, pc_end: int, insns: bytes, cie: _Cie,
+                 insns_va: int = 0):
         self.pc_begin = pc_begin
         self.pc_end = pc_end
         self.insns = insns
         self.cie = cie
+        self.insns_va = insns_va
 
 
-def _read_encoded(data: bytes, i: int, enc: int, field_va: int) -> tuple[int | None, int]:
+# (4) 第四次修改（2026-11-26）
+# bug 原因：DW_EH_PE_datarel 的掩码值误写为 0x50（0x50 实际是 DW_EH_PE_aligned，
+#           真正的 datarel 是 0x30），导致 0x30 编码静默返回未加基址的原始负偏移，
+#           且无法接受调用方传入的 datarel_base（如 .eh_frame_hdr 基址）。
+# 解决方案：修正 datarel 为 0x30，新增可选 datarel_base 参数——有基址时相加，
+#           缺基址或遇到其它无基址相对编码（textrel/funcrel/aligned）时返回 (None, i)。
+def _read_encoded(data: bytes, i: int, enc: int, field_va: int,
+                  datarel_base: int | None = None) -> tuple[int | None, int]:
     """读一个 DW_EH_PE 编码的值，返回 (value, new_i)。
 
     支持 absptr / uleb / udata2/4/8 / sleb / sdata2/4/8，应用位支持
-    pcrel（+字段自身地址）与 datarel。不支持的编码返回 (None, i)。
+    pcrel（+字段自身地址）与 datarel（+datarel_base）。不支持的编码返回 (None, i)。
     """
     if enc == 0xFF:                       # DW_EH_PE_omit
         return None, i
@@ -244,16 +253,21 @@ def _read_encoded(data: bytes, i: int, enc: int, field_va: int) -> tuple[int | N
     else:
         return None, i
 
-    if app == 0x10:                        # pcrel：相对该字段自身地址
+    if app == 0x10:                        # DW_EH_PE_pcrel：相对该字段自身地址
         val += field_va
-    elif app == 0x50:                      # datarel：本实现无 datarel 基址，如实放弃
+    elif app == 0x30:                      # DW_EH_PE_datarel：相对段/表基址
+        if datarel_base is None:
+            return None, i
+        val += datarel_base
+    elif app != 0x00:                      # 其它无基址相对编码（textrel/funcrel/aligned）
         return None, i
     return val, i
 
 
-def _skip_encoded(data: bytes, i: int, enc: int, field_va: int) -> int:
+def _skip_encoded(data: bytes, i: int, enc: int, field_va: int,
+                  datarel_base: int | None = None) -> int:
     """跳过（不解析）一个 DW_EH_PE 值——用于跳过 personality 指针等。"""
-    _, i = _read_encoded(data, i, enc, field_va)
+    _, i = _read_encoded(data, i, enc, field_va, datarel_base=datarel_base)
     return i
 
 
@@ -356,14 +370,16 @@ def _parse_fde(body: bytes, cie: _Cie, rec_va: int,
     if pc_range is None:
         unsupported.add(0xFF01)
         return None
+    insns_off = p
     insns = body[p:]
     if cie.has_z:
         # FDE 的 augmentation data：长度前缀 + 内容（通常是 LSDA 指针），整体跳过
         aug_len, q = _uleb(insns, 0)
+        insns_off += q + aug_len
         insns = insns[q + aug_len:]
     if pc_range <= 0:
         return None
-    return _Fde(pc_begin, pc_begin + pc_range, insns, cie)
+    return _Fde(pc_begin, pc_begin + pc_range, insns, cie, insns_va=rec_va + insns_off)
 
 
 # ---------------------------------------------------------------- 规则状态机
@@ -411,7 +427,7 @@ _ABORT = 2       # 该 FDE 无法可靠展开（指令编码不可知 / CFA 变�
 
 
 def _run_stream(st: _State, data: bytes, cie: _Cie, initial: dict[int, tuple],
-                target_pc: int, unsupported: set) -> int:
+                target_pc: int, unsupported: set, insns_va: int = 0) -> int:
     """执行一段 CFI 指令流，把规则累积进 st。
 
     返回 _STOP（已到达 target_pc 对应的行）/ _ABORT（放弃该 FDE）/ 0（走完）。
@@ -460,11 +476,16 @@ def _run_stream(st: _State, data: bytes, cie: _Cie, initial: dict[int, tuple],
         if op == _E_NOP:
             continue
 
+        # (4) 第四次修改（2026-11-26）
+        # bug 原因：DW_CFA_set_loc 此前写死按 8 字节 <Q 读取绝对地址，未遵循 .eh_frame 中
+        #           cie.fde_enc 指定的指针编码（如 4 字节 sdata4 pcrel），会读错地址并令后续指令错位。
+        # 解决方案：改用 _read_encoded 按 cie.fde_enc（及字段 VA insns_va + i）解码目标地址。
         if op == _E_SET_LOC:
-            if i + 8 > n:
+            loc_val, new_i = _read_encoded(data, i, cie.fde_enc, insns_va + i)
+            if loc_val is None or new_i == i:
                 return _ABORT
-            st.loc = struct.unpack_from("<Q", data, i)[0]
-            i += 8
+            st.loc = loc_val
+            i = new_i
             if st.loc > target_pc:
                 return _STOP
             continue
@@ -627,7 +648,7 @@ def _rules_at(fde: _Fde, pc: int, unsupported: set) -> _State | None:
     cie.initial_regs = dict(st.regs)
     cie.initial_cfa = (st.cfa_reg, st.cfa_off)
 
-    rc = _run_stream(st, fde.insns, cie, initial, pc, unsupported)
+    rc = _run_stream(st, fde.insns, cie, initial, pc, unsupported, insns_va=fde.insns_va)
     if rc == _ABORT:
         return None
     return st
@@ -676,7 +697,8 @@ def _as_internal_fde(fde) -> _Fde | None:
     if isinstance(fde, dict):
         cie = fde.get("_cie_obj")
         if cie is not None:
-            return _Fde(fde["pc_begin"], fde["pc_end"], fde["insns"], cie)
+            return _Fde(fde["pc_begin"], fde["pc_end"], fde["insns"], cie,
+                        insns_va=fde.get("insns_va", 0))
     return None
 
 
@@ -746,8 +768,8 @@ def _decode_eh_frame_hdr(so) -> dict:
     version = data[0]
     ptr_enc, count_enc, table_enc = data[1], data[2], data[3]
     p = 4
-    frame_ptr, p = _read_encoded(data, p, ptr_enc, addr + p)
-    count, p = _read_encoded(data, p, count_enc, addr + p)
+    frame_ptr, p = _read_encoded(data, p, ptr_enc, addr + p, datarel_base=addr)
+    count, p = _read_encoded(data, p, count_enc, addr + p, datarel_base=addr)
     out.update({
         "found": True,
         "version": version,
@@ -847,13 +869,16 @@ def parse_eh_frame(so) -> dict:
             if cie is not None:
                 cies[rec_start] = cie
         else:
-            # .eh_frame 里 cie_pointer 是**反向位移**，相对本记录的
-            # cie_pointer 字段起点：cie_off = rec_start + 4 - cie_id
-            cie_off = rec_start + 4 - cie_id
+            # (4) 第四次修改（2026-11-26）
+            # bug 原因：DWARF64（length == 0xFFFFFFFF）记录头占 12 字节（j = rec_start + 12），
+            #           旧代码写死 rec_start + 4 与 rec_start + 8，导致 cie_off 和 rec_va 偏移 8 字节。
+            # 解决方案：统一使用实际头尾偏移 j 与 j + 4（DWARF32 与 DWARF64 均精确）。
+            # .eh_frame 里 cie_pointer 是**反向位移**，相对本记录的 cie_pointer 字段起点 j
+            cie_off = j - cie_id
             cie = cies.get(cie_off)
             if cie is not None:
-                # initial_location 字段的 VA = 记录起点 + 8（length + cie_ptr 之后）
-                fde = _parse_fde(body, cie, eh_addr + rec_start + 8, unsupported)
+                # initial_location 字段的 VA = eh_addr + j + 4（紧接 cie_pointer 之后）
+                fde = _parse_fde(body, cie, eh_addr + j + 4, unsupported)
                 if fde is not None:
                     fdes.append(fde)
         i = rec_end
@@ -882,6 +907,7 @@ def _fde_dict(f: _Fde) -> dict:
         "pc_begin": f.pc_begin,
         "pc_end": f.pc_end,
         "insns": f.insns,
+        "insns_va": f.insns_va,
         "code_align": cie.code_align,
         "data_align": cie.data_align,
         "ra_reg": cie.ra_reg,
@@ -1068,9 +1094,13 @@ class CfiUnwinder:
         self._unsupported: set[int] = set()
         self._first_cov: dict | None = None
 
+    # (4) 第四次修改（2026-11-26）
+    # bug 原因：`if not base or not size:` 把静态分析常用的 base=0 当作假值直接 return，
+    #           导致 unwind_frames(..., base=0) 永远无法登记模块而展开失败。
+    # 解决方案：区分 base is None 与 base == 0，允许 base == 0 正常登记。
     def add_module(self, base: int, size: int, so=None, name: str = "") -> None:
         """登记一个模块。so 为 None 表示"知道范围但没加载静态文件"。"""
-        if not base or not size:
+        if base is None or int(base) < 0 or not size or int(size) <= 0:
             return
         self._modules.append({"base": int(base), "size": int(size),
                               "so": so, "name": name or getattr(so, "name", "")})
@@ -1135,15 +1165,22 @@ class CfiUnwinder:
         first_cov: dict | None = None
         start_pc = int(pc)
         covered_start = False
-        seen: set[int] = set()
+        # (4) 第四次修改（2026-11-26）
+        # bug 原因：seen 仅按 cur_pc 去重，合法的递归调用栈（相同 PC、不同 SP）会被误判为死循环而截断。
+        # 解决方案：seen 改为记录 (cur_pc, cur_sp) 二元组，允许不同栈帧的递归正常展开，
+        #           同时由外层 limit 上限兜底防止真死循环。
+        seen: set[tuple[int, int | None]] = set()
         stop_reason = ""
 
         cur_pc = start_pc
         for depth in range(limit):
-            if cur_pc in seen:
-                stop_reason = f"检测到循环：PC {cur_pc:#x} 已出现过，停止"
+            cur_sp = cur.get("sp")
+            state_key = (cur_pc, cur_sp)
+            if state_key in seen:
+                sp_s = f"{cur_sp:#x}" if cur_sp is not None else "None"
+                stop_reason = f"检测到循环：状态 (PC={cur_pc:#x}, SP={sp_s}) 已出现过，停止"
                 break
-            seen.add(cur_pc)
+            seen.add(state_key)
 
             mod = self._module_for(cur_pc)
             if mod is None:
@@ -1235,6 +1272,10 @@ class CfiUnwinder:
                 break
 
             # ---- 恢复寄存器，为下一帧准备 ----
+            # (4) 第四次修改（2026-11-26）
+            # bug 原因：对 DW_CFA_undefined / expr 或栈读取失败（read_ptr 返回 None）的寄存器，
+            #           旧代码直接 continue 静默沿用 callee 的旧寄存器值，可能让上层帧算出错误 CFA/RA。
+            # 解决方案：明确将其从 new_regs 中移除（含 fp/lr 别名），使下一帧按“未知值”如实处理。
             new_regs = dict(cur)
             new_regs["sp"] = cfa
             self._reader.prefetch(cfa)
@@ -1244,7 +1285,12 @@ class CfiUnwinder:
                 if kind == "offset":
                     val = self._reader.read_ptr(cfa + rule[1])
                     if val is None:
-                        continue          # 读不到就保留旧值，下一帧会如实失败
+                        new_regs.pop(name, None)
+                        if name == "x29":
+                            new_regs.pop("fp", None)
+                        elif name == "x30":
+                            new_regs.pop("lr", None)
+                        continue
                     new_regs[name] = _strip_pac(val) if regnum == internal.cie.ra_reg else val
                 elif kind == "val_offset":
                     new_regs[name] = cfa + rule[1]
@@ -1252,6 +1298,18 @@ class CfiUnwinder:
                     src = cur.get(_reg_name(rule[1]))
                     if src is not None:
                         new_regs[name] = src
+                    else:
+                        new_regs.pop(name, None)
+                        if name == "x29":
+                            new_regs.pop("fp", None)
+                        elif name == "x30":
+                            new_regs.pop("lr", None)
+                elif kind in ("undefined", "expr"):
+                    new_regs.pop(name, None)
+                    if name == "x29":
+                        new_regs.pop("fp", None)
+                    elif name == "x30":
+                        new_regs.pop("lr", None)
             # RA 规则也可能来自 "register"（罕见：LR 未入栈）
             new_regs["pc"] = next_pc
             cur = new_regs

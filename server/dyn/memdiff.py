@@ -41,6 +41,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import shlex
 import subprocess
 
 __all__ = ["mem_snapshot", "mem_diff", "mem_snapshot_clear",
@@ -52,9 +54,52 @@ _HELPER_DEVICE = "/data/local/tmp/mda_memsnap"
 _HELPER_LOCAL = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "device", "mda_memsnap")
 
+_SAFE_KEY_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+
+
+def _validate_snap_key(key: str) -> str | None:
+    """校验快照名白名单（[A-Za-z0-9_.-]+ 且不含 .. 或前导点），防路径穿越与命令注入。"""
+    raw = str(key or "").strip()
+    if not raw or ".." in raw or raw.startswith(".") or not _SAFE_KEY_RE.match(raw):
+        return None
+    return raw
+
+
+def _device_file_size(exe: str, serial: str, path: str) -> int | None:
+    """读取设备端文件真实大小（优先 stat -c %s，回退 ls -ln 第 5 列）。"""
+    q = shlex.quote(path)
+    try:
+        r = subprocess.run([exe, "-s", serial, "shell",
+                            f"stat -c %s {q} 2>/dev/null"],
+                           capture_output=True, text=True, timeout=20)
+        lines = (r.stdout or "").strip().splitlines()
+        if lines and lines[0].strip().isdigit():
+            return int(lines[0].strip())
+    except Exception:                                     # noqa: BLE001
+        pass
+    try:
+        r2 = subprocess.run([exe, "-s", serial, "shell",
+                             f"ls -ln {q} 2>/dev/null"],
+                            capture_output=True, text=True, timeout=20)
+        for ln in (r2.stdout or "").splitlines():
+            parts = ln.split()
+            if len(parts) >= 5 and parts[0].startswith("-") and parts[4].isdigit():
+                return int(parts[4])
+    except Exception:                                     # noqa: BLE001
+        pass
+    return None
+
 
 def ensure_memsnap_helper(serial: str) -> dict:
-    """确保设备上有 memsnap helper（本地没有就先编译提示）。"""
+    """确保设备上有 memsnap helper（本地没有就先编译提示）。
+
+    (4) 第四次修改（2026-11-26）
+    bug 原因：① 用 `re.search(r"\\s(\\d+)\\s", ls -l)` 误取硬链接数 "1"，导致每次重复 push
+              引发 ETXTBSY；
+              ② 未检查 `adb push` 的 returncode，推送失败仍假报 ok=True。
+    解决方案：改用 stat -c %s（回退 ls -ln 第 5 列）取真实文件大小；
+              显式检查 adb push 与 chmod 的 returncode，失败返回 PUSH_FAILED。
+    """
     out: dict = {"ok": False, "device_path": _HELPER_DEVICE, "pushed": False}
     if not os.path.isfile(_HELPER_LOCAL):
         out["error"] = ("本地没有编译产物：dyn/device/mda_memsnap 不存在；"
@@ -66,20 +111,26 @@ def ensure_memsnap_helper(serial: str) -> dict:
 
         exe = resolve_adb()
         size = os.path.getsize(_HELPER_LOCAL)
-        r = subprocess.run([exe, "-s", serial, "shell",
-                            f"ls -l {_HELPER_DEVICE} 2>/dev/null"],
-                           capture_output=True, text=True, timeout=20)
-        import re
-
-        m = re.search(r"\s(\d+)\s", r.stdout or "")
-        if m and int(m.group(1)) == size:
+        dev_size = _device_file_size(exe, serial, _HELPER_DEVICE)
+        if dev_size is not None and dev_size == size:
             out["ok"] = True
             out["note"] = "设备上已有同版本 helper，跳过推送"
             return out
-        subprocess.run([exe, "-s", serial, "push", _HELPER_LOCAL,
-                        _HELPER_DEVICE], capture_output=True, timeout=120)
-        subprocess.run([exe, "-s", serial, "shell",
-                        f"chmod 755 {_HELPER_DEVICE}"], capture_output=True)
+        pr = subprocess.run([exe, "-s", serial, "push", _HELPER_LOCAL,
+                             _HELPER_DEVICE],
+                            capture_output=True, text=True, timeout=120)
+        if pr.returncode != 0:
+            out["code"] = "PUSH_FAILED"
+            out["error"] = (f"推送失败(rc={pr.returncode})："
+                            f"{((pr.stderr or '') + (pr.stdout or '')).strip()[:200]}")
+            return out
+        cr = subprocess.run([exe, "-s", serial, "shell",
+                             f"chmod 755 {shlex.quote(_HELPER_DEVICE)}"],
+                            capture_output=True, text=True, timeout=30)
+        if cr.returncode != 0:
+            out["code"] = "CHMOD_FAILED"
+            out["error"] = f"chmod 失败(rc={cr.returncode})：{(cr.stderr or '')[:200]}"
+            return out
         out["ok"] = True
         out["pushed"] = True
     except Exception as exc:                              # noqa: BLE001
@@ -122,12 +173,16 @@ def mem_snapshot(serial: str, pid: int,
     快照**留在设备上**（/data/local/tmp/mda_snap_<key>.bin），
     不传回 Mac。diff 也在设备上算，只返回变化的块。
     """
+    # (4) 第四次修改（2026-11-26）：严格校验快照名白名单，拒绝路径穿越与非法字符
+    safe = _validate_snap_key(key)
+    if not safe:
+        return {"ok": False, "code": "BAD_KEY",
+                "error": f"非法快照名 {key!r}：仅允许 [A-Za-z0-9_.-]，不能含 '..' 或以 '.' 开头"}
     h = ensure_memsnap_helper(serial)
     if not h.get("ok"):
         return {"ok": False, "code": h.get("code"), "error": h.get("error")}
 
-    safe = "".join(c for c in str(key) if c.isalnum() or c in "_-")[:32] or "default"
-    r = _run(serial, f"snap {int(pid)} {safe} {int(max_mb)}", timeout=180)
+    r = _run(serial, f"snap {int(pid)} {shlex.quote(safe)} {int(max_mb)}", timeout=180)
     r["key"] = safe
     r["helper_pushed"] = h.get("pushed", False)
     if r.get("ok"):
@@ -176,8 +231,11 @@ def mem_diff(serial: str, pid: int, key: str = "default",
         mem_diff(pid=..., key="r98", min_size=90, max_size=110)
         → 直接列出新增的 90~110 字节块
     """
-    safe = "".join(c for c in str(key) if c.isalnum() or c in "_-")[:32] or "default"
-    r = _run(serial, f"diff {int(pid)} {safe} {int(min_size)} "
+    safe = _validate_snap_key(key)
+    if not safe:
+        return {"ok": False, "code": "BAD_KEY",
+                "error": f"非法快照名 {key!r}：仅允许 [A-Za-z0-9_.-]，不能含 '..' 或以 '.' 开头"}
+    r = _run(serial, f"diff {int(pid)} {shlex.quote(safe)} {int(min_size)} "
                      f"{int(max_size)} {int(max_report)}", timeout=180)
     if r.get("ok"):
         cnt = int(r.get("count") or 0)
@@ -196,5 +254,8 @@ def mem_diff(serial: str, pid: int, key: str = "default",
 
 def mem_snapshot_clear(serial: str, key: str = "default") -> dict:
     """删掉设备上的快照文件。"""
-    safe = "".join(c for c in str(key) if c.isalnum() or c in "_-")[:32] or "default"
-    return _run(serial, f"clear {safe}", timeout=30)
+    safe = _validate_snap_key(key)
+    if not safe:
+        return {"ok": False, "code": "BAD_KEY",
+                "error": f"非法快照名 {key!r}：仅允许 [A-Za-z0-9_.-]，不能含 '..' 或以 '.' 开头"}
+    return _run(serial, f"clear {shlex.quote(safe)}", timeout=30)

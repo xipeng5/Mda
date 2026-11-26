@@ -84,9 +84,22 @@ class Plugin(PluginBase):
         limit = int(args.get("limit", 20))
         legacy_list = bool(args.get("legacy_list", False))
 
-        so = session.get(so_name)
+        # (2) 第二次修改（2026-11-26）
+        # bug 原因：1) 未捕获 session.get() 的 KeyError，so 未加载时直接抛异常而非返 SO_NOT_LOADED；
+        #           2) 未先确保单函数 xref（ensure_function），导致未提前 build_xrefs 时 fn.string_refs 恒为 0；
+        #           3) 未捕获非 ARM64 架构下创建 xref/Disassembler 抛出的 ValueError。
+        # 解决方案：捕获 KeyError 返 SO_NOT_LOADED、捕获 ValueError 返 UNSUPPORTED_ARCH；
+        #           遍历函数时优先调用 x.ensure_function(fn.addr) 以填充 string_refs 与指令。
+        try:
+            so = session.get(so_name)
+        except KeyError as exc:
+            return {"ok": False, "error": str(exc),
+                    "code": getattr(exc, "mda_code", "SO_NOT_LOADED")}
         # 用规范名取 xref，避免别名在前半段成功、后半段 KeyError
-        x = session.xref(so.name)
+        try:
+            x = session.xref(so.name)
+        except ValueError as exc:
+            return {"ok": False, "code": "UNSUPPORTED_ARCH", "error": str(exc)}
 
         profiles = []
         # (1) 改遍历整张函数表，而不是被抹掉的导出表
@@ -94,6 +107,8 @@ class Plugin(PluginBase):
         for fn in funcs:
             if fn.addr <= 0:
                 continue
+            if hasattr(x, "ensure_function"):
+                x.ensure_function(fn.addr)
             name = fn.name or f"sub_{fn.addr:x}"
             insns = fn.instructions or x.disasm.disasm_function(fn.addr)
             calls = []

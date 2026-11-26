@@ -569,10 +569,17 @@ def read_string(so, addr: int, max_length: int = 256,
     #               实测 0x3496 处返回 terminated:true, value:"" 的假"空字符串"。
     #     解决方案：与 read_typed 共用取字节逻辑（静态走 _read_span 允许相邻续读，
     #               运行时走 frida），字符串不再因节边界被误判为空。
+    # (26) 第二十六次修改（2026-11-26）
+    # bug 原因：except MemReadError 把 ADDR_UNMAPPED（静态地址超出模块范围）吞掉后
+    #           落入 _read_span_runtime，而后者不做模块上界检查，导致越界仍继续读出脏数据。
+    # 解决方案：对 ADDR_UNMAPPED / NO_RUNTIME / MODULE_NOT_LOADED 直接向上抛出，
+    #           仅在跨页读失败（READ_FAILED）时降级折半短读。
     if source == SOURCE_RUNTIME:
         try:
             data = _read_exact_runtime(rb, so, addr, max_length)
-        except MemReadError:
+        except MemReadError as exc:
+            if exc.code in ("ADDR_UNMAPPED", "NO_RUNTIME", "MODULE_NOT_LOADED"):
+                raise
             # 运行时字符串常读到页尾才失败：允许短读，只要有内容就用
             data = _read_span_runtime(rb, so, addr, max_length)
     else:
@@ -661,7 +668,13 @@ def read_pointer(so, addr: int, depth: int = 1, offset: int = 0,
     #          与"失败要明确报错"的约定冲突。
     # 解决方案：起始地址必须先读通，读不通按 read_typed 的口径抛 MemReadError；
     #          只有「跟链途中」的不可读才是正常终止（记 stopped_at/reason）。
-    _read_exact(so, addr, psize, source=source, rb=rb)
+    # (27) 第二十七次修改（2026-11-26）
+    # bug 原因：source="runtime" 且 depth >= 2 时，第 0 层读出的指针值已是运行时绝对地址
+    #           （堆/栈/另一模块），后续层若继续走 _read_exact -> _read_exact_runtime 会
+    #           检查 0 <= current < mod.size 或二次加基址，导致多层指针跟链必然失败。
+    # 解决方案：第 0 层仍按静态偏移走 _read_exact（复用首读字节避免重复 RPC）；
+    #           source="runtime" 的第 1 层起直接按绝对运行时地址调用 rb.read_memory。
+    first_raw = _read_exact(so, addr, psize, source=source, rb=rb)
 
     chain: list[dict] = []
     visited: list[int] = []
@@ -674,12 +687,27 @@ def read_pointer(so, addr: int, depth: int = 1, offset: int = 0,
         if current in visited:
             stopped_at, reason = hex(current), "cycle"
             break
-        try:
-            raw = _read_exact(so, current, psize, source=source, rb=rb)
-        except MemReadError as exc:
-            stopped_at = hex(current)
-            reason = "unmapped" if exc.code == "ADDR_UNMAPPED" else "unreadable"
-            break
+        if level == 0:
+            raw = first_raw
+        elif source == SOURCE_RUNTIME:
+            reader = getattr(rb, "read_memory", None)
+            if not callable(reader):
+                stopped_at, reason = hex(current), "unreadable"
+                break
+            try:
+                raw = reader(current, psize)
+            except Exception:                             # noqa: BLE001
+                raw = None
+            if not raw or len(raw) < psize:
+                stopped_at, reason = hex(current), "unreadable"
+                break
+        else:
+            try:
+                raw = _read_exact(so, current, psize, source=source, rb=rb)
+            except MemReadError as exc:
+                stopped_at = hex(current)
+                reason = "unmapped" if exc.code == "ADDR_UNMAPPED" else "unreadable"
+                break
 
         value = struct.unpack(fmt, raw)[0]
         visited.append(current)
@@ -741,7 +769,11 @@ def _direct_read_batch(serial: str, pid: int, regions: list) -> list:
     try:
         dev = frida.get_device(serial, timeout=15)
         sess = dev.attach(int(pid))
-        spec = [[int(r["addr"]), int(r["size"])] for r in regions]
+        # (28) 第二十八次修改（2026-11-26）
+        # bug 原因：64 位地址以整数序列化给 JS ptr(...) 会受 float64 53 位精度限制，
+        #           ARM64 TBI 指针（0xb4...）会被截断。
+        # 解决方案：统一转为 hex(int(...)) 字符串传给 JS ptr("0x...")。
+        spec = [[hex(int(r["addr"])), int(r["size"])] for r in regions]
         js = (
             "var SPEC = " + json.dumps(spec) + ";"
             "var out = [];"
@@ -915,10 +947,20 @@ def dump_vm_state(serial: str, pid: int, ctx_ptr: int,
                 count = c4
                 csize = 4
 
-        if count > cmax:
+        # (29) 第二十九次修改（2026-11-26）
+        # bug 原因：① 只校验 count > cmax，未拦截 count == 0 或 count < cmin，导致 count==0 时
+        #             尝试读 0 字节并误报 READ_FAILED；
+        #           ② instr_size <= 0 时后续 len(raw) // int(instr_size) 会触发 ZeroDivisionError。
+        # 解决方案：校验 instr_size > 0，并将 count <= 0 或 count < cmin 或 count > cmax
+        #           统一返回 COUNT_SUSPICIOUS。
+        if int(instr_size) <= 0:
+            return {"ok": False, "code": "BAD_REQUEST",
+                    "error": f"instr_size 必须为正整数，实际 {instr_size!r}"}
+
+        if count <= 0 or count < cmin or count > cmax:
             return {"ok": False, "code": "COUNT_SUSPICIOUS",
-                    "error": (f"指令计数 {count} 明显不合理（>{cmax}），"
-                              "可能偏移/宽度不对；已停止读取避免读爆内存"),
+                    "error": (f"指令计数 {count} 不在合理区间 ({max(1, cmin)}..{cmax}]，"
+                              "可能偏移/宽度不对或尚未初始化；已停止读取"),
                     "raw_count": count,
                     "count_offset": int(count_offset),
                     "count_size_used": csize}
@@ -1014,56 +1056,58 @@ def read_memory_batch(serial: str, pid: int, regions: list,
 
     返回：{count, results[]}，每段 {addr, ok, hex, size, error}
     """
-    own_rb = False
-    if rb is None:
+    # (30) 第三十次修改（2026-11-26）
+    # bug 原因：rb is None 时先 Rebase.attach 了一次，随后又调 _direct_read_batch 再次
+    #           dev.attach，同一进程双重 attach（frida 上易卡死且白白多打断目标一次）；
+    #           即使调用方已传入 rb 也仍忽略 rb 去重新 attach。
+    # 解决方案：先校验 regions；若已传入 rb 则直接复用 rb.read_many（零额外 attach），
+    #           未传 rb 时仅调用一次 _direct_read_batch（单次 attach）。
+    items = []
+    for r in (regions or []):
+        if not isinstance(r, dict):
+            continue
+        a = r.get("addr")
         try:
-            from server.dyn.rebase import Rebase
+            a = int(a, 16) if isinstance(a, str) else int(a)
+        except (TypeError, ValueError):
+            continue
+        if a <= 0:
+            continue
+        size = r.get("size", 16)
+        try:
+            size = max(1, min(int(size), 4096))
+        except (TypeError, ValueError):
+            size = 16
+        items.append({"addr": a, "size": size})
 
-            rb = Rebase.attach(serial, int(pid))
-            own_rb = True
-        except Exception as exc:                          # noqa: BLE001
-            return {"ok": False, "code": "ATTACH_FAILED",
-                    "error": f"attach 失败：{exc}"}
+    if not items:
+        return {"ok": False, "code": "NO_REGIONS",
+                "error": "regions 为空或格式不对（需要 [{addr, size}, ...]）"}
 
-    try:
-        items = []
-        for r in (regions or []):
-            if not isinstance(r, dict):
-                continue
-            a = r.get("addr")
-            try:
-                a = int(a, 16) if isinstance(a, str) else int(a)
-            except (TypeError, ValueError):
-                continue
-            if a <= 0:
-                continue
-            size = r.get("size", 16)
-            try:
-                size = max(1, min(int(size), 4096))
-            except (TypeError, ValueError):
-                size = 16
-            items.append({"addr": a, "size": size})
-
-        if not items:
-            return {"ok": False, "code": "NO_REGIONS",
-                    "error": "regions 为空或格式不对（需要 [{addr, size}, ...]）"}
-
+    if rb is not None and callable(getattr(rb, "read_many", None)):
+        raw_res = rb.read_many(items)
+        results = []
+        for i, r in enumerate(items):
+            item = raw_res[i] if i < len(raw_res) else None
+            if item and item.get("ok"):
+                results.append({"addr": hex(int(r["addr"])), "ok": True,
+                                "size": int(item.get("size") or (len(item.get("hex", "")) // 2)),
+                                "hex": item.get("hex", "")})
+            else:
+                results.append({"addr": hex(int(r["addr"])), "ok": False,
+                                "error": (item or {}).get("err") or (item or {}).get("error") or "无响应"})
+    else:
         results = _direct_read_batch(serial, int(pid), items)
-        ok_count = sum(1 for r in results if r.get("ok"))
-        return {
-            "ok": True,
-            "implemented": True,
-            "count": len(results),
-            "readable": ok_count,
-            "results": results,
-            "note": "所有段在同一次 attach 内读完，不会多次打断目标",
-        }
-    finally:
-        if own_rb:
-            try:
-                rb.detach()
-            except Exception:                             # noqa: BLE001
-                pass
+
+    ok_count = sum(1 for r in results if r.get("ok"))
+    return {
+        "ok": True,
+        "implemented": True,
+        "count": len(results),
+        "readable": ok_count,
+        "results": results,
+        "note": "所有段在同一次 attach 内读完，不会多次打断目标",
+    }
 
 
 def dump_vm_state_auto(serial: str, pid: int,
@@ -1174,19 +1218,22 @@ def dump_vm_state_auto(serial: str, pid: int,
         #               这样既不会阻塞通信，也能在可接受时间内覆盖目标区域。
         import json as _json
 
+        # (31) 第三十一次修改（2026-11-26）
+        # bug 原因：BASE 用 %d 注入 JS 数字并做 a += 8 算术，ARM64 TBI 64 位地址会遭 float64
+        #           53 位精度截断导致扫描偏移错乱。
+        # 解决方案：改用 ptr("%s") 传入十六进制字符串，并用 BASE.add(off) 做原生 64 位指针步进。
         js = """
         (function () {
           var COUNT_OFF = %d, ARR_OFF = %d, INSTR = %d;
-          var BASE = %d, SPAN = %d;
+          var BASE = ptr("%s"), SPAN = %d;
           var MAXC = %d;
           var out = [];
           var cache = {};
-          var end = BASE + SPAN;
-          for (var a = BASE; a + ARR_OFF + 8 < end; a += 8) {
+          for (var off = 0; off + ARR_OFF + 8 < SPAN; off += 8) {
             if (out.length >= MAXC) break;
             var p, cnt, arr;
             try {
-              p = ptr(a);
+              p = BASE.add(off);
               cnt = p.add(COUNT_OFF).readU64().toNumber();
               if (cnt < 2 || cnt > 100000) continue;
               arr = p.add(ARR_OFF).readPointer();
@@ -1228,7 +1275,7 @@ def dump_vm_state_auto(serial: str, pid: int,
                     break
                 span = min(SLICE, size - off)
                 piece = js % (int(count_offset), int(array_offset),
-                              max(16, int(instr_size)), base + off, span,
+                              max(16, int(instr_size)), hex(base + off), span,
                               int(max_candidates) - len(candidates))
                 got: dict = {}
                 try:
@@ -1403,9 +1450,16 @@ def probe_vm_from_hits(serial: str, pid: int, hits: list,
         #                而根因是计数宽度不符。
         #      解决方案：按 count_size 选择 readU8/U16/U32/U64；判定区间也用
         #                参数（count_min/count_max），默认与原逻辑等价。
+        # (32) 第三十二次修改（2026-11-26）
+        # bug 原因：① spec 用整数序列化 64 位 TBI 指针给 JS ptr(...) 会发生 float64 53 位截断；
+        #           ② Frida 的 readU8/readU16/readU32 返回原生 JS number（非 UInt64），
+        #             对其调用 .toNumber() 会抛 TypeError 被 catch 吞掉，导致 1/2/4 字节计数全灭。
+        # 解决方案：地址改传 hex(int(...)) 字符串；仅在 csize == 8（readU64）时调用 .toNumber()。
         csize = int(count_size) if int(count_size) in (1, 2, 4, 8) else 8
         read_fn = {1: "readU8", 2: "readU16", 4: "readU32", 8: "readU64"}[csize]
-        spec = [c["ptr"] for c in cands]
+        cnt_expr = ("p.add(CO)." + read_fn + "().toNumber()"
+                    if csize == 8 else "p.add(CO)." + read_fn + "()")
+        spec = [hex(int(c["ptr"])) for c in cands]
         js = (
             "var P = " + _json.dumps(spec) + ";"
             "var CO = " + str(int(count_offset)) + ", AO = " + str(int(array_offset)) + ";"
@@ -1413,7 +1467,7 @@ def probe_vm_from_hits(serial: str, pid: int, hits: list,
             "for (var i = 0; i < P.length; i++) {"
             "  try {"
             "    var p = ptr(P[i]);"
-            "    var cnt = p.add(CO)." + read_fn + "().toNumber();"
+            "    var cnt = " + cnt_expr + ";"
             "    var arr = p.add(AO).readPointer();"
             "    out.push({cnt: cnt, arr: arr.toString()});"
             "  } catch (e) { out.push(null); }"
@@ -1751,6 +1805,10 @@ def decode_runtime_insn(serial: str, pid: int, so_name: str,
             except Exception:                             # noqa: BLE001
                 regs = {}
 
+            # (33) 第三十三次修改（2026-11-26）
+            # bug 原因：is_branch 与 _branch_kind 漏掉 b.eq/b.ne 等全部 ARM64 条件分支（b.*），
+            #           导致条件跳转在运行时指令解码中被误标为非分支指令。
+            # 解决方案：在 is_branch 与 _branch_kind 中识别 mnem.startswith("b.")。
             mnem = ins.mnemonic
             out.append({
                 "addr": hex(int(ins.address)),
@@ -1759,9 +1817,10 @@ def decode_runtime_insn(serial: str, pid: int, so_name: str,
                 "raw_hex": bytes(ins.bytes).hex(),
                 "mnemonic": mnem,
                 "op_str": ins.op_str or "",
-                "is_branch": mnem in ("b", "bl", "br", "blr", "ret",
-                                      "cbz", "cbnz", "tbz", "tbnz",
-                                      "braa", "braaz", "blraa", "blraaz"),
+                "is_branch": (mnem in ("b", "bl", "br", "blr", "ret", "retaa", "retab",
+                                       "cbz", "cbnz", "tbz", "tbnz",
+                                       "braa", "braaz", "blraa", "blraaz")
+                              or mnem.startswith("b.")),
                 "branch_kind": _branch_kind(mnem),
                 "reg_values": regs,
             })
@@ -1797,14 +1856,14 @@ def _branch_kind(mnemonic: str) -> str:
     """
     if mnemonic in ("bl", "blr", "blraa", "blraaz"):
         return "call"                    # 调用，会返回
-    if mnemonic in ("ret",):
+    if mnemonic in ("ret", "retaa", "retab", "eret"):
         return "return"
     if mnemonic in ("br", "braa", "braaz"):
         return "indirect_jump"           # 间接跳转，目标来自寄存器
-    if mnemonic in ("cbz", "cbnz", "tbz", "tbnz"):
-        return "cond_jump"
-    if mnemonic == "b":
+    if mnemonic == "b" or mnemonic == "b.al":
         return "jump"
+    if mnemonic in ("cbz", "cbnz", "tbz", "tbnz") or mnemonic.startswith("b."):
+        return "cond_jump"
     return ""
 
 
@@ -1825,23 +1884,43 @@ def _find_so_for_runtime(so_name: str):
         return None
 
 
+# (34) 第三十四次修改（2026-11-26）
+# bug 原因：原实现读取不存在的 so._segments 属性后落入 fh.seek(offset)，当虚拟地址与
+#           文件偏移不等（常见于非首段 PT_LOAD）时会读歪字节，导致 patched 误判。
+# 解决方案：优先调用 SoFile 真实存在的 so.read(int(offset), int(size))；回退时兼容
+#           so._loads 四元组 (va, end, file_off, flags) 换算精确文件偏移。
 def _read_so_bytes_raw(so, offset: int, size: int) -> bytes:
-    """读 so 静态文件里的原始字节（按段换算文件偏移）。
-
-    (22) 第二十二次修改（2026-11-06）：新增，用于判断运行时指令是否被改过。
-    """
+    """读 so 静态文件里的原始字节（优先走 so.read，再按 PT_LOAD 换算文件偏移）。"""
+    off_i = int(offset)
+    sz_i = int(size)
+    if sz_i <= 0:
+        return b""
+    reader = getattr(so, "read", None)
+    if callable(reader):
+        try:
+            data = reader(off_i, sz_i)
+            if data:
+                return bytes(data)
+        except Exception:                                 # noqa: BLE001
+            pass
     path = getattr(so, "path", "") or ""
     if not path:
         return b""
     try:
         with open(path, "rb") as fh:
+            for item in (getattr(so, "_loads", None) or []):
+                if isinstance(item, (tuple, list)) and len(item) >= 3:
+                    va, end, file_off = int(item[0]), int(item[1]), int(item[2])
+                    if va <= off_i < end:
+                        fh.seek(file_off + (off_i - va))
+                        return fh.read(sz_i)
             for seg in (getattr(so, "_segments", None) or []):
                 va = int(getattr(seg, "vaddr", 0) or 0)
                 memsz = int(getattr(seg, "memsz", 0) or 0)
-                if va <= offset < va + max(memsz, 1):
-                    fh.seek(int(getattr(seg, "offset", 0) or 0) + (offset - va))
-                    return fh.read(int(size))
-            fh.seek(int(offset))
-            return fh.read(int(size))
+                if va <= off_i < va + max(memsz, 1):
+                    fh.seek(int(getattr(seg, "offset", 0) or 0) + (off_i - va))
+                    return fh.read(sz_i)
+            fh.seek(off_i)
+            return fh.read(sz_i)
     except Exception:                                     # noqa: BLE001
         return b""

@@ -14,6 +14,7 @@ Message/MakeCode/is_code/get_flags/del_items 为全部调用量）。
 """
 from __future__ import annotations
 
+import bisect
 import re
 
 from server.core.session import Session
@@ -26,6 +27,22 @@ DELIT_DELNAMES = 2
 SN_NOCHECK = 0
 SN_NOWARN = 0x80
 
+# (2) 第二次修改（2026-11-26）
+# bug 原因：run_idc 执行 IDC 脚本时直接把完整 __builtins__ 暴露给 exec，
+#           脚本可经 __import__/open/eval/exec 越权读写任意文件或执行任意命令。
+# 解决方案：收窄为最小安全内置集合，仅开放基础类型与纯计算函数。
+_SAFE_BUILTINS: dict = {
+    "int": int, "float": float, "str": str, "bool": bool,
+    "len": len, "range": range, "hex": hex, "oct": oct, "bin": bin,
+    "ord": ord, "chr": chr, "abs": abs, "min": min, "max": max,
+    "sum": sum, "round": round, "divmod": divmod, "pow": pow,
+    "list": list, "dict": dict, "set": set, "tuple": tuple,
+    "enumerate": enumerate, "zip": zip, "sorted": sorted,
+    "reversed": reversed, "any": any, "all": all,
+    "isinstance": isinstance, "print": print,
+    "True": True, "False": False, "None": None,
+}
+
 
 class IdcError(Exception):
     pass
@@ -36,8 +53,11 @@ class IdcContext:
 
     def __init__(self, session: Session, so_name: str):
         self.session = session
-        self.so_name = so_name
-        self.so = session.get(so_name)
+        if hasattr(session, "resolve"):
+            self.so, self.so_name = session.resolve(so_name)
+        else:
+            self.so_name = so_name
+            self.so = session.get(so_name)
         self.messages: list[str] = []
 
     # ---- 内部 ----
@@ -66,7 +86,28 @@ class IdcContext:
         fn = Function(addr=ea, size=size, discovered_by="idc", so_name=self.so_name)
         self.so.functions[ea] = fn
         self._refresh_ranges()
+        self._invalidate_caches(ea)
         return fn
+
+    def _invalidate_caches(self, ea: int) -> None:
+        """函数边界或名称变化后使反汇编缓存与引用指令缓存失效。"""
+        xrefs = getattr(self.session, "_xrefs", None) or {}
+        x = xrefs.get(self.so_name)
+        targets = {ea}
+        starts = getattr(self.so, "_starts", None) or sorted(self.so.functions)
+        idx = bisect.bisect_left(starts, ea)
+        if idx > 0:
+            targets.add(starts[idx - 1])
+        for a in targets:
+            fn = self.so.functions.get(a)
+            if fn is not None:
+                fn.instructions = []
+            if x is not None:
+                dis = getattr(x, "disasm", None)
+                if dis is not None and hasattr(dis, "invalidate_cache"):
+                    dis.invalidate_cache(a)
+                if hasattr(x, "_insn_cache"):
+                    x._insn_cache.pop(a, None)
 
     def _refresh_ranges(self) -> None:
         """重建函数区间索引，并**同步**刷新 function_at 用的起点表。
@@ -108,10 +149,16 @@ class IdcContext:
         data = self.so.read(ea, 4)
         if not data or len(data) < 4:
             return 0
+        # (2) 第二次修改（2026-11-26）
+        # bug 原因：get_flags 创建 self._probe_md 时未设 detail=True，若脚本先调 get_flags
+        #           再调 MakeFunction(ea, BADADDR)，_infer_end 复用该 _probe_md 访问 insn.operands
+        #           会直接抛出 capstone.CsError（Details are disabled）。
+        # 解决方案：在 get_flags 创建 _probe_md 时即设置 detail=True，并在 _infer_end 兜底确认。
         try:
             from capstone import Cs, CS_ARCH_ARM64, CS_MODE_LITTLE_ENDIAN
             if not hasattr(self, "_probe_md"):
                 self._probe_md = Cs(CS_ARCH_ARM64, CS_MODE_LITTLE_ENDIAN)
+                self._probe_md.detail = True
             first = next(self._probe_md.disasm(data, ea), None)
             return 1 if first is not None else 0
         except Exception:
@@ -150,6 +197,7 @@ class IdcContext:
                 if inferred > ea:
                     fn.size = inferred - ea
             self._refresh_ranges()
+            self._invalidate_caches(ea)
             return 1
         except IdcError:
             return 0
@@ -166,6 +214,8 @@ class IdcContext:
             md = Cs(CS_ARCH_ARM64, CS_MODE_LITTLE_ENDIAN)
             md.detail = True  # 访问 operands 必须开 detail，否则 CS_ERR_DETAIL
             self._probe_md = md
+        elif not md.detail:
+            md.detail = True
         code = self.so.read(ea, limit - ea)
         if not code:
             return ea
@@ -190,6 +240,7 @@ class IdcContext:
         fn = self._ensure_func(ea)
         fn.name = name
         self.session._export_index.setdefault(name, []).append((self.so_name, ea))
+        self._invalidate_caches(ea)
 
     def set_cmt(self, ea: int, cmt: str, _rep: int = 0) -> None:
         self.session.comments[(self.so_name, ea)] = cmt
@@ -224,23 +275,35 @@ _KW = ("if", "while", "for", "else", "return", "static", "auto")
 
 
 def _split_top(s: str, sep: str = ",") -> list[str]:
-    """按顶层逗号切分（忽略括号/字符串内）。"""
+    """按顶层分隔符切分（忽略括号与双/单引号字符串内部）。"""
     parts, depth, cur, i = [], 0, "", 0
-    instr = False
+    quote: str | None = None
     while i < len(s):
         c = s[i]
-        if c == '"' and (i == 0 or s[i - 1] != "\\"):
-            instr = not instr
-        if not instr:
-            if c in "([":
-                depth += 1
-            elif c in ")]":
-                depth -= 1
-            elif c == sep and depth == 0:
-                parts.append(cur)
-                cur = ""
-                i += 1
+        if quote is not None:
+            cur += c
+            if c == "\\" and i + 1 < len(s):
+                cur += s[i + 1]
+                i += 2
                 continue
+            if c == quote:
+                quote = None
+            i += 1
+            continue
+        if c in ('"', "'"):
+            quote = c
+            cur += c
+            i += 1
+            continue
+        if c in "([":
+            depth += 1
+        elif c in ")]":
+            depth -= 1
+        elif c == sep and depth == 0:
+            parts.append(cur)
+            cur = ""
+            i += 1
+            continue
         cur += c
         i += 1
     if cur.strip():
@@ -267,11 +330,21 @@ def _split_cond_body(raw: str) -> tuple[str, str]:
     if not raw.startswith("("):
         return raw, ""
     depth = 0
-    instr = False
-    for i, c in enumerate(raw):
-        if c == '"' and (i == 0 or raw[i - 1] != "\\"):
-            instr = not instr
-        if instr:
+    quote: str | None = None
+    i = 0
+    while i < len(raw):
+        c = raw[i]
+        if quote is not None:
+            if c == "\\" and i + 1 < len(raw):
+                i += 2
+                continue
+            if c == quote:
+                quote = None
+            i += 1
+            continue
+        if c in ('"', "'"):
+            quote = c
+            i += 1
             continue
         if c == "(":
             depth += 1
@@ -279,25 +352,105 @@ def _split_cond_body(raw: str) -> tuple[str, str]:
             depth -= 1
             if depth == 0:
                 return raw[1:i], raw[i + 1:].strip()
+        i += 1
     return raw, ""
 
 
+def _preprocess_idc(src: str) -> str:
+    """单遍词法预处理：剥离 // 与 /* */ 注释并将 { } 拆行，严格跳过字符串字面量内部。"""
+    out: list[str] = []
+    i, n = 0, len(src)
+    quote: str | None = None
+    while i < n:
+        ch = src[i]
+        if quote is not None:
+            out.append(ch)
+            if ch == "\\" and i + 1 < n:
+                out.append(src[i + 1])
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in ('"', "'"):
+            quote = ch
+            out.append(ch)
+            i += 1
+            continue
+        if src.startswith("//", i):
+            nl = src.find("\n", i + 2)
+            if nl < 0:
+                break
+            out.append("\n")
+            i = nl + 1
+            continue
+        if src.startswith("/*", i):
+            end = src.find("*/", i + 2)
+            if end < 0:
+                break
+            i = end + 2
+            continue
+        if ch in ("{", "}"):
+            out.append(f"\n{ch}\n")
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
+    text = "".join(out)
+    return re.sub(r"^\s*#include.*$", "", text, flags=re.M)
+
+
 def _expr(s: str) -> str:
-    """表达式翻译：! → not、&& → and、|| → or。"""
-    s = re.sub(r"!(?=[A-Za-z_0-9(])", "not ", s)
-    s = s.replace("&&", " and ").replace("||", " or ")
-    s = s.replace("BADADDR", str(BADADDR))
-    return s
+    """表达式翻译：! → not、&& → and、|| → or、BADADDR（跳过字符串字面量内部）。"""
+    out: list[str] = []
+    buf: list[str] = []
+    i, n = 0, len(s)
+    quote: str | None = None
+
+    def _flush() -> None:
+        if not buf:
+            return
+        seg = "".join(buf)
+        buf.clear()
+        seg = re.sub(r"!(?=[A-Za-z_0-9(])", "not ", seg)
+        seg = seg.replace("&&", " and ").replace("||", " or ")
+        seg = re.sub(r"\bBADADDR\b", str(BADADDR), seg)
+        out.append(seg)
+
+    while i < n:
+        ch = s[i]
+        if quote is not None:
+            out.append(ch)
+            if ch == "\\" and i + 1 < n:
+                out.append(s[i + 1])
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in ('"', "'"):
+            _flush()
+            quote = ch
+            out.append(ch)
+            i += 1
+            continue
+        buf.append(ch)
+        i += 1
+    _flush()
+    return "".join(out)
 
 
+# (2) 第二次修改（2026-11-26）
+# bug 原因：① 注释剥离与 `{`/`}` 拆分此前直接跑全局正则，破坏字符串内的 URL（"http://..."）、
+#           "/*...*/" 及 "{...}" 模板；② `auto x = 0x1000;` 被整行删除导致后续变量 NameError；
+#           ③ 单行 `if (a) x=1; else if (b) x=2; else x=3;` 在遇到首条 else 时只取了当前片段
+#           `body = p2` 而丢弃了 `parts[pi+1:]`，导致后续 else 分支静默丢失。
+# 解决方案：① 改用 _preprocess_idc 词法扫描跳过双/单引号字符串；② auto 声明按顶层逗号拆分，
+#           保留带 "=" 的初始化赋值语句；③ 抽取单行体链展开逻辑，将 `parts[pi:]` 完整拼接回送循环。
 def _translate(src: str) -> str:
-    src = re.sub(r"//[^\n]*", "", src)
-    src = re.sub(r"/\*.*?\*/", "", src, flags=re.S)
-    src = re.sub(r"^\s*#include.*$", "", src, flags=re.M)
-
-    # 词法拆行：把 { 和 } 拆成独立行（字符串内的不动）
-    src = re.sub(r"\{", "\n{\n", src)
-    src = re.sub(r"\}", "\n}\n", src)
+    src = _preprocess_idc(src)
     lines = [l.strip() for l in src.splitlines() if l.strip()]
 
     out: list[str] = []
@@ -305,6 +458,44 @@ def _translate(src: str) -> str:
 
     def ind() -> str:
         return "    " * depth
+
+    def _emit_inline_chain(body: str) -> None:
+        """展开单行条件后的语句体及可能串联的 else if / else 尾巴。"""
+        nonlocal depth
+        while body:
+            body = body.rstrip(";").strip()
+            if not body:
+                break
+            em = re.match(r"^else\s+if\s*(.*)$", body, re.S)
+            if em:
+                cond2, body2 = _split_cond_body(em.group(1).strip())
+                out.append(f"{ind()}elif {_expr(_strip_parens(cond2))}:")
+                body = body2.strip()
+                continue
+            if re.match(r"^else(?:\b|\s|$)", body):
+                tail2 = body[4:].strip().rstrip(";").strip()
+                out.append(f"{ind()}else:")
+                if tail2 and tail2 != "{":
+                    depth += 1
+                    out.append(ind() + _stmt(tail2))
+                    depth -= 1
+                body = ""
+                continue
+            parts = _split_top(body, ";")
+            consumed_all = True
+            for pi, part in enumerate(parts):
+                p2 = part.strip()
+                if not p2:
+                    continue
+                if re.match(r"^else(?:\b|\s|$)", p2):
+                    body = "; ".join(p.strip() for p in parts[pi:] if p.strip())
+                    consumed_all = False
+                    break
+                depth += 1
+                out.append(ind() + _stmt(p2))
+                depth -= 1
+            if consumed_all:
+                body = ""
 
     i = 0
     while i < len(lines):
@@ -334,29 +525,28 @@ def _translate(src: str) -> str:
             depth += 1
             continue
 
-        # auto 声明：删除（多变量声明 auto n, r;）
-        if re.match(r"^auto\s", ln):
+        # auto 声明：无初值声明删除（auto n, r;），带初值转为赋值（auto x = 0x1000; -> x = 0x1000）
+        if re.match(r"^auto\s+", ln):
+            rest = re.sub(r"^auto\s+", "", ln).strip().rstrip(";").strip()
+            for decl in _split_top(rest, ","):
+                d = decl.strip()
+                if "=" in d:
+                    out.append(ind() + _stmt(d))
             continue
 
         # return
-        if ln.startswith("return"):
+        if re.match(r"^return(?:\b|\s|;|$)", ln):
             body = ln[len("return"):].strip().rstrip(";").strip()
             out.append(f"{ind()}return {_expr(body)}" if body else f"{ind()}return")
             continue
 
         # else / else if
-        if ln.startswith("} else") or ln.startswith("else"):
+        if ln.startswith("} else") or re.match(r"^else(?:\b|\s|$)", ln):
             rest = re.sub(r"^[\}\s]*else\s*", "", ln).strip()
-            if rest.startswith("if"):
-                # BUG-15 修复：else if 行也用 _split_cond_body 精确切分条件与单行体
-                #（旧实现 rest.find(")") 找第一个括号，嵌套调用时错位产生非法行）
+            if re.match(r"^if(?:\s*\(|\b)", rest):
                 cond2, body2 = _split_cond_body(rest[2:].strip())
                 out.append(f"{ind()}elif {_expr(_strip_parens(cond2))}:")
-                tail = body2.strip().rstrip(";").strip()
-                if tail and tail != "{":
-                    depth += 1
-                    out.append(ind() + _stmt(tail))
-                    depth -= 1
+                _emit_inline_chain(body2.strip())
                 continue
             out.append(f"{ind()}else:")
             tail = rest.rstrip(";").strip()
@@ -369,57 +559,13 @@ def _translate(src: str) -> str:
             continue
 
         # if / while 单行或块
-        # BUG-15 修复：if 单行体可能自带 "else if ..." / "else ..." 尾巴
-        #（IDC 惯用 if (a) x=1; else if (b) x=2; 单行链）。递归处理尾巴，
-        # 避免生成 "elif (0) ok = 2:" 这类非法 Python。
         m = re.match(r"^(if|while)\s*\((.*)\)\s*(\{)?(.*)$", ln)
         if m:
             raw = ln[len(m.group(1)):].strip()
             cond_s, body_s = _split_cond_body(raw)
             out.append(f"{ind()}{m.group(1)} {_expr(_strip_parens(cond_s))}:")
-            self_depth = depth
-            body = body_s.strip()
-            while body:
-                body = body.rstrip(";").strip()
-                if not body:
-                    break
-                # 尾巴是 else / else if → 同级续写
-                em = re.match(r"^else\s+if\s*(.*)$", body, re.S)
-                if em:
-                    # 保留 "(cond) body" 完整结构交给 _split_cond_body
-                    # （此前剥掉 "(" 导致 "(0) ok = 2" 变 "0) ok = 2"，条件切分错位）
-                    cond2, body2 = _split_cond_body(em.group(1).strip())
-                    out.append(f"{ind()}elif {_expr(_strip_parens(cond2))}:")
-                    body = body2.strip()
-                    continue
-                if body.startswith("else"):
-                    tail2 = body[4:].strip().rstrip(";").strip()
-                    out.append(f"{ind()}else:")
-                    if tail2 and tail2 != "{":
-                        depth += 1
-                        out.append(ind() + _stmt(tail2))
-                        depth -= 1
-                    body = ""
-                    continue
-                # 普通单行体：按顶层分号切分（单行可能含 "stmt1; stmt2"）
-                # BUG-15 伴生修复：切分后若后续段以 else 开头，回送循环继续处理
-                from server.scripting.idc import _split_top as _st
-                parts = _st(body, ";")
-                consumed_all = True
-                for pi, part in enumerate(parts):
-                    p2 = part.strip()
-                    if not p2:
-                        continue
-                    if p2.startswith("else"):
-                        body = p2
-                        consumed_all = False
-                        break
-                    depth += 1
-                    out.append(ind() + _stmt(p2))
-                    depth -= 1
-                if consumed_all:
-                    body = ""
-            if not body and m.group(3) and not body_s.strip():
+            _emit_inline_chain(body_s.strip())
+            if not body_s.strip() and m.group(3):
                 depth += 1
             continue
 
@@ -440,7 +586,7 @@ def run_idc(session: Session, so_name: str, source: str) -> dict:
     py = _translate(source)
     ctx = IdcContext(session, so_name)
     globs: dict = {
-        "__builtins__": __builtins__,
+        "__builtins__": dict(_SAFE_BUILTINS),
         **{k: getattr(ctx, k) for k in dir(ctx) if not k.startswith("_")},
         "BADADDR": BADADDR,
         "DELIT_SIMPLE": DELIT_SIMPLE,
@@ -460,5 +606,11 @@ def run_idc(session: Session, so_name: str, source: str) -> dict:
         return {"error": f"IDC 转换失败: {e}", "converted": py}
     except IdcError as e:
         return {"error": f"IDC 语义错误: {e}", "messages": ctx.messages}
+    # (6) 第六次修改（2026-11-26）
+    # bug 原因：IDC 运行期抛出的 NameError/TypeError 等异常（如被沙箱拦截的 __import__）
+    #          未被 run_idc 捕获，会直接穿透到调用方导致未处理崩溃。
+    # 解决方案：兜底捕获 Exception 转为结构化 error 字段返回，保留已输出 messages。
+    except Exception as e:  # noqa: BLE001
+        return {"error": f"IDC 运行错误: {type(e).__name__}: {e}", "messages": ctx.messages}
     named = sum(1 for f in session.get(so_name).functions.values() if f.name)
     return {"messages": ctx.messages, "named_functions": named, "converted_python": py}

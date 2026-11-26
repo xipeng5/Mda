@@ -23,7 +23,27 @@ from __future__ import annotations
 
 import re
 
+from server.core.addr import parse_addr
 from server.core.plugins import PluginBase
+
+# 允许的 mode 及其归一化映射（兼容 docstring 中的别名）
+_MODE_ALIAS = {
+    "all": "all",
+    "refs": "refs",
+    "find_refs": "refs",
+    "check_reloc": "check_reloc",
+    "check_base_reloc": "check_reloc",
+    "indirect": "indirect",
+    "vtable": "indirect",
+}
+
+
+def _reg_norm(reg: str) -> str:
+    """将 ARM64 的 xN/wN 寄存器归一为同号标识，便于追踪 32/64 位别名。"""
+    r = reg.lower()
+    if len(r) >= 2 and r[0] in ("x", "w") and r[1:].isdigit():
+        return "r" + r[1:]
+    return r
 
 
 class Plugin(PluginBase):
@@ -61,13 +81,44 @@ class Plugin(PluginBase):
             return {"error": str(exc),
                     "code": getattr(exc, "mda_code", "SO_NOT_LOADED")}
 
-        from server.core.disasm import Disassembler
+        # (5) 第五次修改（2026-11-26）
+        # bug 原因：1) addr_filter 在循环内才做 int(addr_filter)，不支持 "0x..." 字符串且非法值抛异常；
+        #           2) mode 未做白名单校验，未知 mode 静默返回不完整结构，且与 docstring 别名不兼容；
+        #           3) 未捕获非 ARM64 架构下 Disassembler 抛出的 ValueError。
+        # 解决方案：循环外提前通过 parse_addr 解析 addr_filter，非法返 BAD_ADDR；
+        #           校验并归一化 mode（兼容 find_refs/check_base_reloc/indirect/vtable），未知返 BAD_MODE；
+        #           捕获非 ARM64 异常返 UNSUPPORTED_ARCH。
+        raw_mode = args.get("mode", "all")
+        mode = _MODE_ALIAS.get(str(raw_mode))
+        if mode is None:
+            return {"ok": False, "code": "BAD_MODE",
+                    "error": f"未知 mode={raw_mode!r}，可选：all/refs/check_reloc/indirect/vtable"}
 
-        mode = args.get("mode", "all")
-        addr_filter = args.get("addr")
+        raw_addr = args.get("addr")
+        addr_filter = None
+        if raw_addr is not None:
+            addr_filter = parse_addr(raw_addr)
+            if addr_filter is None:
+                return {"ok": False, "code": "BAD_ADDR",
+                        "error": f"非法地址参数 addr={raw_addr!r}"}
+
         limit = int(args.get("limit", 100))
         mod_lo, mod_hi = self._module_range(so)
-        dis = Disassembler(so)
+
+        if mode == "indirect":
+            return {
+                "ok": True, "so": so.name,
+                "module_range": [hex(mod_lo), hex(mod_hi)],
+                "scanned_insns": 0, "scanned_ranges": 0,
+                "indirect": self._vtable_refs(so, addr_filter, limit),
+            }
+
+        from server.core.disasm import Disassembler
+
+        try:
+            dis = Disassembler(so)
+        except ValueError as exc:
+            return {"ok": False, "code": "UNSUPPORTED_ARCH", "error": str(exc)}
 
         # 全库线性扫（可执行段）
         refs = []
@@ -96,7 +147,7 @@ class Plugin(PluginBase):
                 t = int(t)
                 in_range = mod_lo <= t < mod_hi
                 # 目标过滤
-                if addr_filter is not None and int(addr_filter) != t:
+                if addr_filter is not None and addr_filter != t:
                     continue
                 refs.append({
                     "from": hex(insn.addr),
@@ -156,17 +207,30 @@ class Plugin(PluginBase):
             rtype           重定位类型
             block           [起, 止) 该槽所在的连续指针块（vtable 范围）
         """
+        # (6) 第六次修改（2026-11-26）
+        # bug 原因：1) _vtable_refs 未校验 is_vtable 与 block_end > block_start，
+        #              对 IRELATIVE 等条目会输出假块 ["0x0", "0x0"]；
+        #           2) _find_compensation 未检查补偿指令是否引用了当前 adrp/add 的目的寄存器，产生无关误报。
+        # 解决方案：仅当 blk.get("is_vtable") 且 block_end > block_start 时输出 block；
+        #           _find_compensation 提取当前指令目的寄存器，仅保留真正引用它的补偿指令。
         try:
             from server.core import rela as _rela
 
+            parsed_filter = parse_addr(addr_filter) if addr_filter is not None else None
             items = []
             for it in _rela.rela_dump(so, 0, 0, "code_target", 0):
                 tgt = int(it["addend_hex"], 16)
-                if addr_filter is not None and int(addr_filter) != tgt:
+                if parsed_filter is not None and parsed_filter != tgt:
                     continue
                 slot = int(it["offset_hex"], 16)
                 blk = _rela.vtable_at(so, slot)
                 fn = so.function_at(tgt)
+                b_start = blk.get("block_start")
+                b_end = blk.get("block_end")
+                has_block = (bool(blk.get("is_vtable"))
+                             and b_start is not None
+                             and b_end is not None
+                             and b_end > b_start)
                 items.append({
                     "slot": hex(slot),
                     "target": hex(tgt),
@@ -174,9 +238,8 @@ class Plugin(PluginBase):
                                          else f"sub_{tgt:x}") if fn else None),
                     "at_function_entry": bool(fn and fn.addr == tgt),
                     "rtype": it.get("rtype_name", ""),
-                    "block": ([hex(blk["block_start"]), hex(blk["block_end"])]
-                              if blk.get("block_start") is not None else None),
-                    "at_function_entry_slot": blk.get("index"),
+                    "block": [hex(b_start), hex(b_end)] if has_block else None,
+                    "at_function_entry_slot": blk.get("index") if has_block else None,
                 })
             return {
                 "count": len(items),
@@ -193,17 +256,29 @@ class Plugin(PluginBase):
 
 
     def _find_compensation(self, insns, idx):
-        """在后继指令里找可能的补偿运算（add/eor/sub 带寄存器）。"""
+        """在后继指令里找引用了当前 adrp/add 目的寄存器的补偿运算（add/eor/sub）。"""
+        cur_text = insns[idx].text or ""
+        m0 = re.match(r"\w+\s+(x\d+|w\d+)\b", cur_text)
+        tracked = {_reg_norm(m0.group(1))} if m0 else set()
         found = []
         for insn in insns[idx + 1: idx + 9]:
-            m = re.match(r"(add|eor|sub)\s+(\w+),\s*(\w+),\s*(\w+)", insn.text or "")
+            text = insn.text or ""
+            m = re.match(r"(add|eor|sub)\s+(\w+),\s*(\w+),\s*(\w+)", text)
             if m:
-                found.append({"addr": hex(insn.addr),
-                              "op": m.group(1),
-                              "dst": m.group(2),
-                              "src1": m.group(3),
-                              "src2": m.group(4),
-                              "insn": insn.text})
+                dst_n = _reg_norm(m.group(2))
+                s1_n = _reg_norm(m.group(3))
+                s2_n = _reg_norm(m.group(4))
+                if not tracked or s1_n in tracked or s2_n in tracked:
+                    found.append({"addr": hex(insn.addr),
+                                  "op": m.group(1),
+                                  "dst": m.group(2),
+                                  "src1": m.group(3),
+                                  "src2": m.group(4),
+                                  "insn": text})
+                    if tracked:
+                        tracked.add(dst_n)
+                elif dst_n in tracked:
+                    tracked.discard(dst_n)
         return found
 
     def _module_range(self, so):

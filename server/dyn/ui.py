@@ -554,14 +554,16 @@ def _match(n: UiNode, text: str, resource_id: str, content_desc: str,
             return True
         return value == want if exact else want.lower() in value.lower()
 
-    # resource_id 允许省略包名前缀：人常说 "id/ok_button" 而不是
-    # "com.foo:id/ok_button"。两种写法都支持。
+    # (3) 第三次修改（2026-11-26）
+    # bug 原因：resource_id.lstrip("id/") 会按字符集剥除前缀中所有 'i'/'d'/'/' 字符，
+    #           例如 "dialog_ok" 被误删成 "alog_ok"，导致后缀匹配失效或误匹配。
+    # 解决方案：改为 resource_id.removeprefix("id/") 仅精确剥除 "id/" 前缀。
     if resource_id and not hit(n.resource_id, resource_id):
         alt = resource_id
         if not alt.startswith("id/") and ":id/" in n.resource_id:
             alt = "id/" + resource_id
         if not (hit(n.resource_id, alt) or n.resource_id.endswith(":" + resource_id)
-                or n.resource_id.endswith("/" + resource_id.lstrip("id/"))):
+                or n.resource_id.endswith("/" + resource_id.removeprefix("id/"))):
             return False
     return (hit(n.text, text) and hit(n.content_desc, content_desc)
             and hit(n.cls, cls))
@@ -605,9 +607,15 @@ def find_nodes(nodes: list[UiNode], text: str = "", resource_id: str = "",
         if clickable_only and not n.clickable:
             continue
         hit = _match(n, text, resource_id, content_desc, cls, exact)
+        # (3) 第三次修改（2026-11-26）
+        # bug 原因：label_match 降级分支只检查了 n.label 与 text，直接绕过了已指定的
+        #           cls / resource_id / content_desc 过滤条件，导致返回错误类型控件。
+        # 解决方案：进入 label_match 前先调用 _match(n, "", resource_id, content_desc, cls, exact)
+        #           确保除 text 外的其余条件均满足。
         if not hit and label_match and text and _leaf_container(n):
-            lb = n.label
-            hit = (lb == text) if exact else (text.lower() in lb.lower())
+            if _match(n, "", resource_id, content_desc, cls, exact):
+                lb = n.label
+                hit = (lb == text) if exact else (text.lower() in lb.lower())
         if hit:
             out.append(n)
             if limit and len(out) >= limit:
@@ -846,7 +854,7 @@ def ui_find(serial: str, text: str = "", resource_id: str = "",
 
 def ui_click(serial: str, x: int | None = None, y: int | None = None,
              text: str = "", resource_id: str = "", content_desc: str = "",
-             cls: str = "", exact: bool = False, index: int = 0,
+             cls: str = "", exact: bool = False, index: int | None = None,
              wait: float = 0.0) -> dict:
     """点击。两种模式：给坐标，或给查找条件（内部只 dump 一次）。
 
@@ -896,7 +904,11 @@ def ui_click(serial: str, x: int | None = None, y: int | None = None,
                 f"没找到匹配 {cond} 的控件（本次界面共 "
                 f"{count_nodes(nodes)} 个节点），未执行点击",
             )
-        if index:
+        # (3) 第三次修改（2026-11-26）
+        # bug 原因：原判断写 `if index:`，当用户按提示传 `index=0` 选择第 0 个候选时
+        #           被当成 False 再次落入 AMBIGUOUS 分支，导致第 0 项永远选不中。
+        # 解决方案：index 默认改为 None，判断改为 `if index is not None:`。
+        if index is not None:
             idx = _int_arg(index, "index", lo=0, hi=max(0, len(hits) - 1))
             target = hits[idx]
         else:
@@ -951,7 +963,7 @@ def ui_click(serial: str, x: int | None = None, y: int | None = None,
 
 def ui_input(serial: str, content: str, text: str = "",
              resource_id: str = "", content_desc: str = "", cls: str = "",
-             exact: bool = False, index: int = 0,
+             exact: bool = False, index: int | None = None,
              clear_first: bool = True) -> dict:
     """输入文本。先点中目标控件，再 input text。
 
@@ -989,7 +1001,8 @@ def ui_input(serial: str, content: str, text: str = "",
             "UI_NODE_NOT_FOUND",
             f"没找到输入目标 {cond}（本次界面共 {count_nodes(nodes)} 个节点）",
         )
-    if index:
+    # (3) 第三次修改（2026-11-26）：同 ui_click，使用 `index is not None` 修复 index=0 不可选
+    if index is not None:
         idx = _int_arg(index, "index", lo=0, hi=max(0, len(hits) - 1))
         target = hits[idx]
     else:

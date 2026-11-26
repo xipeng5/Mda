@@ -24,23 +24,16 @@ with open(os.path.join(ROOT, "server", "version.py"), encoding="utf-8") as _f:
 VERSION = _ver_ns["__version__"]
 
 def _scan_pkg_modules(root: str, pkg: str) -> list:
-    """扫描某个包目录下的**全部** .py，返回 "pkg.mod" 形式的模块名列表。
+    """递归扫描某个包目录下的**全部** .py，返回 "pkg.sub.mod" 形式的模块名列表。
+
+    (12) 第十二次修改（2026-11-26）
+    bug 原因：原实现仅用 os.listdir 扫描一层目录，漏掉了 server/core/dex 等嵌套子包，
+              打包版里导入 server.core.dex.* 会报 ModuleNotFoundError。
+    解决方案：改为 os.walk 递归扫描（跳过 __pycache__ 与隐藏目录），同时收录含 __init__.py
+              的子包名及其下所有 .py 模块。
 
     (4) 第四次修改（2026-11-13）：支持带斜线的相对路径（如 "server/dyn"）。
-        原因：所有 Python 包整体移入 server/ 后，模块名变成 server.dyn.xxx，
-        而这个助手原来只拼 "dyn.xxx"。现在把路径按 / 拆成点号，
-        两种写法都能用。
-    
-
-    (3) 第三次修改（2026-11-06）：新增。
-
-    为什么不用 collect_submodules：它在 PyInstaller 6.22.3 下会漏模块
-    （本仓库已实测三次），而漏掉的模块在打包版里表现为 MODULE_UNAVAILABLE，
-    源码环境却完全正常——这类问题极难发现。
-
-    为什么不用硬编码列表：每新增一个文件都要回来改 spec，人一定会忘。
-
-    直接扫目录最可靠：文件在，模块就在。
+    (3) 第三次修改（2026-11-06）：新增目录扫描替代不稳定的 collect_submodules。
     """
     import os as _os
 
@@ -49,14 +42,59 @@ def _scan_pkg_modules(root: str, pkg: str) -> list:
     out = []
     if not _os.path.isdir(pkg_dir):
         return out
-    prefix = ".".join(parts)
-    for name in sorted(_os.listdir(pkg_dir)):
-        if not name.endswith(".py"):
-            continue
-        stem = name[:-3]
-        if stem in ("__init__", "__main__"):
-            continue
-        out.append(f"{prefix}.{stem}")
+    base_prefix = ".".join(parts)
+    for dirpath, dirnames, filenames in _os.walk(pkg_dir):
+        dirnames[:] = sorted(
+            d for d in dirnames if d != "__pycache__" and not d.startswith(".")
+        )
+        rel = _os.path.relpath(dirpath, pkg_dir)
+        if rel == ".":
+            cur_prefix = base_prefix
+        else:
+            rel_parts = [p for p in rel.replace("\\", "/").split("/") if p and p != "."]
+            cur_prefix = f"{base_prefix}.{'.'.join(rel_parts)}"
+            if "__init__.py" in filenames:
+                out.append(cur_prefix)
+        for name in sorted(filenames):
+            if not name.endswith(".py"):
+                continue
+            stem = name[:-3]
+            if stem in ("__init__", "__main__"):
+                continue
+            out.append(f"{cur_prefix}.{stem}")
+    return out
+
+
+# (13) 第十三次修改（2026-11-26）
+# bug 原因：datas 直接整目录打包会把 __pycache__、.pyc、编译中间产物（.o/.elf）
+#           以及未引用的旧版离线文件 web/dist/data.js 全部塞进 .app 包，增大体积并污染包体。
+# 解决方案：新增 _collect_clean_dir 逐文件递归收集并过滤上述无关产物。
+def _collect_clean_dir(
+    src_dir: str,
+    dst_dir: str,
+    exclude_exts: tuple = (),
+    exclude_names: tuple = (),
+) -> list:
+    """递归收集数据目录，过滤 __pycache__、.pyc/.pyo、指定后缀及指定文件名。"""
+    import os as _os
+
+    out = []
+    if not _os.path.isdir(src_dir):
+        return out
+    for dirpath, dirnames, filenames in _os.walk(src_dir):
+        dirnames[:] = sorted(
+            d for d in dirnames if d != "__pycache__" and not d.startswith(".")
+        )
+        rel = _os.path.relpath(dirpath, src_dir)
+        target_dir = dst_dir if rel == "." else _os.path.join(dst_dir, rel)
+        for fname in sorted(filenames):
+            if fname.startswith(".") or fname.endswith((".pyc", ".pyo")):
+                continue
+            if exclude_names and fname in exclude_names:
+                continue
+            if exclude_exts and fname.endswith(exclude_exts):
+                continue
+            out.append((_os.path.join(dirpath, fname), target_dir))
     return out
 
 
@@ -134,11 +172,21 @@ datas = [
     #              perf_watch 直接报 HELPER_NOT_BUILT —— 而源码环境完全正常。
     #              这与之前 frida_tools/bridges/*.js 漏收是同一类问题。
     #     解决方案：显式把整个目录作为 datas 收进去（保留相对路径 dyn/device）。
-    (os.path.join(ROOT, "server", "dyn", "device"),
-     os.path.join("server", "dyn", "device")),
-    (os.path.join(ROOT, "assets"), "assets"),
-    (os.path.join(ROOT, "server", "plugins"), os.path.join("server", "plugins")),
-    (os.path.join(ROOT, "web", "dist"), os.path.join("web", "dist")),   # 前端产物
+    *_collect_clean_dir(
+        os.path.join(ROOT, "server", "dyn", "device"),
+        os.path.join("server", "dyn", "device"),
+        exclude_exts=(".o", ".elf"),
+    ),
+    *_collect_clean_dir(os.path.join(ROOT, "assets"), "assets"),
+    *_collect_clean_dir(
+        os.path.join(ROOT, "server", "plugins"),
+        os.path.join("server", "plugins"),
+    ),
+    *_collect_clean_dir(
+        os.path.join(ROOT, "web", "dist"),
+        os.path.join("web", "dist"),
+        exclude_names=("data.js",),
+    ),   # 前端产物（排除未引用的旧版 data.js）
 ]
 
 hiddenimports = (

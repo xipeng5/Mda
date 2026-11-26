@@ -230,11 +230,13 @@ def search_insn(so, mnemonic: str = "", operand_pattern: str = "",
     # (4) 段表兜底：加固样本常无节表。PT_LOAD 里 flags bit0 = X（可执行）。
     #      没有这一步时 sections 为空会让整个搜索一次都不执行，
     #      却返回 matched=0 伪装成"没有命中"。
+    # (5) 第五次修改（2026-11-26）
+    # bug 原因：此前存在 `if not text_only and sec.is_exec: continue`，导致传 text_only=False
+    #           时反而跳过 .text 等可执行节，与“扫描全部节”语义相反。
+    # 解决方案：删除该错误分支，text_only=True 仅扫可执行节，text_only=False 扫描全部节。
     scan_ranges: list[tuple[int, int]] = []
     for sec in getattr(so, "sections", []):
         if text_only and not sec.is_exec:
-            continue
-        if not text_only and sec.is_exec:
             continue
         scan_ranges.append((sec.addr, sec.size))
 

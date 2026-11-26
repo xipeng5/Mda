@@ -55,8 +55,56 @@ plugin_run(name="emulate_func", args={
 from __future__ import annotations
 
 from pathlib import Path
+import struct
 
+from server.core.addr import parse_addr
 from server.core.plugins import PluginBase
+
+
+def _read_pt_loads(raw: bytes, fallback_loads: list) -> list[tuple[int, int, int, int, int]]:
+    """从 ELF64 Program Header 读取 PT_LOAD 列表，返回 (vaddr, filesz, memsz, offset, flags)。
+
+    优先直接读原始 ELF 头以保留 p_memsz（包含 .bss 零初始化区）；
+    若不是标准 64 位小端 ELF，则回退使用 so._loads。
+    """
+    if len(raw) >= 0x40 and raw[:4] == b"\x7fELF" and raw[4] == 2 and raw[5] == 1:
+        e_phoff, = struct.unpack_from("<Q", raw, 0x20)
+        e_phentsize, e_phnum = struct.unpack_from("<HH", raw, 0x36)
+        if e_phentsize >= 56 and e_phnum > 0 and e_phoff + e_phentsize * e_phnum <= len(raw):
+            segs: list[tuple[int, int, int, int, int]] = []
+            for i in range(e_phnum):
+                pos = e_phoff + i * e_phentsize
+                p_type, p_flags = struct.unpack_from("<II", raw, pos)
+                p_offset, p_vaddr, _pa, p_filesz, p_memsz = struct.unpack_from("<QQQQQ", raw, pos + 8)
+                if p_type == 1 and max(p_memsz, p_filesz) > 0:
+                    segs.append((p_vaddr, p_filesz, max(p_memsz, p_filesz), p_offset, p_flags))
+            if segs:
+                segs.sort(key=lambda x: x[0])
+                return segs
+    out = []
+    for vaddr, vend, off, flags in fallback_loads or []:
+        sz = max(0, vend - vaddr)
+        if sz > 0:
+            out.append((vaddr, sz, sz, off, flags))
+    return out
+
+
+def _pick_heap_base(occupied: list[tuple[int, int]], heap_size: int) -> int:
+    """动态挑选一个不与已映射段及栈重叠的堆基址（1MB 对齐）。"""
+    align = 0x100000
+    so_ends = [b for a, b in occupied if b < 0x700000000000]
+    max_so_end = max(so_ends, default=0)
+    cand = max(0x400000, ((max_so_end + align + (align - 1)) & ~(align - 1)))
+    while True:
+        cand_end = cand + heap_size
+        conflict = None
+        for a, b in occupied:
+            if cand < b and a < cand_end:
+                conflict = b
+                break
+        if conflict is None:
+            return cand
+        cand = (conflict + align + (align - 1)) & ~(align - 1)
 
 
 class Plugin(PluginBase):
@@ -105,21 +153,34 @@ class Plugin(PluginBase):
             return {"error": str(exc),
                     "code": getattr(exc, "mda_code", "SO_NOT_LOADED")}
 
+        # (5) 第五次修改（2026-11-26）
+        # bug 原因：1) 未校验 so.arch == 183，非 ARM64 样本强行按 ARM64 模拟；
+        #           2) addr 未统一用 parse_addr，非法地址抛异常；
+        #           3) 仅按 so._loads 的 filesz 映射，缺失 .bss（p_memsz > p_filesz）导致读/写全局变量触发未映射异常；
+        #           4) stack_size 未做 4KB 对齐与下界保护；
+        #           5) L188 f-string `{addr,hex}` 笔误；
+        #           6) 启用 stubs 时 heap_base 硬编码 0x400000，>4MB 的 so 会被堆覆写自身代码/数据。
+        # 解决方案：校验 arch==183、用 parse_addr 解析所有地址、结合 ELF PHDR 完整映射 memsz(.bss)、
+        #           4KB 对齐 stack_size、修正 f-string，并在未显式指定 heap_base 时动态计算无冲突堆基址。
+        if getattr(so, "arch", None) != 183:
+            return {"ok": False, "code": "UNSUPPORTED_ARCH",
+                    "error": f"emulate_func 仅支持 ARM64 (arch=183)，当前 arch={getattr(so, 'arch', None)}"}
+
         path = getattr(so, "path", None)
         if not path or not Path(path).exists():
             return {"error": f"找不到 so 文件：{path}", "code": "NO_FILE"}
 
-        a = args["addr"]
-        addr = int(str(a), 16) if isinstance(a, str) and \
-            str(a).lower().startswith("0x") else int(a)
+        addr = parse_addr(args["addr"])
+        if addr is None:
+            return {"ok": False, "code": "BAD_ADDR",
+                    "error": f"非法地址参数 addr={args['addr']!r}"}
         max_insns = int(args.get("max_insns", 100000))
         trace = bool(args.get("trace", False))
 
-        # ---- 建模拟器并映射 so 的所有 PT_LOAD 段 ----
+        # ---- 建模拟器并映射 so 的所有 PT_LOAD 段（含 .bss 的 memsz） ----
         uc = Uc(UC_ARCH_ARM64, UC_MODE_ARM)
         raw = Path(path).read_bytes()
-        # 用文件的 PT_LOAD 段布局映射（so._loads 是 (vaddr, end, off, flags)）
-        loads = getattr(so, "_loads", []) or []
+        loads = _read_pt_loads(raw, getattr(so, "_loads", []) or [])
         if not loads:
             return {"error": "so 没有 PT_LOAD 段信息，无法映射",
                     "code": "NO_LOADSEG"}
@@ -127,9 +188,9 @@ class Plugin(PluginBase):
         mapped = []
         page_size = 0x1000
         covered: list[tuple[int, int]] = []
-        for vaddr, vend, off, flags in loads:
-            size = vend - vaddr
-            if size <= 0:
+        for vaddr, filesz, memsz, off, flags in loads:
+            vend = vaddr + memsz
+            if memsz <= 0:
                 continue
             # (2) 按页对齐映射，且**只映射未覆盖的部分**，避免段间重叠 UC_ERR_MAP
             start = vaddr & ~(page_size - 1)
@@ -152,14 +213,19 @@ class Plugin(PluginBase):
                             "code": "MAP_FAILED"}
                 covered.append((cur, chunk_end))
                 cur = chunk_end
-            chunk = raw[off:off + size] if off + size <= len(raw) else raw[off:]
-            if chunk:
-                uc.mem_write(vaddr, chunk)
-            mapped.append({"vaddr": hex(vaddr), "size": size,
+            if filesz > 0:
+                chunk = raw[off:off + filesz] if off + filesz <= len(raw) else raw[off:]
+                if chunk:
+                    uc.mem_write(vaddr, chunk)
+            mapped.append({"vaddr": hex(vaddr), "size": filesz, "memsz": memsz,
                            "flags": hex(flags), "file_off": hex(off)})
 
-        # ---- 栈 ----
-        stack_size = int(args.get("stack_size", 0x10000))
+        # ---- 栈（向上 4KB 对齐，至少 2 页以容纳哨兵页与栈空间） ----
+        raw_stack_size = parse_addr(args.get("stack_size", 0x10000))
+        if raw_stack_size is None or raw_stack_size <= 0:
+            return {"ok": False, "code": "BAD_ARGS",
+                    "error": f"非法 stack_size={args.get('stack_size')!r}"}
+        stack_size = (max(raw_stack_size, 0x2000) + page_size - 1) & ~(page_size - 1)
         stack_base = 0x7FFF00000000
         uc.mem_map(stack_base, stack_size)
         sp = stack_base + stack_size - 0x1000
@@ -185,9 +251,10 @@ class Plugin(PluginBase):
             buf_bad = None
         else:
             buf_specs = []
-            buf_bad = f"buffer 类型不支持：{type(buf).__name__}（要 dict 或 [{addr,hex},...])"
+            buf_bad = f"buffer 类型不支持：{type(buf).__name__}（要 dict 或 [{{addr,hex}},...])"
         buffer_applied: list[dict] = []
         buffer_skipped: list[dict] = []
+        occupied: list[tuple[int, int]] = list(covered) + [(stack_base, stack_base + stack_size)]
         for spec in buf_specs:
             try:
                 if not isinstance(spec, dict) or spec.get("addr") is None \
@@ -195,15 +262,19 @@ class Plugin(PluginBase):
                     buffer_skipped.append({"spec": str(spec)[:80],
                                            "reason": "缺 addr 或 hex"})
                     continue
-                sa = str(spec["addr"])
-                baddr = int(sa, 16) if sa.lower().startswith("0x") else int(sa)
+                baddr = parse_addr(spec["addr"])
+                if baddr is None:
+                    buffer_skipped.append({"spec": str(spec)[:80],
+                                           "reason": f"非法地址 addr={spec['addr']!r}"})
+                    continue
                 bdata = bytes.fromhex(str(spec["hex"]).replace(" ", ""))
                 bpage = baddr & ~0xFFF
-                need = ((baddr - bpage) + len(bdata) + 0xFFF) & ~0xFFF
+                need = max(page_size, ((baddr - bpage) + len(bdata) + 0xFFF) & ~0xFFF)
                 try:
                     uc.mem_map(bpage, need)
                 except Exception:                         # noqa: BLE001
                     pass                                  # 已映射就跳过
+                occupied.append((bpage, bpage + need))
                 uc.mem_write(baddr, bdata)
                 # 回读校验：静默失败必须变成可见结果
                 readback = bytes(uc.mem_read(baddr, len(bdata)))
@@ -224,11 +295,22 @@ class Plugin(PluginBase):
         if stubs_arg not in (None, False):
             try:
                 from server.core.unicorn_stubs import StubEngine
+                heap_size_val = parse_addr(args.get("heap_size", 0x100000))
+                if heap_size_val is None or heap_size_val <= 0:
+                    heap_size_val = 0x100000
+                heap_size_val = (heap_size_val + page_size - 1) & ~(page_size - 1)
+                if args.get("heap_base") is not None:
+                    heap_base_val = parse_addr(args.get("heap_base"))
+                    if heap_base_val is None:
+                        return {"ok": False, "code": "BAD_ADDR",
+                                "error": f"非法地址参数 heap_base={args.get('heap_base')!r}"}
+                else:
+                    heap_base_val = _pick_heap_base(occupied, heap_size_val)
                 stub_engine = StubEngine(
                     uc, getattr(so, "plt_map", {}) or {}, stubs_arg,
                     vfs=args.get("vfs"),
-                    heap_base=int(args.get("heap_base", 0x400000)),
-                    heap_size=int(args.get("heap_size", 0x100000)),
+                    heap_base=heap_base_val,
+                    heap_size=heap_size_val,
                 )
                 stub_engine.setup_heap()
                 from unicorn import UC_HOOK_CODE as _UC_HOOK_CODE
@@ -245,7 +327,9 @@ class Plugin(PluginBase):
             if v is None:
                 continue
             try:
-                iv = int(str(v), 16) if str(v).lower().startswith("0x") else int(v)
+                iv = parse_addr(v)
+                if iv is None:
+                    continue
                 uc.reg_write(getattr(__import__("unicorn.arm64_const",
                                                 fromlist=["x"]),
                                     f"UC_ARM64_REG_{rn.upper()}"), iv)
@@ -427,29 +511,23 @@ class Plugin(PluginBase):
             # 显式范围（最常用、最精确）
             for spec in dump_opt:
                 try:
-                    a = spec.get("addr")
-                    a = int(str(a), 16) if str(a).lower().startswith("0x") else int(a)
+                    a = parse_addr(spec.get("addr"))
+                    if a is None:
+                        continue
                     n = int(spec.get("size", 64))
                 except Exception:                         # noqa: BLE001
                     continue
                 _one(a, n, "explicit")
         elif dump_opt == "stack":
-            # (3) 第三次修改（2026-11-18）
-            #     bug 原因（两层）：
-            #       ① 初版用「运行后的 sp」算已用长度 `(栈顶 - sp)`，
-            #          但函数返回后 sp 已恢复，算出来接近 0；
-            #       ② 改用「入口 sp 到栈顶」也不对——**入口 sp 本身就等于
-            #          栈顶**（`sp = stack_base + stack_size - 0x1000`），
-            #          所以 `top - entry_sp == 0`，区间恒为空。
-            #          实测 liblog 0x5020：entry_sp = top = 0x7fff0000f000。
-            #     解决方案：栈向下生长，函数用过的区域在
-            #               `[entry_sp - 已用, entry_sp)`。取
-            #               `[entry_sp - stack_size, entry_sp)` 与**运行后
-            #               sp** 的并集下界，导出这段；空的部分读出来是 0，
-            #               正好作为「这里没写」的证据。
+            # (6) 第六次修改（2026-11-26）
+            # bug 原因：原代码 low = top - stack_size == stack_base - 0x1000 落在未映射区，
+            #           导致 mem_read 必败且即使不越界也会优先读到空栈底而非函数真实栈帧。
+            # 解决方案：下界固定为已映射的 stack_base，优先从入口栈顶 top 向下取
+            #           [max(stack_base, top - dump_max), top) 以读取真实栈帧。
             top = stack_base + stack_size - 0x1000
-            low = top - stack_size            # 栈区最底
-            _one(low, top - low, "stack")
+            low = stack_base
+            start = max(low, top - dump_max)
+            _one(start, top - start, "stack")
         elif dump_opt == "all":
             # 导出所有已映射区间。**不按 R/W 过滤**：covered 里没有 flags，
             # 而"只导可写段"需要额外传权限信息；与其用假判据筛掉一段，

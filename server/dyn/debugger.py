@@ -32,7 +32,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 
-from server.dyn.rebase import Rebase, RuntimeModule
+from server.dyn.rebase import Rebase, RuntimeModule, unload_script_async
 
 # 命中后的动作
 ACTION_RESUME = "resume"
@@ -420,7 +420,12 @@ def _parse_addr(value) -> int:
 class Debugger:
     """绑定单个进程的动态调试会话。"""
 
-    def __init__(self, rebase: Rebase):
+    # (21) 第二十一次修改（2026-11-26）
+    # bug 原因：原有 _hits 满 2000 条后下标游标失效，且缺乏主动命中回调导致上层不轮询时
+    #           无法及时感知 paused 状态与触发 auto_resume。
+    # 解决方案：维护单调递增 _hit_seq（与 _seq 同步），支持构造函数 on_hit 与 set_on_hit
+    #           注册全局命中回调，并提供 resume_token / clear_hits 供服务层安全复用。
+    def __init__(self, rebase: Rebase, on_hit=None):
         self.rb = rebase
         self.session = rebase.session
         self._lock = threading.Lock()          # 保护 hits/events/state/pending 等共享状态
@@ -439,7 +444,8 @@ class Debugger:
         self._events: deque[BreakpointHit] = deque(maxlen=_MAX_EVENTS)
         self._poll_cursor = 0                  # poll_events 默认游标（只增不减）
         self._wait_cursor = 0                  # wait_hits 专用游标，与 poll 互不干扰
-        self._seq = 0                          # 命中序号，从 1 开始
+        self._hit_seq = 0                      # 单调命中序号，从 1 开始且永不回退
+        self._seq = 0                          # 与 _hit_seq 同步保留（向后兼容）
         self._version = 0                      # 命中计数版本号，wait_hits 用它判断「有没有新的」
         self._state = STATE_IDLE
         self._script = None
@@ -447,8 +453,23 @@ class Debugger:
         # 不会重复登记，也不会因为写法差异导致摘错钩子。
         self._hooks: dict[int, dict] = {}          # runtime_addr -> {so_name, static_addr, policy}
         self._callbacks: dict[int, object] = {}    # runtime_addr -> on_hit 回调
+        self._global_on_hit = on_hit               # 会话级全局命中回调（如 DynamicService）
         self._pending_tokens: set[str] = set()            # 已命中但还没放行的挂起 token
         self._last_error = ""
+
+    def set_on_hit(self, callback) -> None:
+        """设置或替换会话级全局命中回调（收到 BreakpointHit，在释放锁后调用）。"""
+        with self._lock:
+            self._global_on_hit = callback
+
+    def clear_hits(self) -> int:
+        """线程安全清空命中与事件缓存，保留 _pending_tokens 与单调序号 _hit_seq。"""
+        with self._lock:
+            n = len(self._hits)
+            self._hits.clear()
+            self._events.clear()
+            self._hits_discarded = 0
+            return n
 
     # ---------- 对外只读状态 ----------
 
@@ -736,6 +757,10 @@ class Debugger:
                 "woken": woken,
                 "failed": len(failed)}
 
+    def resume_token(self, token: str) -> dict:
+        """按单个挂起 token 精准放行，不越权唤醒其他无关断点的挂起线程。"""
+        return self.resume(token=token)
+
     # ---------- 线程 ----------
 
     def threads(self) -> list[dict]:
@@ -781,28 +806,26 @@ class Debugger:
     def runtime_modules(self) -> list[RuntimeModule]:
         return self.rb.refresh_modules()
 
+    # (22) 第二十二次修改（2026-11-26）
+    # bug 原因：① 原顺序"先 resume 再 del_all"存在重入窗口：刚放行的线程在摘钩前
+    #             可能立刻再次命中 hold 断点重新挂起，导致后续 unload 悬挂；
+    #           ② 同步调用 script.unload() 在 frida 17.23.3 上会永久卡死。
+    # 解决方案：改为先 _rpc_call("del_all") 摘钩阻止新命中，再 self.resume() 放行
+    #           已挂起线程，最后通过 unload_script_async 带有限超时在守护线程卸载脚本。
     def close(self) -> None:
-        """摘掉全部钩子、卸载脚本、断开会话（幂等）。
-
-        (1) 第一次修改
-        bug 原因：必然要放行所有挂起线程——脚本一旦 unload，阻塞在 recv().wait()
-                  里的线程就没人唤醒了（真实 frida 会让它们随脚本销毁而行为未定义）。
-                  旧实现对挂起中的会话直接 unload，属于「关得掉但可能留下卡死的线程」。
-        解决方案：顺序固定为「先放行 → 再摘钩 → 再卸载 → 最后标 detached」，
-                  每一步都独立 try 兜底；摘钩走带超时的 RPC，JS 侧没响应也不卡死关闭流程。
-        """
-        # 1) 先放行仍被挂起的线程，否则后面 unload 时它们没有唤醒来源
-        try:
-            self.resume()
-        except Exception:                                 # noqa: BLE001
-            pass
-        # 2) 摘钩（带超时守卫，JS 侧不响应也不会卡住关闭）
+        """摘掉全部钩子、放行挂起线程、异步卸载脚本并断开会话（幂等）。"""
+        # 1) 先摘钩（带超时守卫），阻止放行后立刻重入 hold 断点再次挂起
         if self._script is not None:
             try:
                 self._rpc_call("del_all", timeout=_CLOSE_RPC_TIMEOUT)
             except Exception:                             # noqa: BLE001
                 pass
-        # 3) 卸载脚本
+        # 2) 再放行已挂起的线程，避免卸载脚本时它们失去唤醒来源
+        try:
+            self.resume()
+        except Exception:                                 # noqa: BLE001
+            pass
+        # 3) 清空状态并异步卸载脚本（带有限超时，防止 frida 17.23.3 同步 unload 永久卡死）
         with self._lock:
             script = self._script
             self._script = None
@@ -811,10 +834,7 @@ class Debugger:
             self._pending_tokens.clear()
             self._state = STATE_DETACHED
         if script is not None:
-            try:
-                script.unload()
-            except Exception:                             # noqa: BLE001
-                pass
+            unload_script_async(script, timeout=_CLOSE_RPC_TIMEOUT)
         # 4) 断开会话
         try:
             self.rb.detach()
@@ -940,9 +960,15 @@ class Debugger:
         )
         hit.held = bool(token)
         hit.token = token
+        # (23) 第二十三次修改（2026-11-26）
+        # bug 原因：命中后未通知会话级全局回调（如 DynamicService），导致不主动 poll 时
+        #           tgt.state 不会即时迁移为 paused，auto_resume 定时器也不会即时启动。
+        # 解决方案：递增单调 _hit_seq（同步 _seq），在释放 _hit_cond 锁之后安全调用
+        #           _global_on_hit(hit) 与单断点 callback(hit)。
         with self._hit_cond:
-            self._seq += 1
-            hit.seq = self._seq
+            self._hit_seq += 1
+            self._seq = self._hit_seq
+            hit.seq = self._hit_seq
             if len(self._hits) == self._hits.maxlen:
                 self._hits_discarded += 1      # 即将挤掉最旧的一条
             self._hits.append(hit)
@@ -953,6 +979,12 @@ class Debugger:
             self._version += 1
             self._hit_cond.notify_all()
             callback = self._callbacks.get(hit.runtime_addr)
+            global_cb = self._global_on_hit
+        if global_cb is not None:
+            try:
+                global_cb(hit)
+            except Exception as exc:                      # noqa: BLE001 - 全局回调失败不能影响调试
+                self._set_error(f"全局 on_hit 回调异常：{type(exc).__name__}: {exc}")
         if callback is None:
             # 运行时地址对不上时（模块重载/地址重新映射）退化为按静态地址找，
             # 保证 on_hit 不会因为 ASLR 换基址就静默失效

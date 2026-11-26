@@ -18,6 +18,20 @@ import json
 import sys
 
 
+def _ret_reg_name(arch) -> str:
+    """按目标架构返回默认函数返回值寄存器名。"""
+    name = str(getattr(arch, "name", arch)).upper()
+    if "AARCH64" in name or "ARM64" in name:
+        return "x0"
+    if "ARM" in name:
+        return "r0"
+    if "AMD64" in name or "X86_64" in name:
+        return "rax"
+    if "X86" in name or "I386" in name:
+        return "eax"
+    return "x0"
+
+
 def main():
     raw = sys.stdin.read()
     try:
@@ -68,16 +82,23 @@ def main():
         return 0
 
     if mode == "decompile":
+        # (2) 第二次修改（2026-11-26）
+        # bug 原因：未校验函数上界，导致不在任何函数范围内的地址回退命中地址最大的无关函数。
+        # 解决方案：按 ad <= target < ad + max(f.size, 4) 校验上界，未命中时返回明确 NO_FUNC 错误。
         want = task.get("addr", 0)
         cfg = proj.analyses.CFGFast(normalize=True)
         fn = cfg.functions.get(want + base) or cfg.functions.get(want)
         if fn is None:
-            cands = [f for ad, f in cfg.functions.items() if ad <= want + base]
+            target = want + base
+            cands = [
+                f for ad, f in cfg.functions.items()
+                if ad <= target < ad + max(int(getattr(f, "size", 0) or 0), 4)
+            ]
             if cands:
                 fn = max(cands, key=lambda f: f.addr)
         if fn is None:
             print(json.dumps({"ok": False, "code": "NO_FUNC",
-                              "error": f"0x{want:x} 不在 CFG 函数表"}))
+                              "error": f"0x{want:x} 不在任何 CFG 函数地址范围内"}))
             return 0
         try:
             dec = proj.analyses.Decompiler(fn)
@@ -132,10 +153,19 @@ def main():
             sym_vars[str(reg).lower()] = var
             setattr(state.regs, str(reg).lower(), var)
 
+        # (3) 第三次修改（2026-11-26）
+        # bug 原因：SimulationManager.explore() 不接受 depth_limit 参数，调用时必然抛 TypeError。
+        # 解决方案：移除 depth_limit，改用 LengthLimiter 探索技术限制最大路径长度（不可用时回退 n）。
         simgr = proj.factory.simgr(state)
         max_depth = int(task.get("max_depth") or 60)
         avoid = task.get("avoid")
-        explore_kw = {"find": find + base, "depth_limit": max_depth}
+        explore_kw = {"find": find + base}
+        if hasattr(angr.exploration_techniques, "LengthLimiter"):
+            simgr.use_technique(
+                angr.exploration_techniques.LengthLimiter(max_length=max_depth)
+            )
+        else:
+            explore_kw["n"] = max_depth
         if avoid is not None:
             av = (int(str(avoid), 16)
                   if isinstance(avoid, str) and str(avoid).lower().startswith("0x")
@@ -162,12 +192,15 @@ def main():
         solved: dict = {}
         try:
             if constraint:
-                # 约定：output==0x... 从 regs.x0 读；xN==0x... 从对应寄存器读
+                # (4) 第四次修改（2026-11-26）
+                # bug 原因：constraint 中 output 硬编码读取 regs.x0，在 ARM/AMD64/X86 架构上会报 AttributeError。
+                # 解决方案：按 proj.arch 映射返回值寄存器（AARCH64→x0、ARM→r0、AMD64→rax、X86→eax）。
                 lhs, rhs = str(constraint).split("==", 1)
                 lhs, rhs = lhs.strip().lower(), rhs.strip()
                 num = (int(rhs, 16) if rhs.lower().startswith("0x")
                        else int(rhs))
-                out_expr = (found_state.regs.x0 if lhs == "output"
+                ret_reg = _ret_reg_name(proj.arch)
+                out_expr = (getattr(found_state.regs, ret_reg) if lhs == "output"
                             else getattr(found_state.regs, lhs))
                 found_state.solver.add(out_expr == num)
             constraint_satisfied = bool(found_state.solver.satisfiable())

@@ -5779,9 +5779,16 @@ def test_r105_static_analysis_plugins():
               str(b0.get("successors")))
 
     # ---- ③ xref_enhanced：模块范围用 PT_LOAD ----
-    T._session.add("/tmp/sscronet.so")
+    # (1) 第一次修改（2026-11-26）
+    # bug 原因：硬编码 /tmp/sscronet.so，文件不存在时直接 FileNotFoundError 中断整份回归脚本。
+    # 解决方案：优先用 /tmp/sscronet.so（若存在），否则回退到仓库自带的 samples/libbase.so
+    #          （同样含非 0 偏移的 .note 杂项节与 0x0 起始的 PT_LOAD），保证离线恒可复现。
+    xref_sample = Path("/tmp/sscronet.so")
+    if not xref_sample.is_file():
+        xref_sample = root / "samples" / "libbase.so"
+    xref_so = T._session.add(str(xref_sample))
     from server.plugins.xref_enhanced import Plugin as _XP
-    d2 = _XP().run(T._session, {"so": "sscronet.so", "mode": "check_reloc",
+    d2 = _XP().run(T._session, {"so": xref_so.name, "mode": "check_reloc",
                                 "limit": 2})
     check("xref_enhanced 返回模块范围",
           d2.get("ok") and len(d2.get("module_range", [])) == 2, str(d2)[:150])

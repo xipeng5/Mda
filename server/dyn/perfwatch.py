@@ -71,6 +71,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -112,8 +113,34 @@ def _shell_root(serial: str, command: str, timeout: int = 90) -> subprocess.Comp
 
     (1) 第一次修改（2026-11-09）：perf_event 需要 CAP_PERFMON，
         普通 shell 身份会被拒，必须 su。
+    (5) 第五次修改（2026-11-26）
+        bug 原因：原实现用 `f"su -c '{command}'"` 裸拼单引号，command 中一旦出现单引号
+                  （例如 appproc.py 的 `grep -c '\\.so'` 或外部参数）会直接截断引号导致
+                  语法错误或命令注入。
+        解决方案：使用 shlex.quote(command) 正确转义整段命令。
     """
-    return _adb(serial, "shell", f"su -c '{command}'", timeout=timeout)
+    return _adb(serial, "shell", f"su -c {shlex.quote(command)}", timeout=timeout)
+
+
+def _device_file_size(serial: str, path: str) -> int | None:
+    """读取设备端文件真实字节数（优先 stat -c %s，回退 ls -ln 第 5 列）。"""
+    q = shlex.quote(path)
+    try:
+        r = _adb(serial, "shell", f"stat -c %s {q} 2>/dev/null", timeout=20)
+        txt = (r.stdout or "").strip().splitlines()
+        if txt and txt[0].strip().isdigit():
+            return int(txt[0].strip())
+    except Exception:                                     # noqa: BLE001
+        pass
+    try:
+        r2 = _adb(serial, "shell", f"ls -ln {q} 2>/dev/null", timeout=20)
+        for ln in (r2.stdout or "").splitlines():
+            parts = ln.split()
+            if len(parts) >= 5 and parts[0].startswith("-") and parts[4].isdigit():
+                return int(parts[4])
+    except Exception:                                     # noqa: BLE001
+        pass
+    return None
 
 
 def _helper_built() -> bool:
@@ -137,16 +164,15 @@ def ensure_helper(serial: str, force_push: bool = False) -> dict:
     out["local_size"] = local_size
 
     if not force_push:
-        # 设备上已有且大小一致就跳过推送
-        try:
-            r = _adb(serial, "shell", f"ls -l {_DEVICE_PATH} 2>/dev/null")
-            m = re.search(r"\s(\d+)\s", r.stdout or "")
-            if m and int(m.group(1)) == local_size:
-                out["ok"] = True
-                out["note"] = "设备上已有同版本 helper，跳过推送"
-                return out
-        except Exception:                                 # noqa: BLE001
-            pass
+        # (5) 第五次修改（2026-11-26）
+        # bug 原因：原实现用 `re.search(r"\s(\d+)\s", ls -l)` 取到的始终是第 2 列硬链接数 "1"，
+        #           与 local_size 永不相等，每次都强推并触发正在运行 daemon 的 ETXTBSY。
+        # 解决方案：改用 _device_file_size (stat -c %s / ls -ln 第 5 列) 获取真实字节数。
+        dev_size = _device_file_size(serial, _DEVICE_PATH)
+        if dev_size is not None and dev_size == local_size:
+            out["ok"] = True
+            out["note"] = "设备上已有同版本 helper，跳过推送"
+            return out
 
     try:
         r = _adb(serial, "push", _LOCAL_HELPER, _DEVICE_PATH, timeout=120)
@@ -172,12 +198,24 @@ def perf_watch_probe(serial: str) -> dict:
     try:
         r = _shell_root(serial, f"{_DEVICE_PATH} probe 0")
         payload = _parse_json(r.stdout)
-        return {"ok": True, "helper": h, "device": payload,
-                "max_slots": PERF_WATCH_MAX_SLOTS,
-                "max_len": PERF_WATCH_MAX_LEN,
-                "note": ("硬件观察点最多 4 个槽位；"
-                         "地址会自动脱 ARM64 tag；"
-                         "观察点按线程生效，0 命中时先确认 tid")}
+        # (5) 第五次修改（2026-11-26）
+        # bug 原因：无论设备端 helper 是否返回 ok=True，原实现一律硬编码返回 ok=True。
+        # 解决方案：透传 payload.get("ok")，失败时带上 code 与 error。
+        probe_ok = bool(payload.get("ok"))
+        res: dict = {
+            "ok": probe_ok,
+            "helper": h,
+            "device": payload,
+            "max_slots": PERF_WATCH_MAX_SLOTS,
+            "max_len": PERF_WATCH_MAX_LEN,
+            "note": ("硬件观察点最多 4 个槽位；"
+                     "地址会自动脱 ARM64 tag；"
+                     "观察点按线程生效，0 命中时先确认 tid"),
+        }
+        if not probe_ok:
+            res["code"] = payload.get("code") or "PROBE_FAILED"
+            res["error"] = payload.get("error") or "设备端 helper 自检失败"
+        return res
     except Exception as exc:                              # noqa: BLE001
         return {"ok": False, "code": "PROBE_FAILED",
                 "error": f"{type(exc).__name__}: {exc}", "helper": h}
@@ -329,13 +367,22 @@ def perf_watch_daemon(serial: str, pid: int, addr: int | str, slot: int = 0,
         perf_watch_poll(serial, slot=0)      # 取命中
         perf_watch_stop(serial, slot=0)      # 停掉
     """
-    try:
-        raw = int(addr, 16) if isinstance(addr, str) else int(addr)
-    except (TypeError, ValueError):
+    # (5) 第五次修改（2026-11-26）
+    # bug 原因：① `int(addr, 16)` 会把纯十进制字符串按十六进制错误解析；
+    #           ② 未校验 watch_type 白名单就直接拼进 root shell，存在命令注入面。
+    # 解决方案：统一使用 server.core.addr.parse_addr 解析地址，并严格校验 watch_type 白名单。
+    from server.core.addr import parse_addr
+
+    raw = parse_addr(addr, default=None)
+    if raw is None or raw < 0:
         return {"ok": False, "code": "BAD_ADDR", "error": f"addr 无法解析：{addr!r}"}
     if int(size) not in (1, 2, 4, 8):
         return {"ok": False, "code": "BAD_SIZE",
                 "error": f"size 只能是 1/2/4/8，收到 {size}"}
+    wt = str(watch_type or "w").strip().lower()
+    if wt not in ("w", "r", "rw", "x", "write", "read", "exec"):
+        return {"ok": False, "code": "BAD_TYPE",
+                "error": f"watch_type 只能是 w/r/rw/x，收到 {watch_type!r}"}
     if not (0 <= int(slot) < _MAX_SLOTS):
         return {"ok": False, "code": "BAD_SLOT",
                 "error": f"slot 必须 0..{_MAX_SLOTS - 1}",
@@ -355,7 +402,7 @@ def perf_watch_daemon(serial: str, pid: int, addr: int | str, slot: int = 0,
         if cands:
             picked_tid = cands[0]
     inner = (f"{_DEVICE_PATH} daemon {int(slot)} {int(pid)} 0x{raw:x} "
-             f"{int(size)} {watch_type} {picked_tid} {ms}")
+             f"{int(size)} {wt} {picked_tid} {ms}")
     # 用 nohup + & 让它在 adb shell 退出后继续活着。
     # 实测不加 nohup 时进程会被 sd 一并回收。
     cmd = f"nohup {inner} >/dev/null 2>&1 &"
@@ -381,7 +428,7 @@ def perf_watch_daemon(serial: str, pid: int, addr: int | str, slot: int = 0,
                          "换一个 tid 再试")}
 
     out = {"ok": True, "slot": int(slot), "addr": st.get("addr"),
-           "tid": st.get("tid"), "size": int(size), "type": watch_type,
+           "tid": st.get("tid"), "size": int(size), "type": wt,
            "state": st,
            "state_file": f"{_DAEMON_DIR}/mda_pw_{int(slot)}.state",
            "hits_file": f"{_DAEMON_DIR}/mda_pw_{int(slot)}.hits",
@@ -497,10 +544,11 @@ def perf_watch(
         · 记录的是**写指令的 pc**，不是调用栈；
           要调用栈请用返回的 ip 去 frida 侧下断点补
     """
-    # 地址归一化：允许 "0x..." 字符串、十进制、带 tag
-    try:
-        raw = int(addr, 16) if isinstance(addr, str) else int(addr)
-    except (TypeError, ValueError):
+    # (5) 第五次修改（2026-11-26）：统一用 parse_addr 解析地址，避免十进制串按 16 进制误解析
+    from server.core.addr import parse_addr
+
+    raw = parse_addr(addr, default=None)
+    if raw is None or raw < 0:
         return {"ok": False, "code": "BAD_ADDR",
                 "error": f"addr 无法解析：{addr!r}"}
 

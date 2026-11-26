@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 
 # GUI 的 Streamable HTTP MCP 端点
 GUI_MCP_URL = os.environ.get("MDA_GUI_MCP", "http://127.0.0.1:8765/mcp")
@@ -36,21 +37,35 @@ PROBE_TIMEOUT = 1.0
 CALL_TIMEOUT = float(os.environ.get("MDA_PROXY_TIMEOUT", "600"))
 
 
+# (3) 第三次修改（2026-11-26）
+# bug 原因：① _GuiLink 多线程并发调用工具时共享 _client / session_id 无锁保护，
+#             存在重握手竞争与状态串写；
+#          ② _parse 解析 SSE 遇到首条 data: 即返回，易被前序通知事件截胡；
+#          ③ call() 收到 GUI 返回的 JSON-RPC error 时因无 result 字段返回 None，
+#             触发调用方回退本地执行，分裂出双会话；
+#          ④ forward() 把成功空文本 ""（bool("") 为 False）误判为 None，同样触发本地重跑。
+# 解决方案：① 给 _GuiLink 加 threading.RLock() 串行化共享状态访问；
+#          ② _parse 遍历全部 data: 行，优先取带 id 的响应，否则取末条有效 JSON；
+#          ③ call() 把 JSON-RPC error 转成 isError=True 的结果字典，交由 forward() 包装为
+#             CallToolResult(is_error=True) 上抛；
+#          ④ forward() 明确区分成功空文本 "" 与转发失败 None（含 content 且非 isError 返回 ""）。
 class _GuiLink:
     """持有与 GUI 的 MCP 会话（session id 会随 GUI 重启失效，需自动重握）。"""
 
     def __init__(self) -> None:
         self.session_id: str | None = None
         self._client = None
+        self._lock = threading.RLock()
 
     # ---------- 底层 ----------
 
     def _http(self):
-        if self._client is None:
-            import httpx2 as httpx
+        with self._lock:
+            if self._client is None:
+                import httpx2 as httpx
 
-            self._client = httpx.Client(timeout=CALL_TIMEOUT)
-        return self._client
+                self._client = httpx.Client(timeout=CALL_TIMEOUT)
+            return self._client
 
     def _headers(self) -> dict:
         h = {
@@ -68,41 +83,52 @@ class _GuiLink:
         if not text:
             return None
         if text.startswith("event:") or text.startswith("data:") or "\ndata:" in text:
+            id_msg = None
+            last_msg = None
             for line in text.splitlines():
                 line = line.strip()
                 if line.startswith("data:"):
                     payload = line[5:].strip()
-                    if payload:
-                        return json.loads(payload)
-            return None
+                    if not payload:
+                        continue
+                    try:
+                        parsed = json.loads(payload)
+                    except json.JSONDecodeError:
+                        continue
+                    last_msg = parsed
+                    if isinstance(parsed, dict) and "id" in parsed:
+                        id_msg = parsed
+            return id_msg if id_msg is not None else last_msg
         return json.loads(text)
 
     def _post(self, message: dict) -> dict | None:
-        r = self._http().post(GUI_MCP_URL, json=message, headers=self._headers())
-        if "mcp-session-id" in r.headers:
-            self.session_id = r.headers["mcp-session-id"]
-        if r.status_code >= 400:
-            # 4xx 且带着旧 session id → GUI 重启过，id 已作废
-            if self.session_id and r.status_code in (400, 404):
-                self.session_id = None
-                raise _Stale()
-            raise RuntimeError(f"GUI MCP 返回 {r.status_code}: {r.text[:160]}")
-        return self._parse(r.text)
+        with self._lock:
+            r = self._http().post(GUI_MCP_URL, json=message, headers=self._headers())
+            if "mcp-session-id" in r.headers:
+                self.session_id = r.headers["mcp-session-id"]
+            if r.status_code >= 400:
+                # 4xx 且带着旧 session id → GUI 重启过，id 已作废
+                if self.session_id and r.status_code in (400, 404):
+                    self.session_id = None
+                    raise _Stale()
+                raise RuntimeError(f"GUI MCP 返回 {r.status_code}: {r.text[:160]}")
+            return self._parse(r.text)
 
     def _handshake(self) -> None:
         """与 GUI 建立一次 MCP 会话（initialize + initialized）。"""
-        self.session_id = None
-        self._post({
-            "jsonrpc": "2.0",
-            "id": "mda-link-init",
-            "method": "initialize",
-            "params": {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {},
-                "clientInfo": {"name": "mda-link", "version": "1"},
-            },
-        })
-        self._post({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        with self._lock:
+            self.session_id = None
+            self._post({
+                "jsonrpc": "2.0",
+                "id": "mda-link-init",
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "clientInfo": {"name": "mda-link", "version": "1"},
+                },
+            })
+            self._post({"jsonrpc": "2.0", "method": "notifications/initialized"})
 
     # ---------- 对外 ----------
 
@@ -122,8 +148,8 @@ class _GuiLink:
         """把一次工具调用转发给 GUI 执行，返回 MCP 的 result 字典。
 
         失败返回 None，由调用方回退到本地执行（GUI 挂了也不能让 AI 断手）。
-        注意：result 里可能带 isError=True（GUI 侧工具自身报错），
-        调用方需据此判定，不能一律当成功。
+        注意：result 里可能带 isError=True（GUI 侧工具自身报错或 JSON-RPC error），
+        调用方需据此判定，不能一律当成功，也不能误当离线回退本地执行。
         """
         msg = {
             "jsonrpc": "2.0",
@@ -131,21 +157,32 @@ class _GuiLink:
             "method": "tools/call",
             "params": {"name": tool, "arguments": arguments or {}},
         }
-        try:
-            if self.session_id is None:
-                self._handshake()
-            resp = self._post(msg)
-        except _Stale:
-            # 会话失效：重握手后重试一次
+        with self._lock:
             try:
-                self._handshake()
+                if self.session_id is None:
+                    self._handshake()
                 resp = self._post(msg)
+            except _Stale:
+                # 会话失效：重握手后重试一次
+                try:
+                    self._handshake()
+                    resp = self._post(msg)
+                except Exception:
+                    return None
             except Exception:
                 return None
-        except Exception:
+        if not isinstance(resp, dict):
             return None
-        if not resp:
-            return None
+        # JSON-RPC error 表示 GUI 已收到并拒绝/报错，不能返回 None 触发本地重跑分裂会话
+        if "error" in resp and resp["error"] is not None:
+            err = resp["error"]
+            if isinstance(err, dict):
+                code = err.get("code")
+                detail = err.get("message") or json.dumps(err, ensure_ascii=False)
+                text = f"GUI MCP 错误 (code={code}): {detail}" if code is not None else f"GUI MCP 错误: {detail}"
+            else:
+                text = f"GUI MCP 错误: {err}"
+            return {"content": [{"type": "text", "text": text}], "isError": True}
         result = resp.get("result")
         return result if isinstance(result, dict) else None
 
@@ -188,6 +225,10 @@ def forward(tool: str, arguments: dict):
                  "内容像报错但状态是成功" 的结果，无法据此自纠。
         解决方案：检测 result["isError"]，为真时构造 is_error=True 的
                  CallToolResult 原样上抛，保持错误语义不丢失。
+    (3) 第三次修改（2026-11-26）：
+        bug 原因：GUI 成功返回空文本 "" 时，旧写法 `return text if text else None`
+                 把合法空字符串返回成了 None，调用方误以为转发失败又在本地重跑。
+        解决方案：只要结果含 content 列表且非 isError，即使文本为空也返回 "" 而非 None。
     """
     if not should_forward():
         return None
@@ -195,11 +236,13 @@ def forward(tool: str, arguments: dict):
     if result is None:
         return None
 
+    content = result.get("content")
     text = ""
-    for item in result.get("content") or []:
-        if isinstance(item, dict) and item.get("type") == "text":
-            text = item.get("text", "")
-            break
+    if isinstance(content, list):
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                text = item.get("text", "")
+                break
 
     if result.get("isError"):
         from mcp.types import CallToolResult, TextContent
@@ -208,6 +251,8 @@ def forward(tool: str, arguments: dict):
             content=[TextContent(text=text or "GUI 侧工具执行失败（无错误详情）")],
             is_error=True,  # mcp 2.x 字段名（isError 是 1.x 的）
         )
+    if isinstance(content, list):
+        return text
     return text if text else None
 
 

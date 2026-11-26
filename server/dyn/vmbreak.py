@@ -255,16 +255,52 @@ def _read_so_bytes(so_name: str, so=None) -> bytes:
     raise FileNotFoundError(f"读不到 so 字节：{so_name}")
 
 
+def _lookup_loaded_so(so_name: str):
+    """尝试从全局 Session 查找已加载的 SoFile，找不到返回 None。"""
+    try:
+        from server.mcp_server.tools import get_session
+
+        ses = get_session()
+        if ses is not None:
+            return ses.get(so_name)
+    except Exception:                                     # noqa: BLE001
+        return None
+    return None
+
+
+def _file_off_to_vaddr(so, file_off: int) -> int | None:
+    """按 SoFile._loads 将 ELF 文件偏移换算为相对模块基址的虚拟地址偏移。"""
+    loads = getattr(so, "_loads", None) or []
+    if not loads:
+        return None
+    base_va = min(va for va, _end, _off, _fl in loads)
+    for va, end, f_off, _fl in loads:
+        filesz = end - va
+        if f_off <= file_off < f_off + filesz:
+            return (va - base_va) + (file_off - f_off)
+    return None
+
+
 def find_dispatch_points(so_name: str, so=None,
                          pattern_hex: str = VM_DEFAULT_PATTERN,
                          limit: int = 2000) -> dict:
     """扫描 so 里所有 VM 派发段的位置。
 
+    (8) 第八次修改（2026-11-26）
+    bug 原因：① 未传 so 时仅按本地文件路径查找，传模块短名（如 libfoo.so）必报
+              SO_NOT_READABLE，即便该 so 已加载在全局 Session 中；
+              ② 直接把原始文件偏移当运行时虚拟偏移返回，当 PT_LOAD 的 p_vaddr 与
+              p_offset 存在页对齐差值时，hook 会落到错误地址。
+    解决方案：so 为 None 时优先从 get_session() 查找已加载 SoFile；
+              命中文件偏移后按 so._loads 换算为虚拟地址偏移返回（同时保留 file_offset）。
+
     这是 `vm_breakpoint` 的前置步骤：先知道有哪几个落点，再决定挂哪个。
 
     返回：{count, points[], note}
-    points[]: {offset, offset_hex}
+    points[]: {offset, offset_hex, file_offset, file_offset_hex}
     """
+    if so is None:
+        so = _lookup_loaded_so(so_name)
     try:
         data = _read_so_bytes(so_name, so)
     except FileNotFoundError as exc:
@@ -287,12 +323,23 @@ def find_dispatch_points(so_name: str, so=None,
         hits.append(i)
         off = i + 1
 
+    points = []
+    for h in hits:
+        vaddr = _file_off_to_vaddr(so, h) if so is not None else None
+        eff = vaddr if vaddr is not None else h
+        points.append({
+            "offset": eff,
+            "offset_hex": hex(eff),
+            "file_offset": h,
+            "file_offset_hex": hex(h),
+        })
+
     return {
         "ok": True,
         "so_name": so_name,
         "pattern": pat.hex(),
-        "count": len(hits),
-        "points": [{"offset": h, "offset_hex": hex(h)} for h in hits],
+        "count": len(points),
+        "points": points,
         "note": ("每个点都是「一条 VM 指令执行完、准备派发下一条」的位置。"
                  "挂在这些点上可以做 VM 级单步/断点。"),
     }
@@ -319,7 +366,8 @@ def vm_breakpoint(serial: str, pid: int, so_name: str, target_idx: int = -1,
                   reg_base_offset: int = VM_DEFAULTS["reg_base_offset"],
                   ip_mode: str = VM_DEFAULTS["ip_mode"],
                   opcode_expr: str = VM_DEFAULTS["opcode_expr"],
-                  ctx_expr: str = "") -> dict:
+                  ctx_expr: str = "",
+                  hold_timeout_ms: int = 2000) -> dict:
     """在 VM 的某条指令上设断点，停下时给出 VM 寄存器堆与 VM 栈。
 
     ## 参数
@@ -444,17 +492,22 @@ def vm_breakpoint(serial: str, pid: int, so_name: str, target_idx: int = -1,
     else:
         ctx_spec = {"kind": "reg", "reg": str(ctx_reg)}
 
-    # 决定挂哪个派发点
+    # (8) 第八次修改（2026-11-26）
+    # bug 原因：dispatch_offset 为空串 "" 时 `is not None` 为真，直接进 int("", 16)
+    #           报 BAD_DISPATCH_OFFSET，无法触发自动扫描；且自动扫描未传入已加载的 SoFile。
+    # 解决方案：空串与 None 等价触发自动扫描；解析走 parse_addr；自动扫描先查 get_session()。
     disp = None
-    if dispatch_offset is not None:
-        try:
-            disp = int(dispatch_offset, 16) if isinstance(dispatch_offset, str) \
-                else int(dispatch_offset)
-        except (TypeError, ValueError):
+    if dispatch_offset is not None and str(dispatch_offset).strip() != "":
+        from server.core.addr import parse_addr
+
+        disp = parse_addr(dispatch_offset, default=None)
+        if disp is None:
             return {"ok": False, "code": "BAD_DISPATCH_OFFSET",
                     "error": f"dispatch_offset 无法解析：{dispatch_offset!r}"}
     else:
-        scan = find_dispatch_points(so_name, pattern_hex=pattern_hex, limit=1)
+        loaded_so = _lookup_loaded_so(so_name)
+        scan = find_dispatch_points(so_name, so=loaded_so,
+                                    pattern_hex=pattern_hex, limit=1)
         if not scan.get("ok") or not scan.get("points"):
             return {"ok": False, "code": "NO_DISPATCH_POINT",
                     "error": "没有扫到派发点；确认 so 与 pattern 是否匹配",
@@ -480,6 +533,7 @@ def vm_breakpoint(serial: str, pid: int, so_name: str, target_idx: int = -1,
         ("__CAPTURE_REGS__", str(int(capture_regs))),
         ("__STACK_BYTES__", str(int(stack_bytes))),
         ("__HOLD__", "true" if hold else "false"),
+        ("__HOLD_TIMEOUT_MS__", str(max(100, min(int(hold_timeout_ms or 2000), 30000)))),
         ("__MAX_HITS__", str(max(1, int(max_hits)))),
         # (5) 第五次修改（2026-11-09）：
         #     bug 原因：code_base 参数一直只躺在签名里，从未传给 JS
@@ -497,7 +551,8 @@ def vm_breakpoint(serial: str, pid: int, so_name: str, target_idx: int = -1,
                          hold=bool(hold), max_hits=int(max_hits),
                          wait=float(wait),
                          target_idx=int(target_idx),
-                         slot_size=int(slot_size))
+                         slot_size=int(slot_size),
+                         hold_timeout_ms=max(100, min(int(hold_timeout_ms or 2000), 30000)))
 
 
 _JS_SPEC_HELPERS = r"""
@@ -516,6 +571,12 @@ _JS_SPEC_HELPERS = r"""
     //     {kind:'ctx',    offset:0x6070}          // ctx 由调用方先解出
     //     {kind:'regoff', reg:'x20', offset:8}
     //     {kind:'none'}
+    // (8) 第八次修改（2026-11-26）
+    // bug 原因：① regOf 不认识 w0..w30，Frida ARM64 context 只有 x0..x30，读 wN 恒返 null；
+    //           ② opcode_expr 为寄存器（kind === 'reg'）时直接对其调用 readScalar(opRes.ptr)
+    //              解引用内存（把标量数值当地址读 U64），必然访问违例读不到 opcode。
+    // 解决方案：① regOf 识别 /^w(\d+)$/ 并读 c['x'+idx].and(0xffffffff)；
+    //           ② 新增 scalarFromReg 直接把寄存器 NativePointer/数值转为标量，绝不解引用内存。
     function regOf(c, name) {
         if (!name) { return null; }
         var n = String(name).toLowerCase();
@@ -524,6 +585,15 @@ _JS_SPEC_HELPERS = r"""
             if (n === 'pc') { return c.pc; }
             if (n === 'lr') { return c.lr; }
             if (n === 'fp') { return c.fp; }
+            var wm = /^w(\d+)$/.exec(n);
+            if (wm) {
+                var idx = parseInt(wm[1], 10);
+                if (idx >= 0 && idx <= 30) {
+                    var xv = c['x' + idx];
+                    if (xv === undefined || xv === null) { return null; }
+                    return (typeof xv.and === 'function') ? xv.and(0xffffffff) : ptr(Number(xv) >>> 0);
+                }
+            }
             var v = c[n];
             return (v === undefined || v === null) ? null : v;
         } catch (e) { return null; }
@@ -587,6 +657,25 @@ _JS_SPEC_HELPERS = r"""
         } catch (e) { return {n: null, s: null, err: String(e)}; }
     }
 
+    // 寄存器标量直接转数值（绝不解引用内存），供 spec.kind === 'reg' 使用
+    function scalarFromReg(p) {
+        try {
+            var s = BigInt(p.toString()).toString(10);
+            var n = Number(s);
+            if (!isFinite(n) || Math.abs(n) > 9007199254740991) { n = null; }
+            return {n: n, s: s, err: ''};
+        } catch (e) {
+            try {
+                var hs = p.toString();
+                var n2 = parseInt(hs, 16);
+                if (!isFinite(n2) || Math.abs(n2) > 9007199254740991) { n2 = null; }
+                return {n: n2, s: hs, err: ''};
+            } catch (e2) {
+                return {n: null, s: null, err: String(e2)};
+            }
+        }
+    }
+
     function hexOf(ptr) {
         return (ptr === null || ptr === undefined) ? null : ptr.toString();
     }
@@ -611,6 +700,8 @@ _JS_VM_BREAK = r"""
     var VM_REG_COUNT = __VM_REG_COUNT__;
     var CAPTURE_REGS = __CAPTURE_REGS__;
     var STACK_BYTES = __STACK_BYTES__;
+    var HOLD = __HOLD__;
+    var HOLD_TIMEOUT_MS = __HOLD_TIMEOUT_MS__;
     var MAX_HITS = __MAX_HITS__;
     // 显式字节码基址；null 表示调用方没给（那就不会算 vm_idx）
     var CODE_BASE = __CODE_BASE__;
@@ -698,14 +789,15 @@ __SPEC_HELPERS__
             }
 
             // opcode：按 OPCODE_SPEC 取（"sp+8" / "x8" / "ctx+0x100"），
-            // 取不到就是 null，不编造。
+            // 取不到就是 null，不编造。kind==='reg' 时寄存器装的是标量本身，绝不解引用。
             var opcodeVal = null;
             var opcodeSrc = 'none';
             if (OPCODE_SPEC.kind !== 'none') {
                 var opRes = resolveValue(c, OPCODE_SPEC, ctxp);
                 opcodeSrc = opRes.src;
                 if (opRes.ptr !== null) {
-                    var sv = readScalar(opRes.ptr);
+                    var sv = (OPCODE_SPEC.kind === 'reg')
+                        ? scalarFromReg(opRes.ptr) : readScalar(opRes.ptr);
                     opcodeVal = (sv.n !== null) ? sv.n : sv.s;
                 }
             }
@@ -739,7 +831,7 @@ __SPEC_HELPERS__
             // idx 只认显式 code_base
             var idx = null;
             var idxSource = 'unavailable';
-            if (CODE_BASE !== null && CODE_BASE !== 0 && vmPc !== null) {
+            if (CODE_BASE !== null && CODE_BASE !== 0 && CODE_BASE !== '' && vmPc !== null) {
                 // (4) 第四次修改（2026-11-09）：
                 //     bug 原因：原来用 vmPc.sub(base).toInt32()，toInt32 会把
                 //               64 位差值截断成 32 位；当 code_base 与 vm_pc 的
@@ -792,7 +884,44 @@ __SPEC_HELPERS__
                     .join('');
             } catch (e) { rec.stack_hex = null; }
 
+            // (8) 第八次修改（2026-11-26）：真实现 HOLD 挂起与放行协议。
+            // bug 原因：原模板未声明 __HOLD__，hold=True 只是空占位符，命中后直接继续跑。
+            // 解决方案：HOLD 为真时给命中记录打上 held=true 与 hold_token，发送现场后通过
+            //           recv('resume', ...).wait() 真正阻塞当前目标线程，直到收到 Python 侧
+            //           resume 指令或超时兜底放行，防止 ANR 死锁。
+            var holdToken = HOLD ? ('vmh_' + hitCount + '_' + this.threadId) : null;
+            rec.held = Boolean(HOLD);
+            rec.hold_token = holdToken;
             send(rec);
+
+            if (HOLD) {
+                var released = false;
+                var releaseReason = 'resumed';
+                var timer = null;
+                if (HOLD_TIMEOUT_MS > 0) {
+                    timer = setTimeout(function () {
+                        if (!released) {
+                            released = true;
+                            releaseReason = 'hold_timeout';
+                            send({kind: 'vm_hold_timeout', token: holdToken,
+                                  hold_timeout_ms: HOLD_TIMEOUT_MS});
+                        }
+                    }, HOLD_TIMEOUT_MS);
+                }
+                try {
+                    var op = recv('resume', function (msg) {
+                        if (!released) {
+                            released = true;
+                            releaseReason = (msg && msg.reason) ? String(msg.reason) : 'resumed';
+                        }
+                    });
+                    op.wait();
+                } catch (eHold) {
+                    releaseReason = 'hold_error:' + String(eHold);
+                }
+                if (timer !== null) { try { clearTimeout(timer); } catch (eT) {} }
+                send({kind: 'vm_resumed', token: holdToken, reason: releaseReason});
+            }
 
             if (hitCount >= MAX_HITS && listener !== null) {
                 listener.detach();
@@ -831,6 +960,13 @@ def _js_str(s) -> str:
 def _js_code_base(code_base) -> str:
     """把 code_base 转成 JS 字面量：没给就是 null。
 
+    (8) 第八次修改（2026-11-26）
+    bug 原因：原实现直接 return str(v)，遇到 ARM64 64 位 TBI 指针（如 0xb400007d8780a000，
+              超过 JS Number 安全整数上限 2^53-1）时会被 JS 浮点舍入截断低位，
+              导致 ptr(CODE_BASE) 算出的 vm_idx 错位。
+    解决方案：超过 2^53-1 (0x1fffffffffffff) 的 64 位地址输出 "0x..." 字符串字面量，
+              由 JS 侧 ptr("0x...") 无损解析；安全整数范围内保留十进制数字。
+
     支持 int 与 "0x..." / "12345" 字符串。给不出合法值一律当 null，
     宁可不算 idx，也不注入一个错的基址。
     """
@@ -841,7 +977,11 @@ def _js_code_base(code_base) -> str:
             and code_base.lower().startswith("0x") else int(code_base)
     except (TypeError, ValueError):
         return "null"
-    return str(v) if v > 0 else "null"
+    if v <= 0:
+        return "null"
+    if v > 0x1FFFFFFFFFFFFF:
+        return json.dumps(f"0x{v:x}")
+    return str(v)
 
 
 def _detach_async(sess, timeout: float = 2.0) -> None:
@@ -869,7 +1009,8 @@ def _run_vm_break(serial: str, pid: int, so_name: str, user_js: str,
                   hold: bool = True, max_hits: int = 1,
                   wait: float = 10.0,
                   target_idx: int = -1,
-                  slot_size: int = 16) -> dict:
+                  slot_size: int = 16,
+                  hold_timeout_ms: int = 2000) -> dict:
     """注入 VM 断点脚本并等待命中。
 
     (1) 第一次修改（2026-11-09）：
@@ -880,6 +1021,12 @@ def _run_vm_break(serial: str, pid: int, so_name: str, user_js: str,
                   被外层 except 包成 VM_BREAK_FAILED。
                   表现为：target_idx 给任何值（含 -1）都报同一个 NameError。
         解决方案：把 target_idx / slot_size 显式传进来，供文案与诊断使用。
+
+    (8) 第八次修改（2026-11-26）：配合 _JS_VM_BREAK 的 HOLD 挂起协议。
+        bug 原因：原实现仅传 hold 形参但从不处理 resume，导致模板无法安全挂起。
+        解决方案：收到 held=True 的命中后记录挂起令牌；单次会话收尾或超时前
+                  显式 post({"type": "resume", ...}) 放行目标线程，防止 ANR 死锁，
+                  并在返回值里如实报告 hold_requested / held_count / resumed_events。
     """
     import time as _time
 
@@ -892,12 +1039,14 @@ def _run_vm_break(serial: str, pid: int, so_name: str, user_js: str,
     script_src = user_js.replace("SO_NAME", _js_str(so_name))
 
     sess = None
+    script = None
     try:
         dev = frida.get_device(serial, timeout=15)
         sess = dev.attach(int(pid))
         script = sess.create_script(script_src)
         box: dict = {"installed": None, "hits": [], "error": None,
-                     "stopped": False}
+                     "stopped": False, "held_tokens": [], "resumed": [],
+                     "hold_timeouts": []}
 
         def _on_msg(msg, data):
             payload = msg.get("payload")
@@ -910,6 +1059,19 @@ def _run_vm_break(serial: str, pid: int, so_name: str, user_js: str,
                 box["installed"] = payload
             elif kind == "vm_hit":
                 box["hits"].append(payload)
+                if payload.get("held") and payload.get("hold_token"):
+                    box["held_tokens"].append(payload["hold_token"])
+            elif kind == "vm_resumed":
+                box["resumed"].append(payload)
+            elif kind == "vm_hold_timeout":
+                box["hold_timeouts"].append(payload)
+                # 超时通知到来时立即补发 resume 解除 recv().wait() 阻塞
+                try:
+                    script.post({"type": "resume",
+                                 "token": payload.get("token"),
+                                 "reason": "hold_timeout"})
+                except Exception:                         # noqa: BLE001
+                    pass
             elif kind == "stopped":
                 box["stopped"] = True
                 # (4) 第四次修改（2026-11-16）：
@@ -934,7 +1096,29 @@ def _run_vm_break(serial: str, pid: int, so_name: str, user_js: str,
                 break
             if len(box["hits"]) >= max(1, max_hits):
                 break
+            # 多命中 hold 场景：收到前几次命中并完成采集后立即放行以等待后续命中
+            if hold and len(box["held_tokens"]) > len(box["resumed"]) and max_hits > 1:
+                tok = box["held_tokens"][len(box["resumed"])]
+                try:
+                    script.post({"type": "resume", "token": tok,
+                                 "reason": "next_hit"})
+                except Exception:                         # noqa: BLE001
+                    pass
             _time.sleep(0.05)
+
+        # 收尾前放行所有仍处于挂起态的线程，避免单次会话结束导致目标 ANR
+        if hold and box["held_tokens"]:
+            pending = max(0, len(box["held_tokens"]) - len(box["resumed"]))
+            for _ in range(pending):
+                try:
+                    script.post({"type": "resume",
+                                 "reason": "auto_release_oneshot"})
+                except Exception:                         # noqa: BLE001
+                    pass
+            t_rel = _time.time()
+            while _time.time() - t_rel < 0.5 and len(box["resumed"]) < len(box["held_tokens"]):
+                _time.sleep(0.02)
+
         try:
             script.post({"type": "stop"})
         except Exception:                                 # noqa: BLE001
@@ -963,7 +1147,18 @@ def _run_vm_break(serial: str, pid: int, so_name: str, user_js: str,
         "installed": box["installed"],
         "hit_count": len(box["hits"]),
         "hits": box["hits"],
+        "hold_requested": bool(hold),
+        "held_count": len(box["held_tokens"]),
+        "hold_timeout_ms": int(hold_timeout_ms),
     }
+    if box["resumed"]:
+        out["resumed_events"] = box["resumed"]
+    if hold and box["hits"]:
+        out["hold_note"] = (
+            "命中后已通过 recv('resume').wait() 挂起目标线程并抓齐快照，"
+            f"随后在单次会话结束前自动发送 resume 放行（防 ANR 超时 {int(hold_timeout_ms)}ms）；"
+            "如需跨工具调用持久暂停，请使用持久会话断点 set_breakpoint(hold=True)。"
+        )
     if box["error"]:
         out["code"] = box.get("error_code") or "VM_BREAK_FAILED"
         out["error"] = box["error"]
@@ -1075,16 +1270,20 @@ def vm_regs_snapshot(serial: str, pid: int, so_name: str,
     else:
         ctx_spec = {"kind": "reg", "reg": str(ctx_reg)}
 
+    # (8) 第八次修改（2026-11-26）：dispatch_offset 为 "" 时等价于 None 触发自动扫描，
+    #     并从全局 Session 查找已加载 SoFile 传入 find_dispatch_points 换算虚拟地址。
     disp = None
-    if dispatch_offset is not None:
-        try:
-            disp = int(dispatch_offset, 16) if isinstance(dispatch_offset, str) \
-                else int(dispatch_offset)
-        except (TypeError, ValueError):
+    if dispatch_offset is not None and str(dispatch_offset).strip() != "":
+        from server.core.addr import parse_addr
+
+        disp = parse_addr(dispatch_offset, default=None)
+        if disp is None:
             return {"ok": False, "code": "BAD_DISPATCH_OFFSET",
                     "error": f"无法解析：{dispatch_offset!r}"}
     else:
-        scan = find_dispatch_points(so_name, pattern_hex=pattern_hex, limit=1)
+        loaded_so = _lookup_loaded_so(so_name)
+        scan = find_dispatch_points(so_name, so=loaded_so,
+                                    pattern_hex=pattern_hex, limit=1)
         if not scan.get("ok") or not scan.get("points"):
             return {"ok": False, "code": "NO_DISPATCH_POINT", "scan": scan}
         disp = scan["points"][0]["offset"]
@@ -1115,7 +1314,7 @@ def vm_regs_snapshot(serial: str, pid: int, so_name: str,
         dev = frida.get_device(serial, timeout=15)
         sess = dev.attach(int(pid))
         script = sess.create_script(js)
-        box: dict = {"snap": None, "error": None}
+        box: dict = {"snap": None, "error": None, "fail_count": 0, "last_err": ""}
 
         def _on(m, d):
             p = m.get("payload")
@@ -1125,6 +1324,9 @@ def vm_regs_snapshot(serial: str, pid: int, so_name: str,
                 return
             if p.get("kind") == "snapshot":
                 box["snap"] = p
+            elif p.get("kind") == "stopped":
+                box["fail_count"] = int(p.get("fail_count") or 0)
+                box["last_err"] = str(p.get("last_err") or "")
             elif p.get("kind") == "error":
                 box["error"] = p.get("error")
 
@@ -1137,6 +1339,12 @@ def vm_regs_snapshot(serial: str, pid: int, so_name: str,
             if box["snap"] or box["error"]:
                 break
             _time.sleep(0.03)
+        if not box["snap"] and not box["error"]:
+            try:
+                script.post({"type": "stop"})
+                _time.sleep(0.1)
+            except Exception:                             # noqa: BLE001
+                pass
     except Exception as exc:                              # noqa: BLE001
         return {"ok": False, "code": "SNAPSHOT_FAILED",
                 "error": f"{type(exc).__name__}: {exc}"}
@@ -1146,9 +1354,20 @@ def vm_regs_snapshot(serial: str, pid: int, so_name: str,
     if box["error"]:
         return {"ok": False, "code": "SNAPSHOT_FAILED", "error": box["error"]}
     if not box["snap"]:
-        return {"ok": False, "code": "NO_SAMPLE",
-                "error": "窗口内没有走到派发点（可能 VM 当前没在跑）",
-                "hint": "先触发目标功能，再调用本工具"}
+        out_no: dict = {
+            "ok": False, "code": "NO_SAMPLE",
+            "error": "窗口内没有走到派发点（可能 VM 当前没在跑）",
+            "hint": "先触发目标功能，再调用本工具",
+        }
+        if box.get("fail_count"):
+            out_no["fail_count"] = box["fail_count"]
+            out_no["last_err"] = box["last_err"]
+            out_no["error"] = (
+                f"派发点命中 {box['fail_count']} 次但均因 ctx 取值失败跳过"
+                f"（{box['last_err']}）"
+            )
+            out_no["hint"] = "检查 ctx_reg / ctx_expr 配置是否与当前 VM 一致"
+        return out_no
     snap = box["snap"]
     snap["ok"] = True
     snap["note"] = ("vm_pc 是「下一条要执行的 VM 指令」的 pc；"
@@ -1196,6 +1415,19 @@ __SPEC_HELPERS__
 
             var ctxRes = resolveValue(c, CTX_SPEC, null);
             var ctxp = ctxRes.ptr;
+            // (8) 第八次修改（2026-11-26）
+            // bug 原因：_JS_VM_SNAPSHOT 声明了 failCount/lastErr 却从未使用，
+            //           ctxp === null 时仍然落空读完并置 done=true 结束采样。
+            // 解决方案：当 ctx 必需且 ctxp === null 时累计 failCount/lastErr 并跳过，
+            //           继续等待后续命中；opcode_expr 为寄存器时用 scalarFromReg 不解引用内存。
+            var ctxRequired = (CTX_SPEC.kind !== 'none') || (IP_MODE === 'ctx')
+                              || (REG_BASE_OFFSET > 0)
+                              || (OPCODE_SPEC.kind === 'ctx');
+            if (ctxp === null && ctxRequired) {
+                failCount++;
+                lastErr = ctxRes.err || 'ctx-missing';
+                return;
+            }
             rec.ctx = hexOf(ctxp);
             rec.ctx_source = ctxRes.src;
 
@@ -1245,14 +1477,15 @@ __SPEC_HELPERS__
                 } catch (e) { rec.err_regs = String(e); }
             }
 
-            // opcode：按 spec 取（"sp+8" / "x8" / "ctx+0x100"）
+            // opcode：按 spec 取（"sp+8" / "x8" / "ctx+0x100"）；kind==='reg' 绝不解引用
             rec.opcode = null;
             rec.opcode_source = 'none';
             if (OPCODE_SPEC.kind !== 'none') {
                 var opRes = resolveValue(c, OPCODE_SPEC, ctxp);
                 rec.opcode_source = opRes.src;
                 if (opRes.ptr !== null) {
-                    var sv = readScalar(opRes.ptr);
+                    var sv = (OPCODE_SPEC.kind === 'reg')
+                        ? scalarFromReg(opRes.ptr) : readScalar(opRes.ptr);
                     rec.opcode = (sv.n !== null) ? sv.n : sv.s;
                     if (sv.err) { rec.err_opcode = sv.err; }
                 }
@@ -1263,10 +1496,20 @@ __SPEC_HELPERS__
                     .map(function (b) { return ('0' + b.toString(16)).slice(-2); })
                     .join('');
             } catch (e) {}
+            if (failCount > 0) {
+                rec.fail_count = failCount;
+                rec.last_err = lastErr;
+            }
             send(rec);
             done = true;
             try { listener.detach(); } catch (e) {}
         }
+    });
+
+    recv('stop', function () {
+        done = true;
+        try { listener.detach(); } catch (e) {}
+        send({kind: 'stopped', fail_count: failCount, last_err: lastErr});
     });
 })();
 """

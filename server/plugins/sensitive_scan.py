@@ -41,9 +41,12 @@ class Plugin(PluginBase):
     usage = ('{"so": "liblog.so", "kind": "url|ip|path|key|all", '
              '"min_len": 4, "dedupe": true}  // so 也接受 so_name')
 
-    # 特征前缀，按需扩充
+    # (4) 第四次修改（2026-11-26）
+    # bug 原因：1) _KEY 中的 "AKIA" 为大写，但匹配逻辑对目标串做了 v.lower()，导致永远无法命中 AWS Key；
+    #           2) 未捕获 session.strings(so_name) 在 so 未加载时抛出的 KeyError。
+    # 解决方案：将 "AKIA" 改为小写 "akia"；捕获 KeyError 并返回 SO_NOT_LOADED 错误。
     _URL = ("http://", "https://", "ws://", "wss://")
-    _KEY = ("api_key", "apikey", "secret", "token", "passwd", "password", "AKIA")
+    _KEY = ("api_key", "apikey", "secret", "token", "passwd", "password", "akia")
 
     # (2) 路径判据：先粗筛，再用 _is_real_path 精确判定
     _PATH_RE = re.compile(r"^/[\w./+-]*$")
@@ -71,7 +74,12 @@ class Plugin(PluginBase):
                     "ip_format_string": 0}
 
         seen: dict[str, set] = {k: set() for k in hits}
-        for st in session.strings(so_name).all_strings():
+        try:
+            str_analyzer = session.strings(so_name)
+        except KeyError as exc:
+            return {"ok": False, "error": str(exc),
+                    "code": getattr(exc, "mda_code", "SO_NOT_LOADED")}
+        for st in str_analyzer.all_strings():
             v = st.value
             if not v:
                 continue
