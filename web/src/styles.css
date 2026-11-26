@@ -1200,3 +1200,98 @@ button.mini-btn:disabled{opacity:.4;cursor:not-allowed}
 .dyn-cell i{font-style:normal;color:var(--fg3);font-size:10.5px}
 .dyn-cell b{font-weight:500;color:var(--fg);overflow:hidden;
   text-overflow:ellipsis;white-space:nowrap;max-width:260px}
+
+/* ---------------- 控制台视图（2026-11-19 新增） ----------------
+   MCP 调用控制台：AI 每次调工具的完整输入/输出 + 手动 frida 脚本执行。
+
+   (1) 第一次修改（2026-11-19）
+   bug 原因：最初做成全屏浮层（遮罩 + 居中卡片），用户反馈
+             "右边直接新建一个 tab 就行了，不用弹窗"——弹窗会挡住
+             反汇编/监控台，来回切成本高。
+   解决方案：改成与 .monitor / .ft-view 同级的视图，铺满 stage，
+            不再有遮罩与关闭按钮；显隐由 mainView 决定。
+            旧的 .console-layer 遮罩样式已随之删除，不留死代码。 */
+.console-view{flex:1;display:flex;flex-direction:column;min-height:0;
+  overflow:hidden;animation:enter .18s ease-out}
+.console-box{flex:1;display:flex;flex-direction:column;background:var(--panel);min-height:0}
+.console-head{flex:0 0 auto;display:flex;align-items:center;gap:8px;
+  padding:7px 10px;border-bottom:1px solid var(--line);background:var(--panel2)}
+.console-head .title{font-weight:700;letter-spacing:.1em;font-size:12px}
+.console-head .sub{color:var(--fg3);font-size:10.5px;letter-spacing:.05em}
+.ctab{height:20px;padding:0 8px;border:1px solid transparent;color:var(--fg3);
+  font-size:10.5px;letter-spacing:.06em;cursor:pointer;background:transparent;
+  font-family:var(--mono)}
+.ctab:hover{color:var(--fg2)}
+.ctab.on{color:var(--live);border-color:var(--live-dim);background:var(--live-soft)}
+
+.console-body{flex:1;overflow-y:auto;overflow-x:hidden;padding:8px 10px;
+  font-size:11.5px;min-height:0;background:var(--bg)}
+.con-row{margin-bottom:12px;padding-bottom:10px;border-bottom:1px dashed var(--line)}
+.con-row:last-child{border-bottom:none}
+.con-line{display:flex;align-items:center;gap:8px;margin-bottom:4px}
+.con-line .t{color:var(--fg3);font-variant-numeric:tabular-nums}
+.con-line .arrow{color:var(--live);font-weight:700}
+.con-line .tool{color:var(--fg);font-weight:600}
+.con-line .ms{color:var(--fg3);font-size:10.5px}
+.badge{font-size:9.5px;padding:1px 5px;border:1px solid var(--line);
+  color:var(--fg3);letter-spacing:.06em}
+.badge.ok{color:var(--ok);border-color:var(--ok)}
+.badge.err{color:var(--danger);border-color:var(--danger)}
+.con-label{color:var(--fg3);font-size:10px;letter-spacing:.1em;margin:6px 0 2px}
+.con-label .warn{color:var(--attention);margin-left:5px;letter-spacing:0}
+.con-label .dim{color:var(--fg3);margin-left:5px;letter-spacing:0}
+.con-block{position:relative;border-left:2px solid var(--line);
+  background:var(--panel2);padding:5px 8px}
+.con-block.in{border-left-color:var(--live-dim)}
+.con-block.out{border-left-color:var(--ok)}
+.con-block.err{border-left-color:var(--danger);background:var(--danger-soft)}
+.con-block pre{margin:0;white-space:pre-wrap;word-break:break-all;
+  line-height:1.55;color:var(--fg2);font-family:var(--mono);font-size:11px}
+.con-block.err pre{color:var(--danger)}
+.con-more{margin-top:4px;background:transparent;border:none;color:var(--live);
+  cursor:pointer;font-size:10.5px;font-family:var(--mono);padding:0}
+.con-empty{color:var(--fg3);font-size:10.5px;padding-left:4px}
+/* 常驻实时输出：唯一允许多条的区域，压缩成紧凑行，最多 10 条 */
+.con-keep{margin-top:10px;border:1px solid var(--line);background:var(--panel2)}
+.con-keep-head{display:flex;align-items:center;gap:8px;padding:4px 8px;
+  border-bottom:1px solid var(--line);color:var(--fg3);font-size:10.5px;letter-spacing:.06em}
+.con-keep-line{display:flex;gap:10px;align-items:flex-start;padding:4px 8px;
+  border-bottom:1px dashed var(--line)}
+.con-keep-line:last-child{border-bottom:none}
+.con-keep-line .t{flex:0 0 auto;color:var(--fg3);font-size:10.5px;
+  font-variant-numeric:tabular-nums;padding-top:5px}
+.con-keep-line .con-block{flex:1;min-width:0}
+
+.console-input{flex:0 0 auto;border-top:1px solid var(--line);padding:7px 10px;
+  background:var(--panel2);display:flex;flex-direction:column;gap:6px}
+.con-tools{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.con-field{height:20px;width:150px;background:var(--panel);border:1px solid var(--line);
+  color:var(--fg);font-family:var(--mono);font-size:11px;padding:0 6px;outline:none}
+.con-field.narrow{width:80px}
+.con-field:focus{border-color:var(--fg3)}
+.con-ta{width:100%;height:84px;resize:vertical;background:var(--panel);
+  border:1px solid var(--line);color:var(--fg);font-family:var(--mono);
+  font-size:11.5px;line-height:1.55;padding:6px 8px;outline:none}
+.con-ta:focus{border-color:var(--live)}
+.con-actions{display:flex;align-items:center;gap:8px}
+.con-actions .hint{color:var(--fg3);font-size:10.5px}
+.con-live{display:inline-flex;align-items:center;gap:5px;font-size:10.5px;
+  color:var(--live);border:1px solid var(--live-dim);background:var(--live-soft);
+  padding:1px 6px}
+.con-mini{background:transparent;border:none;color:var(--danger);cursor:pointer;
+  font-size:10.5px;font-family:var(--mono);padding:0 0 0 4px}
+
+/* ---------------- frida 终端（2026-11-19 最终形态） ----------------
+   脚本 console.log / send 打印什么就逐行显示什么，像 frida 命令行。
+   不是"输入/输出 JSON 查看器"——那些 con-block / con-label / con-more
+   是旧形态的遗留样式，已不再被组件引用（保留不影响，但不再使用）。 */
+.term-body{flex:1;overflow-y:auto;overflow-x:auto;padding:10px 12px;
+  background:#f7f8fa;font-family:var(--mono);min-height:0}
+html[data-theme="dark"] .term-body{background:#0d0f10}
+.term-line{display:flex;gap:6px;white-space:pre-wrap;word-break:break-all;
+  line-height:1.6;font-size:12px;color:var(--fg)}
+.term-line.out .term-text{color:var(--fg)}
+.term-line.err .term-text{color:var(--danger)}
+.term-line.sys .term-text{color:var(--fg3)}
+.term-prefix{color:var(--fg3);flex:0 0 auto;user-select:none}
+.term-hint{color:var(--fg3);font-size:11.5px;line-height:1.8;white-space:pre-wrap}

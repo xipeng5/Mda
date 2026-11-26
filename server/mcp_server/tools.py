@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections import deque
 
 from mcp.server.mcpserver import MCPServer
 
@@ -55,9 +56,59 @@ def _notify_ui(event: dict) -> None:
         except Exception:
             pass
 
-# AI 活动日志：GUI 订阅显示。结构 {ts, tool, args, summary, ms}
-_activity_log: list[dict] = []
+# AI 活动日志：GUI 订阅显示。
+# 结构 {ts, tool, args, summary, ms, result, result_ms, ok}
+#
+# (1) 第一次修改（2026-11-19）
+# bug 原因：原 `_activity_log` 是**无界 list**，而当时每条只存几字节 summary，
+#          所以无界也没出事。加了 result（工具真实返回值）之后，单条可能几十 KB
+#          （hits 一次 12KB/条、disassemble 可达上万行），几百条就把内存吃爆，
+#          且 get_activity_log 每次都要 list() 全量复制。
+# 解决方案：改用 deque(maxlen=300)，与前端控制台保留条数一致；超限丢最旧。
+_activity_log: deque[dict] = deque(maxlen=300)
 _log_listeners: list = []  # 回调列表，GUI 注册
+
+# 单条 result 的字符上限。
+# 为什么需要：控制台要"像终端一样完整打印"，但把 hits 的全量返回（数百条 × 12KB）
+# 直接推给浏览器会把页面卡死。32KB 足够覆盖绝大多数工具的真实返回，
+# 超出的截断并在界面上**明确标注原长**（绝不静默丢弃）。
+_RESULT_MAX_CHARS = 32 * 1024
+
+
+def _result_brief(result) -> dict:
+    """把工具返回值整理成可上流的 {text, truncated, bytes}。
+
+    (1) 第一次修改（2026-11-19）：新增。此前工具返回值**从未上流到界面**——
+        logged 只广播 args/summary，用户在「实时」页看不到任何输出，
+        而本次需求正是"要像终端一样看到输入和输出"。这里补上输出这一侧。
+
+    返回值形态可能是 str / dict / CallToolResult / dataclass / None，
+    统一序列化成文本给前端渲染，不假设某一种类型。
+    """
+    if result is None:
+        return {"text": "", "truncated": False, "bytes": 0}
+    # CallToolResult（失败路径）：把里面的 TextContent 取出来
+    content = getattr(result, "content", None)
+    if content and isinstance(content, (list, tuple)):
+        parts = []
+        for c in content:
+            t = getattr(c, "text", None)
+            if isinstance(t, str):
+                parts.append(t)
+        if parts:
+            result = "\n".join(parts)
+    if isinstance(result, str):
+        text = result
+    else:
+        try:
+            text = json.dumps(result, ensure_ascii=False, indent=2, default=str)
+        except Exception:                                  # noqa: BLE001
+            text = str(result)
+    total = len(text)
+    if total > _RESULT_MAX_CHARS:
+        text = text[:_RESULT_MAX_CHARS]
+        return {"text": text, "truncated": True, "bytes": total}
+    return {"text": text, "truncated": False, "bytes": total}
 
 
 def on_activity(cb) -> None:
@@ -65,14 +116,33 @@ def on_activity(cb) -> None:
     _log_listeners.append(cb)
 
 
-def _activity(tool: str, args: dict, summary: str, ms: float) -> None:
-    """记录一条 AI 活动并广播（日志行 + UI 回放事件）。"""
+def _activity(tool: str, args: dict, summary: str, ms: float,
+              result=None, ok: bool = True) -> None:
+    """记录一条 AI 活动并广播（日志行 + 控制台输入输出 + UI 回放事件）。
+
+    (1) 第一次修改（2026-11-19）：新增 result / ok 参数。
+        bug 原因：原签名只有 (tool, args, summary, ms)，工具的真实返回值
+                  **无法到达界面**。用户要求"看得到输入和输出"，而输出这侧
+                  完全缺失；args 也只以 summary 形式被截到 60 字符。
+        解决方案：把 result 整理后随 entry 一起广播（args 保持完整 dict 不动），
+                  前端控制台据此渲染"→ 输入 / ← 输出"两段。
+    """
+    brief = _result_brief(result)
     entry = {
         "ts": time.strftime("%H:%M:%S"),
+        # (1) 修订：补一个**真实**的 epoch 时间戳。
+        # 为什么不能只留 HH:MM:SS：控制台要把"AI 调用"和"手动 frida 脚本 send"
+        # 两路记录混成一条按时间排列的流，而 HH:MM:SS 分辨率只有秒且无法跨源比较。
+        # 前端若用 Date.now() 去猜排序键，那就是伪造数据——排序结果会骗人。
+        "t": time.time(),
         "tool": tool,
         "args": args,
         "summary": summary,
         "ms": round(ms, 1),
+        "ok": ok,
+        "result": brief["text"],
+        "result_truncated": brief["truncated"],
+        "result_bytes": brief["bytes"],
     }
     _activity_log.append(entry)
     for cb in _log_listeners:
@@ -141,8 +211,20 @@ def _emit_ui_replay_inner(tool: str, args: dict) -> None:
 
 
 def get_activity_log(limit: int = 200) -> list[dict]:
-    """取最近活动（GUI 启动晚于 AI 操作时补看）。"""
-    return _activity_log[-limit:]
+    """取最近活动（GUI 启动晚于 AI 操作时补看）。
+
+    (1) 第一次修改（2026-11-19）
+    bug 原因：`_activity_log` 从 list 改成 deque(maxlen=300) 之后，
+              原来的 `_activity_log[-limit:]` 直接抛
+              TypeError: sequence index must be integer, not 'slice'。
+              这是换容器类型的连带回归——deque 不支持切片。
+    解决方案：用 itertools.islice 的等价写法。limit<=0 视为不限（返回全部），
+              与调用方语义保持一致；转成 list 返回，调用方仍按列表使用。
+    """
+    items = list(_activity_log)
+    if limit and limit > 0:
+        return items[-limit:]
+    return items
 
 
 def get_session() -> Session:
@@ -221,6 +303,9 @@ def logged(tool_name: str | None = None):
 
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
+            # (2) 第二次修改（2026-11-20）：移除了 set_tool(name) ——
+            #     它只服务于已删除的全局输出旁路 hook。工具输出不该进
+            #     frida 终端（那是用户手敲脚本的地方），故一并删掉。
             # 用单调时钟：墙钟会被 NTP/手动校时改变，差值会出负数
             t0 = time.monotonic()
             # bug 原因：MCP 框架以**关键字**方式调用工具函数，位置参数元组
@@ -253,7 +338,9 @@ def logged(tool_name: str | None = None):
                         for k, v in call_args.items()
                         if v not in (None, "")
                     ]
-                    _activity(name, call_args, ", ".join(parts) or "", ms)
+                    # 转发路径同样要把结果上流：GUI 侧执行完的真实返回在 fw 里，
+                    # 控制台必须看到它，否则"转发的调用"在控制台是空白输出。
+                    _activity(name, call_args, ", ".join(parts) or "", ms, result=fw)
                     return fw
 
             try:
@@ -264,7 +351,10 @@ def logged(tool_name: str | None = None):
                     for k, v in call_args.items()
                     if v not in (None, "")
                 ]
-                _activity(name, call_args, ", ".join(parts) or "", ms)
+                # (1) 修订：把真实返回值一并上流，控制台据此渲染"输出"。
+                # 必须在 _inject_env 之前取，避免 env 注入把工具的原始输出混进
+                # 环境信息里（控制台要看到的是工具自己产出的东西）。
+                _activity(name, call_args, ", ".join(parts) or "", ms, result=result)
                 # 动态调用统一附上运行环境（前台是谁 / 目标是否在前台）
                 return _inject_env(result, call_args, tool_name=name)
             except Exception as e:
@@ -272,7 +362,8 @@ def logged(tool_name: str | None = None):
                 import traceback
 
                 tb = traceback.format_exc()
-                _activity(name, call_args, f"✗ {type(e).__name__}: {str(e)[:80]}", ms)
+                _activity(name, call_args, f"✗ {type(e).__name__}: {str(e)[:80]}", ms,
+                          result={"error": f"{type(e).__name__}: {e}"}, ok=False)
                 # 透传真实异常给 AI（isError 标记 + 类型/消息/堆栈尾行）
                 from mcp.types import CallToolResult, TextContent
 

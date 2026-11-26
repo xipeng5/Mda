@@ -1112,6 +1112,114 @@ async def mcp_config(request):
     })
 
 
+# ---------------------------------------------------------------- 控制台
+# (1) 第一次修改（2026-11-19）：新增三个端点，支撑「MCP 调用控制台」。
+#     需求来源：用户要求"顶部建一个界面，hook 时能看到输入和输出，
+#              像在终端手动输入看结果一样"，并明确"入参 = AI 写给工具的参数，
+#              结果 = 工具的返回"，同时"支持用户手动写 frida 命令"。
+#     为什么后端要动：工具返回值此前**从未上流**（见 tools._activity 的注释），
+#              所以"输出"这一侧是空的；手动执行 frida 则完全没有入口。
+
+
+async def console_history(request):
+    """控制台历史：AI 调用记录（含输入参数与输出结果）。
+
+    为什么单独一个端点而不是只靠 WS：
+      WS 断了重连时前端会丢中间那段，而控制台是"事后要翻"的东西，
+      必须有可回溯的来源。返回的是 _activity_log 的快照（有界 300 条）。
+    """
+    try:
+        from server.mcp_server.tools import get_activity_log
+
+        items = get_activity_log(300)
+    except Exception as exc:                              # noqa: BLE001
+        return JSONResponse({"ok": False, "error": f"{type(exc).__name__}: {exc}",
+                             "items": []}, status_code=500)
+    return JSONResponse({"ok": True, "count": len(items), "items": items})
+
+
+async def console_events(request):
+    """手动 frida 脚本产生的事件（send / error / start / stop）。
+
+    after 为时间戳游标：只返回 t > after 的事件，前端增量拉取不会重复渲染。
+    """
+    try:
+        from server.dyn.console import recent_events
+
+        # (1) 修订：用 query_params 而不是 request.query。
+        # bug 原因：这个项目基于 Starlette，Request 没有 `.query` 属性
+        #          （那是 Flask 的写法），实测直接 500。全项目其它端点
+        #          都用 request.query_params，这里必须一致。
+        after = float(request.query_params.get("after") or 0)
+        items = recent_events(after)
+    except Exception as exc:                              # noqa: BLE001
+        return JSONResponse({"ok": False, "error": f"{type(exc).__name__}: {exc}",
+                             "items": []}, status_code=500)
+    return JSONResponse({"ok": True, "count": len(items), "items": items,
+                         "now": time.time()})
+
+
+async def frida_js(request):
+    """在目标进程里执行一段手动 frida 脚本。
+
+    body: {serial, pid, js, mode: "once"|"keep", timeout?}
+    """
+    try:
+        body = await request.json()
+    except Exception:                                     # noqa: BLE001
+        return _err("body 必须是 JSON")
+    serial = str(body.get("serial") or "").strip()
+    pid = body.get("pid")
+    js = str(body.get("js") or "")
+    mode = str(body.get("mode") or "once")
+    try:
+        timeout = float(body.get("timeout") or 5.0)
+    except (TypeError, ValueError):
+        timeout = 5.0
+
+    def work():
+        from server.dyn.console import run_js
+
+        return run_js(serial, int(pid or 0), js, mode=mode, timeout=timeout)
+
+    # 脚本可能卡住（死循环 / 等设备响应），放到线程池里跑，别堵住事件循环
+    out = await run_in_threadpool(work)
+    # (1) 第一次修改（2026-11-19）
+    # bug 原因：原先这里调 tools._activity() 把手动执行也记成一条"AI 调用"，
+    #          结果控制台里同一次执行显示两遍——上面一条 frida_js(手动) 的
+    #          AI 记录（含 args/result），下面一条 frida 实际输出，内容重复。
+    #          而且手动执行根本不是 AI 调用，混进"AI 调用"筛选里语义也错。
+    # 解决方案：不再写 _activity。手动执行的输出统一由 dyn/console.py 的
+    #          _emit 事件流承载，前端 ConsoleOverlay 只从那条流取，
+    #          与 AI 调用彻底分开——两路数据各走各的通道，不会互相污染。
+    return JSONResponse(out)
+
+
+async def frida_js_stop(request):
+    """停止常驻脚本。body: {script_id?} 或 {serial, pid}；都不给则全停。"""
+    try:
+        body = await request.json()
+    except Exception:                                     # noqa: BLE001
+        body = {}
+    def work():
+        from server.dyn.console import stop_js
+
+        sid = body.get("script_id")
+        return stop_js(int(sid) if sid else None,
+                       str(body.get("serial") or ""),
+                       int(body.get("pid") or 0))
+
+    return JSONResponse(await run_in_threadpool(work))
+
+
+async def frida_js_list(request):
+    """当前存活的常驻脚本（界面顶部显示"正在观测什么"）。"""
+    from server.dyn.console import list_scripts
+
+    items = list_scripts()
+    return JSONResponse({"ok": True, "count": len(items), "items": items})
+
+
 def _snapshot_payload() -> str:
     """当前模块 + 每个模块的函数表，序列化成 WS 消息。
 
@@ -1266,6 +1374,17 @@ async def lifespan(_app):
     #     时机：必须在 mcp.start_http() 之前设置，避免启动瞬间就被转发命中。
     os.environ["MDA_IS_GUI"] = "1"
 
+    # (2) 第二次修改（2026-11-20）：**移除**全局 frida 输出旁路 hook。
+    #     bug 原因：上一版包装了 frida.core.Session.create_script，把**所有**
+    #               工具脚本的 send 都旁路进 frida 终端。但工具的 send 是
+    #               **内部数据传输**（set_breakpoint 一次就 send 整个模块列表、
+    #               java_hook 一次 send 全部命中），不是脚本输出。结果用户
+    #               手敲一句 console.log("hello")，终端里跟着吐出一大坨
+    #               几百个模块的 JSON —— 用户明确指出"这他妈的是什么"。
+    #     解决方案：整套旁路删除。终端**只显示用户在这个输入框里执行的
+    #               脚本**产生的输出，不掺任何工具的内部数据。
+    #               工具的输出该由 AI 通过 MCP 结果读，不属于这个终端。
+
     # AI 每调用一次工具 → 推给前端：日志、观察列表、球体脉冲
     def _on_ai(entry: dict) -> None:
         # 先维护待命表：装上/撤掉都要让界面知道，否则「AI 在盯着什么」会失真
@@ -1289,7 +1408,19 @@ async def lifespan(_app):
             "summary": entry.get("summary", ""),
             "args": entry.get("args", {}),
             "ts": entry.get("ts", ""),
+            # 真实 epoch 时间戳：控制台要把 AI 调用与手动脚本事件混排，
+            # 只有 HH:MM:SS 无法跨源比较（前端拿 Date.now() 猜排序就是伪造数据）
+            "t": entry.get("t", 0),
             "ms": entry.get("ms", 0),
+            # (1) 第一次修改（2026-11-19）：把工具真实返回值一并推给前端。
+            #    bug 原因：此前只推 args/summary，控制台"输出"侧永远是空的，
+            #              用户看不到任何工具跑出来的东西。
+            #    解决方案：透传 tools._activity 已整理好的 result 三件套
+            #              （text / truncated / bytes），前端据此渲染并可标注截断。
+            "ok": entry.get("ok", True),
+            "result": entry.get("result", ""),
+            "result_truncated": bool(entry.get("result_truncated")),
+            "result_bytes": int(entry.get("result_bytes") or 0),
         })
 
     # AI 的工具调用翻译成的"等价界面操作"（goto / filter_funcs / show_xrefs …）
@@ -1339,6 +1470,12 @@ routes = [
     Route("/api/xrefs", xrefs),
     Route("/api/strings", strings),
     Route("/api/xrefs/build", build_xrefs, methods=["POST"]),
+    # 控制台（2026-11-19 新增）：AI 调用的输入/输出历史 + 手动 frida 执行
+    Route("/api/console/history", console_history),
+    Route("/api/console/events", console_events),
+    Route("/api/frida_js", frida_js, methods=["POST"]),
+    Route("/api/frida_js/stop", frida_js_stop, methods=["POST"]),
+    Route("/api/frida_js/list", frida_js_list),
     WebSocketRoute("/api/events", events),
 ]
 

@@ -56,6 +56,48 @@ export type ApiNavStats = {
   hooks?: ApiHooks;
 };
 export type ApiArmed = { key: string; tool: string; label: string; target: string; ts: string };
+
+/** 控制台记录（AI 调用的完整输入/输出）。
+ *  (1) 第一次修改（2026-11-19）：新增。此前前端只能拿到被截断到 60 字符的
+ *  summary，看不到工具真实返回；控制台的"输出"一栏因此必须是新字段。 */
+export type ApiConsoleItem = {
+  ts?: string;
+  /** 真实 epoch 秒。控制台要把 AI 调用与手动脚本事件混排，只有 HH:MM:SS
+   *  无法跨源比较；前端若用 Date.now() 猜排序键就是伪造数据。 */
+  t?: number;
+  tool: string;
+  args?: Record<string, unknown>;
+  summary?: string;
+  ms?: number;
+  ok?: boolean;
+  /** 工具返回值的文本形态（后端已序列化） */
+  result?: string;
+  /** 结果是否因超长被截断（界面上必须如实标注，不能静默丢） */
+  result_truncated?: boolean;
+  /** 截断前的原始长度（字符数） */
+  result_bytes?: number;
+};
+
+/** frida 脚本输出终端的一行。
+ *  (1) 修订（2026-11-19）：kind 增加 "line"，代表脚本 console.log/send 打印的
+ *      一行**纯文本**。终端里打印什么就显示什么，不再用 payload 做 JSON 区块。 */
+export type ApiConsoleEvent = {
+  kind: "line" | "send" | "error" | "start" | "stop";
+  ts: string;
+  t: number;
+  script_id?: number;
+  serial?: string;
+  pid?: number;
+  /** kind=line 时是脚本打印的原始文本行 */
+  text?: string;
+  /** 有值表示这条是 AI 调工具时内部脚本的旁路输出，标注来源工具名 */
+  source?: string;
+  payload?: unknown;
+  error?: string;
+  stack?: string;
+  mode?: string;
+  reason?: string;
+};
 export type ApiXrefItem = { addr: string; name: string; is_export: boolean; size: number };
 /** 函数检视器：一个函数的全部已知事实（右侧面板） */
 
@@ -292,4 +334,40 @@ export const api = {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ so }),
     }),
+
+  // ---------------------------------------------------------------- 控制台
+  // (1) 第一次修改（2026-11-19）：控制台需要两路数据——
+  //     ① AI 调用的输入/输出历史（可回溯，WS 断了重连也能补回来）
+  //     ② 手动 frida 脚本产生的事件（增量拉取，带游标）
+  consoleHistory: () =>
+    j<{ ok: boolean; count: number; items: ApiConsoleItem[] }>(
+      `${API_BASE}/api/console/history`
+    ),
+  consoleEvents: (after: number) =>
+    j<{ ok: boolean; count: number; items: ApiConsoleEvent[]; now: number }>(
+      `${API_BASE}/api/console/events?after=${after}`
+    ),
+  /** 执行一段 frida JS，返回脚本 console.log/send 打印的纯文本行。 */
+  runFridaJs: (opts: { serial: string; pid: number; js: string; mode?: "once" | "keep"; timeout?: number }) =>
+    j<{ ok: boolean; code?: string; error?: string; lines?: string[]; script_id?: number; ms?: number; hint?: string }>(
+      `${API_BASE}/api/frida_js`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(opts),
+      }
+    ),
+  stopFridaJs: (opts: { script_id?: number; serial?: string; pid?: number }) =>
+    j<{ ok: boolean; stopped?: number[]; count?: number; error?: string }>(
+      `${API_BASE}/api/frida_js/stop`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(opts),
+      }
+    ),
+  fridaJsList: () =>
+    j<{ ok: boolean; count: number; items: { script_id: number; serial: string; pid: number; mode: string; age_s: number }[] }>(
+      `${API_BASE}/api/frida_js/list`
+    ),
 };

@@ -23,6 +23,18 @@ export type AiEvent = {
   summary?: string;
   ms?: number;
   ts?: string;
+  // (1) 第一次修改（2026-11-19）：控制台需要 AI 调用的完整输入/输出。
+  //    bug 原因：原类型只有 tool/args/summary/ms/ts，summary 里的参数被后端
+  //              截到 60 字符，且**工具的返回值从未上流**——用户在界面上
+  //              根本看不到"输出"，而本次需求正是要像终端一样看输入和输出。
+  //    解决方案：补 t（真实 epoch，用于两路混排）、ok、result 三件套。
+  //              监控台本身不消费这些字段，但控制台与它共用同一条 aiEvents 流，
+  //              所以类型必须在这里一并声明，避免两处各写一份而漂移。
+  t?: number;
+  ok?: boolean;
+  result?: string;
+  result_truncated?: boolean;
+  result_bytes?: number;
 };
 
 type Props = {

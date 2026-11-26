@@ -12,6 +12,7 @@ import { DynStateView } from "./components/DynStateView";
 import type { DynKind } from "./components/DynStateView";
 import { NeedSoView } from "./components/DynStateView";
 import { RealtimeMonitor, type AiEvent } from "./components/RealtimeMonitor";
+import { ConsoleOverlay } from "./components/ConsoleOverlay";
 import { ToolsView } from "./components/ToolsView";
 import { ProcessesView } from "./components/ProcessesView";
 import { XrefView } from "./components/XrefView";
@@ -576,7 +577,17 @@ export default function App() {
     sock.onerror = () => { setWsAlive(false); };
 
     sock.onmessage = (ev) => {
-      let msg: { type?: string; tool?: string; args?: Record<string, unknown>; summary?: string; ms?: number; ts?: string; event?: Record<string, unknown> };
+      // (1) 第一次修改（2026-11-19）：补 t / ok / result 三件套。
+      //    bug 原因：这条 WS 消息类型里没有工具返回值字段，而服务端
+      //              api.py 的 _on_ai 已经会推 result/result_truncated/result_bytes。
+      //              不补类型就只能 as any 绕过，那等于放弃编译期检查。
+      //    解决方案：把控制台需要的字段显式声明在这里，与 server/api.py 的
+      //              _broadcast_sync 载荷一一对应。
+      let msg: { type?: string; tool?: string; args?: Record<string, unknown>;
+                 summary?: string; ms?: number; ts?: string; t?: number;
+                 ok?: boolean; result?: string; result_truncated?: boolean;
+                 result_bytes?: number;
+                 event?: Record<string, unknown> };
       try { msg = JSON.parse(ev.data); } catch { return; }
       // hello：刚连上时服务端把已有模块报一次，必须对齐（之前完全没处理）
       if (msg.type === "hello") {
@@ -679,7 +690,15 @@ export default function App() {
           if (aiPausedRef.current) return prev;
           const next = [
             { tool: msg.tool ?? "", args: msg.args as Record<string, unknown> | undefined,
-              summary: msg.summary, ms: msg.ms, ts: msg.ts },
+              summary: msg.summary, ms: msg.ms, ts: msg.ts,
+              // (1) 第一次修改（2026-11-19）：透传后端给的输入/输出完整信息，
+              // 控制台据此渲染两段。缺这些字段时控制台只能看到参数摘要，
+              // 输出侧永远空白——那正是改之前的状态。
+              t: typeof msg.t === "number" ? msg.t : undefined,
+              ok: msg.ok !== false,
+              result: typeof msg.result === "string" ? msg.result : "",
+              result_truncated: !!msg.result_truncated,
+              result_bytes: typeof msg.result_bytes === "number" ? msg.result_bytes : 0 },
             ...prev,
           ];
           return next.slice(0, 500);   // 上限，避免长时间运行吃内存
@@ -1006,6 +1025,17 @@ export default function App() {
             >
               工具{toolN != null ? ` ${toolN}` : ""}
             </button>
+            {/* (1) 第一次修改（2026-11-19）：控制台作为「工具」右侧的新 tab。
+                用户明确要求"右边直接新建一个 tab 就行了，不用弹窗"——
+                做成视图而非浮层，可以和反汇编/监控台并排切着用。
+                显示真实事件条数（与本视图里能翻到的记录同源）。 */}
+            <button
+              className={"vtab" + (mainView === "console" ? " on" : "")}
+              onClick={() => setMainView("console")}
+              title="控制台：看 AI 每次调用的完整输入/输出，也可以手动执行 frida 脚本"
+            >
+              控制台{aiEvents.length ? ` ${aiEvents.length}` : ""}
+            </button>
             <span className="grow" />
             <ArmedBar />
           </div>
@@ -1075,6 +1105,12 @@ export default function App() {
           {mainView === "tools" && (
             <ToolsView counts={toolCounts} />
           )}
+
+          {/* (1) 第一次修改（2026-11-19）：控制台视图（与工具同级，不是弹窗）。
+              为什么无条件渲染而不加 empty 判断：控制台看的是 AI 调了哪些工具、
+              手动跑 frida 的结果，这些都与是否加载了 so 无关——
+              加上 empty 守卫会退化成"没 so 就白屏"（R83 那种坑）。 */}
+          <ConsoleOverlay open={mainView === "console"} />
 
           {mainView === "processes" && (
             <ProcessesView />
