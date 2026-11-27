@@ -1059,21 +1059,52 @@ async def disasm(request):
     def work():
         x = _session.xref(name)
         x.ensure_function(addr)
+        fn = so.function_at(addr)
+        fn_start = fn.addr if fn else addr
+        fn_end = fn_start + max(fn.size, 4) if fn else addr + 4
         insns = x.disasm.disasm_function(addr)
-        return {
-            "addr": addr,
-            "items": [
-                {
-                    "addr": ins.addr,
-                    "bytes": bytes(ins.bytes).hex(),
-                    "text": (ins.mnemonic + (" " + ins.op_str if ins.op_str else "")).strip(),
-                    "is_call": bool(ins.is_call),
-                    "is_ret": bool(ins.is_ret),
-                    "call_target": ins.call_target,
-                }
-                for ins in insns
-            ],
-        }
+        st = None
+        try:
+            st = _session.strings(name)
+        except Exception:                                 # noqa: BLE001
+            st = None
+        loaded_sos = set(_session.modules.keys())
+        items = []
+        for ins in insns:
+            row = {
+                "addr": ins.addr,
+                "bytes": bytes(ins.bytes).hex(),
+                "text": (ins.mnemonic + (" " + ins.op_str if ins.op_str else "")).strip(),
+                "is_call": bool(ins.is_call),
+                "is_ret": bool(ins.is_ret),
+                "call_target": ins.call_target,
+            }
+            # 补充跳转目标、跨 SO 符号名与行内字符串引用（向后兼容增量字段）
+            if ins.call_target is not None:
+                if fn_start <= ins.call_target < fn_end:
+                    row["jump_so"] = name
+                    row["jump_addr"] = ins.call_target
+                else:
+                    lk = _session.resolve_call(name, ins.call_target)
+                    if lk and lk.callee_so in loaded_sos and lk.callee_addr:
+                        row["jump_so"] = lk.callee_so
+                        row["jump_addr"] = lk.callee_addr
+                        row["sym_ref"] = f"{lk.callee_so}!{lk.callee}" if lk.callee_so != name else lk.callee
+                    elif lk and lk.callee:
+                        row["sym_ref"] = f"{lk.callee}@plt" if lk.via_plt else lk.callee
+                    else:
+                        tfn = so.function_at(ins.call_target)
+                        if tfn:
+                            row["jump_so"] = name
+                            row["jump_addr"] = ins.call_target
+                            if tfn.addr != fn_start:
+                                row["sym_ref"] = tfn.name or f"sub_{tfn.addr:x}"
+            if st is not None and ins.ref_addr is not None:
+                sref = st.string_at(ins.ref_addr)
+                if sref and sref.value:
+                    row["str_ref"] = sref.value[:120]
+            items.append(row)
+        return {"addr": addr, "items": items}
 
     return JSONResponse(await run_in_threadpool(work))
 
@@ -1182,16 +1213,59 @@ async def fn_detail(request):
                 item["site"] = hex(site)
             return item
 
-        # 调用者 / 被调用：调用点归一到调用者函数入口并按入口去重
-        callers = [named(entry, site) for entry, site in _normalize_callers(so, x.callers_of_fn(base))]
+        # 调用者 / 被调用：调用点归一到调用者函数入口并按入口去重（含已建图跨 SO 边）
+        loaded_sos = set(_session.modules.keys())
+        callers = [
+            {**named(entry, site), "so": name}
+            for entry, site in _normalize_callers(so, x.callers_of_fn(base))
+        ]
+        seen_callers = {(name, c["addr"]) for c in callers}
+        if fn is not None and fn.is_export and fn.name:
+            for other_name, other_so in _session.modules.items():
+                if other_name == name:
+                    continue
+                ox = _session.xref(other_name)
+                if not getattr(ox, "_built", False):
+                    continue
+                for plt_addr, sym in (getattr(other_so, "plt_map", None) or {}).items():
+                    if sym != fn.name:
+                        continue
+                    for c_entry, c_site in _normalize_callers(other_so, ox.callers_of_fn(plt_addr)):
+                        key_pair = (other_name, hex(c_entry))
+                        if key_pair in seen_callers:
+                            continue
+                        seen_callers.add(key_pair)
+                        cf = other_so.function_at(c_entry)
+                        callers.append({
+                            "so": other_name,
+                            "addr": hex(c_entry),
+                            "site": hex(c_site),
+                            "name": (cf.name or f"sub_{c_entry:x}") if cf else f"sub_{c_entry:x}",
+                            "is_export": bool(cf.is_export) if cf else False,
+                        })
+
         callees: list[dict] = []
         # 绝不访问 @property plt_calls（会触发 20-30s 全量 build），只读内部 _plt_calls
         plt_addrs = set(getattr(x, "_plt_calls", None) or {})
         for a in (x.callees_of_fn(base) or []):
-            item = named(a)
-            # 落在 PLT 的是外部导入（calloc / __errno 这类），标出来
-            item["plt"] = a in plt_addrs
-            callees.append(item)
+            lk = _session.resolve_call(name, a)
+            if lk and lk.callee_so in loaded_sos and lk.callee_addr:
+                tso = _session.modules[lk.callee_so]
+                tfn = tso.function_at(lk.callee_addr)
+                t_entry = tfn.addr if tfn else lk.callee_addr
+                callees.append({
+                    "so": lk.callee_so,
+                    "addr": hex(t_entry),
+                    "name": (tfn.name or lk.callee or f"sub_{t_entry:x}") if tfn else (lk.callee or f"sub_{t_entry:x}"),
+                    "is_export": bool(tfn.is_export) if tfn else False,
+                    "plt": bool(lk.via_plt),
+                })
+            else:
+                item = named(a)
+                item["so"] = name
+                # 落在 PLT 的是外部导入（calloc / __errno 这类），标出来
+                item["plt"] = a in plt_addrs
+                callees.append(item)
 
         # 这个函数引用了哪些字符串（xref 已有反向索引，这里取正向）
         strings: list[dict] = []
@@ -1363,10 +1437,59 @@ async def xref_tree(request):
             ]
             return node
 
+        loaded_sos = set(_session.modules.keys())
+        direct_callers = [
+            {**named(c_entry, c_site), "so": name}
+            for c_entry, c_site in _normalize_callers(so, x.callers_of_fn(base))
+        ]
+        seen_c = {(name, c["addr"]) for c in direct_callers}
+        if fn is not None and fn.is_export and fn.name:
+            for other_name, other_so in _session.modules.items():
+                if other_name == name:
+                    continue
+                ox = _session.xref(other_name)
+                if not getattr(ox, "_built", False):
+                    continue
+                for plt_addr, sym in (getattr(other_so, "plt_map", None) or {}).items():
+                    if sym != fn.name:
+                        continue
+                    for c_entry, c_site in _normalize_callers(other_so, ox.callers_of_fn(plt_addr)):
+                        kp = (other_name, hex(c_entry))
+                        if kp in seen_c:
+                            continue
+                        seen_c.add(kp)
+                        cf = other_so.function_at(c_entry)
+                        direct_callers.append({
+                            "so": other_name,
+                            "addr": hex(c_entry),
+                            "site": hex(c_site),
+                            "name": (cf.name or f"sub_{c_entry:x}") if cf else f"sub_{c_entry:x}",
+                            "is_export": bool(cf.is_export) if cf else False,
+                            "size": int(cf.size) if cf else 0,
+                        })
+
+        direct_callees = []
+        for c in (x.callees_of_fn(base) or []):
+            ca = _as_int(c)
+            lk = _session.resolve_call(name, ca)
+            if lk and lk.callee_so in loaded_sos and lk.callee_addr:
+                tso = _session.modules[lk.callee_so]
+                tfn = tso.function_at(lk.callee_addr)
+                t_entry = tfn.addr if tfn else lk.callee_addr
+                direct_callees.append({
+                    "so": lk.callee_so,
+                    "addr": hex(t_entry),
+                    "name": (tfn.name or lk.callee or f"sub_{t_entry:x}") if tfn else (lk.callee or f"sub_{t_entry:x}"),
+                    "is_export": bool(tfn.is_export) if tfn else False,
+                    "size": int(tfn.size) if tfn else 0,
+                })
+            else:
+                direct_callees.append({**named(ca), "so": name})
+
         return {
-            "root": layer(base, depth),
-            "callers": [named(c_entry, c_site) for c_entry, c_site in _normalize_callers(so, x.callers_of_fn(base))],
-            "callees": [named(_as_int(c)) for c in (x.callees_of_fn(base) or [])],
+            "root": {**layer(base, depth), "so": name},
+            "callers": direct_callers,
+            "callees": direct_callees,
         }
 
     return JSONResponse(await run_in_threadpool(work))
@@ -1379,18 +1502,251 @@ async def strings(request):
         return _err(f"未加载的 so：{name}", 404)
 
     def work():
+        so = _session.modules[name]
         st = _session.strings(name)
         kw_l = kw.lower()
         rows = []
         for s in st.all_strings():
             if kw_l and kw_l not in s.value.lower():
                 continue
-            rows.append({"addr": s.addr, "value": s.value[:200], "refs": len(s.referenced_by)})
+            ref_fn = None
+            if s.referenced_by:
+                rfn = so.function_at(s.referenced_by[0])
+                if rfn is not None:
+                    ref_fn = rfn.addr
+            rows.append({
+                "addr": s.addr,
+                "value": s.value[:200],
+                "refs": len(s.referenced_by),
+                "section": getattr(s, "section", ".rodata"),
+                "ref_fn": ref_fn,
+            })
             if len(rows) >= 500:
                 break
         return {"items": rows}
 
     return JSONResponse(await run_in_threadpool(work))
+
+
+# (60) 第六十次修改（2026-11-27）
+# bug 原因：decompile_view / cfg_view / rename_fn_api / set_comment_api / plugin_run_api
+#           直接调用挂有 @logged() 装饰器的 MCP 工具函数，导致用户在 Web UI 点击函数、
+#           切伪代码/CFG、重命名、写注释或点插件快捷分析时，会触发 _activity 广播假 AI 事件
+#           污染实时工具流，甚至触发 _emit_ui_replay 造成界面回环。
+# 解决方案：上述 5 个 Web 端只读/编辑接口全部改为直调内核层（PseudocodeGenerator、
+#           get_plugins().run、_session 与 annotations.store），并补充请求体 dict 校验，
+#           彻底隔离人工 GUI 操作与 AI MCP 调用流。
+async def decompile_view(request):
+    """返回函数的真实源地址映射伪代码（style=c 默认结构化伪 C，style=raw 原始指令对照）。"""
+    name = request.query_params.get("so", "")
+    addr_text = request.query_params.get("addr", "0")
+    style = (request.query_params.get("style") or "c").strip().lower()
+    if name not in _session.modules:
+        return _err(f"未加载的 so：{name}", 404)
+    try:
+        addr = int(addr_text, 0)
+    except ValueError:
+        return _err("addr 非法")
+
+    def _resolve_sym(so_n: str, target: int):
+        lk = _session.resolve_call(so_n, target)
+        if lk and lk.callee:
+            other_so = lk.callee_so if (lk.callee_so and lk.callee_so != so_n) else ""
+            return (other_so, lk.callee, lk.callee_addr)
+        return None
+
+    def work():
+        so = _session.get(name)
+        d = _session.xref(name).disasm
+        if style == "raw":
+            from server.core.pseudocode import PseudocodeGenerator
+
+            code = PseudocodeGenerator(so, d).generate(addr, resolve=_resolve_sym, with_addr=True)
+            return {"ok": True, "so": name, "addr": hex(addr), "style": "raw", "code": code}
+        from server.core.pseudocode_c import PseudoCGenerator
+
+        return PseudoCGenerator(so, d, resolve=_resolve_sym).generate(addr)
+
+    return JSONResponse(await run_in_threadpool(work))
+
+
+async def cfg_view(request):
+    """返回函数的真实基本块 CFG 控制流图（直接复用 disasm_func 插件，不经 @logged）。"""
+    name = request.query_params.get("so", "")
+    addr_text = request.query_params.get("addr", "0")
+    if name not in _session.modules:
+        return _err(f"未加载的 so：{name}", 404)
+    try:
+        addr = int(addr_text, 0)
+    except ValueError:
+        return _err("addr 非法")
+
+    def work():
+        from server.mcp_server.tools import get_plugins
+
+        res = get_plugins().run("disasm_func", {"so": name, "addr": hex(addr)})
+        return res if isinstance(res, dict) else {"ok": False, "error": str(res)}
+
+    try:
+        return JSONResponse(await run_in_threadpool(work))
+    except Exception as exc:                               # noqa: BLE001
+        return _err(f"CFG 构建失败：{exc}", 500)
+
+
+async def rename_fn_api(request):
+    """原地重命名函数（同步写入会话与注解持久化，供前端 N 快捷键调用）。"""
+    try:
+        body = await request.json()
+    except Exception:                                      # noqa: BLE001
+        return _err("请求体非合法 JSON")
+    if not isinstance(body, dict):
+        return _err("请求体必须是 JSON 对象")
+    name = str(body.get("so") or "")
+    new_name = str(body.get("name") or "").strip()
+    if name not in _session.modules or not new_name:
+        return _err("缺少有效的 so 或新函数名")
+    try:
+        addr = int(body.get("addr"), 0) if isinstance(body.get("addr"), str) else int(body.get("addr"))
+    except Exception:                                      # noqa: BLE001
+        return _err("addr 非法")
+
+    def work():
+        import dataclasses as _dc
+        from server.mcp_server.tools import get_plugins
+
+        so = _session.get(name)
+        canon = _session.key(name)
+        fn = so.function_at(addr)
+        if fn is None:
+            return {"error": f"{addr:#x} 不在任何函数内"}
+        old = fn.name or f"sub_{fn.addr:x}"
+        fn.name = new_name
+        try:
+            from server.core.annotations import store as _anno
+            _anno.save(so.name, fn.addr, rename=new_name)
+        except Exception:                                  # noqa: BLE001
+            pass
+        if old in so.exports:
+            renamed = so.exports.pop(old)
+            if _dc.is_dataclass(renamed):
+                renamed = _dc.replace(renamed, name=new_name)
+            elif hasattr(renamed, "name"):
+                renamed.name = new_name
+            so.exports[new_name] = renamed
+            old_entries = _session._export_index.get(old)
+            if old_entries is not None:
+                kept = [
+                    (n, a) for (n, a) in old_entries
+                    if not (n in (canon, so.name) and a == fn.addr)
+                ]
+                if kept:
+                    _session._export_index[old] = kept
+                else:
+                    _session._export_index.pop(old, None)
+            new_entries = _session._export_index.setdefault(new_name, [])
+            if (canon, fn.addr) not in new_entries:
+                new_entries.append((canon, fn.addr))
+        try:
+            get_plugins().emit("after_rename", {"so_name": so.name, "addr": fn.addr, "old": old, "new": new_name})
+        except Exception:                                  # noqa: BLE001
+            pass
+        return {"ok": True, "so": so.name, "addr": fn.addr, "old": old, "name": new_name}
+
+    res = await run_in_threadpool(work)
+    if res.get("error"):
+        return _err(str(res["error"]), 400)
+    _broadcast_sync({"type": "modules_changed", "modules": list(_session.modules.keys())})
+    return JSONResponse({"ok": True, "so": name, "addr": res["addr"], "name": new_name})
+
+
+async def comments_api(request):
+    """查询指定 so 的全部地址注释。"""
+    name = request.query_params.get("so", "")
+    if name not in _session.modules:
+        return _err(f"未加载的 so：{name}", 404)
+
+    def work():
+        key = _session.key(name)
+        items = {
+            hex(a): c
+            for (n, a), c in _session.comments.items()
+            if n == key and c
+        }
+        return {"ok": True, "so": name, "items": items}
+
+    return JSONResponse(await run_in_threadpool(work))
+
+
+async def set_comment_api(request):
+    """设置或清除指定地址注释（同步持久化，供前端 ; 快捷键调用）。"""
+    try:
+        body = await request.json()
+    except Exception:                                      # noqa: BLE001
+        return _err("请求体非合法 JSON")
+    if not isinstance(body, dict):
+        return _err("请求体必须是 JSON 对象")
+    name = str(body.get("so") or "")
+    comment = str(body.get("comment") or "").strip()
+    if name not in _session.modules:
+        return _err(f"未加载的 so：{name}", 404)
+    try:
+        addr = int(body.get("addr"), 0) if isinstance(body.get("addr"), str) else int(body.get("addr"))
+    except Exception:                                      # noqa: BLE001
+        return _err("addr 非法")
+
+    def work():
+        from server.mcp_server.tools import get_plugins
+
+        key = _session.key(name)
+        if comment:
+            _session.comments[(key, addr)] = comment
+        else:
+            _session.comments.pop((key, addr), None)
+        try:
+            from server.core.annotations import store as _anno
+            _anno.save(key, addr, comment=comment)
+        except Exception:                                  # noqa: BLE001
+            pass
+        try:
+            get_plugins().emit("after_comment", {"so_name": key, "addr": addr, "comment": comment})
+        except Exception:                                  # noqa: BLE001
+            pass
+        return {"ok": True, "so": name, "addr": hex(addr), "comment": comment}
+
+    return JSONResponse(await run_in_threadpool(work))
+
+
+_READONLY_WEB_PLUGINS = frozenset({
+    "struct_infer", "sensitive_scan", "func_profile",
+    "const_fingerprint", "detect_obfuscation",
+})
+
+
+async def plugin_run_api(request):
+    """运行只读静态分析插件（供底部抽屉「插件快捷分析」实时展示真实插件输出，不经 @logged）。"""
+    try:
+        body = await request.json()
+    except Exception:                                      # noqa: BLE001
+        return _err("请求体非合法 JSON")
+    if not isinstance(body, dict):
+        return _err("请求体必须是 JSON 对象")
+    pname = str(body.get("name") or "").strip()
+    if pname not in _READONLY_WEB_PLUGINS:
+        return _err(f"插件 {pname} 不在 Web 只读分析白名单内", 403)
+    args = body.get("args") or {}
+    if not isinstance(args, dict):
+        return _err("args 必须是 JSON 对象")
+
+    def work():
+        from server.mcp_server.tools import get_plugins
+
+        res = get_plugins().run(pname, args)
+        return res if isinstance(res, dict) else {"ok": True, "text": str(res)}
+
+    try:
+        return JSONResponse(await run_in_threadpool(work))
+    except Exception as exc:                               # noqa: BLE001
+        return _err(f"插件执行失败：{exc}", 500)
 
 
 # (57) 第五十七次修改（2026-11-26）
@@ -1558,6 +1914,230 @@ async def frida_js_list(request):
 
     items = list_scripts()
     return JSONResponse({"ok": True, "count": len(items), "items": items})
+
+
+# ---------------------------------------------------------------- 设置与设备工具箱（直调核心，不经 @logged）
+
+
+async def settings_get(request):
+    """读取设置页持久化配置与当前本机局域网 IP。"""
+    def work():
+        from server.dyn import toolbox as _tb
+
+        return {
+            "ok": True,
+            "settings": _tb.load_settings(),
+            "path": _tb.settings_file_path(),
+            "host_ip": _tb.detect_host_ip(),
+        }
+
+    return JSONResponse(await run_in_threadpool(work))
+
+
+async def settings_save(request):
+    """保存设置页配置到本地 settings.json。"""
+    try:
+        body = await request.json()
+    except Exception:                                     # noqa: BLE001
+        return _err("请求体不是合法 JSON", 400)
+    if not isinstance(body, dict):
+        return _err("请求体必须是 JSON 对象", 400)
+
+    def work():
+        from server.dyn import toolbox as _tb
+
+        saved = _tb.save_settings(body)
+        return {"ok": True, "settings": saved, "path": _tb.settings_file_path()}
+
+    try:
+        return JSONResponse(await run_in_threadpool(work))
+    except ValueError as exc:
+        return _err(str(exc), 400)
+
+
+async def toolbox_devices(request):
+    """列出在线 ADB 设备真实信息（机型、Root、前台包名），可选附带已安装第三方包名。"""
+    inc_pkg = (request.query_params.get("packages") or "").strip() in ("1", "true", "yes")
+    serial = (request.query_params.get("serial") or "").strip()
+
+    def work():
+        from server.dyn import toolbox as _tb
+
+        target = serial if inc_pkg else ""
+        if inc_pkg and not target:
+            # 未指定 serial 时传占位标识，让 list_online_devices 自动选唯一在线设备
+            res = _tb.list_online_devices()
+            online = [d["serial"] for d in res.get("devices", []) if d.get("state") == "device"]
+            if len(online) == 1:
+                return _tb.list_online_devices(include_packages_for=online[0])
+            return res
+        return _tb.list_online_devices(include_packages_for=target)
+
+    return JSONResponse(await run_in_threadpool(work))
+
+
+async def toolbox_proxy_status(request):
+    """查询手机全局代理与 mitmproxy 系统证书实时状态。"""
+    serial = (request.query_params.get("serial") or "").strip()
+    port_raw = (request.query_params.get("port") or "").strip()
+    cert_path = (request.query_params.get("cert_path") or "").strip()
+
+    def work():
+        from server.dyn.adb import DynError
+        from server.dyn import toolbox as _tb
+
+        cfg = _tb.load_settings()
+        port = int(port_raw) if port_raw else int(cfg.get("proxy_port", 8080))
+        cp = cert_path or str(cfg.get("cert_path") or _tb.DEFAULT_CERT_PATH)
+        try:
+            return _tb.proxy_status(serial=serial, port=port, cert_path=cp), 200
+        except (DynError, ValueError) as exc:
+            return {"ok": False, "code": getattr(exc, "code", "INVALID_ARG"), "error": str(exc)}, 200
+
+    try:
+        payload, status = await run_in_threadpool(work)
+        return JSONResponse(payload, status_code=status)
+    except ValueError as exc:
+        return _err(str(exc), 400)
+
+
+async def toolbox_proxy_action(request):
+    """执行手机全局代理开关或系统证书安装/移除。"""
+    try:
+        body = await request.json()
+    except Exception:                                     # noqa: BLE001
+        return _err("请求体不是合法 JSON", 400)
+    if not isinstance(body, dict):
+        return _err("请求体必须是 JSON 对象", 400)
+
+    def work():
+        from server.dyn.adb import DynError
+        from server.dyn import toolbox as _tb
+
+        cfg = _tb.load_settings()
+        action = str(body.get("action") or "status").strip().lower()
+        serial = str(body.get("serial") or "").strip()
+        host = str(body.get("host") if "host" in body else cfg.get("proxy_host", "")).strip()
+        port = body.get("port") if body.get("port") not in (None, "") else cfg.get("proxy_port", 8080)
+        cp = str(body.get("cert_path") or cfg.get("cert_path") or _tb.DEFAULT_CERT_PATH).strip()
+
+        try:
+            if action == "on":
+                return _tb.proxy_set(serial=serial, enable=True, host=host, port=port, cert_path=cp)
+            if action == "off":
+                return _tb.proxy_set(serial=serial, enable=False, port=port, cert_path=cp)
+            if action in ("cert_install", "cert-install"):
+                return _tb.proxy_cert_install(serial=serial, cert_path=cp, port=port)
+            if action in ("cert_remove", "cert-remove"):
+                return _tb.proxy_cert_remove(serial=serial, cert_path=cp, port=port)
+            if action == "status":
+                return _tb.proxy_status(serial=serial, port=port, cert_path=cp)
+            return {"ok": False, "code": "BAD_ACTION", "error": f"不支持的操作：{action}"}
+        except (DynError, ValueError) as exc:
+            return {"ok": False, "code": getattr(exc, "code", "INVALID_ARG"), "error": str(exc)}
+
+    return JSONResponse(await run_in_threadpool(work))
+
+
+async def toolbox_app_suspend(request):
+    """执行 App 冻结 / 解冻 / 状态查询（pm suspend / pm unsuspend）。"""
+    try:
+        body = await request.json()
+    except Exception:                                     # noqa: BLE001
+        return _err("请求体不是合法 JSON", 400)
+    if not isinstance(body, dict):
+        return _err("请求体必须是 JSON 对象", 400)
+
+    def work():
+        from server.dyn.adb import DynError
+        from server.dyn import toolbox as _tb
+
+        serial = str(body.get("serial") or "").strip()
+        action = str(body.get("action") or "status").strip().lower()
+        pkgs = body.get("packages")
+        if isinstance(pkgs, str):
+            pkgs = [p.strip() for p in pkgs.split() if p.strip()]
+        try:
+            return _tb.app_suspend_action(serial=serial, action=action, packages=pkgs)
+        except (DynError, ValueError) as exc:
+            return {"ok": False, "code": getattr(exc, "code", "INVALID_ARG"), "error": str(exc)}
+
+    return JSONResponse(await run_in_threadpool(work))
+
+
+async def toolbox_app_label(request):
+    """快速读取真机上指定包名的真实应用显示名称（供设置页保存常用 App 时自动填名称）。"""
+    serial = (request.query_params.get("serial") or "").strip()
+    package = (request.query_params.get("package") or "").strip()
+
+    def work():
+        from server.dyn.adb import DynError
+        from server.dyn import toolbox as _tb
+
+        try:
+            label = _tb.resolve_app_label(serial=serial, package=package)
+            return {"ok": True, "package": package, "label": label}
+        except (DynError, ValueError) as exc:
+            return {"ok": False, "code": getattr(exc, "code", "INVALID_ARG"), "error": str(exc), "label": ""}
+
+    return JSONResponse(await run_in_threadpool(work))
+
+
+async def toolbox_app_labels_batch(request):
+    """批量并发读取多个包名的真实应用名（带磁盘缓存，供已安装列表和自动补全使用）。"""
+    try:
+        body = await request.json()
+    except Exception:                                     # noqa: BLE001
+        return _err("请求体不是合法 JSON", 400)
+    if not isinstance(body, dict):
+        return _err("请求体必须是 JSON 对象", 400)
+
+    def work():
+        from server.dyn.adb import DynError
+        from server.dyn import toolbox as _tb
+
+        serial = str(body.get("serial") or "").strip()
+        pkgs = body.get("packages") if isinstance(body.get("packages"), list) else []
+        try:
+            labels = _tb.resolve_app_labels_batch(serial=serial, packages=pkgs)
+            return {"ok": True, "labels": labels}
+        except (DynError, ValueError) as exc:
+            return {"ok": False, "code": getattr(exc, "code", "INVALID_ARG"), "error": str(exc), "labels": {}}
+
+    return JSONResponse(await run_in_threadpool(work))
+
+
+async def toolbox_app_reset(request):
+    """执行 App 强制停止、可选清数据（pm clear）与可选延迟重启。"""
+    try:
+        body = await request.json()
+    except Exception:                                     # noqa: BLE001
+        return _err("请求体不是合法 JSON", 400)
+    if not isinstance(body, dict):
+        return _err("请求体必须是 JSON 对象", 400)
+
+    def work():
+        from server.dyn.adb import DynError
+        from server.dyn import toolbox as _tb
+
+        cfg = _tb.load_settings()
+        serial = str(body.get("serial") or "").strip()
+        package = str(body.get("package") or cfg.get("reset_package", "")).strip()
+        clear_data = bool(body.get("clear_data", True))
+        relaunch = bool(body.get("relaunch", cfg.get("reset_relaunch", True)))
+        wait_sec = body.get("wait_sec") if body.get("wait_sec") is not None else cfg.get("reset_wait_sec", 2.0)
+        try:
+            return _tb.app_reset(
+                serial=serial,
+                package=package,
+                clear_data=clear_data,
+                relaunch=relaunch,
+                wait_sec=wait_sec,
+            )
+        except (DynError, ValueError) as exc:
+            return {"ok": False, "code": getattr(exc, "code", "INVALID_ARG"), "error": str(exc)}
+
+    return JSONResponse(await run_in_threadpool(work))
 
 
 # (58) 第五十八次修改（2026-11-26）
@@ -1839,6 +2419,12 @@ routes = [
     Route("/api/load_upload", load_upload, methods=["POST"]),
     Route("/api/functions", functions),
     Route("/api/disasm", disasm),
+    Route("/api/decompile", decompile_view),
+    Route("/api/cfg", cfg_view),
+    Route("/api/rename", rename_fn_api, methods=["POST"]),
+    Route("/api/comments", comments_api),
+    Route("/api/comment", set_comment_api, methods=["POST"]),
+    Route("/api/plugin_run", plugin_run_api, methods=["POST"]),
     Route("/api/xrefs", xrefs),
     Route("/api/strings", strings),
     Route("/api/xrefs/build", build_xrefs, methods=["POST"]),
@@ -1848,6 +2434,16 @@ routes = [
     Route("/api/frida_js", frida_js, methods=["POST"]),
     Route("/api/frida_js/stop", frida_js_stop, methods=["POST"]),
     Route("/api/frida_js/list", frida_js_list),
+    # 设置与设备工具箱（2026-11-27 新增：手机代理/证书、App 冻结、强停清数据重启）
+    Route("/api/settings", settings_get),
+    Route("/api/settings", settings_save, methods=["POST"]),
+    Route("/api/toolbox/devices", toolbox_devices),
+    Route("/api/toolbox/app_label", toolbox_app_label),
+    Route("/api/toolbox/app_labels", toolbox_app_labels_batch, methods=["POST"]),
+    Route("/api/toolbox/proxy/status", toolbox_proxy_status),
+    Route("/api/toolbox/proxy", toolbox_proxy_action, methods=["POST"]),
+    Route("/api/toolbox/app_suspend", toolbox_app_suspend, methods=["POST"]),
+    Route("/api/toolbox/app_reset", toolbox_app_reset, methods=["POST"]),
     WebSocketRoute("/api/events", events),
 ]
 

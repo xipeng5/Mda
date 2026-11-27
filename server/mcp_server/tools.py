@@ -8788,3 +8788,105 @@ def uprobe_probe(serial: str) -> str:
     except Exception as exc:                              # noqa: BLE001
         return _j({"error": f"{type(exc).__name__}: {exc}",
                    "code": "UPROBE_PROBE_FAILED"})
+
+
+# ---------------- 设备常用工具箱（与设置页手动按钮共用底层实现） ----------------
+
+
+@server.tool()
+@logged()
+def device_proxy(
+    serial: str = "",
+    action: str = "status",
+    host: str = "",
+    port: int = 8080,
+    cert_path: str = "~/.mitmproxy/mitmproxy-ca-cert.pem",
+) -> str:
+    """控制 Android 手机系统全局 HTTP 代理与 mitmproxy 系统证书（对应设置页「手机代理」）。
+
+    action 取值：
+      - "status"       查看代理键值、手机 wlan0 IP、本机 IP、端口监听与系统证书状态
+      - "on"           开启全局代理指向本机（host 留空则自动检测本机局域网 IP）
+      - "off"          清除全局代理，恢复手机直连
+      - "cert_install" 安装 mitmproxy 根证书为系统证书（Magisk 持久化 + 即时生效，需 Root）
+      - "cert_remove"  移除系统证书并标记卸载 Magisk 模块（需 Root）
+    """
+    from server.dyn.adb import DynError
+    from server.dyn import toolbox as _tb
+
+    act = str(action or "status").strip().lower()
+    try:
+        if act == "status":
+            return _j(_tb.proxy_status(serial=serial, port=port, cert_path=cert_path))
+        if act == "on":
+            return _j(_tb.proxy_set(serial=serial, enable=True, host=host, port=port, cert_path=cert_path))
+        if act == "off":
+            return _j(_tb.proxy_set(serial=serial, enable=False, port=port, cert_path=cert_path))
+        if act in ("cert_install", "cert-install"):
+            return _j(_tb.proxy_cert_install(serial=serial, cert_path=cert_path, port=port))
+        if act in ("cert_remove", "cert-remove"):
+            return _j(_tb.proxy_cert_remove(serial=serial, cert_path=cert_path, port=port))
+        return _j({"ok": False, "code": "BAD_ACTION",
+                   "error": f"不支持的 action：{action!r}（仅支持 status/on/off/cert_install/cert_remove）"})
+    except (DynError, ValueError) as exc:
+        code = getattr(exc, "code", "INVALID_ARG")
+        return _j({"ok": False, "code": code, "error": str(exc)})
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"ok": False, "code": "PROXY_FAILED", "error": f"{type(exc).__name__}: {exc}"})
+
+
+@server.tool()
+@logged()
+def device_app_suspend(
+    serial: str = "",
+    action: str = "status",
+    packages: list[str] | None = None,
+) -> str:
+    """冻结/解冻 Android App（pm suspend / pm unsuspend），阻止浏览器深链自动跳 App。
+
+    不删除数据与登录态，解冻即刻恢复，无需 Root。
+    action：freeze（冻结）/ unfreeze（解冻）/ status（查状态）。
+    packages 留空时读取设置页已保存的常用冻结包名列表。
+    """
+    from server.dyn.adb import DynError
+    from server.dyn import toolbox as _tb
+
+    try:
+        return _j(_tb.app_suspend_action(serial=serial, action=action, packages=packages))
+    except (DynError, ValueError) as exc:
+        code = getattr(exc, "code", "INVALID_ARG")
+        return _j({"ok": False, "code": code, "error": str(exc)})
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"ok": False, "code": "SUSPEND_FAILED", "error": f"{type(exc).__name__}: {exc}"})
+
+
+@server.tool()
+@logged()
+def device_app_reset(
+    serial: str = "",
+    package: str = "",
+    clear_data: bool = True,
+    relaunch: bool = True,
+    wait_sec: float = 2.0,
+) -> str:
+    """强制停止 App、可选清理应用数据（pm clear）并在延时后重新启动。
+
+    用于归因/冷启动复测。package 留空时读取设置页已保存的目标包名；
+    clear_data=False 时仅执行强制停止（及可选重启）。
+    """
+    from server.dyn.adb import DynError
+    from server.dyn import toolbox as _tb
+
+    try:
+        return _j(_tb.app_reset(
+            serial=serial,
+            package=package,
+            clear_data=bool(clear_data),
+            relaunch=bool(relaunch),
+            wait_sec=float(wait_sec),
+        ))
+    except (DynError, ValueError) as exc:
+        code = getattr(exc, "code", "INVALID_ARG")
+        return _j({"ok": False, "code": code, "error": str(exc)})
+    except Exception as exc:                              # noqa: BLE001
+        return _j({"ok": False, "code": "APP_RESET_FAILED", "error": f"{type(exc).__name__}: {exc}"})

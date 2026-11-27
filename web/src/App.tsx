@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { hex, type ModuleData, type Func } from "./lib/data";
 import {
   API_BASE,
@@ -8,30 +8,35 @@ import {
   copyText,
   hasNativeDialog,
   pickSoFile,
+  type ApiDynState,
+  type ApiNavStats,
+  type ApiSection,
+  type ApiString,
+  type ApiTool,
 } from "./lib/api";
-import type { ApiInsn, ApiNavStats } from "./lib/api";
-import { SphereCanvas } from "./components/SphereCanvas";
-import { LeftPanel } from "./components/LeftPanel";
+import { classifyTool, LAYER_NAMES, TOOL_COLOR, TOOL_LABEL, toolToLayer } from "./lib/toolMeta";
 import { LeftNav } from "./components/LeftNav";
+import { LeftPanel } from "./components/LeftPanel";
 import { HeatBar } from "./components/HeatBar";
 import { FlatTable } from "./components/FlatTable";
 import { Inspector } from "./components/Inspector";
-import { DynStateView } from "./components/DynStateView";
-import type { DynKind } from "./components/DynStateView";
-import { NeedSoView } from "./components/DynStateView";
+import { DynStateView, NeedSoView, type DynKind } from "./components/DynStateView";
 import { RealtimeMonitor, type AiEvent } from "./components/RealtimeMonitor";
-import { ConsoleOverlay } from "./components/ConsoleOverlay";
 import { ToolsView } from "./components/ToolsView";
 import { ProcessesView } from "./components/ProcessesView";
 import { XrefView } from "./components/XrefView";
 import { GraphView } from "./components/GraphView";
 import { TimelineView } from "./components/TimelineView";
-import { ArmedBar } from "./components/ArmedBar";
-import { CodeOverlay } from "./components/CodeOverlay";
-import type { Relations, Theme } from "./lib/sphere";
+import { CodeStage } from "./components/CodeStage";
+import { BottomDrawer } from "./components/BottomDrawer";
+import { CommandPalette, type PaletteAction } from "./components/CommandPalette";
+import { SettingsView } from "./components/SettingsView";
+import type { OpsSignal } from "./components/DeviceOpsDeck";
+import type { Theme } from "./lib/sphere";
 
 type LogItem = { time: string; text: string; kind?: string };
 type WatchItem = { so: string; name: string; addr: number };
+type HistEntry = { so: string; addr: number };
 
 const now = () => new Date().toLocaleTimeString("zh-CN", { hour12: false });
 
@@ -39,84 +44,94 @@ export default function App() {
   const [modules, setModules] = useState<ModuleData[]>([]);
   const [active, setActive] = useState(0);
   const [sel, setSel] = useState<number[]>([]);
+  const [selInsnAddr, setSelInsnAddr] = useState<number | null>(null);
   const [logs, setLogs] = useState<LogItem[]>([]);
   const [watch, setWatch] = useState<WatchItem[]>([]);
-  // 实时监控台：每次 MCP 工具调用都进这条流（服务端 @logged 广播）
   const [aiEvents, setAiEvents] = useState<AiEvent[]>([]);
-  // 节流 tick：AI 事件再多，依赖它的刷新最多 900ms 一次。
-  // 直接用 aiEvents.length 做依赖会变成"每条事件一次请求"，几百条就把
-  // 浏览器的并发配额打爆（实测 ERR_INSUFFICIENT_RESOURCES）。
   const [aiTick, setAiTick] = useState(0);
   const tickTimer = useRef<number | null>(null);
-  // 顶部标签上的计数要真实：引用数来自 nav_stats，工具数来自注册表
   const [navSt, setNavSt] = useState<ApiNavStats | null>(null);
-  const [toolN, setToolN] = useState<number | null>(null);
+  const [dynState, setDynState] = useState<ApiDynState | null>(null);
+  const [toolsList, setToolsList] = useState<ApiTool[]>([]);
   const [aiPaused, setAiPaused] = useState(false);
-  // (131) WS 的 onmessage 闭包里读不到最新的 aiPaused（effect 依赖不含它），
-  //       用 ref 镜像，保证暂停立刻生效。
   const aiPausedRef = useRef(false);
-  // 每个工具被调用过几次（事件流与工具页共用）
+  const [followAi, setFollowAi] = useState(true);
+  const followAiRef = useRef(true);
+  followAiRef.current = followAi;
+
   const [toolCounts, setToolCounts] = useState<Record<string, number>>({});
-  // 视图集合：monitor / module / tools / processes / xref / graph / timeline
-  //         / strings / sections / dyn:*（断点/命中/内存/派发点/寄存器/轨迹/行为）
-  // 用 string 而不是字面量联合：左栏入口会持续增加，字面量类型每加一个都要改这里，
-  // 改了还会忘记同步渲染分支（R83 那种"渲染条件是 mod，没 so 就白屏"的坑）。
+  // 主视图：monitor(工具流) | tools(137工具库) | split(并排伪代码 F5) | disasm(反汇编 1) | cfg(Space) | graph(4)
+  //         以及完整保留原有次级视图：xref | timeline | processes | strings | sections | dyn:*
   const [mainView, setMainView] = useState<string>("monitor");
-  // (1) 第一次修改：主题默认跟随系统外观（macOS 深色/浅色），不再硬编码 dark。
-  //     手动点过切换按钮后锁定用户选择，系统再变也不覆盖。
-  // 默认浅色，与设计稿一致（原型 --bg:#fbfbfc）；用户可手动切深色
-  const [theme, setTheme] = useState<Theme>("light");
+  const mainViewRef = useRef<string>("monitor");
+  mainViewRef.current = mainView;
+  const [preselectTool, setPreselectTool] = useState<string | null>(null);
+
+  // 主题（支持 localStorage 记住用户手动偏好，默认浅色与原版一致）
+  const [theme, setTheme] = useState<Theme>(() => {
+    try {
+      const saved = localStorage.getItem("mda_theme");
+      if (saved === "dark" || saved === "light") return saved;
+    } catch { /* ignore */ }
+    return "light";
+  });
   const themeLocked = useRef(false);
-  const [code, setCode] = useState<{ open: boolean; rows: ApiInsn[]; live: boolean }>({ open: false, rows: [], live: false });
-  // (134) 第一百三十四次修改（2026-11-26）
-  // bug 原因：① 代码页内联展开 expanded 仅以数字 addr 为键，多 so 同偏移时会互相串显反汇编；
-  //           ② appendModule 在 React 18 批处理下于 setModules updater 内写局部变量 newIndex，
-  //              导致 newIndex 恒为 0、新模块未正确选中；
-  //           ③ unloadModule 缺少 active 依赖且在 setModules updater 内嵌套调用 setActive，
-  //              同时 doSync / modules_snapshot 既会硬重置 active=0 又不支持移除后端已卸载模块；
-  //           ④ HeatBar 点击直接走精确匹配 jumpToAddr，桶边界地址几乎永远报"跳转失败"；
-  //           ⑤ /api/unload、/api/mcp-config、WS /api/events 未统一基于 API_BASE，
-  //              且 POST /api/unload 缺少 X-MDA-Client: 1 头；
-  //           ⑥ 全局 Enter 快捷键未排除 textarea/select/contentEditable 且闭包陈旧；
-  //           ⑦ frida 终端 Tab 标题和角标错误显示 aiEvents.length；
-  //           ⑧ 多个异步 useEffect 缺少取消标志 alive。
-  // 解决方案：expanded 改用 `${so}:${addr}` 复合键；用 modulesRef/activeRef/selRef 同步协调
-  //           模块增删与选中状态，绝不在 setState updater 中嵌套 setState；新增 jumpToNearestAddr
-  //           供热力条智能落到所属或最近函数；统一走 API_BASE + apiWsUrl + CLIENT_HEADERS；
-  //           修复全局快捷键排除集合与最新引用；终端 Tab 改显示活跃常驻脚本数；补齐 alive 标志。
-  const [expanded, setExpanded] = useState<Record<string, ApiInsn[]>>({});
-  const expandedRef = useRef<Record<string, ApiInsn[]>>({});
-  expandedRef.current = expanded;
+
+  // 可拖拽三栏与底部抽屉布局
+  const [leftOpen, setLeftOpen] = useState(true);
+  const [rightOpen, setRightOpen] = useState(true);
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  const [drawerTab, setDrawerTab] = useState<"plugins" | "terminal">("plugins");
+  const [leftW, setLeftW] = useState(248);
+  const [rightW, setRightW] = useState(288);
+  const [drawerH, setDrawerH] = useState(206);
+  const [leftTab, setLeftTab] = useState<"funcs" | "strings" | "sections" | "nav">("funcs");
+  const [leftFilter, setLeftFilter] = useState("");
+  const [leftStrings, setLeftStrings] = useState<ApiString[]>([]);
+  const [leftSections, setLeftSections] = useState<ApiSection[]>([]);
+
+  // 导航历史栈（Alt+← / Alt+→）
+  const [history, setHistory] = useState<HistEntry[]>([]);
+  const [histIdx, setHistIdx] = useState(-1);
+
+  // 原地注释 / 重命名 / 本地断点标记
+  const [commentsBySo, setCommentsBySo] = useState<Record<string, Record<string, string>>>({});
+  const [bpMarks, setBpMarks] = useState<Set<string>>(new Set());
+  const [inlineDialog, setInlineDialog] = useState<{ kind: "rename" | "comment"; value: string } | null>(null);
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  const [toast, setToast] = useState("");
+  const toastTimer = useRef<number | null>(null);
+
+  // 全局 AI 操控动效状态（顶栏流光条 + 热力条雷达扫光 + 右下角悬浮 HUD + 设备动效信号）
+  const [opsSignal, setOpsSignal] = useState<OpsSignal | null>(null);
+  const opsSeqRef = useRef(0);
+  const [beamCol, setBeamCol] = useState<string | null>(null);
+  const [heatSweepKey, setHeatSweepKey] = useState(0);
+  const [stageAura, setStageAura] = useState<"" | "aura-freeze" | "aura-hit" | "aura-hook">("");
+  const [hud, setHud] = useState<{ tool: string; cat: string; col: string; sub: string; layer: string } | null>(null);
+  const [aiHit, setAiHit] = useState<{ seq: number; addr: number | null }>({ seq: 0, addr: null });
+  const beamTimerRef = useRef<number | null>(null);
+  const hudTimerRef = useRef<number | null>(null);
+
   const [liveScripts, setLiveScripts] = useState(0);
+  const [armedBpCount, setArmedBpCount] = useState(0);
   const aiEventSeq = useRef(0);
-  // 代码页列表：以当前选中函数为中心的 60 行窗口。
-  // 只渲染前 60 个的话，AI 操作靠后的函数时列表里没有它，定位就落空了。
-  const codeListRef = useRef<HTMLDivElement | null>(null);
-  const [relations, setRelations] = useState<Relations | null>(null);
-  const [bps] = useState<Record<string, Set<number>>>({});
-  const [progress, setProgress] = useState<{ percent: number } | null>(null);
   const [apiOk, setApiOk] = useState<boolean | null>(null);
-  // 版本号来自 /api/health（唯一来源是 version.py），不在前端硬编码
   const [ver, setVer] = useState("");
-  const [rotateIdx, setRotateIdx] = useState<number | null>(null);
-  const [jumpText, setJumpText] = useState("");
   const [busySo, setBusySo] = useState<string | null>(null);
-  const [flash, setFlash] = useState<{ i: number; seq: number } | null>(null);
-  const [pulseKey, setPulseKey] = useState(0);
   const [loading, setLoading] = useState<{ name: string } | null>(null);
   const [loadError, setLoadError] = useState("");
   const [dragging, setDragging] = useState(false);
-  const flashSeq = useRef(0);
   const backendMods = useRef<Set<string>>(new Set());
   const wsRef = useRef<WebSocket | null>(null);
-  // 最新 state 的镜像：ws 回调 / 异步回调里的闭包拿不到最新值，必须走 ref
   const modulesRef = useRef<ModuleData[]>([]);
   const modRef = useRef<ModuleData | undefined>(undefined);
   const activeRef = useRef(0);
   const selRef = useRef<number[]>([]);
-  // 服务端有、界面还没有的 so（来自 nav_stats 这条可靠路径）
-  const [pendingSo, setPendingSo] = useState("");
   const booted = useRef(false);
+  const [wsAlive, setWsAlive] = useState(false);
+  const retryDelay = useRef(1000);
+  const syncSeq = useRef(0);
 
   const mod = modules[active];
   const selected = sel[active] ?? -1;
@@ -126,152 +141,21 @@ export default function App() {
   activeRef.current = active;
   selRef.current = sel;
 
+  const showToast = useCallback((msg: string) => {
+    setToast(msg);
+    if (toastTimer.current != null) window.clearTimeout(toastTimer.current);
+    toastTimer.current = window.setTimeout(() => setToast(""), 2200);
+  }, []);
+
   const log = useCallback((text: string, kind?: string) => {
     setLogs((prev) => [...prev.slice(-300), { time: now(), text, kind }]);
   }, []);
 
-  /** 展开/收起某个函数的反汇编（使用 so:addr 复合键，杜绝多 so 同偏移串显） */
-  const toggleFn = useCallback(async (soName: string, addr: number) => {
-    const key = `${soName}:${addr}`;
-    if (expandedRef.current[key]) {
-      setExpanded((prev) => {
-        const next = { ...prev };
-        delete next[key];
-        return next;
-      });
-      return;
-    }
-    const d = await api.disasm(soName, addr);
-    if (d?.items?.length) {
-      setExpanded((prev) => ({ ...prev, [key]: d.items }));
-    }
-  }, []);
-
-  /** 跳到指定 so 的指定函数（引用页/图谱/检视器点击进出；精确找不到时自动回退到所在函数） */
-  const jumpToAddr = useCallback(
-    (soName: string, a: number) => {
-      const curMods = modulesRef.current;
-      const mi = curMods.findIndex((m) => m.so === soName);
-      if (mi < 0) {
-        log(`跳转失败：没有模块 ${soName}`);
-        return;
-      }
-      const funcs = curMods[mi].funcs;
-      let i = funcs.findIndex((x) => x.a === a);
-      if (i < 0) {
-        i = funcs.findIndex((x) => a >= x.a && a < x.a + Math.max(4, x.s));
-      }
-      if (i < 0) {
-        log(`跳转失败：${soName} 里没有 0x${a.toString(16)}`);
-        return;
-      }
-      activeRef.current = mi;
-      setActive(mi);
-      setSel((prev) => {
-        const next = prev.slice();
-        next[mi] = i;
-        selRef.current = next;
-        return next;
-      });
-      setMainView("module");
-    },
-    [log]
-  );
-
-  /** 热力条点击跳转：优先精确命中/所属函数，否则自动落到距离最近的下一个（或前一个）函数 */
-  const jumpToNearestAddr = useCallback(
-    (soName: string, a: number) => {
-      const curMods = modulesRef.current;
-      const mi = curMods.findIndex((m) => m.so === soName);
-      if (mi < 0) {
-        log(`跳转失败：没有模块 ${soName}`);
-        return;
-      }
-      const funcs = curMods[mi].funcs;
-      if (!funcs.length) {
-        log(`跳转失败：${soName} 没有可用函数`);
-        return;
-      }
-      let bestIdx = -1;
-      let bestNextDist = Infinity;
-      let bestPrevIdx = -1;
-      let bestPrevAddr = -1;
-      for (let k = 0; k < funcs.length; k++) {
-        const fn = funcs[k];
-        if (fn.a === a) {
-          bestIdx = k;
-          break;
-        }
-        if (a >= fn.a && a < fn.a + Math.max(4, fn.s)) {
-          bestIdx = k;
-          break;
-        }
-        if (fn.a > a && fn.a - a < bestNextDist) {
-          bestNextDist = fn.a - a;
-          bestIdx = k;
-        }
-        if (fn.a < a && fn.a > bestPrevAddr) {
-          bestPrevAddr = fn.a;
-          bestPrevIdx = k;
-        }
-      }
-      if (bestIdx < 0) bestIdx = bestPrevIdx >= 0 ? bestPrevIdx : 0;
-      activeRef.current = mi;
-      setActive(mi);
-      setSel((prev) => {
-        const next = prev.slice();
-        next[mi] = bestIdx;
-        selRef.current = next;
-        return next;
-      });
-      setMainView("module");
-    },
-    [log]
-  );
-
-  /* 代码页可见的那 60 个函数：以当前选中为中心 */
-  const codeWindow = (() => {
-    if (!mod) return [];
-    const n = mod.funcs.length;
-    const cur = Math.min(Math.max(sel[active] ?? 0, 0), Math.max(0, n - 1));
-    const win = Math.min(60, n);
-    const start = Math.max(0, Math.min(cur - Math.floor(win / 2), n - win));
-    return mod.funcs.slice(start, start + win);
-  })();
-
-  /* AI 打到某个函数时：那一行蓝色闪一下，并滚到可见处。
-     原来是 flash → SphereCanvas（已不再渲染），等于这个反馈丢了。 */
-  useEffect(() => {
-    if (!flash) return;
-    const box = codeListRef.current;
-    if (!box) return;
-    const row = box.querySelector<HTMLElement>(`.fnrow[data-i="${flash.i}"]`);
-    if (!row) return;
-    row.classList.remove("flash");
-    void row.offsetWidth;              // 强制回流，让动画能重播
-    row.classList.add("flash");
-    const br = box.getBoundingClientRect();
-    const rr = row.getBoundingClientRect();
-    if (rr.top < br.top || rr.bottom > br.bottom) {
-      box.scrollTop += (rr.top + rr.bottom) / 2 - (br.top + br.bottom) / 2;
-    }
-    const t = window.setTimeout(() => row.classList.remove("flash"), 1300);
-    return () => window.clearTimeout(t);
-  }, [flash?.seq]);
-
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
+    try { localStorage.setItem("mda_theme", theme); } catch { /* ignore */ }
   }, [theme]);
 
-  // 把最新的 modules / 当前模块镜像到 ref，供 WebSocket 回调读取
-  useEffect(() => {
-    modulesRef.current = modules;
-    modRef.current = mod;
-  }, [modules, mod]);
-
-  // 跟随系统外观变化 —— **仅在用户手动切过主题之后**才生效。
-  // 启动时不跟随：设计稿是浅色基准，且 WKWebView 启动会派发一次媒体查询事件，
-  // 若不设门槛，窗口会在这时被改回深色（浏览器里没有这个行为，实测踩到）。
   useEffect(() => {
     const mq = window.matchMedia?.("(prefers-color-scheme: light)");
     if (!mq) return;
@@ -282,11 +166,105 @@ export default function App() {
     return () => mq.removeEventListener?.("change", onChange);
   }, []);
 
-  useEffect(() => {
-    setPulseKey((k) => k + 1);
-  }, [active]);
+  /** 触发全局 AI 操控动效（仅由真实后端 WebSocket AI 工具事件驱动） */
+  const fireGlobalFx = useCallback((tool: string, summary: string, ms?: number) => {
+    const cat = classifyTool(tool);
+    const col = /freeze/.test(tool) ? "#38bdf8" : (TOOL_COLOR[cat] || "#4c8dff");
+    const layerIdx = toolToLayer(tool, cat);
+    const seq = ++opsSeqRef.current;
 
-  /** 同步对齐服务端模块集合（支持新增与移除已卸载模块，同时保留当前 active 与 sel） */
+    setOpsSignal({ seq, tool, ms, summary });
+    setBeamCol(col);
+    setHeatSweepKey((k) => k + 1);
+    if (beamTimerRef.current != null) window.clearTimeout(beamTimerRef.current);
+    beamTimerRef.current = window.setTimeout(() => setBeamCol(null), 1550);
+
+    if (/freeze/.test(tool)) setStageAura("aura-freeze");
+    else if (cat === "bp") setStageAura("aura-hit");
+    else if (cat === "behavior") setStageAura("aura-hook");
+    else setStageAura("");
+    window.setTimeout(() => setStageAura(""), 900);
+
+    if (mainViewRef.current !== "monitor") {
+      setHud({ tool, cat, col, sub: summary, layer: LAYER_NAMES[layerIdx].replace(/ 层$/, "") });
+      if (hudTimerRef.current != null) window.clearTimeout(hudTimerRef.current);
+      hudTimerRef.current = window.setTimeout(() => setHud(null), 2600);
+    } else {
+      setHud(null);
+    }
+  }, []);
+
+  /** 跳转到指定 so + 地址，支持历史栈入栈与自动切代码视图 */
+  const jumpToAddr = useCallback(
+    (soName: string, a: number, opts?: { pushHist?: boolean; targetView?: string }) => {
+      const curMods = modulesRef.current;
+      const mi = curMods.findIndex((m) => m.so === soName);
+      if (mi < 0) {
+        showToast(`未加载模块 ${soName}`);
+        return;
+      }
+      const funcs = curMods[mi].funcs;
+      if (!funcs.length) return;
+      let i = funcs.findIndex((x) => x.a === a);
+      if (i < 0) i = funcs.findIndex((x) => a >= x.a && a < x.a + Math.max(4, x.s));
+      if (i < 0) {
+        // 落到最近函数（热力条点击保证不报失败）
+        let best = 0;
+        let bestDist = Infinity;
+        for (let k = 0; k < funcs.length; k++) {
+          const d = Math.abs(funcs[k].a - a);
+          if (d < bestDist) { bestDist = d; best = k; }
+        }
+        i = best;
+      }
+      const targetFn = funcs[i];
+      activeRef.current = mi;
+      setActive(mi);
+      setSel((prev) => {
+        const next = prev.slice();
+        next[mi] = i;
+        selRef.current = next;
+        return next;
+      });
+      setSelInsnAddr(a >= targetFn.a && a < targetFn.a + Math.max(4, targetFn.s) ? a : targetFn.a);
+
+      if (opts?.pushHist !== false) {
+        setHistory((prev) => {
+          const sliced = prev.slice(0, histIdx + 1);
+          const last = sliced[sliced.length - 1];
+          if (last && last.so === soName && last.addr === targetFn.a) return sliced;
+          const next = [...sliced, { so: soName, addr: targetFn.a }].slice(-80);
+          setHistIdx(next.length - 1);
+          return next;
+        });
+      }
+
+      if (opts?.targetView) {
+        setMainView(opts.targetView);
+      } else if (mainViewRef.current === "monitor" || mainViewRef.current === "tools") {
+        setMainView("split");
+      }
+    },
+    [histIdx, showToast]
+  );
+
+  const goBack = useCallback(() => {
+    if (histIdx <= 0) return;
+    const nextIdx = histIdx - 1;
+    const h = history[nextIdx];
+    setHistIdx(nextIdx);
+    if (h) jumpToAddr(h.so, h.addr, { pushHist: false });
+  }, [histIdx, history, jumpToAddr]);
+
+  const goFwd = useCallback(() => {
+    if (histIdx >= history.length - 1) return;
+    const nextIdx = histIdx + 1;
+    const h = history[nextIdx];
+    setHistIdx(nextIdx);
+    if (h) jumpToAddr(h.so, h.addr, { pushHist: false });
+  }, [histIdx, history, jumpToAddr]);
+
+  /** 同步对齐服务端模块集合（支持新增与移除已卸载模块） */
   const reconcileModules = useCallback(
     (aliveSet: Set<string> | null, added: ModuleData[], focusNew = false) => {
       const curMods = modulesRef.current;
@@ -296,13 +274,11 @@ export default function App() {
       let changed = false;
       const nextMods: ModuleData[] = [];
       const nextSel: number[] = [];
-      const removedSos: string[] = [];
 
       curMods.forEach((m, i) => {
         if (aliveSet && !aliveSet.has(m.so)) {
           changed = true;
           backendMods.current.delete(m.so);
-          removedSos.push(m.so);
         } else {
           nextMods.push(m);
           nextSel.push(curSel[i] ?? 0);
@@ -323,9 +299,8 @@ export default function App() {
       if (!changed) return;
 
       let nextActive = 0;
-      if (focusNew && firstNewIdx >= 0) {
-        nextActive = firstNewIdx;
-      } else if (curSo) {
+      if (focusNew && firstNewIdx >= 0) nextActive = firstNewIdx;
+      else if (curSo) {
         const keptIdx = nextMods.findIndex((m) => m.so === curSo);
         nextActive = keptIdx >= 0 ? keptIdx : 0;
       }
@@ -336,630 +311,426 @@ export default function App() {
       setModules(nextMods);
       setSel(nextSel);
       setActive(nextActive);
-
-      if (removedSos.length) {
-        setExpanded((prev) => {
-          const next = { ...prev };
-          for (const k of Object.keys(next)) {
-            if (removedSos.some((s) => k.startsWith(`${s}:`))) delete next[k];
-          }
-          return next;
-        });
-      }
     },
     []
   );
 
-  /** 后端已解析完成 → 拉函数表、建模块、选中第一个导出函数 */
-  const appendModule = useCallback(async (so: string, path: string) => {
-    const fn = await api.functions(so, "", 200000);
-    if (!fn) throw new Error("后端没有返回函数表");
-    const funcs: Func[] = fn.items.map((it) => ({
-      n: it.name, a: it.addr, s: it.size, e: it.is_export ? 1 : 0, r: it.refs ?? 0,
-    }));
-    if (!funcs.length) throw new Error("这个 so 里没有解析出任何函数");
-    const data: ModuleData = { so, path, size: 0, sections: [], funcs, disasm: {}, callers: {}, callees: {} };
-    backendMods.current.add(so);
-    const cur = modulesRef.current;
-    const exists = cur.findIndex((m) => m.so === so);
-    if (exists >= 0) {
-      activeRef.current = exists;
-      setActive(exists);
-      return;
-    }
-    reconcileModules(null, [data], true);
-    log(`已打开 ${so} · ${funcs.length} 函数（后端实时解析）`, "ai");
-  }, [log, reconcileModules]);
-
-  /** 释放一个模块：只清 mda 内的解析结果，不影响设备端进程。 */
-  const unloadModule = useCallback(async (so: string) => {
-    try {
-      const r = await fetch(`${API_BASE}/api/unload`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", ...CLIENT_HEADERS },
-        body: JSON.stringify({ so }),
-      });
-      const j = await r.json();
-      if (!r.ok || j.ok === false) {
-        log(`释放失败：${j.error || r.statusText}`, "ai");
+  const appendModule = useCallback(
+    async (so: string, path: string) => {
+      const fn = await api.functions(so, "", 200000);
+      if (!fn) throw new Error("后端没有返回函数表");
+      const funcs: Func[] = fn.items.map((it) => ({
+        n: it.name,
+        a: it.addr,
+        s: it.size,
+        e: it.is_export ? 1 : 0,
+        r: it.refs ?? 0,
+      }));
+      if (!funcs.length) throw new Error("这个 so 里没有解析出任何函数");
+      const data: ModuleData = { so, path, size: 0, sections: [], funcs, disasm: {}, callers: {}, callees: {} };
+      backendMods.current.add(so);
+      const cur = modulesRef.current;
+      const exists = cur.findIndex((m) => m.so === so);
+      if (exists >= 0) {
+        activeRef.current = exists;
+        setActive(exists);
         return;
       }
-      // 从本地状态里移除，保持前后端一致（绝不在 setModules updater 里嵌套调 setActive）
-      backendMods.current.delete(so);
-      const aliveSet = new Set(modulesRef.current.map((m) => m.so).filter((name) => name !== so));
-      reconcileModules(aliveSet, [], false);
-      log(`已释放 ${so}（约 ${j.freed_estimate_mb ?? "?"} MB），设备端进程不受影响`, "ai");
-    } catch (e) {
-      log(`释放出错：${String(e)}`, "ai");
-    }
-  }, [log, reconcileModules]);
+      reconcileModules(null, [data], true);
+      log(`已打开 ${so} · ${funcs.length} 函数（后端实时解析）`, "ai");
+    },
+    [log, reconcileModules]
+  );
 
-  /** 按路径加载（原生对话框选择的结果） */
-  const buildModule = useCallback(async (path: string): Promise<void> => {
-    const name = path.split("/").pop() || path;
-    setLoading({ name });
-    setLoadError("");
-    try {
-      const r = await api.load(path);
-      if (!r?.module) throw new Error("解析失败：不是可识别的 ELF，或文件不可读");
-      await appendModule(r.module.so, path);
-    } catch (e) {
-      setLoadError(String(e));
-      log(`打开失败：${e}`);
-    } finally {
-      setLoading(null);
-    }
-  }, [appendModule, log]);
+  const unloadModule = useCallback(
+    async (so: string) => {
+      try {
+        const r = await fetch(`${API_BASE}/api/unload`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", ...CLIENT_HEADERS },
+          body: JSON.stringify({ so }),
+        });
+        const j = await r.json();
+        if (!r.ok || j.ok === false) {
+          showToast(`释放失败：${j.error || r.statusText}`);
+          return;
+        }
+        backendMods.current.delete(so);
+        const aliveSet = new Set(modulesRef.current.map((m) => m.so).filter((n) => n !== so));
+        reconcileModules(aliveSet, [], false);
+        showToast(`已释放 ${so}（约 ${j.freed_estimate_mb ?? "?"} MB）`);
+      } catch (e) {
+        showToast(`释放出错：${String(e)}`);
+      }
+    },
+    [reconcileModules, showToast]
+  );
 
-  /** 拖入文件：字节上传 → 后端落盘解析 */
-  const uploadFile = useCallback(async (file: File): Promise<void> => {
-    setLoading({ name: file.name });
-    setLoadError("");
-    try {
-      const buf = await file.arrayBuffer();
-      const r = await api.upload(file.name, buf);
-      await appendModule(r.module.so, r.path);
-    } catch (e) {
-      setLoadError(String(e));
-      log(`拖入失败：${e}`);
-    } finally {
-      setLoading(null);
-    }
-  }, [appendModule, log]);
+  const buildModule = useCallback(
+    async (path: string) => {
+      const name = path.split("/").pop() || path;
+      setLoading({ name });
+      setLoadError("");
+      try {
+        const r = await api.load(path);
+        if (!r?.module) throw new Error("解析失败：不是可识别的 ELF，或文件不可读");
+        await appendModule(r.module.so, path);
+        setMainView("split");
+      } catch (e) {
+        setLoadError(String(e));
+        log(`打开失败：${e}`);
+      } finally {
+        setLoading(null);
+      }
+    },
+    [appendModule, log]
+  );
 
-  /** 系统文件对话框 → 后端加载 */
+  const uploadFile = useCallback(
+    async (file: File) => {
+      setLoading({ name: file.name });
+      setLoadError("");
+      try {
+        const buf = await file.arrayBuffer();
+        const r = await api.upload(file.name, buf);
+        await appendModule(r.module.so, r.path);
+        setMainView("split");
+      } catch (e) {
+        setLoadError(String(e));
+        log(`拖入失败：${e}`);
+      } finally {
+        setLoading(null);
+      }
+    },
+    [appendModule, log]
+  );
+
   const openSo = useCallback(async () => {
     if (!hasNativeDialog()) {
-      setLoadError("当前是浏览器窗口，没有系统文件对话框；请用桌面窗口（python app.py）打开 so。");
+      showToast("浏览器模式可直接拖入 .so 文件，或用 python app.py 桌面窗口打开文件选择框");
       return;
     }
     const path = await pickSoFile();
-    if (!path) return;                       // 用户取消
+    if (!path) return;
     await buildModule(path);
-  }, [buildModule]);
+  }, [buildModule, showToast]);
 
-  // 启动：后端若已有会话就重建模块；没有就停在空状态（不再有任何内置示例数据）
-  /** 启动时从服务端拉模块列表并补齐。
-   *  用 nav_stats 而不是 /api/modules：后者在 WKWebView 里会被缓存成旧空数组。 */
   const bootstrapModules = useCallback(async () => {
-    // 优先用服务端**内联**进 HTML 的初始模块（最可靠：
-    // WKWebView 里 /api/modules 的响应恒为空，实测没找到根治办法）
     const boot = (window as unknown as {
       __MDA_BOOT__?: { modules?: { so: string; path: string }[] };
     }).__MDA_BOOT__;
     for (const m of boot?.modules ?? []) {
       if (backendMods.current.has(m.so)) continue;
-      try {
-        await appendModule(m.so, m.path);
-      } catch {
-        /* 坏文件交给日志 */
-      }
+      try { await appendModule(m.so, m.path); } catch { /* ignore */ }
     }
     if (boot?.modules?.length) return;
-
-    // 定时问一次"服务端有哪些模块"：nav_stats 不带 so 时返回 serverModules。
-    // 这是在 /api/modules 不可用时唯一能拿到列表的通道。
     try {
       const r = await api.navStats("");
-      const live = new Set((r?.serverModules ?? []).map((m) => m.so));
-      void live;
       for (const m of r?.serverModules ?? []) {
         if (backendMods.current.has(m.so)) continue;
-        try {
-          await appendModule(m.so, m.path);
-        } catch {
-          /* 坏文件交给日志 */
-        }
+        try { await appendModule(m.so, m.path); } catch { /* ignore */ }
       }
-    } catch {
-      /* 启动探测失败不影响其它功能 */
-    }
+    } catch { /* ignore */ }
   }, [appendModule]);
 
   useEffect(() => {
     if (booted.current) return;
     booted.current = true;
-    (async () => {
+    void (async () => {
       const h = await api.health();
       const ok = !!h?.ok;
       setApiOk(ok);
       if (h?.version) setVer(h.version);
       if (!ok) {
-        setLogs([{ time: now(), text: "后端未连接：请用 python app.py 启动（不要直接开 HTML）" }]);
+        setLogs([{ time: now(), text: "后端未连接：请用 python app.py 或 python -m server.api 启动" }]);
         return;
       }
-      setLogs([{ time: now(), text: `MDA Web 启动 · 后端已连接（${location.host}）` }]);
+      setLogs([{ time: now(), text: `MDA Studio v2 已连接后端（${location.host}）` }]);
       await bootstrapModules();
       for (const so of h.modules ?? []) {
+        if (backendMods.current.has(so)) continue;
         setLoading({ name: so });
-        try {
-          await appendModule(so, so);
-        } catch (e) {
-          log(`${so} 恢复失败：${e}`);
-        }
+        try { await appendModule(so, so); } catch (e) { log(`${so} 恢复失败：${e}`); }
       }
       setLoading(null);
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // 真实 AI 事件（MCP 调用 → 日志/观察/脉冲）
-  /** 把界面模块列表和服务端对齐（新增 + 删除）。
-   *  抽成独立函数是因为 hello / modules_changed 两条路径都要用；
-   *  用 useCallback 保持稳定引用，避免 ws 因它重建。 */
-  const syncSeq = useRef(0);
-
-  const doSync = useCallback(async (mySeq: number) => {
-    // 直接问 nav_stats（不带 so）：后端会返回 serverModules（带时间戳防 WKWebView 缓存）。
-    const nav = await api.navStats("");
-    if (!nav) return;
-    const serverMods = nav.serverModules ?? [];
-    setNavSt(nav);
-    const alive = new Set(serverMods.map((m) => m.so));
-
-    // ① 先把服务端有、本地没有的模块数据全部取好（异步阶段）
-    const needLoad = serverMods.filter((m) => !backendMods.current.has(m.so));
-    const loaded: ModuleData[] = [];
-    for (const m of needLoad) {
-      try {
-        const fn = await api.functions(m.so, "", 200000);
-        if (!fn?.items?.length) continue;
-        const fns: Func[] = fn.items.map((it) => ({
-          n: it.name, a: it.addr, s: it.size, e: it.is_export ? 1 : 0, r: it.refs ?? 0,
-        }));
-        loaded.push({
-          so: m.so, path: m.path, size: 0, sections: [], funcs: fns,
-          disasm: {}, callers: {}, callees: {},
-        });
-      } catch {
+  const doSync = useCallback(
+    async (mySeq: number) => {
+      const nav = await api.navStats("");
+      if (!nav) return;
+      const serverMods = nav.serverModules ?? [];
+      setNavSt(nav);
+      const alive = new Set(serverMods.map((m) => m.so));
+      const needLoad = serverMods.filter((m) => !backendMods.current.has(m.so));
+      const loaded: ModuleData[] = [];
+      for (const m of needLoad) {
+        try {
+          const fn = await api.functions(m.so, "", 200000);
+          if (!fn?.items?.length) continue;
+          const fns: Func[] = fn.items.map((it) => ({
+            n: it.name, a: it.addr, s: it.size, e: it.is_export ? 1 : 0, r: it.refs ?? 0,
+          }));
+          loaded.push({ so: m.so, path: m.path, size: 0, sections: [], funcs: fns, disasm: {}, callers: {}, callees: {} });
+        } catch { /* ignore */ }
       }
-    }
+      if (mySeq !== syncSeq.current) return;
+      const wasEmpty = modulesRef.current.length === 0;
+      reconcileModules(Array.isArray(nav.serverModules) ? alive : null, loaded, wasEmpty);
+    },
+    [reconcileModules]
+  );
 
-    // ② 只有最新一次同步能落地（旧请求的结果丢弃，防覆盖）
-    if (mySeq !== syncSeq.current) return;
-    // 同时支持新增与移除后端已卸载模块，并保留用户当前 active 与 sel
-    const wasEmpty = modulesRef.current.length === 0;
-    reconcileModules(Array.isArray(nav.serverModules) ? alive : null, loaded, wasEmpty);
-    for (const d of loaded) log(`已打开 ${d.so} · ${d.funcs.length} 函数`, "ai");
-  }, [log, reconcileModules]);
+  const syncModules = useCallback(async () => {
+    syncSeq.current += 1;
+    const mySeq = syncSeq.current;
+    try { await doSync(mySeq); } catch { /* ignore */ }
+  }, [doSync]);
 
-  /** 串行包装：并发调用会互相覆盖 setModules，必须互斥 */
-  /** nav_stats 带回来的服务端模块列表 → 补齐本地。
-   *  这是 /api/modules 被 WKWebView 缓存时的可靠替代路径。 */
   const handleServerModules = useCallback(
     (mods: { so: string; path: string }[]) => {
       for (const m of mods) {
         if (backendMods.current.has(m.so)) continue;
-        setPendingSo(m.so);
-        void (async () => {
-          try {
-            await appendModule(m.so, m.path);
-          } catch {
-            /* 坏文件交给日志 */
-          }
-        })();
+        void appendModule(m.so, m.path).catch(() => {});
       }
     },
     [appendModule]
   );
 
-  const syncModules = useCallback(async () => {
-    // 不用锁：用请求号保证只有最新一次的结果落地。
-    // 锁在这里反复卡死（ref + useCallback 重建的组合不可靠），
-    // 而"旧结果不落地"这个需求用序号就能满足，且不可能卡死。
-    syncSeq.current += 1;
-    const mySeq = syncSeq.current;
-    try {
-      await doSync(mySeq);
-    } catch (e) {
-      log(`同步模块失败：${String(e).slice(0, 80)}`, "ai");
-    }
-  }, [doSync, log]);
-
-  /** WebSocket 心跳：每 3 秒要一次模块快照。
-   *  独立于连接生命周期——连接重建不该让同步停摆（实测 sent 会卡住）。 */
-  useEffect(() => {
-    const ask = () => {
-      const ws = wsRef.current;
-      try {
-        if (ws && ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ type: "sync" }));
-        }
-      } catch {
-        /* 断线下一轮再试 */
-      }
-    };
-    ask();
-    const id = setInterval(ask, 3000);
-    return () => {
-      clearInterval(id);
-    };
-  }, []);
-
-  // 顶栏计数：按当前模块查，事件到来时刷新（左栏与顶栏必须同源）
-  useEffect(() => {
-    let alive = true;
-    void (async () => {
-      const r = await api.navStats(mod?.so ?? "");
-      if (alive && r) setNavSt(r);
-    })();
-    return () => {
-      alive = false;
-    };
-  }, [mod?.so, aiTick]);
-
-  // 工具注册表大小（顶栏「工具 N」用）。只取一次，注册表不会在运行中变。
+  // 拉取 137 个真实工具清单
   useEffect(() => {
     let alive = true;
     void (async () => {
       const r = await api.tools();
-      if (alive && r?.tools) setToolN(r.tools.length);
+      if (alive && r?.tools) setToolsList(r.tools);
     })();
-    return () => {
-      alive = false;
-    };
+    return () => { alive = false; };
   }, []);
 
-  /** 轮询服务端模块列表（3 秒）。
-   *  为什么必须轮询：模块通常是页面加载**之后**才加进来的，
-   *  启动时那一次探测拿不到；而 /api/modules 在 WKWebView 里不可靠。
-   *  nav_stats（不带 so）会返回 serverModules，这是验证可用的通道。 */
+  // 拉取导航统计 + 动态状态 + 待命断点计数
+  useEffect(() => {
+    let alive = true;
+    void (async () => {
+      const [ns, ds, arm] = await Promise.all([
+        api.navStats(mod?.so ?? ""),
+        api.dynState(),
+        api.armed(),
+      ]);
+      if (!alive) return;
+      if (ns) setNavSt(ns);
+      if (ds) setDynState(ds);
+      if (arm) setArmedBpCount(arm.count ?? 0);
+    })();
+    return () => { alive = false; };
+  }, [mod?.so, aiTick]);
+
+  // 切换模块时加载真实注释表 + 左栏字符串/段节
+  useEffect(() => {
+    if (!mod) return;
+    let alive = true;
+    void (async () => {
+      const r = await api.comments(mod.so);
+      if (alive && r?.items) {
+        setCommentsBySo((prev) => ({ ...prev, [mod.so]: r.items }));
+      }
+    })();
+    return () => { alive = false; };
+  }, [mod?.so]);
+
+  useEffect(() => {
+    if (!mod || (leftTab !== "strings" && leftTab !== "sections")) return;
+    let alive = true;
+    void (async () => {
+      if (leftTab === "strings") {
+        const r = await api.strings(mod.so, leftFilter);
+        if (alive && r?.items) setLeftStrings(r.items);
+      } else {
+        const r = await api.sections(mod.so);
+        if (alive && r?.items) setLeftSections(r.items);
+      }
+    })();
+    return () => { alive = false; };
+  }, [mod?.so, leftTab, leftFilter]);
+
+  // WebSocket 实时事件流 + 3s 模块对齐心跳
+  useEffect(() => {
+    const id = window.setInterval(() => {
+      const ws = wsRef.current;
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        try { ws.send(JSON.stringify({ type: "sync" })); } catch { /* ignore */ }
+      }
+    }, 3000);
+    return () => window.clearInterval(id);
+  }, []);
+
   useEffect(() => {
     let stop = false;
     const tick = async () => {
       if (stop) return;
-      try {
-        const r = await api.navStats("");
-        if (stop || !r) return;
-        const list = r.serverModules ?? [];
-        if (Array.isArray(r.serverModules)) {
-          reconcileModules(new Set(list.map((m) => m.so)), [], false);
-        }
-        for (const m of list) {
-          if (stop) return;
-          if (backendMods.current.has(m.so)) continue;
-          try {
-            await appendModule(m.so, m.path);
-          } catch {
-          }
-        }
-      } catch {
+      const r = await api.navStats("");
+      if (stop || !r) return;
+      const list = r.serverModules ?? [];
+      if (Array.isArray(r.serverModules)) {
+        reconcileModules(new Set(list.map((m) => m.so)), [], false);
+      }
+      for (const m of list) {
+        if (stop || backendMods.current.has(m.so)) continue;
+        try { await appendModule(m.so, m.path); } catch { /* ignore */ }
       }
     };
-    void tick();
-    const id = setInterval(tick, 3000);
-    return () => {
-      stop = true;
-      clearInterval(id);
-    };
+    const id = window.setInterval(() => void tick(), 3500);
+    return () => { stop = true; window.clearInterval(id); };
   }, [appendModule, reconcileModules]);
 
-
-
-  // 事件流连接状态（与 HTTP「后端已连接」是两回事）
-  const [wsAlive, setWsAlive] = useState(false);
-  const retryDelay = useRef(1000);
-  const closed = useRef(false);
-
   useEffect(() => {
-    closed.current = false;
-    // (133) 每条连接自己的销毁标记：共享 ref 会被下一次 effect 重置，
-    //       导致旧连接的 onclose 误判为"没销毁"并额外建连（StrictMode 下必现）。
     let disposed = false;
     let ws: WebSocket | null = null;
     let retryTimer: number | null = null;
 
-    // 注意：必须读 modulesRef，不能读 modules —— 这个 effect 只在挂载时跑一次，
-    // 闭包里的 modules 永远是空数组（AI 定位因此一直失效，实测 hit 恒为 null）。
-    const findName = (so: string, addr: number): string => {
-      const m = modulesRef.current.find((x) => x.so === so);
-      return m?.funcs.find((x) => x.a === addr)?.n ?? hex(addr);
-    };
-    const toIdx = (so: string, addr: number): { mi: number; i: number } | null => {
-      const cur = modulesRef.current;
-      const mi = cur.findIndex((m) => m.so === so);
-      if (mi < 0) return null;
-      const i = cur[mi].funcs.findIndex((x) => x.a === addr);
-      return i < 0 ? null : { mi, i };
-    };
-
-    /** 给一条连接挂上全部 handler（新建/重连共用同一套） */
-    const wire = (sock: WebSocket) => {
-    sock.onopen = () => {
-      wsRef.current = sock;
-      setWsAlive(true);
-      retryDelay.current = 1000;
-    };
-    sock.onclose = () => {
-      setWsAlive(false);
-      wsRef.current = null;
-      // (133) 只看**本连接**是否被销毁，不看共享 ref
-      if (disposed) return;
-      const delay = retryDelay.current;
-      retryDelay.current = Math.min(delay * 2, 10_000);
-      retryTimer = window.setTimeout(() => { if (!disposed) connect(); }, delay);
-    };
-    sock.onerror = () => { setWsAlive(false); };
-
-    sock.onmessage = (ev) => {
-      // (1) 第一次修改（2026-11-19）：补 t / ok / result 三件套。
-      //    bug 原因：这条 WS 消息类型里没有工具返回值字段，而服务端
-      //              api.py 的 _on_ai 已经会推 result/result_truncated/result_bytes。
-      //              不补类型就只能 as any 绕过，那等于放弃编译期检查。
-      //    解决方案：把控制台需要的字段显式声明在这里，与 server/api.py 的
-      //              _broadcast_sync 载荷一一对应。
-      let msg: { type?: string; tool?: string; args?: Record<string, unknown>;
-                 summary?: string; ms?: number; ts?: string; t?: number;
-                 ok?: boolean; result?: string; result_truncated?: boolean;
-                 result_bytes?: number;
-                 event?: Record<string, unknown> };
-      try { msg = JSON.parse(ev.data); } catch { return; }
-      // hello：刚连上时服务端把已有模块报一次，必须对齐（之前完全没处理）
-      if (msg.type === "hello") {
-        void syncModules();
-        return;
-      }
-      // WebSocket 推来的模块快照：这是 WKWebView 里唯一可靠的通道
-      // （/api GET 会被复用成旧响应，实测请求到达后端但 body 是旧的）
-      if (msg.type === "modules_snapshot") {
-        type FnRow = {
-          name: string; addr: number; size: number; is_export: boolean; refs: number;
-        };
-        const details = (msg as {
-          details?: { so: string; path: string; functions?: FnRow[] }[];
-        }).details ?? [];
-        const serverSet = new Set(details.map((m) => m.so));
-        const added: ModuleData[] = [];
-        for (const m of details) {
-          if (backendMods.current.has(m.so)) continue;
-          const rows = m.functions ?? [];
-          if (!rows.length) continue;
-          const funcs: Func[] = rows.map((it) => ({
-            n: it.name, a: it.addr, s: it.size,
-            e: it.is_export ? 1 : 0, r: it.refs ?? 0,
-          }));
-          added.push({
-            so: m.so, path: m.path, size: 0, sections: [],
-            funcs, disasm: {}, callers: {}, callees: {},
-          });
-        }
-        const wasEmpty = modulesRef.current.length === 0;
-        reconcileModules(serverSet, added, wasEmpty);
-        for (const d of added) {
-          log(`已打开 ${d.so} · ${d.funcs.length} 函数（WebSocket 快照）`, "ai");
-        }
-        return;
-      }
-      // (3) 第三次修改（2026-11-11）：
-      //     bug 原因：服务端在卸载/清空后会广播 modules_changed，
-      //               但前端只处理 ai / ui 两类消息——于是 AI 通过 MCP 调
-      //               unload_so / clear_modules 之后，界面仍显示旧模块，
-      //               点一下就是 404，与「AI 与界面同会话」的目标相悖。
-      //     解决方案：收到 modules_changed 就按服务端给的模块列表对齐本地状态。
-      if (msg.type === "modules_changed") {
-        void syncModules();
-        return;
-      }
-      if (msg.type === "ai" && msg.tool === "load_so") {
-        // (2) 第一次修改：AI 通过 MCP 加载 so 后，界面自动出现该模块。
-        //     原因：之前只有 AI 自己看得见，人要在窗口里手动再开一次。
-        void (async () => {
-          try {
-          // 直接问 nav_stats（不带 so）：后端会返回 serverModules。
-    // 不再先用 /api/modules 判断"要不要查"——那一步在 WKWebView 里恒空，
-    // 会让整条链在第一环就断掉（实测：anySo="" 导致 navStats 根本不调用）。
-    const nav = await api.navStats("");
-    const serverMods = nav?.serverModules ?? [];
-    setNavSt(nav ?? null);
-    const mods = { modules: serverMods };
-          for (const m of mods?.modules ?? []) {
-            // backendMods 是 ref，比 state 可靠（state 在闭包里会过期）
-            if (backendMods.current.has(m.so)) continue;
-            setLoading({ name: m.so });
-            try { await appendModule(m.so, m.path); } catch { /* 坏文件交给日志 */ }
-          }
-          } finally {
-            // 无论成功失败都必须收遮罩，否则整屏被盖住
-            setLoading(null);
-          }
-        })();
-      }
-      if (msg.type === "armed_changed") {
-        // 待命状态是持久状态，单独走一条通道给 ArmedBar
-        const list = (msg as { items?: unknown }).items;
-        window.dispatchEvent(
-          new CustomEvent("mda:armed", { detail: Array.isArray(list) ? list : [] })
-        );
-      }
-      if (msg.type === "ai") {
-        // 节流：900ms 内只让 tick 前进一次
-        if (tickTimer.current == null) {
-          tickTimer.current = window.setTimeout(() => {
-            tickTimer.current = null;
-            setAiTick((v) => v + 1);
-          }, 900);
-        }
-        // 每次工具调用都进实时流。暂停时不再追加（但也不丢已有数据）。
-        setToolCounts((prev) => {
-          const k = msg.tool ?? "";
-          if (!k) return prev;
-          return { ...prev, [k]: (prev[k] ?? 0) + 1 };
-        });
-        setAiEvents((prev) => {
-          if (aiPausedRef.current) return prev;
-          const next = [
-            { id: ++aiEventSeq.current,
-              tool: msg.tool ?? "", args: msg.args as Record<string, unknown> | undefined,
-              summary: msg.summary, ms: msg.ms, ts: msg.ts,
-              // (1) 第一次修改（2026-11-19）：透传后端给的输入/输出完整信息，
-              // 控制台据此渲染两段。缺这些字段时控制台只能看到参数摘要，
-              // 输出侧永远空白——那正是改之前的状态。
-              t: typeof msg.t === "number" ? msg.t : undefined,
-              ok: msg.ok !== false,
-              result: typeof msg.result === "string" ? msg.result : "",
-              result_truncated: !!msg.result_truncated,
-              result_bytes: typeof msg.result_bytes === "number" ? msg.result_bytes : 0 },
-            ...prev,
-          ];
-          return next.slice(0, 500);   // 上限，避免长时间运行吃内存
-        });
-        const a = (msg.args ?? {}) as { so_name?: string; name?: string; addr?: number };
-        const so = a.so_name ?? a.name ?? "";
-        const addr = typeof a.addr === "number" ? a.addr : undefined;
-        log(`[AI] ${msg.tool}(${so}${addr !== undefined ? ", " + hex(addr) : ""}) ${msg.summary ?? ""}`, "ai");
-        if (so && addr !== undefined) {
-          setWatch((w) => [{ so, name: findName(so, addr), addr }, ...w].slice(0, 60));
-          const hit = toIdx(so, addr);
-          if (hit) {
-            setActive(hit.mi);
-            setSel((prev) => prev.map((v, k) => (k === hit.mi ? hit.i : v)));
-            flashSeq.current += 1;
-            setFlash({ i: hit.i, seq: flashSeq.current });
-          }
-        }
-        setBusySo(so || null);
-        setTimeout(() => setBusySo((v) => (v === so ? null : v)), 1600);
-      } else if (msg.type === "ui" && msg.event?.type === "goto") {
-        const e = msg.event as { so_name: string; addr: number };
-        const hit = toIdx(e.so_name, e.addr);
-        if (hit) {
-          setActive(hit.mi);
-          setSel((prev) => prev.map((v, k) => (k === hit.mi ? hit.i : v)));
-          setRotateIdx(hit.i);
-        }
-      }
-    };
-    };  // ← wire() 结束
-
-    /** 建一条新连接；断线后由 onclose 再次调用（指数退避） */
     const connect = () => {
-      try {
-        ws = new WebSocket(apiWsUrl("/api/events"));
-      } catch {
-        return;
-      }
-      wire(ws);
-    };
-    connect();
+      try { ws = new WebSocket(apiWsUrl("/api/events")); } catch { return; }
+      ws.onopen = () => {
+        wsRef.current = ws;
+        setWsAlive(true);
+        retryDelay.current = 1000;
+      };
+      ws.onclose = () => {
+        setWsAlive(false);
+        wsRef.current = null;
+        if (disposed) return;
+        const delay = retryDelay.current;
+        retryDelay.current = Math.min(delay * 2, 10_000);
+        retryTimer = window.setTimeout(() => { if (!disposed) connect(); }, delay);
+      };
+      ws.onerror = () => setWsAlive(false);
+      ws.onmessage = (ev) => {
+        let msg: {
+          type?: string;
+          tool?: string;
+          args?: Record<string, unknown>;
+          summary?: string;
+          ms?: number;
+          ts?: string;
+          t?: number;
+          ok?: boolean;
+          result?: string;
+          result_truncated?: boolean;
+          result_bytes?: number;
+          items?: unknown;
+          details?: { so: string; path: string; functions?: { name: string; addr: number; size: number; is_export: boolean; refs: number }[] }[];
+          event?: Record<string, unknown>;
+        };
+        try { msg = JSON.parse(ev.data); } catch { return; }
 
+        if (msg.type === "hello" || msg.type === "modules_changed") {
+          void syncModules();
+          return;
+        }
+        if (msg.type === "modules_snapshot") {
+          const details = msg.details ?? [];
+          const serverSet = new Set(details.map((m) => m.so));
+          const added: ModuleData[] = [];
+          for (const m of details) {
+            if (backendMods.current.has(m.so) || !m.functions?.length) continue;
+            added.push({
+              so: m.so,
+              path: m.path,
+              size: 0,
+              sections: [],
+              funcs: m.functions.map((it) => ({
+                n: it.name, a: it.addr, s: it.size, e: it.is_export ? 1 : 0, r: it.refs ?? 0,
+              })),
+              disasm: {}, callers: {}, callees: {},
+            });
+          }
+          reconcileModules(serverSet, added, modulesRef.current.length === 0);
+          return;
+        }
+        if (msg.type === "armed_changed") {
+          const list = Array.isArray(msg.items) ? msg.items : [];
+          setArmedBpCount(list.length);
+          window.dispatchEvent(new CustomEvent("mda:armed", { detail: list }));
+          return;
+        }
+        if (msg.type === "ai") {
+          if (msg.tool === "load_so") void syncModules();
+          if (tickTimer.current == null) {
+            tickTimer.current = window.setTimeout(() => {
+              tickTimer.current = null;
+              setAiTick((v) => v + 1);
+            }, 900);
+          }
+          const toolName = msg.tool ?? "";
+          if (toolName) {
+            setToolCounts((prev) => ({ ...prev, [toolName]: (prev[toolName] ?? 0) + 1 }));
+          }
+          const newEv: AiEvent = {
+            id: ++aiEventSeq.current,
+            tool: toolName,
+            args: msg.args,
+            summary: msg.summary,
+            ms: msg.ms,
+            ts: msg.ts || now(),
+            t: typeof msg.t === "number" ? msg.t : undefined,
+            ok: msg.ok !== false,
+            result: typeof msg.result === "string" ? msg.result : "",
+            result_truncated: !!msg.result_truncated,
+            result_bytes: typeof msg.result_bytes === "number" ? msg.result_bytes : 0,
+          };
+          setAiEvents((prev) => (aiPausedRef.current ? prev : [newEv, ...prev].slice(0, 500)));
+
+          // 驱动真实 AI 操控设备动画特效
+          fireGlobalFx(toolName, msg.summary || toolName, msg.ms);
+
+          const a = (msg.args ?? {}) as { so_name?: string; name?: string; addr?: number };
+          const so = a.so_name ?? a.name ?? "";
+          const addr = typeof a.addr === "number" ? a.addr : undefined;
+          log(`[AI] ${toolName}(${so}${addr !== undefined ? ", " + hex(addr) : ""}) ${msg.summary ?? ""}`, "ai");
+          if (so && addr !== undefined) {
+            const curMod = modulesRef.current.find((x) => x.so === so);
+            const fnNm = curMod?.funcs.find((x) => x.a === addr)?.n ?? hex(addr);
+            setWatch((w) => [{ so, name: fnNm, addr }, ...w].slice(0, 60));
+            if (followAiRef.current && mainViewRef.current !== "monitor" && mainViewRef.current !== "tools") {
+              jumpToAddr(so, addr, { pushHist: false });
+            }
+            setAiHit((prev) => ({ seq: prev.seq + 1, addr }));
+          }
+          if (so) {
+            setBusySo(so);
+            window.setTimeout(() => setBusySo((v) => (v === so ? null : v)), 1500);
+          }
+        } else if (msg.type === "ui" && msg.event?.type === "goto") {
+          const e = msg.event as { so_name: string; addr: number };
+          jumpToAddr(e.so_name, e.addr);
+        }
+      };
+    };
+
+    connect();
     return () => {
-      // (133) 标记本连接已销毁（只影响它自己）
       disposed = true;
-      closed.current = true;
       if (retryTimer != null) window.clearTimeout(retryTimer);
-      if (tickTimer.current != null) {
-        window.clearTimeout(tickTimer.current);
-        tickTimer.current = null;
-      }
+      if (tickTimer.current != null) window.clearTimeout(tickTimer.current);
       wsRef.current = null;
       ws?.close();
     };
-    // 只依赖稳定回调：modules 变化不应重建连接（否则消息会丢）
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [appendModule, syncModules, reconcileModules]);
+  }, [appendModule, syncModules, reconcileModules, fireGlobalFx]);
 
-  // 选中变化：取真实 xrefs + 反汇编
-  useEffect(() => {
-    if (!mod || selected < 0) return;
-    let cancelled = false;
-    const so = mod.so;
-    const addr = mod.funcs[selected].a;
-    (async () => {
-      const have = backendMods.current.has(so);
-      const x = have ? await api.xrefs(so, addr) : null;
-      if (cancelled) return;
-      const toNum = (h: string) => parseInt(h, 16);
-      if (x) setRelations({ ins: x.callers.map(toNum), outs: x.callees.map(toNum) });
-      else setRelations(null);
-      if (code.open) {
-        const d = have ? await api.disasm(so, addr) : null;
-        if (cancelled) return;
-        if (d) setCode((c) => ({ ...c, rows: d.items, live: true }));
-        else setCode((c) => ({ ...c, rows: [], live: false }));
-      }
-    })();
-    return () => { cancelled = true; };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [active, selected]);
-
-  const selectFn = (mi: number, i: number) => {
-    setSel((prev) => prev.map((v, k) => (k === mi ? i : v)));
-    if (mi !== active) setActive(mi);
-    setRotateIdx(i);
-  };
-
-  const openCode = async () => {
-    const curMod = modRef.current;
-    const curSel = selRef.current[activeRef.current] ?? -1;
-    const curFn = curMod && curSel >= 0 ? curMod.funcs[curSel] : null;
-    if (!curMod || !curFn) return;
-    setCode({ open: true, rows: [], live: false });
-    const d = await api.disasm(curMod.so, curFn.a);
-    if (d) {
-      setCode({ open: true, rows: d.items, live: true });
-      log(`反汇编 ${curFn.n} · ${d.items.length} 条（后端实时解码）`, "ai");
-    } else {
-      setCode({ open: true, rows: [], live: false });
-      log(`反汇编失败：后端没有返回 ${curFn.n} 的指令`, "ai");
-    }
-  };
-  const openCodeRef = useRef(openCode);
-  openCodeRef.current = openCode;
-
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") { setCode((c) => ({ ...c, open: false })); return; }
-      if (e.key !== "Enter") return;
-      const target = e.target as HTMLElement | null;
-      if (
-        target instanceof HTMLInputElement ||
-        target instanceof HTMLTextAreaElement ||
-        target instanceof HTMLSelectElement ||
-        target instanceof HTMLButtonElement ||
-        target?.isContentEditable
-      ) {
-        return;
-      }
-      void openCodeRef.current();
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, []);
-
-  const buildXrefs = async () => {
+  const buildXrefs = useCallback(async () => {
     if (!mod) return;
-    log("开始构建引用图（后端真实构建）");
-    setProgress({ percent: 5 });
-    const t0 = setInterval(() => setProgress((p) => (p ? { percent: Math.min(92, p.percent + 7) } : p)), 260);
+    showToast(`正在为 ${mod.so} 构建真实交叉引用图…`);
     const r = await api.buildXrefs(mod.so);
-    clearInterval(t0);
-    setProgress({ percent: 100 });
-    setTimeout(() => setProgress(null), 700);
-    if (r) setAiTick((v) => v + 1);
-    log(r ? "引用图构建完成" : "引用图构建失败", "ai");
-  };
+    if (r?.ok) {
+      setAiTick((v) => v + 1);
+      showToast(`${mod.so} 交叉引用图构建完成`);
+    } else {
+      showToast("引用图构建失败");
+    }
+  }, [mod, showToast]);
 
-  /** 复制 MCP 配置：HTTP 与 stdio 两种都写进同一个 mcpServers，粘过去删掉不用的那条即可 */
   const copyMcpConfig = useCallback(async () => {
     try {
       const cfg = await (await fetch(`${API_BASE}/api/mcp-config`)).json();
@@ -974,22 +745,207 @@ export default function App() {
         2
       );
       const ok = await copyText(text);
-      log(ok ? "已复制 MCP 配置（含 HTTP 与 stdio 两种写法）" : "复制失败：请检查剪贴板权限", "ai");
+      showToast(ok ? "已复制 MCP 配置（HTTP + stdio）" : "复制失败：请检查剪贴板权限");
     } catch (e) {
-      log(`读取 MCP 配置失败：${e}`);
+      showToast(`读取 MCP 配置失败：${e}`);
     }
-  }, [log]);
+  }, [showToast]);
+
+  /** 提交原地重命名或注释到真实后端 */
+  const submitInlineDialog = useCallback(async () => {
+    if (!inlineDialog || !mod || !f) {
+      setInlineDialog(null);
+      return;
+    }
+    const val = inlineDialog.value.trim();
+    if (inlineDialog.kind === "rename") {
+      if (!val) { setInlineDialog(null); return; }
+      const r = await api.renameFn(mod.so, f.a, val);
+      if (r?.ok) {
+        setModules((prev) =>
+          prev.map((m) =>
+            m.so !== mod.so
+              ? m
+              : { ...m, funcs: m.funcs.map((fn) => (fn.a === f.a ? { ...fn, n: val } : fn)) }
+          )
+        );
+        showToast(`已重命名为 ${val}`);
+      } else {
+        showToast("重命名失败");
+      }
+    } else {
+      const targetAddr = selInsnAddr ?? f.a;
+      const r = await api.setComment(mod.so, targetAddr, val);
+      if (r?.ok) {
+        setCommentsBySo((prev) => {
+          const cur = { ...(prev[mod.so] ?? {}) };
+          if (val) cur[hex(targetAddr)] = val;
+          else delete cur[hex(targetAddr)];
+          return { ...prev, [mod.so]: cur };
+        });
+        showToast(val ? `已写入注释 @ ${hex(targetAddr)}` : `已清除注释 @ ${hex(targetAddr)}`);
+      } else {
+        showToast("写入注释失败");
+      }
+    }
+    setInlineDialog(null);
+  }, [inlineDialog, mod, f, selInsnAddr, showToast]);
+
+  const toggleBpMark = useCallback(
+    (soName: string, addr: number) => {
+      const k = `${soName}:${hex(addr)}`;
+      setBpMarks((prev) => {
+        const next = new Set(prev);
+        if (next.has(k)) {
+          next.delete(k);
+          showToast(`已移除本地断点标记 ${hex(addr)}`);
+        } else {
+          next.add(k);
+          showToast(`已标记断点位 ${soName} @ ${hex(addr)}（真机断点可让 AI 调 set_breakpoint）`);
+        }
+        return next;
+      });
+    },
+    [showToast]
+  );
+
+  // 拖拽调整左栏 / 右栏 / 底部抽屉尺寸
+  const startResize = (kind: "left" | "right" | "drawer", e: React.MouseEvent) => {
+    e.preventDefault();
+    const startPos = kind === "drawer" ? e.clientY : e.clientX;
+    const startSize = kind === "left" ? leftW : kind === "right" ? rightW : drawerH;
+    const onMove = (ev: MouseEvent) => {
+      const delta = (kind === "drawer" ? ev.clientY : ev.clientX) - startPos;
+      if (kind === "left") setLeftW(Math.max(180, Math.min(420, startSize + delta)));
+      else if (kind === "right") setRightW(Math.max(220, Math.min(440, startSize - delta)));
+      else setDrawerH(Math.max(120, Math.min(420, startSize - delta)));
+    };
+    const onUp = () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  };
+
+  // 全局快捷键（严格隔离 INPUT/TEXTAREA/SELECT/contentEditable 与弹窗）
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const meta = e.metaKey || e.ctrlKey;
+      if (meta && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        setPaletteOpen((v) => !v);
+        return;
+      }
+      if (meta && e.key.toLowerCase() === "b") {
+        e.preventDefault();
+        setLeftOpen((v) => !v);
+        return;
+      }
+      if (meta && e.key.toLowerCase() === "j") {
+        e.preventDefault();
+        setDrawerOpen((v) => !v);
+        return;
+      }
+      if (meta && e.key.toLowerCase() === "i") {
+        e.preventDefault();
+        setRightOpen((v) => !v);
+        return;
+      }
+      if (meta && e.key === ",") {
+        e.preventDefault();
+        setMainView((v) => (v === "settings" ? "monitor" : "settings"));
+        return;
+      }
+      if (e.altKey && e.key === "ArrowLeft") {
+        e.preventDefault();
+        goBack();
+        return;
+      }
+      if (e.altKey && e.key === "ArrowRight") {
+        e.preventDefault();
+        goFwd();
+        return;
+      }
+
+      const tgt = e.target as HTMLElement | null;
+      if (
+        tgt instanceof HTMLInputElement ||
+        tgt instanceof HTMLTextAreaElement ||
+        tgt instanceof HTMLSelectElement ||
+        tgt?.isContentEditable ||
+        paletteOpen ||
+        inlineDialog != null
+      ) {
+        return;
+      }
+
+      if (e.key === "F5" && modRef.current) {
+        e.preventDefault();
+        setMainView((v) => (v === "split" ? "disasm" : "split"));
+      } else if (e.key === " " && modRef.current) {
+        e.preventDefault();
+        setMainView((v) => (v === "cfg" ? "split" : "cfg"));
+      } else if (e.key === "1" && modRef.current) {
+        setMainView("disasm");
+      } else if (e.key === "4" && modRef.current) {
+        setMainView("graph");
+      } else if (e.key === "5") {
+        setMainView("monitor");
+      } else if (e.key === "6") {
+        setMainView("tools");
+      } else if (e.key.toLowerCase() === "n" && modRef.current && f) {
+        e.preventDefault();
+        setInlineDialog({ kind: "rename", value: f.n });
+      } else if (e.key === ";" && modRef.current && f) {
+        e.preventDefault();
+        const a = selInsnAddr ?? f.a;
+        setInlineDialog({ kind: "comment", value: commentsBySo[modRef.current.so]?.[hex(a)] ?? "" });
+      } else if (e.key.toLowerCase() === "b" && modRef.current && f) {
+        e.preventDefault();
+        toggleBpMark(modRef.current.so, selInsnAddr ?? f.a);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [goBack, goFwd, paletteOpen, inlineDialog, f, selInsnAddr, commentsBySo, toggleBpMark]);
+
+  // 左侧函数列表（支持关键词过滤 + 导出优先 + 限制 400 条保证万级函数流畅）
+  const filteredFuncs = useMemo(() => {
+    if (!mod) return [];
+    const kw = leftFilter.trim().toLowerCase();
+    const src = kw
+      ? mod.funcs.filter((fn) => fn.n.toLowerCase().includes(kw) || hex(fn.a).includes(kw))
+      : mod.funcs;
+    return src.slice(0, 400);
+  }, [mod, leftFilter]);
+
+  const paletteActions = useMemo<PaletteAction[]>(
+    () => [
+      { kind: "视图", title: "实时工具流 & 设备运行态监控", meta: "5", run: () => setMainView("monitor") },
+      { kind: "视图", title: `全部 ${toolsList.length || 140} 个真实 MCP 工具目录`, meta: "6", run: () => setMainView("tools") },
+      { kind: "设置", title: "设置 & 设备工具箱（手机代理 / 冻结 App / 清数据重启）", meta: "⌘,", run: () => setMainView("settings") },
+      { kind: "视图", title: "并排对照：反汇编 + 伪代码 (F5)", meta: "F5", run: () => mod && setMainView("split") },
+      { kind: "视图", title: "CFG 基本块控制流图 (Space)", meta: "Space", run: () => mod && setMainView("cfg") },
+      { kind: "视图", title: "跨 SO 调用图谱", meta: "4", run: () => mod && setMainView("graph") },
+      { kind: "抽屉", title: "打开底部 Frida 终端", meta: "⌘J", run: () => { setDrawerTab("terminal"); setDrawerOpen(true); } },
+      { kind: "抽屉", title: "打开底部插件快捷分析", meta: "⌘J", run: () => { setDrawerTab("plugins"); setDrawerOpen(true); } },
+      { kind: "操作", title: "建立当前 SO 交叉引用图", meta: "Xref", run: () => void buildXrefs() },
+      { kind: "操作", title: "切换深色 / 浅色主题", meta: "Theme", run: () => { themeLocked.current = true; setTheme((t) => (t === "dark" ? "light" : "dark")); } },
+    ],
+    [toolsList.length, mod, buildXrefs]
+  );
 
   const empty = modules.length === 0;
+  const totalFnsAll = modules.reduce((acc, m) => acc + m.funcs.length, 0);
+  const showRightInspector = rightOpen && mainView !== "monitor" && mainView !== "tools" && mainView !== "settings";
 
   return (
     <div
-      className="app"
+      className="v2-shell"
       onDragOver={(e) => { e.preventDefault(); if (!dragging) setDragging(true); }}
       onDragLeave={(e) => {
-        // 只有真正离开窗口才收起提示（子元素间移动会连续触发 dragleave）
-        if (e.clientX <= 0 || e.clientY <= 0 ||
-            e.clientX >= window.innerWidth || e.clientY >= window.innerHeight) {
+        if (e.clientX <= 0 || e.clientY <= 0 || e.clientX >= window.innerWidth || e.clientY >= window.innerHeight) {
           setDragging(false);
         }
       }}
@@ -1000,387 +956,629 @@ export default function App() {
         if (file) void uploadFile(file);
       }}
     >
-      <header className="topbar">
-        <div className="brand">
-          <span className="mark" />MDA
-          <small>{ver ? `${ver} · web` : "web"}</small>
+      {/* 顶栏 */}
+      <header className="v2-topbar">
+        <div className="v2-brand">
+          <div className="v2-brand-mark">M</div>
+          <span>MDA</span>
+          <span className="v2-brand-ver">{ver || "Studio"}</span>
         </div>
-        <div className="divider" />
-        <div className="so-tabs">
+        <div className="v2-sep" />
+
+        <div className="v2-mod-pills">
           {modules.map((m, i) => (
-            <span
+            <div
               key={m.so}
-              className={"so-tab" + (i === active ? " on" : "") + (busySo === m.so ? " busy" : "")}
+              className={"v2-mod-pill" + (i === active ? " active" : "") + (busySo === m.so ? " busy" : "")}
+              onClick={() => {
+                setActive(i);
+                if (mainView === "monitor" || mainView === "tools") setMainView("split");
+              }}
             >
-              <button className="so-tab-main" onClick={() => setActive(i)}>
-                {m.so}<span className="n">{m.funcs.length}</span>
-              </button>
+              <span
+                className="v2-mod-dot"
+                style={{ background: i % 2 === 0 ? "var(--accent)" : "var(--violet)" }}
+              />
+              <span>{m.so}</span>
+              <span className="cnt">{m.funcs.length}</span>
               <button
-                className="so-tab-x"
-                title={`释放 ${m.so}（只清界面与解析结果，不影响设备）`}
-                onClick={(e) => {
-                  e.stopPropagation();
-                  void unloadModule(m.so);
-                }}
+                className="v2-mod-x"
+                title={`释放 ${m.so}`}
+                onClick={(e) => { e.stopPropagation(); void unloadModule(m.so); }}
               >
                 ✕
               </button>
-            </span>
+            </div>
           ))}
-          <button className="so-add" onClick={openSo} title="打开 so">+</button>
         </div>
-        <div className="divider" />
-        <button className="btn primary" onClick={openSo}>打开 so</button>
-        <div className="grow" />
-        <input
-          className="jump"
-          disabled={empty}
-          title={empty ? "先打开一个 so 才能跳转" : ""}
-          placeholder={empty ? "打开 so 后可跳转地址 / 函数名" : "跳转到地址或函数名…"}
-          value={jumpText}
-          onChange={(e) => setJumpText(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key !== "Enter" || !mod) return;
-            const v = jumpText.trim().toLowerCase();
-            if (!v) return;
-            const i = mod.funcs.findIndex((fn) => fn.n.toLowerCase().includes(v) || hex(fn.a) === v);
-            if (i < 0) { log(`未找到「${jumpText}」`); return; }
-            selectFn(active, i);
-            setMainView("module");   // 跳转 = 过去看它，不能只改选中
-            log(`跳转到 ${mod.funcs[i].n} @ ${hex(mod.funcs[i].a)}`);
-          }}
-        />
+        <button className="v2-top-btn" onClick={openSo} title="打开或拖入 .so 文件">
+          + 打开 so
+        </button>
+
+        <div className="v2-sep" />
+
+        <div style={{ display: "flex", alignItems: "center", gap: 2 }}>
+          <button className="v2-icon-btn" onClick={goBack} disabled={histIdx <= 0} title="后退 (Alt+←)">
+            <svg className="ic" viewBox="0 0 16 16"><path d="M10 3.5L5.5 8 10 12.5" /></svg>
+          </button>
+          <button className="v2-icon-btn" onClick={goFwd} disabled={histIdx >= history.length - 1} title="前进 (Alt+→)">
+            <svg className="ic" viewBox="0 0 16 16"><path d="M6 3.5L10.5 8 6 12.5" /></svg>
+          </button>
+        </div>
+
+        <button className="v2-cmd-trigger" onClick={() => setPaletteOpen(true)} title="全局搜索与命令面板 (⌘K)">
+          <svg className="ic ic-sm" viewBox="0 0 16 16"><circle cx="7" cy="7" r="4.5" /><path d="M10.5 10.5L14 14" /></svg>
+          <span className="v2-cmd-crumb">
+            {mod && f ? (
+              <>{mod.so} <span>/</span> {f.n} <span>@ {hex(f.a)}</span></>
+            ) : (
+              <span>搜索函数、{toolsList.length || 140} 个工具或设置…</span>
+            )}
+          </span>
+          <span className="v2-kbd">⌘K</span>
+        </button>
+
         <button
-          className="btn"
+          className={"v2-ai-pill" + (followAi ? " following" : "") + (beamCol ? " busy" : "")}
+          onClick={() => {
+            if (mainView !== "monitor") setMainView("monitor");
+            else {
+              setFollowAi((v) => !v);
+              showToast(!followAi ? "已开启 AI 视角跟随" : "已暂停 AI 视角跟随");
+            }
+          }}
+          title="点击进入工具流，或在工具流内开关 AI 视角跟随"
+        >
+          <span className={"v2-pulse-dot" + (wsAlive ? "" : " off")} />
+          <span>{wsAlive ? (followAi ? "AI 实时 · 跟随开" : "AI 实时 · 跟随关") : "事件流重连中"}</span>
+        </button>
+
+        <button
+          className="v2-top-btn"
           onClick={buildXrefs}
           disabled={empty}
-          title={empty ? "先打开一个 so 才能建引用图" : "真实构建引用图（全库扫描入边）"}
+          title="为当前 SO 构建全量交叉引用图"
         >
-          建立引用图
+          建引用图
         </button>
-        <button className="btn" onClick={() => { themeLocked.current = true; setTheme(theme === "dark" ? "light" : "dark"); }}>
-          {theme === "dark" ? "◑ 深色" : "◒ 浅色"}
+
+        <button className="v2-top-btn" onClick={copyMcpConfig} title="复制 MCP 配置（HTTP + stdio）">
+          MCP 配置
         </button>
-        <div className="divider" />
-        <button className="btn" onClick={copyMcpConfig} title="复制 MCP 配置，粘到 AI 客户端的 mcpServers 里">
-          复制 MCP 配置
+
+        <div style={{ display: "flex", alignItems: "center", gap: 2 }}>
+          <button
+            className={"v2-icon-btn" + (leftOpen ? " on" : "")}
+            onClick={() => setLeftOpen((v) => !v)}
+            title="折叠/展开左栏 (⌘B)"
+          >
+            <svg className="ic" viewBox="0 0 16 16"><rect x="2" y="2.5" width="12" height="11" rx="2" /><path d="M6 2.5v11" /></svg>
+          </button>
+          <button
+            className={"v2-icon-btn" + (drawerOpen ? " on" : "")}
+            onClick={() => setDrawerOpen((v) => !v)}
+            title="折叠/展开底部插件与 Frida 终端抽屉 (⌘J)"
+          >
+            <svg className="ic" viewBox="0 0 16 16"><rect x="2" y="2.5" width="12" height="11" rx="2" /><path d="M2 10h12" /></svg>
+          </button>
+          <button
+            className={"v2-icon-btn" + (rightOpen ? " on" : "")}
+            onClick={() => setRightOpen((v) => !v)}
+            title="折叠/展开右侧检视器 (⌘I)"
+          >
+            <svg className="ic" viewBox="0 0 16 16"><rect x="2" y="2.5" width="12" height="11" rx="2" /><path d="M10 2.5v11" /></svg>
+          </button>
+        </div>
+
+        <button
+          className={"v2-top-btn" + (mainView === "settings" ? " pri" : "")}
+          onClick={() => setMainView((v) => (v === "settings" ? "monitor" : "settings"))}
+          title="设置 & 设备工具箱：手机代理、冻结 App、清数据重启 (⌘,)"
+        >
+          设置
         </button>
-        <span className="chip" title={wsAlive ? "事件流正常，界面在实时更新" : "事件流已断开，界面可能停在旧数据；正在自动重连"}>
-          <i className={"dot " + (wsAlive ? "ok" : "")} />
-          事件流 {wsAlive ? "实时" : "重连中"}
-        </span>
-        <span className="chip" title="HTTP 接口可用性（与事件流独立）">
-          <i className={"dot " + (apiOk ? "ok" : "")} />
-          {apiOk ? "接口正常" : "接口断开"}
-        </span>
-        <span className="chip" id="modcount">模块 {modules.length} / 函数 {mod?.funcs.length ?? 0}</span>
+
+        <button
+          className="v2-top-btn"
+          onClick={() => {
+            themeLocked.current = true;
+            setTheme((t) => (t === "dark" ? "light" : "dark"));
+          }}
+        >
+          {theme === "dark" ? "深色" : "浅色"}
+        </button>
       </header>
 
-      <main className="workspace">
-        <div className="side">
-          <LeftNav
-            so={mod?.so ?? ""}
-            activeView={mainView}
-            onPick={(v) => setMainView(v as typeof mainView)}
-            onServerModules={handleServerModules}
-            fnCount={mod?.funcs.length}
-            tick={aiTick}
+      {/* AI 操控能量流光条 */}
+      <div
+        className={"v2-ai-beam" + (beamCol ? " on" : "")}
+        style={beamCol ? { ["--beam-col" as string]: beamCol } : undefined}
+      />
+
+      {/* 全局引用密度热力条 */}
+      {!empty && mod && (
+        <div className="v2-heat-wrap">
+          <HeatBar
+            so={mod.so}
+            xrefBuilt={navSt?.xref_built}
+            onPickAddr={(a) => jumpToAddr(mod.so, a, { targetView: "split" })}
           />
-          <LeftPanel
-            logs={logs}
-            watch={watch}
-            onPickWatch={(w) => log(`观察：${w.name} @ ${hex(w.addr)}`)}
-          />
+          <div key={heatSweepKey} className={"v2-heat-sweep" + (heatSweepKey > 0 ? " go" : "")} />
         </div>
-        <section className={"stage" + (code.open ? " compact" : "")}>
-          {/* 主视图切换：实时监控台（AI 在做什么） / 模块视图（so 结构） */}
-          <div className="viewtabs">
-            {/* 标签顺序与原型一致：实时 / 代码 / 引用 / 图谱 / 时间线 / 工具。
-                计数都来自真实数据：引用=xref 边数，函数=真实函数数，
-                工具=注册表大小，时间线=事件条数。
-                「进程」不再是独立标签——原型把它放在左栏「目标进程」，
-                这里同样通过左栏进入（视图仍然存在）。 */}
-            <button
-              className={"vtab" + (mainView === "monitor" ? " on" : "")}
-              onClick={() => setMainView("monitor")}
-            >
-              <i className={"vdot" + (aiPaused ? "" : " live")} />
-              实时
-            </button>
-            <button
-              className={"vtab" + (mainView === "module" ? " on" : "")}
-              onClick={() => setMainView("module")}
-              disabled={empty}
-              title={empty ? "先打开一个 so" : modules[active]?.so ?? ""}
-            >
-              代码{!empty && mod ? ` ${mod.funcs.length}` : ""}
-            </button>
-            <button
-              className={"vtab" + (mainView === "xref" ? " on" : "")}
-              onClick={() => setMainView("xref")}
-              disabled={!f}
-              title={f ? "谁调用了它 / 它调用了谁" : "先选一个函数"}
-            >
-              引用{navSt?.refs != null ? ` ${navSt.refs}` : ""}
-            </button>
-            <button
-              className={"vtab" + (mainView === "graph" ? " on" : "")}
-              onClick={() => setMainView("graph")}
-              disabled={!f}
-              title={f ? "调用关系图" : "先选一个函数"}
-            >
-              图谱
-            </button>
-            <button
-              className={"vtab" + (mainView === "timeline" ? " on" : "")}
-              onClick={() => setMainView("timeline")}
-            >
-              时间线{aiEvents.length ? ` ${aiEvents.length}` : ""}
-            </button>
-            <button
-              className={"vtab" + (mainView === "tools" ? " on" : "")}
-              onClick={() => setMainView("tools")}
-            >
-              工具{toolN != null ? ` ${toolN}` : ""}
-            </button>
-            {/* (1) 第一次修改（2026-11-19）：控制台作为「工具」右侧的新 tab。
-                用户明确要求"右边直接新建一个 tab 就行了，不用弹窗"——
-                做成视图而非浮层，可以和反汇编/监控台并排切着用。
-                显示真实事件条数（与本视图里能翻到的记录同源）。 */}
-            <button
-              className={"vtab" + (mainView === "console" ? " on" : "")}
-              onClick={() => setMainView("console")}
-              title="frida 终端：手动执行一次性或常驻 frida 脚本，实时查看 console.log / send 输出"
-            >
-              frida 终端{liveScripts > 0 ? ` ${liveScripts}` : ""}
-            </button>
-            <span className="grow" />
-            <ArmedBar />
+      )}
+
+      {/* 主三栏可拖拽工作区 */}
+      <div className="v2-main">
+        {/* 左栏 */}
+        <aside
+          className={"v2-sidebar" + (leftOpen ? "" : " collapsed")}
+          style={{ width: leftOpen ? leftW : 0 }}
+        >
+          <div className="v2-seg-wrap">
+            <div className="v2-seg">
+              <button className={leftTab === "funcs" ? "on" : ""} onClick={() => setLeftTab("funcs")}>函数</button>
+              <button className={leftTab === "strings" ? "on" : ""} onClick={() => setLeftTab("strings")}>字符串</button>
+              <button className={leftTab === "sections" ? "on" : ""} onClick={() => setLeftTab("sections")}>段节</button>
+              <button className={leftTab === "nav" ? "on" : ""} onClick={() => setLeftTab("nav")}>导航</button>
+            </div>
+            {leftTab !== "nav" && (
+              <div className="v2-filter-box">
+                <svg className="ic ic-sm" style={{ color: "var(--fg-3)" }} viewBox="0 0 16 16">
+                  <circle cx="7" cy="7" r="4.5" /><path d="M10.5 10.5L14 14" />
+                </svg>
+                <input
+                  value={leftFilter}
+                  onChange={(e) => setLeftFilter(e.target.value)}
+                  placeholder="过滤函数、地址或字符串…"
+                  autoComplete="off"
+                />
+              </div>
+            )}
           </div>
 
-          {/* 引用密度：全局背景信息，不属于任何一个视图（原型同位置） */}
-          {!empty && mod && (
-            <HeatBar
-              so={mod.so}
-              xrefBuilt={navSt?.xref_built}
-              onPickAddr={(a) => jumpToNearestAddr(mod.so, a)}
-            />
-          )}
-
-          {/* 「实时」页永远渲染监控台：动态操作不依赖 so 文件。
-              没模块时监控台自己引导，而不是整页换成空状态——
-              否则 AI 在 hook/操作设备时，用户看到的是死页面。 */}
-          {mainView === "monitor" && (
-            <RealtimeMonitor
-              mods={modules.map((m) => ({ so: m.so, n: m.funcs.length }))}
-              hooksProp={navSt?.hooks ?? null}
-              events={aiEvents}
-              paused={aiPaused}
-              onTogglePause={() =>
-                setAiPaused((v) => {
-                  aiPausedRef.current = !v;   // (131) 同步给 WS 闭包
-                  return !v;
-                })
-              }
-              onClear={() => setAiEvents([])}
-            />
-          )}
-
-          {mainView === "xref" && f && mod && (
-            <XrefView
-              so={mod.so}
-              addr={f.a}
-              fnName={f.n}
-              onJump={(a) => jumpToAddr(mod.so, a)}
-            />
-          )}
-
-          {mainView === "graph" && f && mod && (
-            <GraphView
-              so={mod.so}
-              addr={f.a}
-              fnName={f.n}
-              onJump={(a) => jumpToAddr(mod.so, a)}
-            />
-          )}
-
-          {mainView === "strings" && !mod && !loading && (
-            <NeedSoView what="字符串表" why="字符串来自 ELF 的 .rodata 段，必须先载入一个 so" />
-          )}
-
-          {mainView === "strings" && mod && (
-            <FlatTable so={mod.so} kind="strings" />
-          )}
-
-          {mainView === "sections" && !mod && !loading && (
-            <NeedSoView what="段 / 节表" why="段表是 ELF 文件结构的一部分，必须先载入一个 so" />
-          )}
-
-          {mainView === "sections" && mod && (
-            <FlatTable so={mod.so} kind="sections" />
-          )}
-
-          {mainView === "timeline" && (
-            <TimelineView events={aiEvents} />
-          )}
-
-          {mainView === "tools" && (
-            <ToolsView counts={toolCounts} />
-          )}
-
-          {/* (1) 第一次修改（2026-11-19）：控制台视图（与工具同级，不是弹窗）。
-              为什么无条件渲染而不加 empty 判断：控制台看的是 AI 调了哪些工具、
-              手动跑 frida 的结果，这些都与是否加载了 so 无关——
-              加上 empty 守卫会退化成"没 so 就白屏"（R83 那种坑）。 */}
-          <ConsoleOverlay open={mainView === "console"} onScriptsChange={setLiveScripts} />
-
-          {mainView === "processes" && (
-            <ProcessesView />
-          )}
-
-          {mainView.startsWith("dyn:") && (
-            <DynStateView kind={mainView.slice(4) as DynKind} />
-          )}
-
-          {mainView === "module" && !empty && mod && (
-            <>
-            <div className="stage-canvas">
-              {/* 反汇编列表：热力条下面的主体（原型代码页） */}
-              <div className="code-listing" ref={codeListRef}>
-                {codeWindow.map((fn) => {
-                  const expKey = `${mod.so}:${fn.a}`;
-                  const expRows = expanded[expKey];
-                  return (
-                  <div key={expKey}>
-                    <div
-                      className={"fnrow" + (f && f.a === fn.a ? " sel" : "")}
-                      data-i={mod.funcs.findIndex((x) => x.a === fn.a)}
-                      onClick={() => {
-                        // (132) 必须先选中：右边检视器/引用/图谱都跟着 f 走，
-                        //       只 toggle 不 select 会让 f 永远停在第一个函数。
-                        const idx = mod.funcs.findIndex((x) => x.a === fn.a);
-                        if (idx >= 0) {
-                          setActive(modules.findIndex((m) => m.so === mod.so));
-                          selectFn(modules.findIndex((m) => m.so === mod.so), idx);
-                        }
-                        void toggleFn(mod.so, fn.a);
-                      }}
-                    >
-                      <span className="fn-t">
-                        {expRows ? "▾" : "▸"}
-                      </span>
-                      <span className="fn-n">{fn.n}</span>
-                      {fn.e && <span className="fn-tag">导出</span>}
-                      <span className="fn-a">0x{fn.a.toString(16)}</span>
-                    </div>
-                    {expRows && (
-                      <div className="ins-list">
-                        {expRows.map((ins) => (
-                          <div className="ins-row" key={ins.addr}>
-                            <span className="ins-a">
-                              0x{ins.addr.toString(16)}
-                            </span>
-                            <span className="ins-b">{ins.bytes}</span>
-                            {/* 指令拆成 助记符 + 操作数 分别着色，
-                                跳转/返回再单独标色（原型是这么分的） */}
-                            <span
-                              className={
-                                "ins-x" +
-                                (ins.is_call ? " call" : "") +
-                                (ins.is_ret ? " ret" : "")
-                              }
-                            >
-                              <b className="ins-mn">
-                                {ins.text.includes(" ")
-                                  ? ins.text.slice(0, ins.text.indexOf(" "))
-                                  : ins.text}
-                              </b>
-                              {ins.text.includes(" ") && (
-                                <span className="ins-op">
-                                  {ins.text.slice(ins.text.indexOf(" ") + 1)}
-                                </span>
-                              )}
-                            </span>
-                          </div>
-                        ))}
+          <div className="v2-list-body">
+            {leftTab === "funcs" && (
+              mod ? (
+                <>
+                  {filteredFuncs.map((fn) => {
+                    const isSel = f?.a === fn.a;
+                    return (
+                      <div
+                        key={fn.a}
+                        className={"v2-fn-item" + (isSel ? " sel" : "") + (fn.e ? " exp" : "")}
+                        onClick={() => jumpToAddr(mod.so, fn.a)}
+                      >
+                        <span className="nm" title={fn.n}>{fn.n}</span>
+                        <span className="ad">{hex(fn.a)}</span>
+                        <span className="rf">{fn.r || ""}</span>
                       </div>
-                    )}
-                  </div>
-                  );
-                })}
-                <div className="fn-more">
-                  … 其余 {Math.max(0, mod.funcs.length - 60)} 个函数
+                    );
+                  })}
+                  {!filteredFuncs.length && (
+                    <div style={{ padding: 18, textAlign: "center", color: "var(--fg-3)" }}>无匹配函数</div>
+                  )}
+                </>
+              ) : (
+                <div style={{ padding: 18, textAlign: "center", color: "var(--fg-3)", fontSize: 12 }}>
+                  拖入或点击「+ 打开 so」加载模块；动态分析可直接切到「工具流」或「导航」
                 </div>
+              )
+            )}
+
+            {leftTab === "strings" && (
+              mod ? (
+                leftStrings.map((s) => (
+                  <div
+                    key={s.addr}
+                    className="v2-str-item"
+                    onClick={() => {
+                      if (s.ref_fn != null) {
+                        jumpToAddr(mod.so, s.ref_fn, { targetView: "split" });
+                        showToast(`已跳至引用该字符串的函数 ${hex(s.ref_fn)}`);
+                      } else {
+                        showToast(`字符串地址 ${hex(s.addr)}（尚未发现代码引用）`);
+                      }
+                    }}
+                  >
+                    <div className="v2-str-val">"{s.value}"</div>
+                    <div className="v2-str-meta">
+                      <span>{hex(s.addr)}{s.section ? ` · ${s.section}` : ""}</span>
+                      <span>{s.refs} 引用</span>
+                    </div>
+                  </div>
+                ))
+              ) : (
+                <div style={{ padding: 18, textAlign: "center", color: "var(--fg-3)" }}>请先打开一个 so</div>
+              )
+            )}
+
+            {leftTab === "sections" && (
+              mod ? (
+                leftSections.map((s) => {
+                  const cls = s.flags.includes("x") ? " exec" : s.flags.includes("w") ? " rw" : "";
+                  return (
+                    <div className="v2-sec-item" key={`${s.name}-${s.addr}`}>
+                      <span className={"v2-sec-perm" + cls}>{s.flags}</span>
+                      <span style={{ flex: 1, color: "var(--fg)", overflow: "hidden", textOverflow: "ellipsis" }}>
+                        {s.name}
+                      </span>
+                      <span style={{ color: "var(--fg-3)" }}>{s.addr}</span>
+                    </div>
+                  );
+                })
+              ) : (
+                <div style={{ padding: 18, textAlign: "center", color: "var(--fg-3)" }}>请先打开一个 so</div>
+              )
+            )}
+
+            {leftTab === "nav" && (
+              <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                <LeftNav
+                  so={mod?.so ?? ""}
+                  activeView={mainView === "split" || mainView === "disasm" ? "module" : mainView}
+                  onPick={(v) => setMainView(v === "module" ? "split" : v)}
+                  onServerModules={handleServerModules}
+                  fnCount={mod?.funcs.length}
+                  tick={aiTick}
+                />
+                <LeftPanel
+                  logs={logs}
+                  watch={watch}
+                  onPickWatch={(w) => jumpToAddr(w.so, w.addr, { targetView: "split" })}
+                />
               </div>
-            </div>
-            </>
-          )}
+            )}
+          </div>
+        </aside>
 
-          {mainView === "module" && empty && !loading && (
-            <div className="empty-stage">
-              <div className="empty-mark"><span className="mark" /></div>
-              <div className="empty-title">打开一个 so 开始分析</div>
-              <div className="empty-sub">多 so 同会话 · 跨 so 调用链 · ELF 32/64 · 节表损坏也能读</div>
-              <button className="btn primary" onClick={openSo}>打开 so 文件</button>
-              <div className="empty-hint">
-                {hasNativeDialog() ? "会弹出 macOS 文件选择框" : "浏览器模式没有文件对话框，请用 python app.py 打开桌面窗口"}
-              </div>
-              {loadError && <div className="empty-err">{loadError}</div>}
-            </div>
-          )}
-
-          {loading && (
-            <div className="loading-layer">
-              <div className="spinner" />
-              <div className="loading-text">正在解析 {loading.name}…</div>
-              <div className="loading-sub">读取段表 → 发现函数 → 建索引</div>
-            </div>
-          )}
-
-
-          <CodeOverlay
-            open={code.open}
-            fnName={f?.n ?? "—"}
-            fnAddr={f?.a ?? 0}
-            size={f?.s ?? 0}
-            refs={f?.r ?? 0}
-            isExport={!!f?.e}
-            rows={code.rows}
-            onClose={() => setCode((c) => ({ ...c, open: false }))}
-          />
-        </section>
-        {/* 右栏：实时页自带「事件详情」，不需要再挂一个函数列表（原型也是这样） */}
-        {/* 右侧：函数检视器（原型 aside.insp）。实时页自带事件详情，不显示。 */}
-        {mainView !== "monitor" && (
-          <Inspector
-            mods={modules}
-            current={mod && f ? { so: mod.so, addr: f.a, name: f.n } : null}
-            onPickFn={(soName, addr2) => jumpToAddr(soName, addr2)}
-          />
+        {leftOpen && (
+          <div className="v2-resizer-v" onMouseDown={(e) => startResize("left", e)} title="拖拽调整左侧宽度" />
         )}
-      </main>
+
+        {/* 中央工作台 + 底部抽屉 */}
+        <div className="v2-center">
+          <div className="v2-stage-bar">
+            <div className="v2-mode-tabs">
+              <button
+                className={"v2-mode-tab" + (mainView === "monitor" ? " on" : "")}
+                onClick={() => setMainView("monitor")}
+              >
+                工具流 <span className="hint-k">{aiEvents.length || 5}</span>
+              </button>
+              <button
+                className={"v2-mode-tab" + (mainView === "tools" ? " on" : "")}
+                onClick={() => setMainView("tools")}
+              >
+                工具库 <span className="hint-k">{toolsList.length || 140}</span>
+              </button>
+              <button
+                className={"v2-mode-tab" + (mainView === "split" ? " on" : "")}
+                onClick={() => setMainView("split")}
+                disabled={empty}
+              >
+                并排伪代码 <span className="hint-k">F5</span>
+              </button>
+              <button
+                className={"v2-mode-tab" + (mainView === "disasm" ? " on" : "")}
+                onClick={() => setMainView("disasm")}
+                disabled={empty}
+              >
+                反汇编 <span className="hint-k">1</span>
+              </button>
+              <button
+                className={"v2-mode-tab" + (mainView === "cfg" ? " on" : "")}
+                onClick={() => setMainView("cfg")}
+                disabled={!f}
+              >
+                CFG 控制流 <span className="hint-k">Space</span>
+              </button>
+              <button
+                className={"v2-mode-tab" + (mainView === "graph" ? " on" : "")}
+                onClick={() => setMainView("graph")}
+                disabled={!f}
+              >
+                跨 SO 图谱 <span className="hint-k">4</span>
+              </button>
+              <button
+                className={"v2-mode-tab" + (mainView === "xref" ? " on" : "")}
+                onClick={() => setMainView("xref")}
+                disabled={!f}
+              >
+                引用{navSt?.refs != null ? ` ${navSt.refs}` : ""}
+              </button>
+              <button
+                className={"v2-mode-tab" + (mainView === "timeline" ? " on" : "")}
+                onClick={() => setMainView("timeline")}
+              >
+                时间线
+              </button>
+              <button
+                className={"v2-mode-tab" + (mainView === "settings" ? " on" : "")}
+                onClick={() => setMainView("settings")}
+                title="设置 & 设备常用工具箱 (⌘,)"
+              >
+                设置 <span className="hint-k">⌘,</span>
+              </button>
+            </div>
+
+            <div className="v2-fn-actions">
+              <button
+                className="v2-act-btn"
+                disabled={!f}
+                onClick={() => f && setInlineDialog({ kind: "rename", value: f.n })}
+                title="原地重命名当前函数 (N)"
+              >
+                重命名 <span className="v2-kbd">N</span>
+              </button>
+              <button
+                className="v2-act-btn"
+                disabled={!f}
+                onClick={() => {
+                  if (!mod || !f) return;
+                  const a = selInsnAddr ?? f.a;
+                  setInlineDialog({ kind: "comment", value: commentsBySo[mod.so]?.[hex(a)] ?? "" });
+                }}
+                title="给选中地址写注释 (;)"
+              >
+                注释 <span className="v2-kbd">;</span>
+              </button>
+              <button
+                className="v2-act-btn"
+                disabled={!f}
+                onClick={() => mod && f && toggleBpMark(mod.so, selInsnAddr ?? f.a)}
+                title="本地标记/取消断点 (B)"
+              >
+                断点 <span className="v2-kbd">B</span>
+              </button>
+            </div>
+          </div>
+
+          <div className={"v2-stage-body" + (stageAura ? ` ${stageAura}` : "")}>
+            {mainView === "monitor" && (
+              <RealtimeMonitor
+                events={aiEvents}
+                wsAlive={wsAlive}
+                paused={aiPaused}
+                onTogglePause={() =>
+                  setAiPaused((v) => {
+                    aiPausedRef.current = !v;
+                    return !v;
+                  })
+                }
+                onClear={() => setAiEvents([])}
+                mods={modules.map((m) => ({ so: m.so, n: m.funcs.length }))}
+                hooksProp={navSt?.hooks ?? null}
+                dynState={dynState}
+                currentAddr={f?.a ?? null}
+                opsSignal={opsSignal}
+                onOpenTools={(tn) => {
+                  if (tn) setPreselectTool(tn);
+                  setMainView("tools");
+                }}
+                onJumpToCode={(soName, addr) => {
+                  if (addr != null) jumpToAddr(soName, addr, { targetView: "split" });
+                  else {
+                    const mi = modules.findIndex((m) => m.so === soName);
+                    if (mi >= 0) { setActive(mi); setMainView("split"); }
+                  }
+                }}
+                armedBpCount={armedBpCount}
+                toolsCount={toolsList.length || 140}
+              />
+            )}
+
+            {mainView === "tools" && (
+              <ToolsView
+                counts={toolCounts}
+                initialSelected={preselectTool}
+              />
+            )}
+
+            {mainView === "settings" && (
+              <SettingsView
+                theme={theme}
+                onToggleTheme={() => {
+                  themeLocked.current = true;
+                  setTheme((t) => (t === "dark" ? "light" : "dark"));
+                }}
+                onOpenToolDoc={(tn) => {
+                  setPreselectTool(tn);
+                  setMainView("tools");
+                }}
+                onToast={showToast}
+              />
+            )}
+
+            {(mainView === "split" || mainView === "disasm" || mainView === "cfg") && mod && f && (
+              <CodeStage
+                so={mod.so}
+                fnAddr={f.a}
+                fnName={f.n}
+                fnSize={f.s}
+                isExport={!!f.e}
+                mode={mainView}
+                selInsnAddr={selInsnAddr}
+                onSelectInsn={setSelInsnAddr}
+                onJump={(soName, addr) => jumpToAddr(soName, addr)}
+                onSwitchMode={(m) => setMainView(m)}
+                comments={commentsBySo[mod.so] ?? {}}
+                bpMarks={bpMarks}
+                onToggleBpMark={toggleBpMark}
+                aiHitSeq={aiHit.seq}
+                aiHitAddr={aiHit.addr}
+              />
+            )}
+
+            {(mainView === "split" || mainView === "disasm" || mainView === "cfg") && empty && !loading && (
+              <div className="empty-stage">
+                <div className="empty-mark"><span className="mark" /></div>
+                <div className="empty-title">拖入或打开一个 .so 开始分析</div>
+                <div className="empty-sub">多 so 同会话 · F5 伪代码联动 · Space 控制流图 · 跨 so 调用链</div>
+                <button className="v2-top-btn pri" style={{ height: 32, padding: "0 14px" }} onClick={openSo}>
+                  打开 so 文件
+                </button>
+                {loadError && <div className="empty-err">{loadError}</div>}
+              </div>
+            )}
+
+            {mainView === "graph" && mod && f && (
+              <GraphView
+                so={mod.so}
+                addr={f.a}
+                fnName={f.n}
+                onJump={(soName, addr) => jumpToAddr(soName, addr, { targetView: "graph" })}
+                onOpenCode={(soName, addr) => jumpToAddr(soName, addr, { targetView: "split" })}
+                onBuildXrefs={buildXrefs}
+              />
+            )}
+
+            {mainView === "xref" && mod && f && (
+              <XrefView
+                so={mod.so}
+                addr={f.a}
+                fnName={f.n}
+                onJump={(a) => jumpToAddr(mod.so, a, { targetView: "split" })}
+              />
+            )}
+
+            {mainView === "timeline" && <TimelineView events={aiEvents} />}
+            {mainView === "processes" && <ProcessesView />}
+            {mainView.startsWith("dyn:") && <DynStateView kind={mainView.slice(4) as DynKind} />}
+            {mainView === "strings" && (mod ? <FlatTable so={mod.so} kind="strings" /> : <NeedSoView what="字符串表" why="请先载入一个 so" />)}
+            {mainView === "sections" && (mod ? <FlatTable so={mod.so} kind="sections" /> : <NeedSoView what="段 / 节表" why="请先载入一个 so" />)}
+
+            {loading && (
+              <div className="loading-layer">
+                <div className="spinner" />
+                <div className="loading-text">正在解析 {loading.name}…</div>
+                <div className="loading-sub">读取段表 → 发现函数 → 建索引</div>
+              </div>
+            )}
+          </div>
+
+          {drawerOpen && (
+            <div className="v2-resizer-h" onMouseDown={(e) => startResize("drawer", e)} title="拖拽调整底部抽屉高度" />
+          )}
+
+          {/* 底部可拖拽抽屉：插件快捷分析 + 真实 Frida 终端 */}
+          <BottomDrawer
+            open={drawerOpen}
+            height={drawerH}
+            tab={drawerTab}
+            onChangeTab={setDrawerTab}
+            onClose={() => setDrawerOpen(false)}
+            so={mod?.so ?? ""}
+            fnAddr={f?.a ?? null}
+            fnName={f?.n ?? ""}
+            onJumpFn={(soName, addr) => jumpToAddr(soName, addr, { targetView: "split" })}
+            liveScripts={liveScripts}
+            onScriptsChange={setLiveScripts}
+          />
+        </div>
+
+        {showRightInspector && (
+          <>
+            <div className="v2-resizer-v" onMouseDown={(e) => startResize("right", e)} title="拖拽调整右侧检视器宽度" />
+            <aside className="v2-inspector" style={{ width: rightW }}>
+              <Inspector
+                mods={modules}
+                current={mod && f ? { so: mod.so, addr: f.a, name: f.n } : null}
+                onPickFn={(soName, addr) => jumpToAddr(soName, addr)}
+              />
+            </aside>
+          </>
+        )}
+      </div>
+
+      {/* 状态栏 */}
+      <footer className="v2-statusbar">
+        <span style={{ color: apiOk ? "var(--green)" : "var(--rose)", display: "inline-flex", alignItems: "center", gap: 5 }}>
+          <span className={"v2-pulse-dot" + (apiOk ? "" : " off")} style={{ width: 6, height: 6 }} />
+          {apiOk ? "后端已连接" : "后端未连接"} · WS {wsAlive ? "实时" : "重连中"}
+        </span>
+        <span className="mono">
+          {mod && f ? `${mod.so} · ${hex(selInsnAddr ?? f.a)} (${f.s} B)` : "未选中函数"}
+        </span>
+        <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+          ⌘K 搜索 · F5 并排伪代码 · Space CFG · 5 工具流 · 6 工具库 · ⌘J 终端/插件抽屉
+        </span>
+        <div className="r">
+          <span className="mono">{modules.length} 模块 · {totalFnsAll} 函数</span>
+          <span>MDA Studio v2</span>
+        </div>
+      </footer>
+
+      {/* 跨视图悬浮 AI 操控迷你雷达 HUD */}
+      <div
+        className={"v2-device-hud" + (hud ? " show" : "")}
+        style={hud ? { ["--hud-col" as string]: hud.col } : undefined}
+        onClick={() => { setHud(null); setMainView("monitor"); }}
+      >
+        <div className="v2-hud-top">
+          <span className="v2-pulse-dot" style={{ width: 6, height: 6, background: hud?.col || "var(--accent)" }} />
+          <span className="v2-hud-title">{hud?.tool || "AI 操控设备"}</span>
+          {hud && <span className={"v2-badge " + hud.cat} style={{ marginLeft: "auto" }}>{TOOL_LABEL[hud.cat] || hud.cat}</span>}
+        </div>
+        <div className="v2-hud-sub">{hud?.sub || ""}</div>
+        <div className="v2-hud-track">
+          <span>AI</span>
+          <span className="v2-hud-wire" />
+          <span>{hud?.layer || "Android"}</span>
+        </div>
+      </div>
+
+      {/* ⌘K 全局命令面板 */}
+      <CommandPalette
+        open={paletteOpen}
+        onClose={() => setPaletteOpen(false)}
+        modules={modules}
+        tools={toolsList}
+        actions={paletteActions}
+        onJumpFn={(soName, addr) => jumpToAddr(soName, addr, { targetView: "split" })}
+        onPickTool={(tName) => { setPreselectTool(tName); setMainView("tools"); }}
+      />
+
+      {/* 原地重命名 / 注释弹窗 */}
+      {inlineDialog && (
+        <div
+          className="v2-modal-backdrop"
+          onClick={(e) => { if (e.target === e.currentTarget) setInlineDialog(null); }}
+        >
+          <div className="v2-modal-box">
+            <h3>
+              {inlineDialog.kind === "rename"
+                ? `重命名函数 · ${f ? hex(f.a) : ""}`
+                : `写入/编辑指令注释 · ${hex(selInsnAddr ?? f?.a ?? 0)}`}
+            </h3>
+            <input
+              autoFocus
+              value={inlineDialog.value}
+              onChange={(e) => setInlineDialog({ ...inlineDialog, value: e.target.value })}
+              onKeyDown={(e) => {
+                e.stopPropagation();
+                if (e.key === "Enter") { e.preventDefault(); void submitInlineDialog(); }
+                if (e.key === "Escape") { e.preventDefault(); setInlineDialog(null); }
+              }}
+            />
+            <div className="v2-modal-foot">
+              <button className="v2-top-btn" onClick={() => setInlineDialog(null)}>取消</button>
+              <button className="v2-top-btn pri" onClick={() => void submitInlineDialog()}>确定</button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {dragging && (
         <div className="drop-overlay">
           <div className="drop-box">
             <span className="drop-icon" />
             <span>松开即加载 .so</span>
-            <span className="drop-sub">也可以拖多个文件，逐个加入会话</span>
+            <span className="drop-sub">自动上传到后端实时解析</span>
           </div>
         </div>
       )}
 
-      <footer className="statusbar">
-        <span>so <span className="k">{mod?.so ?? "未加载"}</span></span>
-        <span>addr <span className="k">{f ? hex(f.a) : "—"}</span></span>
-        <span>指令 <span className="k">{f ? f.s + "B" : "—"}</span></span>
-        <span>模块 <span className="k">{modules.length}</span></span>
-        <span className="r"><span>{code.live ? "后端实时" : "静态数据"}</span><span>React + TS</span></span>
-      </footer>
+      {toast && <div className="v2-toast">{toast}</div>}
     </div>
   );
-}
-
-function API_LABEL(): string {
-  return location.host || "127.0.0.1:8766";
 }

@@ -92,17 +92,22 @@ export function Inspector({ current, onPickFn }: Props) {
       <div className="insp-sec">
         <div className="insp-sec-hd">调用者<b>{d?.refs_in ?? 0}</b></div>
         <div className="insp-sec-bd">
-          {(d?.callers ?? []).slice(0, MAX_ROWS).map((c) => (
-            <div
-              className="insp-xref"
-              key={c.addr}
-              onClick={() => onPickFn(current.so, parseInt(c.addr, 16))}
-              title={`跳到 ${c.name}`}
-            >
-              <span className="fn">{c.name}</span>
-              <span className="a">{c.addr}</span>
-            </div>
-          ))}
+          {(d?.callers ?? []).slice(0, MAX_ROWS).map((c) => {
+            const targetSo = c.so || current.so;
+            const isCross = targetSo !== current.so;
+            return (
+              <div
+                className="insp-xref"
+                key={`${targetSo}:${c.addr}`}
+                onClick={() => onPickFn(targetSo, parseInt(c.addr, 16))}
+                title={`跳到 ${targetSo}!${c.name}`}
+              >
+                <span className="fn">{c.name}</span>
+                {isCross && <span className="v2-badge plugin">{targetSo}</span>}
+                <span className="a">{c.addr}</span>
+              </div>
+            );
+          })}
           {(d?.refs_in ?? 0) > MAX_ROWS && (
             <div className="insp-xref more">还有 {d!.refs_in - MAX_ROWS} 个…</div>
           )}
@@ -114,17 +119,29 @@ export function Inspector({ current, onPickFn }: Props) {
       <div className="insp-sec">
         <div className="insp-sec-hd">被调用<b>{d?.refs_out ?? 0}</b></div>
         <div className="insp-sec-bd">
-          {(d?.callees ?? []).slice(0, MAX_ROWS).map((c) => (
-            <div
-              className="insp-xref"
-              key={c.addr}
-              onClick={() => !c.plt && onPickFn(current.so, parseInt(c.addr, 16))}
-              title={c.plt ? "外部导入（跨 so / libc），不在本模块内" : `跳到 ${c.name}`}
-            >
-              <span className="fn">{c.name}</span>
-              <span className={"a" + (c.plt ? " dim" : "")}>{c.plt ? "plt" : c.addr}</span>
-            </div>
-          ))}
+          {(d?.callees ?? []).slice(0, MAX_ROWS).map((c) => {
+            const targetSo = c.so || current.so;
+            const isCross = targetSo !== current.so;
+            const canJump = isCross || !c.plt;
+            return (
+              <div
+                className="insp-xref"
+                key={`${targetSo}:${c.addr}:${c.name}`}
+                onClick={() => canJump && onPickFn(targetSo, parseInt(c.addr, 16))}
+                title={
+                  isCross
+                    ? `跨 SO 跳到 ${targetSo}!${c.name}`
+                    : c.plt
+                      ? "外部导入（未加载目标 so）"
+                      : `跳到 ${c.name}`
+                }
+              >
+                <span className="fn">{c.name}</span>
+                {isCross && <span className="v2-badge plugin">{targetSo}</span>}
+                <span className={"a" + (!canJump ? " dim" : "")}>{!canJump ? "plt" : c.addr}</span>
+              </div>
+            );
+          })}
           {(d?.refs_out ?? 0) > MAX_ROWS && (
             <div className="insp-xref more">还有 {d!.refs_out - MAX_ROWS} 个…</div>
           )}

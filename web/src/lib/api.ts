@@ -83,7 +83,32 @@ export type ApiFn = {
   name: string; addr: number; size: number; is_export: boolean;
   discovered_by: string; refs?: number;
 };
-export type ApiInsn = { addr: number; bytes: string; text: string; is_call: boolean; is_ret: boolean };
+export type ApiInsn = {
+  addr: number;
+  bytes: string;
+  text: string;
+  is_call: boolean;
+  is_ret: boolean;
+  call_target?: number | null;
+  jump_so?: string;
+  jump_addr?: number;
+  str_ref?: string;
+  sym_ref?: string;
+};
+export type ApiCfgBlock = {
+  start: string;
+  end: string;
+  insns: { addr: string; text: string }[];
+  successors: { to: string; kind: string }[];
+};
+export type ApiCfgResp = {
+  ok: boolean;
+  so?: string;
+  function?: string;
+  entry?: string;
+  block_count?: number;
+  blocks?: ApiCfgBlock[];
+};
 export type ApiTool = { name: string; desc: string; params: string[]; required: string[] };
 export type ApiHeatmap = {
   so: string; lo: string; hi: string; functions: number;
@@ -92,7 +117,7 @@ export type ApiHeatmap = {
 export type ApiSection = {
   name: string; addr: string; offset: string; size: number; flags: string; type?: string;
 };
-export type ApiString = { addr: number; value: string; refs: number };
+export type ApiString = { addr: number; value: string; refs: number; section?: string; ref_fn?: number | null };
 export type ApiFact = { calls: number; num: number | null; summary: string; ts: string };
 export type ApiHooks = { armed: boolean; pid?: number; on: string[]; off: string[] };
 export type ApiNavStats = {
@@ -148,7 +173,7 @@ export type ApiConsoleEvent = {
   mode?: string;
   reason?: string;
 };
-export type ApiXrefItem = { addr: string; site?: string; name: string; is_export: boolean; size: number };
+export type ApiXrefItem = { addr: string; so?: string; site?: string; name: string; is_export: boolean; size: number };
 /** 函数检视器：一个函数的全部已知事实（右侧面板） */
 
 /** 动态侧状态：断点 / 命中 / 内存 / VM / 行为监控。
@@ -186,8 +211,8 @@ export type ApiFnDetail = {
   refs_out: number;
   section: string;
   attached: boolean;
-  callers: { addr: string; site?: string; name: string; is_export: boolean }[];
-  callees: { addr: string; name: string; is_export: boolean; plt: boolean }[];
+  callers: { so?: string; addr: string; site?: string; name: string; is_export: boolean }[];
+  callees: { so?: string; addr: string; name: string; is_export: boolean; plt: boolean }[];
   strings: { addr: string; value: string }[];
   breakpoint: boolean;
   hits: number;
@@ -206,6 +231,87 @@ export type ApiProcResult = {
   ok?: boolean; error?: string; package?: string; count?: number;
   processes?: ApiProc[]; main_pid?: number; network_pids?: number[];
   network_basis?: string; verdict?: string; hint?: string;
+};
+
+export type ApiFavoriteApp = {
+  name: string;
+  package: string;
+};
+
+export type ApiSettings = {
+  serial: string;
+  proxy_host: string;
+  proxy_port: number;
+  cert_path: string;
+  favorite_apps: ApiFavoriteApp[];
+  suspend_packages: string[];
+  reset_package: string;
+  reset_wait_sec: number;
+  reset_relaunch: boolean;
+};
+
+export type ApiToolboxDevice = {
+  serial: string;
+  state: string;
+  model: string;
+  root: boolean;
+  foreground: string;
+  foreground_label?: string;
+};
+
+export type ApiProxyStatus = {
+  ok: boolean;
+  code?: string;
+  error?: string;
+  message?: string;
+  serial?: string;
+  enabled?: boolean;
+  active_proxy?: string;
+  keys?: Record<string, string>;
+  phone_ip?: string;
+  host_ip?: string;
+  port?: number;
+  port_listening?: boolean;
+  port_listener?: string;
+  cert?: {
+    src: string;
+    exists: boolean;
+    hash: string;
+    installed: boolean;
+    magisk_module: boolean;
+    error?: string;
+  };
+};
+
+export type ApiSuspendItem = {
+  package: string;
+  suspended: boolean;
+  ok: boolean;
+  output?: string;
+};
+
+export type ApiSuspendResp = {
+  ok: boolean;
+  code?: string;
+  error?: string;
+  message?: string;
+  serial?: string;
+  action?: string;
+  items?: ApiSuspendItem[];
+};
+
+export type ApiResetResp = {
+  ok: boolean;
+  code?: string;
+  error?: string;
+  message?: string;
+  serial?: string;
+  package?: string;
+  stopped?: boolean;
+  cleared?: boolean;
+  clear_output?: string;
+  relaunched?: boolean;
+  pid?: number;
 };
 
 /**
@@ -368,6 +474,49 @@ export const api = {
     j<{ addr: number; items: ApiInsn[] }>(
       `${API_BASE}/api/disasm?so=${encodeURIComponent(so)}&addr=${addr}`
     ),
+  /** 获取函数源地址映射伪代码（style="c" 结构化伪 C / style="raw" 指令对照） */
+  decompile: (so: string, addr: number, style: "c" | "raw" = "c") =>
+    j<{
+      ok: boolean;
+      so: string;
+      addr: string;
+      style?: string;
+      code: string;
+      lines?: { addr: number | null; text: string }[];
+    }>(
+      `${API_BASE}/api/decompile?so=${encodeURIComponent(so)}&addr=${addr}&style=${style}`
+    ),
+  /** 获取函数真实基本块 CFG（复用 disasm_func 插件） */
+  cfg: (so: string, addr: number) =>
+    j<ApiCfgResp>(
+      `${API_BASE}/api/cfg?so=${encodeURIComponent(so)}&addr=${addr}`
+    ),
+  /** 原地重命名函数（写入会话与持久化注解） */
+  renameFn: (so: string, addr: number, name: string) =>
+    j<{ ok: boolean; so: string; addr: number; name: string }>(`${API_BASE}/api/rename`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...CLIENT_HEADERS },
+      body: JSON.stringify({ so, addr, name }),
+    }),
+  /** 读取某 so 的全部地址注释 */
+  comments: (so: string) =>
+    j<{ ok: boolean; so: string; items: Record<string, string> }>(
+      `${API_BASE}/api/comments?so=${encodeURIComponent(so)}`
+    ),
+  /** 写入或清除地址注释（写入会话与持久化注解） */
+  setComment: (so: string, addr: number, comment: string) =>
+    j<{ ok: boolean; so: string; addr: string; comment: string }>(`${API_BASE}/api/comment`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...CLIENT_HEADERS },
+      body: JSON.stringify({ so, addr, comment }),
+    }),
+  /** 运行只读静态分析插件（供底部抽屉插件快捷分析展示真实结果） */
+  pluginRun: <T = Record<string, unknown>>(name: string, args: Record<string, unknown>) =>
+    j<T>(`${API_BASE}/api/plugin_run`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...CLIENT_HEADERS },
+      body: JSON.stringify({ name, args }),
+    }),
   xrefs: (so: string, addr: number) =>
     j<{ addr: number; callers: string[]; callees: string[] }>(
       `${API_BASE}/api/xrefs?so=${encodeURIComponent(so)}&addr=${addr}`
@@ -414,4 +563,86 @@ export const api = {
     j<{ ok: boolean; count: number; items: { script_id: number; serial: string; pid: number; mode: string; age_s: number }[] }>(
       `${API_BASE}/api/frida_js/list`
     ),
+
+  // ---------------------------------------------------------------- 设置与设备工具箱
+  settings: () =>
+    j<{ ok: boolean; settings: ApiSettings; path: string; host_ip: string }>(`${API_BASE}/api/settings`),
+  saveSettings: (patch: Partial<ApiSettings>) =>
+    j<{ ok: boolean; settings: ApiSettings; path: string; error?: string }>(`${API_BASE}/api/settings`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...CLIENT_HEADERS },
+      body: JSON.stringify(patch),
+    }),
+  toolboxDevices: (opts?: { serial?: string; packages?: boolean }) => {
+    const q = new URLSearchParams();
+    if (opts?.serial) q.set("serial", opts.serial);
+    if (opts?.packages) q.set("packages", "1");
+    const qs = q.toString();
+    return j<{
+      ok: boolean;
+      adb_path?: string;
+      host_ip?: string;
+      devices: ApiToolboxDevice[];
+      packages?: string[];
+      installed_apps?: ApiFavoriteApp[];
+      error?: string;
+    }>(
+      `${API_BASE}/api/toolbox/devices${qs ? `?${qs}` : ""}`
+    );
+  },
+  toolboxAppLabel: (serial: string, pkg: string) => {
+    const q = new URLSearchParams({ package: pkg });
+    if (serial) q.set("serial", serial);
+    return j<{ ok: boolean; package: string; label: string; error?: string }>(
+      `${API_BASE}/api/toolbox/app_label?${q.toString()}`
+    );
+  },
+  toolboxAppLabels: (serial: string, packages: string[]) =>
+    j<{ ok: boolean; labels: Record<string, string>; error?: string }>(`${API_BASE}/api/toolbox/app_labels`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...CLIENT_HEADERS },
+      body: JSON.stringify({ serial, packages }),
+    }),
+  toolboxProxyStatus: (opts?: { serial?: string; port?: number; cert_path?: string }) => {
+    const q = new URLSearchParams();
+    if (opts?.serial) q.set("serial", opts.serial);
+    if (opts?.port) q.set("port", String(opts.port));
+    if (opts?.cert_path) q.set("cert_path", opts.cert_path);
+    const qs = q.toString();
+    return j<ApiProxyStatus>(`${API_BASE}/api/toolbox/proxy/status${qs ? `?${qs}` : ""}`);
+  },
+  toolboxProxy: (opts: {
+    action: "on" | "off" | "status" | "cert_install" | "cert_remove";
+    serial?: string;
+    host?: string;
+    port?: number;
+    cert_path?: string;
+  }) =>
+    j<ApiProxyStatus>(`${API_BASE}/api/toolbox/proxy`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...CLIENT_HEADERS },
+      body: JSON.stringify(opts),
+    }),
+  toolboxAppSuspend: (opts: {
+    action: "freeze" | "unfreeze" | "status";
+    serial?: string;
+    packages?: string[];
+  }) =>
+    j<ApiSuspendResp>(`${API_BASE}/api/toolbox/app_suspend`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...CLIENT_HEADERS },
+      body: JSON.stringify(opts),
+    }),
+  toolboxAppReset: (opts: {
+    serial?: string;
+    package: string;
+    clear_data: boolean;
+    relaunch: boolean;
+    wait_sec: number;
+  }) =>
+    j<ApiResetResp>(`${API_BASE}/api/toolbox/app_reset`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...CLIENT_HEADERS },
+      body: JSON.stringify(opts),
+    }),
 };

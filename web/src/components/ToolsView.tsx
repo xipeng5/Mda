@@ -1,51 +1,48 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { api, type ApiTool } from "../lib/api";
+import { classifyTool, isReadbackTool, LAYER_NAMES, TOOL_LABEL, toolToLayer } from "../lib/toolMeta";
 
-/**
- * 工具页：全部 MCP 工具的可查清单。
- *
- * 数据直接读服务端注册表（/api/tools）——不复用前端副本，
- * 因为工具是会增加的（这一轮就多了 5 个），任何写死的清单都会过期。
- *
- * 这里只读：工具由 AI 在对话侧调用，界面负责让人看清
- * 「有哪些工具、各自干什么、这一会话调过几次」。
- */
+export { classifyTool as classify } from "../lib/toolMeta";
 
-/** 按工具名前缀归类——通用规则，102 个工具全覆盖，不写死具体工具 */
-export function classify(tool: string): string {
-  const t = tool || "";
-  if (/^vm_|^dump_vm|^probe_vm/.test(t)) return "vm";
-  if (/^perf_watch/.test(t)) return "watch";
-  if (/^java_/.test(t)) return "java";
-  if (/^trace_|^watch_module|^module_load/.test(t)) return "trace";
-  if (/^mem_/.test(t)) return "mem";
-  if (/^behavior_/.test(t)) return "behavior";
-  if (/process|^list_threads|^probe_network/.test(t)) return "proc";
-  if (/breakpoint|^hits$|^wait_hits|^poll_events|^probe_hits|^resume$|^freeze|^unfreeze|^attach|^detach/.test(t))
-    return "bp";
-  if (/^read_|^locate_|^get_callstack|^runtime_modules|^list_modules/.test(t)) return "runtime";
-  return "static";
-}
+const TOOLS_CATS = [
+  { k: "all", label: "全部" },
+  { k: "static", label: "静态" },
+  { k: "bp", label: "断点" },
+  { k: "proc", label: "进程" },
+  { k: "vm", label: "VM" },
+  { k: "mem", label: "内存" },
+  { k: "behavior", label: "行为" },
+  { k: "runtime", label: "运行时" },
+  { k: "trace", label: "轨迹" },
+  { k: "java", label: "Java" },
+  { k: "watch", label: "观察点" },
+  { k: "ui", label: "UI" },
+];
 
-const LABEL: Record<string, string> = {
-  static: "静态", vm: "VM", bp: "断点", proc: "进程", behavior: "行为",
-  mem: "内存", watch: "观察点", trace: "轨迹", java: "Java", runtime: "运行时",
+type Props = {
+  counts: Record<string, number>;
+  /** 外部预选工具（如从工具流详情点击「在 137 工具库查看」或 ⌘K 搜索进入） */
+  initialSelected?: string | null;
 };
 
-type Props = { counts: Record<string, number> };
-
-export function ToolsView({ counts }: Props) {
+/**
+ * 全部 137 个真实 MCP 工具目录：
+ * 直接同步自后端注册表 /api/tools，支持关键词搜索、12 分类过滤、实时调用计数脉冲与自动定位。
+ */
+export function ToolsView({ counts, initialSelected }: Props) {
   const [tools, setTools] = useState<ApiTool[]>([]);
   const [q, setQ] = useState("");
-  const [sel, setSel] = useState<string | null>(null);
+  const [cat, setCat] = useState("all");
+  const [sel, setSel] = useState<string | null>(initialSelected ?? null);
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState<string | null>(null);
   const prevCounts = useRef<Record<string, number>>({});
   const listRef = useRef<HTMLDivElement | null>(null);
 
-  // (1) 第一次修改（2026-11-26）
-  // bug 原因：异步拉取工具清单缺少取消标志。
-  // 解决方案：补齐 alive 取消标志。
+  useEffect(() => {
+    if (initialSelected) setSel(initialSelected);
+  }, [initialSelected]);
+
   useEffect(() => {
     let alive = true;
     void (async () => {
@@ -55,14 +52,13 @@ export function ToolsView({ counts }: Props) {
         setErr("读不到工具清单：后端未连接");
         return;
       }
-      setTools(r.tools ?? []);
+      const list = r.tools ?? [];
+      setTools(list);
+      setSel((cur) => cur || list[0]?.name || null);
     })();
-    return () => {
-      alive = false;
-    };
+    return () => { alive = false; };
   }, []);
 
-  // 计数变了说明刚被调用过 → 那一行脉冲，并自动定位到可视区
   useEffect(() => {
     for (const [tool, n] of Object.entries(counts)) {
       if ((prevCounts.current[tool] ?? 0) !== n) {
@@ -75,121 +71,146 @@ export function ToolsView({ counts }: Props) {
     prevCounts.current = { ...counts };
   }, [counts]);
 
-  // 自动定位：被调用的那行若不在可视区，平滑滚到中间
   useEffect(() => {
     if (!busy) return;
     const list = listRef.current;
     if (!list) return;
-    const row = [...list.querySelectorAll<HTMLElement>(".tvrow")]
-      .find((el) => el.dataset.tool === busy);
-    if (!row) return;                       // 被搜索过滤掉了就不滚
-    // 用 offsetTop 直接算落点并**立即赋值**：
-    //   · getBoundingClientRect 在平滑滚动进行中读到的位置不可靠，
-    //     用"中心差 + scrollTop"算落点会算错（实测滚完行仍在视口外）
-    //   · smooth 动画期间还会被下一次 busy 打断
-    // 即时赋值一次到位，行为确定。
+    const row = [...list.querySelectorAll<HTMLElement>(".v2-tv-row")].find(
+      (el) => el.dataset.tool === busy
+    );
+    if (!row) return;
     const top = row.offsetTop - (list.clientHeight - row.offsetHeight) / 2;
-    const clamped = Math.max(0, Math.min(top, list.scrollHeight - list.clientHeight));
-    if (Math.abs(list.scrollTop - clamped) > 2) list.scrollTop = clamped;
+    list.scrollTop = Math.max(0, Math.min(top, list.scrollHeight - list.clientHeight));
   }, [busy]);
 
   const rows = useMemo(() => {
     const kw = q.trim().toLowerCase();
-    if (!kw) return tools;
-    return tools.filter(
-      (t) =>
+    return tools.filter((t) => {
+      const c = classifyTool(t.name);
+      if (cat !== "all" && c !== cat) return false;
+      if (!kw) return true;
+      return (
         t.name.toLowerCase().includes(kw) ||
         (t.desc ?? "").toLowerCase().includes(kw) ||
         t.params.some((p) => p.toLowerCase().includes(kw))
-    );
-  }, [tools, q]);
+      );
+    });
+  }, [tools, q, cat]);
 
-  const detail = sel ? tools.find((t) => t.name === sel) : null;
+  const detail = sel ? tools.find((t) => t.name === sel) ?? rows[0] ?? null : rows[0] ?? null;
+  const dCat = detail ? classifyTool(detail.name) : "static";
 
   return (
-    <div className="tools-view">
-      <div className="tv-bar">
+    <div className="v2-tools-view">
+      <div className="v2-tv-bar">
         <input
-          className="tv-search"
+          className="v2-tv-search"
           placeholder="搜工具名 / 参数 / 描述…"
           value={q}
           onChange={(e) => setQ(e.target.value)}
         />
-        <span className="tv-count">
-          {rows.length} 个{q ? ` / ${tools.length}` : ""}
+        <span className="mono" style={{ fontSize: 11, color: "var(--fg-2)", whiteSpace: "nowrap" }}>
+          {rows.length} 个{q || cat !== "all" ? ` / ${tools.length}` : ""}
         </span>
-        {err && <span className="tv-err">{err}</span>}
+        <div className="v2-sep" />
+        {TOOLS_CATS.map((c) => {
+          const n =
+            c.k === "all"
+              ? tools.length
+              : tools.filter((t) => classifyTool(t.name) === c.k).length;
+          return (
+            <button
+              key={c.k}
+              className={"v2-cat-pill" + (cat === c.k ? " on" : "")}
+              onClick={() => setCat(c.k)}
+            >
+              <span>{c.label}</span>
+              <b>{n}</b>
+            </button>
+          );
+        })}
+        {err && <span style={{ color: "var(--rose)", fontSize: 11 }}>{err}</span>}
       </div>
 
-      <div className="tv-body">
-        <div className="tv-list" ref={listRef}>
+      <div className="v2-tv-body">
+        <div className="v2-tv-list" ref={listRef}>
           {rows.map((t) => {
-            const type = classify(t.name);
+            const c = classifyTool(t.name);
             const n = counts[t.name] ?? 0;
             return (
               <div
                 key={t.name}
                 data-tool={t.name}
                 className={
-                  "tvrow" + (sel === t.name ? " sel" : "") +
+                  "v2-tv-row" +
+                  (detail?.name === t.name ? " sel" : "") +
                   (busy === t.name ? " busy" : "")
                 }
                 onClick={() => setSel(t.name)}
               >
-                <span className="tv-n">{t.name}</span>
-                <span className={"tv-tp " + type}>{LABEL[type] ?? type}</span>
-                <span className="tv-d">{t.desc}</span>
-                <span className={"tv-c" + (n ? " has" : "")}>{n ? `${n} 次` : "—"}</span>
+                <span className="v2-tv-name" title={t.name}>{t.name}</span>
+                <span className={"v2-badge " + c} style={{ textAlign: "center" }}>
+                  {TOOL_LABEL[c] ?? c}
+                </span>
+                <span className="v2-tv-desc" title={t.desc}>{t.desc}</span>
+                <span className={"v2-tv-cnt" + (n ? " has" : "")}>
+                  {n ? `${n} 次` : "—"}
+                </span>
               </div>
             );
           })}
           {!rows.length && (
-            <div className="tv-empty">
-              {tools.length ? "没有匹配的工具" : "正在读取工具清单…"}
+            <div style={{ padding: 28, textAlign: "center", color: "var(--fg-3)" }}>
+              {tools.length ? "没有匹配的工具" : "正在读取后端工具注册表…"}
             </div>
           )}
         </div>
 
-        <div className="tv-detail">
+        <div className="v2-tv-detail">
           {!detail ? (
-            <div className="tv-empty">点左边任意一个工具</div>
+            <div style={{ color: "var(--fg-3)" }}>点左边任意一个工具查看参数与说明</div>
           ) : (
             <>
-              <div className="tvd-hd">{detail.name}</div>
-              <div className="tvd-sec">类别</div>
-              <div className="tvd-p">
-                <span className={"tv-tp " + classify(detail.name)}>
-                  {LABEL[classify(detail.name)]}
-                </span>
-                <span style={{ marginLeft: 8, color: "var(--fg3)", fontSize: 11 }}>
-                  本会话调用 {counts[detail.name] ?? 0} 次
+              <div className="v2-tvd-hd">{detail.name}</div>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 8 }}>
+                <span className={"v2-badge " + dCat}>{TOOL_LABEL[dCat] ?? dCat}</span>
+                <span style={{ fontSize: 11.5, color: "var(--fg-3)" }}>
+                  本会话调用 <b className="mono" style={{ color: "var(--fg)" }}>{counts[detail.name] ?? 0}</b> 次
                 </span>
               </div>
 
-              <div className="tvd-sec">说明</div>
-              <div className="tvd-desc">{detail.desc || "（无描述）"}</div>
+              <div className="v2-tvd-sec">功能说明</div>
+              <div className="v2-tvd-desc">{detail.desc || "（无描述）"}</div>
 
-              <div className="tvd-sec">参数（{detail.params.length}）</div>
-              <div className="tvd-params">
+              <div className="v2-tvd-sec">参数列表（{detail.params.length}）</div>
+              <div className="v2-tvd-params">
                 {detail.params.length ? (
-                  detail.params.map((p) => (
-                    <span
-                      key={p}
-                      className={"tvd-par" + (detail.required.includes(p) ? " req" : "")}
-                      title={detail.required.includes(p) ? "必填" : "可选"}
-                    >
-                      {p}
-                    </span>
-                  ))
+                  detail.params.map((p) => {
+                    const req = detail.required.includes(p);
+                    return (
+                      <span
+                        key={p}
+                        className={"v2-tvd-par" + (req ? " req" : "")}
+                        title={req ? "必填参数" : "可选参数"}
+                      >
+                        {p}{req ? " *" : ""}
+                      </span>
+                    );
+                  })
                 ) : (
-                  <span style={{ fontSize: 11, color: "var(--fg3)" }}>无参数</span>
+                  <span style={{ fontSize: 11.5, color: "var(--fg-3)" }}>无参数</span>
                 )}
               </div>
 
-              <div className="tvd-sec">为什么这里是只读的</div>
-              <div className="tvd-desc">
-                工具由 AI 在对话侧调用。界面只负责让你看清「有哪些工具、
-                各自干什么、这一会话调过几次」。想用某个工具，在对话里说就行。
+              <div className="v2-tvd-sec">目标子系统通道</div>
+              <div className="v2-tvd-desc">
+                {LAYER_NAMES[toolToLayer(detail.name, dCat)]}（
+                {isReadbackTool(detail.name) ? "双向数据回传通道" : "单向下发控制通道"}）
+              </div>
+
+              <div className="v2-tvd-sec">说明</div>
+              <div className="v2-tvd-desc">
+                全部 {tools.length} 个工具直接读自 MDA 后端注册表（/api/tools）。工具由 AI 在对话侧调用，界面负责实时展示调用流、计数脉冲与设备运行态动效。
               </div>
             </>
           )}
